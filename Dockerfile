@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS source
+FROM node:26-bookworm-slim AS source
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -18,12 +18,12 @@ RUN apt-get update \
 FROM source AS build
 RUN npm run build && npm prune --omit=dev
 
-FROM node:22-bookworm-slim AS codex-baked
+FROM node:26-bookworm-slim AS codex-baked
 ARG CODEX_CLI_VERSION=latest
 RUN npm install --global --prefix /opt/codex-baked "@openai/codex@${CODEX_CLI_VERSION}" \
     && /opt/codex-baked/bin/codex --version
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 
 ARG UV_VERSION=0.11.28
 RUN apt-get update \
