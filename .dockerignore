@@ -1,0 +1,12 @@
+.git
+.github
+.env
+node_modules
+dist
+dist-server
+data
+tenants
+workspaces
+coverage
+*.sqlite*
+*.log

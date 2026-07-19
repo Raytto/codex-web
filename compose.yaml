@@ -1,0 +1,59 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-web:local
+    restart: unless-stopped
+    init: true
+    environment:
+      HOST: 0.0.0.0
+      PORT: 37821
+      BASE_PATH: /codex-web
+      CONTAINERIZED: "true"
+      DATA_ROOT: /app/data
+      TENANT_ROOT: /app/tenants
+      PYTHON_RUNTIME_ROOT: /opt/cww-python
+      CODEX_RUNTIME_PATH: /opt/codex-runtime/current/bin/codex
+      TENANT_WORKER_ISOLATION: "true"
+      TZ: ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:${CODEX_WEB_PORT:-37821}:37821"
+    volumes:
+      - ./.env:/app/.env:ro
+      - app-data:/app/data
+      - tenant-data:/app/tenants
+      - codex-runtime:/opt/codex-runtime
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+      - apparmor=unconfined
+    pids_limit: 1024
+    mem_limit: 8g
+    cpus: 3.5
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/codex-web/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  app-data:
+  tenant-data:
+  codex-runtime:
