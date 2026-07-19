@@ -3,7 +3,7 @@ import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   ArrowUp, Bot, Check, ChevronDown, Download, File as FileIcon, FileImage, FileText, FolderOpen,
-  CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square,
+  CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
   Trash2, X, Zap,
 } from "lucide-react";
 import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
@@ -13,20 +13,34 @@ import { chooseComposerPrimaryAction } from "./composer-action";
 import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
 import { resolveAccountIdentity } from "./account-identity";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
+import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, type ThemePreference } from "./theme";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => readStoredThemePreference());
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
 
   useEffect(() => {
     api.session().then((value) => { setCsrf(value.csrfToken); setSession(value); }).finally(() => setLoading(false));
   }, []);
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!query) return;
+    const update = (event: MediaQueryListEvent) => setSystemPrefersDark(event.matches);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    applyThemePreference(themePreference, systemPrefersDark);
+    try { window.localStorage.setItem(THEME_PREFERENCE_KEY, themePreference); } catch { /* Storage can be unavailable in private browsing. */ }
+  }, [systemPrefersDark, themePreference]);
 
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
-  return <Workspace session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} />;
+  return <Workspace session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -57,7 +71,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   </main>;
 }
 
-function Workspace({ session, onLogout }: { session: Session; onLogout: () => void }) {
+function Workspace({ session, onLogout, themePreference, onThemePreferenceChange }: { session: Session; onLogout: () => void; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(() => window.localStorage.getItem(SELECTED_CONVERSATION_KEY));
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
@@ -423,6 +437,14 @@ function Workspace({ session, onLogout }: { session: Session; onLogout: () => vo
               <button type="button" aria-label="减小聊天正文字号" disabled={fontSizeSaving || chatFontSize <= CHAT_FONT_SIZE_MIN} onClick={() => void changeChatFontSize(-1)}><Minus size={15} /></button>
               <output aria-live="polite">{chatFontSize}px</output>
               <button type="button" aria-label="增大聊天正文字号" disabled={fontSizeSaving || chatFontSize >= CHAT_FONT_SIZE_MAX} onClick={() => void changeChatFontSize(1)}><Plus size={15} /></button>
+            </div>
+          </div>
+          <div className="theme-setting">
+            <div><strong>外观</strong><small>选择固定主题或跟随设备设置</small></div>
+            <div className="theme-options" role="group" aria-label="外观模式">
+              <button type="button" aria-label="使用浅色模式" aria-pressed={themePreference === "light"} onClick={() => onThemePreferenceChange("light")}><Sun size={16} /><span>浅色</span></button>
+              <button type="button" aria-label="使用深色模式" aria-pressed={themePreference === "dark"} onClick={() => onThemePreferenceChange("dark")}><Moon size={16} /><span>深色</span></button>
+              <button type="button" aria-label="外观跟随系统" aria-pressed={themePreference === "system"} onClick={() => onThemePreferenceChange("system")}><Monitor size={16} /><span>系统</span></button>
             </div>
           </div>
         </section>}

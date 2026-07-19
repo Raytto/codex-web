@@ -26,6 +26,7 @@ import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../src/recovery.js";
+import { normalizeThemePreference, resolveTheme, THEME_PREFERENCE_KEY } from "../src/theme.js";
 import type { Conversation, WorkFile } from "../src/api.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-context.js";
 
@@ -36,7 +37,7 @@ test("user-visible branding uses Codex Web without the private product name", ()
   assert.match(index, /<title>Codex Web<\/title>/);
   assert.match(index, /name="application-name" content="Codex Web"/);
   assert.doesNotMatch(`${index}\n${appSource}`, /PP Agent/i);
-  assert.doesNotMatch(appSource, /localStorage\.setItem\([^)]*codex-web:/);
+  assert.doesNotMatch(appSource, /localStorage\.setItem\([^)]*codex-web:(?:model|reasoning)/);
   assert.equal(redactBrandForDisplay("Codex / CHATGPT / agent"), "Codex / Codex Web / agent");
 });
 
@@ -60,6 +61,39 @@ test("chat font sizing keeps readable bounds and scales from the default", () =>
   assert.equal(normalizeChatFontSize("18"), 18);
   assert.equal(normalizeChatFontSize(9), CHAT_FONT_SIZE_MIN);
   assert.equal(normalizeChatFontSize(99), CHAT_FONT_SIZE_MAX);
+});
+
+test("appearance setting supports light, dark, and live system preference", () => {
+  assert.equal(THEME_PREFERENCE_KEY, "codex-web:theme");
+  assert.equal(normalizeThemePreference("light"), "light");
+  assert.equal(normalizeThemePreference("dark"), "dark");
+  assert.equal(normalizeThemePreference("system"), "system");
+  assert.equal(normalizeThemePreference("unexpected"), "light");
+  assert.equal(resolveTheme("system", true), "dark");
+  assert.equal(resolveTheme("system", false), "light");
+  assert.equal(resolveTheme("dark", false), "dark");
+
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /使用浅色模式[\s\S]*使用深色模式[\s\S]*外观跟随系统/);
+  assert.match(appSource, /matchMedia\?\.\("\(prefers-color-scheme: dark\)"\)/);
+  assert.match(styles, /:root\[data-theme="dark"\]/);
+  assert.match(styles, /\.theme-options button\[aria-pressed="true"\]/);
+
+  const darkBlock = styles.match(/:root\[data-theme="dark"\]\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+  const color = (name: string) => darkBlock.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{6})`))?.[1] ?? "";
+  const luminance = (hex: string) => {
+    const channels = [1, 3, 5].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255)
+      .map((value) => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+    return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
+  };
+  const contrast = (foreground: string, background: string) => {
+    const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (values[0] + .05) / (values[1] + .05);
+  };
+  assert.ok(contrast(color("ink"), color("canvas")) >= 7);
+  assert.ok(contrast(color("ink-soft"), color("canvas")) >= 4.5);
+  assert.ok(contrast(color("indigo"), color("paper")) >= 4.5);
 });
 
 test("progress labels do not report intermediate agent messages as complete", () => {

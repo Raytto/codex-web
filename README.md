@@ -1,6 +1,6 @@
 # Codex Web
 
-An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations, file uploads and deliverables, server-side task queues, live steering, cancellation, automatic titles, adjustable reading size, and optional voice transcription.
+An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations, file uploads and deliverables, server-side task queues, live steering, cancellation, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
 
@@ -15,6 +15,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Soft-deleted conversation audit records while workspace files are removed
 - Forced cancellation of running or queued work when a conversation is deleted
 - Automatic short task titles, with manual titles taking precedence
+- Light, dark, and system-following appearance modes
 - Optional Alibaba Cloud DashScope voice transcription
 - A dedicated Unix identity for the Codex worker inside the container
 
