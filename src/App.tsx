@@ -17,6 +17,7 @@ import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, 
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
+import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 
@@ -674,39 +675,29 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
   const queueStatus = activities.findLast((activity) => activity.status === "queued");
   const queued = Boolean(queueStatus) && !activities.some((activity) => activity.status === "running");
   const retrying = !queued && latestStatus?.status === "retrying";
-  const insight = activities.findLast((activity) => ["reasoning", "update"].includes(activity.kind ?? "") && Boolean(activity.detail));
   const plan = activities.findLast((activity) => activity.kind === "todo" && Boolean(activity.items?.length));
-  const steps = compactActivitySteps(activities).slice(-6);
+  const journal = buildProcessJournal(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
   return <div className="activity-card" role="status" aria-live="polite">
-    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始") : retrying ? latestStatus.label : "可随时点击下方停止按钮"}</span></div>
-    {insight && <div className="process-focus"><div><Bot size={14} /><strong>{insight.kind === "reasoning" ? "模型公开思路摘要" : "阶段反馈"}</strong></div><p>{insight.detail}</p></div>}
+    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始") : retrying ? latestStatus.label : "完成前持续保留，可随时引导"}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
-    <div className="process-section-title"><strong>最近步骤</strong><span>实时</span></div>
-    <div className="activity-timeline">{steps.map((activity, index) => <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
-      {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
-      <div><span>{activity.label}</span>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}
-        {activity.kind === "file" && activity.files?.length ? <small>{activity.files.map((file) => file.split(/[\\/]/).at(-1)).join("、")}</small> : null}
-        {["search", "tool"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
-        {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>查看技术细节</summary><code>{activity.detail}</code></details> : null}
-      </div>
-    </div>)}</div>
+    <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 全程保留` : "实时更新"}</span></div>
+    <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
+      ? <section className="process-journal-note" key={activity.seq ?? `${activity.kind}-${index}`}>
+          <header><Bot size={14} /><strong>{activity.kind === "reasoning" ? "重要思路" : "阶段反馈"}</strong>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}</header>
+          <div className="process-note-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{activity.detail}</ReactMarkdown></div>
+        </section>
+      : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
+          {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
+          <div><span>{activity.label}</span>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}
+            {activity.kind === "file" && activity.files?.length ? <small>{activity.files.map((file) => file.split(/[\\/]/).at(-1)).join("、")}</small> : null}
+            {["search", "tool"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
+            {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>查看技术细节</summary><code>{activity.detail}</code></details> : null}
+          </div>
+        </div>) : <p className="process-journal-empty">正在建立执行方向…</p>}</div>
   </div>;
-}
-
-function compactActivitySteps(activities: JobEvent[]): JobEvent[] {
-  const compacted: JobEvent[] = [];
-  for (const activity of activities) {
-    if (!activity.label || ["todo", "reasoning", "update"].includes(activity.kind ?? "")) continue;
-    if (activity.kind === "command" && activity.detail) {
-      const earlier = compacted.findLastIndex((item) => item.kind === "command" && item.detail === activity.detail);
-      if (earlier >= 0) compacted.splice(earlier, 1);
-    }
-    compacted.push(activity);
-  }
-  return compacted;
 }
 
 function formatMessageDateTime(value: string): string {

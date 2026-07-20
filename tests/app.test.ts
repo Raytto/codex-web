@@ -32,6 +32,7 @@ import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../sr
 import { normalizeThemePreference, resolveTheme, THEME_PREFERENCE_KEY } from "../src/theme.js";
 import type { Conversation, WorkFile } from "../src/api.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-context.js";
+import { buildProcessJournal } from "../src/process-journal.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -187,6 +188,28 @@ test("progress labels do not report intermediate agent messages as complete", ()
   } as never), {
     kind: "command", label: "质量验证完成", detail: "Get-Content slides_test.py",
   });
+});
+
+test("running work journal retains every important direction and compacts repeated actions", () => {
+  const journal = buildProcessJournal([
+    { seq: 1, kind: "reasoning", label: "模型思路摘要", detail: "先确认数据口径" },
+    { seq: 2, kind: "command", label: "正在读取并核对资料", detail: "rg sales" },
+    { seq: 3, kind: "command", label: "资料读取与核对完成", detail: "rg sales" },
+    { seq: 4, kind: "update", label: "阶段反馈", detail: "已确认按自然月统计" },
+    { seq: 5, kind: "file", label: "已更新文件", files: ["outputs/report.xlsx"] },
+    { seq: 6, kind: "file", label: "已更新文件", files: ["outputs/report.xlsx"] },
+    { seq: 7, kind: "reasoning", label: "模型思路摘要", detail: "再验证汇总结果" },
+    { seq: 8, kind: "status", label: "工作已完成，正在整理结果" },
+  ]);
+  assert.deepEqual(journal.map((event) => event.seq), [1, 3, 4, 5, 7]);
+  assert.deepEqual(journal.filter((event) => ["reasoning", "update"].includes(event.kind ?? "")).map((event) => event.detail), [
+    "先确认数据口径", "已确认按自然月统计", "再验证汇总结果",
+  ]);
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.match(appSource, /journal\.map/);
+  assert.doesNotMatch(appSource, /compactActivitySteps\(activities\)\.slice/);
+  assert.match(appSource, /\{sending && <article className="message assistant running"/);
+  assert.match(appSource, /完成前持续保留，可随时引导/);
 });
 
 test("recoverable stream errors remain progress events until the turn completes", async () => {
@@ -1363,5 +1386,6 @@ test("conversation detail restores running progress and terminal SSE replay", as
   assert.doesNotMatch(replay.text, /id: 1\n/);
   assert.match(replay.text, /id: 2\n/);
   assert.match(replay.text, /id: 3\n/);
+  assert.match(replay.text, /"created_at":"2026-/);
   await agent.get(`/codex-web/api/conversations/${crypto.randomUUID()}`).expect(404);
 });

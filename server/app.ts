@@ -80,7 +80,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function publish(jobId: string, eventType: string, payload: unknown): void {
     const seq = db.appendEvent(jobId, eventType, payload);
-    for (const response of subscribers.get(jobId) ?? []) writeSse(response, seq, eventType, payload);
+    const livePayload = {
+      ...(payload && typeof payload === "object" ? payload : { payload }),
+      created_at: new Date().toISOString(),
+    };
+    for (const response of subscribers.get(jobId) ?? []) writeSse(response, seq, eventType, livePayload);
     if (["done", "failed"].includes(eventType)) {
       setTimeout(() => {
         for (const response of subscribers.get(jobId) ?? []) response.end();
@@ -714,7 +718,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     let lastSent = after;
     res.write("retry: 2000\n\n");
     for (const event of db.listEvents(job.id, after)) {
-      writeSse(res, event.seq, event.event_type, JSON.parse(event.payload));
+      writeSse(res, event.seq, event.event_type, { created_at: event.created_at, ...JSON.parse(event.payload) });
       lastSent = event.seq;
     }
     const terminalStatuses = ["completed", "failed", "cancelled", "interrupted"];
@@ -724,7 +728,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     subscribers.set(job.id, set);
     const checkedJob = db.getJob(job.id);
     if (!checkedJob || terminalStatuses.includes(checkedJob.status)) {
-      for (const event of db.listEvents(job.id, lastSent)) writeSse(res, event.seq, event.event_type, JSON.parse(event.payload));
+      for (const event of db.listEvents(job.id, lastSent)) writeSse(res, event.seq, event.event_type, { created_at: event.created_at, ...JSON.parse(event.payload) });
       set.delete(res);
       if (set.size === 0) subscribers.delete(job.id);
       return res.end();
