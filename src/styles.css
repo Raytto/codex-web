@@ -487,8 +487,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 
 @media (max-width: 720px) {
-  .sidebar { width: min(288px, 86vw); position: fixed; inset: 0 auto 0 0; z-index: 40; transform: translateX(-102%); transition: transform .2s ease; box-shadow: 12px 0 34px rgba(15, 17, 32, .25); }
-  .sidebar.open { transform: translateX(0); }
+  .sidebar { width: min(288px, 86vw); position: fixed; inset: 0 auto 0 0; z-index: 40; visibility: hidden; transform: translateX(-102%); pointer-events: none; transition: transform .2s ease, visibility 0s linear .2s; box-shadow: none; }
+  .sidebar.open { visibility: visible; transform: translateX(0); pointer-events: auto; transition-delay: 0s; box-shadow: 12px 0 34px rgba(15, 17, 32, .25); }
   .sidebar-backdrop { display: block; position: fixed; inset: 0; z-index: 35; border: 0; background: rgba(15, 17, 32, .48); backdrop-filter: blur(2px); }
   .mobile-only { display: inline-grid; }
   .mobile-header { height: 58px; flex: 0 0 58px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid rgba(15, 17, 32, .08); background: rgba(250, 251, 255, .94); }
@@ -702,3 +702,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .toast { border-color: #6f4148; color: #ffabb3; background: #382126; box-shadow: 0 9px 25px rgba(0, 0, 0, .3); }
 :root[data-theme="dark"] .toast.info { border-color: #42604b; color: #bce4c7; background: #223329; box-shadow: 0 9px 25px rgba(0, 0, 0, .28); }
 :root[data-theme="dark"] .sidebar-backdrop { background: rgba(0, 0, 0, .62); }
+
+@media (max-width: 720px) {
+  :root[data-theme="dark"] .sidebar:not(.open) { box-shadow: none; }
+  :root[data-theme="dark"] .sidebar.open { box-shadow: 12px 0 34px rgba(0, 0, 0, .42); }
+}

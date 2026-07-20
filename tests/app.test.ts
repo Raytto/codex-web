@@ -99,6 +99,13 @@ test("appearance setting supports light, dark, and live system preference", () =
   assert.ok(contrast(color("indigo"), color("paper")) >= 4.5);
 });
 
+test("closed mobile sidebar is not painted as an offscreen shadow layer", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  const mobileBlock = styles.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(mobileBlock, /\.sidebar \{[^}]*visibility: hidden;[^}]*pointer-events: none;[^}]*box-shadow: none;/);
+  assert.match(mobileBlock, /\.sidebar\.open \{[^}]*visibility: visible;[^}]*pointer-events: auto;[^}]*box-shadow:/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.sidebar:not\(\.open\) \{ box-shadow: none; \}/);
+});
 test("selected message text can be quoted into a focused Agent question", () => {
   assert.equal(normalizeAskAgentSelection("  第一行  \r\n\r\n\r\n第二行  \n"), "第一行\n\n第二行");
   assert.equal(buildAskAgentDraft("", "第一行\n第二行"), "请结合以下引用回答我的问题：\n\n> 第一行\n> 第二行\n\n请解释这段引用。");
