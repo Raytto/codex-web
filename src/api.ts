@@ -8,12 +8,13 @@ export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
 };
 export type Message = {
-  id: string; role: "user" | "assistant" | "system"; content: string; created_at: string; files: WorkFile[];
+  id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
   id: string;
   conversation_id: string;
   content: string;
+  quote_excerpt: string | null;
   agent_model: string;
   reasoning_effort: string;
   position: number;
@@ -106,9 +107,10 @@ export const api = {
   renameConversation: (id: string, title: string) => request<{ conversation: Conversation }>(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteConversation: (id: string) => request<void>(`/conversations/${id}`, { method: "DELETE" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
-  sendMessage: (id: string, message: string, files: File[]) => {
+  sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "") => {
     const body = new FormData();
     body.set("message", message);
+    body.set("quoteExcerpt", quoteExcerpt);
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body });
   },
@@ -130,9 +132,10 @@ export const api = {
   restorePendingPrompt: (conversationId: string, promptId: string) => request<{ pendingPrompt: PendingPrompt | null; activeJob: Job | null }>(
     `/conversations/${conversationId}/pending-prompts/${promptId}/restore`, { method: "POST" },
   ),
-  updatePendingPrompt: (conversationId: string, promptId: string, message: string, files: File[], removedFileIds: string[]) => {
+  updatePendingPrompt: (conversationId: string, promptId: string, message: string, files: File[], removedFileIds: string[], quoteExcerpt = "") => {
     const body = new FormData();
     body.set("message", message);
+    body.set("quoteExcerpt", quoteExcerpt);
     body.set("removedFileIds", JSON.stringify(removedFileIds));
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(

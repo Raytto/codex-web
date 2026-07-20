@@ -121,10 +121,13 @@ test("selected message text can be quoted into a focused Agent question", () => 
   assert.match(appSource, /询问 Agent/);
   assert.match(appSource, /className="ask-agent-reference"/);
   assert.match(appSource, /setAskAgentQuote\(normalized\.slice/);
-  assert.match(appSource, /submittedMessage = askAgentQuote \? buildAskAgentDraft/);
+  assert.doesNotMatch(appSource, /buildAskAgentDraft/);
+  assert.match(appSource, /api\.sendMessage\(id, message, files, askAgentQuote\)/);
+  assert.match(appSource, /className="message-reference"/);
   assert.match(appSource, /focusRequest=\{composerFocusRequest\}/);
   assert.match(styles, /\.ask-agent-selection \{[^}]*position: fixed;[^}]*touch-action: manipulation/);
   assert.match(styles, /\.ask-agent-reference \{/);
+  assert.match(styles, /\.message-reference \{/);
   assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-selection/);
   assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-reference/);
 });
@@ -625,6 +628,51 @@ test("single-user login and CSRF protection", async (context) => {
     .field("message", "请制作一份很长很长的家长会成绩分析演示文稿").expect(202);
   assert.equal(instance.db.getConversation(created.body.conversation.id)?.title, "新任务");
   assert.equal(instance.db.getConversation(created.body.conversation.id)?.title_source, "default");
+});
+
+test("quoted selections stay outside the visible message body and survive the pending queue", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-message-quote-test-"));
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
+    username: "pp", passwordHash: bcrypt.hashSync("Quote-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const agent = request.agent(instance.app);
+  const login = await agent.post("/api/auth/login").send({ username: "pp", password: "Quote-Password-2026!" }).expect(200);
+  const created = await agent.post("/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
+  const conversationId = created.body.conversation.id as string;
+
+  await agent.post(`/api/conversations/${conversationId}/messages`)
+    .set("X-CSRF-Token", login.body.csrfToken)
+    .field("message", "这和上一段有什么关系？")
+    .field("quoteExcerpt", "  被引用的第一行\r\n被引用的第二行  ")
+    .expect(202);
+  let detail = await agent.get(`/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.messages[0].content, "这和上一段有什么关系？");
+  assert.equal(detail.body.messages[0].quote_excerpt, "被引用的第一行\n被引用的第二行");
+  assert.doesNotMatch(detail.body.messages[0].content, /请结合以下引用|被引用的第一行/);
+
+  const queued = await agent.post(`/api/conversations/${conversationId}/messages`)
+    .set("X-CSRF-Token", login.body.csrfToken)
+    .field("message", "")
+    .field("quoteExcerpt", "只引用、不写正文")
+    .expect(202);
+  assert.equal(queued.body.pendingPrompt.content, "");
+  assert.equal(queued.body.pendingPrompt.quote_excerpt, "只引用、不写正文");
+
+  const pendingId = queued.body.pendingPrompt.id as string;
+  await agent.post(`/api/conversations/${conversationId}/pending-prompts/${pendingId}/edit`)
+    .set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  await agent.post(`/api/conversations/${conversationId}/pending-prompts/${pendingId}/restore`)
+    .set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  const materialized = instance.db.materializePendingPrompt(pendingId, crypto.randomUUID(), crypto.randomUUID());
+  assert.ok(materialized?.message_id);
+  const quotedMessage = instance.db.getMessage(materialized!.message_id!);
+  assert.equal(quotedMessage?.content, "");
+  assert.equal(quotedMessage?.quote_excerpt, "只引用、不写正文");
+  detail = await agent.get(`/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.messages.at(-1).quote_excerpt, "只引用、不写正文");
 });
 
 test("conversation stop cancels every active job and deletion preserves audit rows while removing physical state", async (context) => {

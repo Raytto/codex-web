@@ -14,7 +14,7 @@ import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
 import { resolveAccountIdentity } from "./account-identity";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
 import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, type ThemePreference } from "./theme";
-import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "./ask-agent-selection";
+import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
 
@@ -143,6 +143,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       setRemovedEditingFileIds([]);
       setFiles([]);
       setInput(result.editingPrompt.content);
+      setAskAgentQuote(result.editingPrompt.quote_excerpt ?? "");
     }
     if (!result.editingPrompt && editingPendingRef.current) {
       setEditingPending(null);
@@ -328,9 +329,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function send(message = input) {
-    const submittedMessage = askAgentQuote ? buildAskAgentDraft(message, askAgentQuote) : message;
     const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
-    if ((!submittedMessage.trim() && files.length === 0 && !hasRetainedEditingFile) || submitting || selectionSaving) return;
+    if ((!message.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile) || submitting || selectionSaving) return;
     setError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
     try {
@@ -341,7 +341,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         selectedIdRef.current = id; setSelectedId(id);
       }
       if (editingPending) {
-        const result = await api.updatePendingPrompt(id, editingPending.id, submittedMessage, files, removedEditingFileIds);
+        const result = await api.updatePendingPrompt(id, editingPending.id, message, files, removedEditingFileIds, askAgentQuote);
         if (result.needsInstruction) {
           const persisted = result.editingPrompt ?? result.pendingPrompt ?? editingPending;
           editingPendingRef.current = persisted; setEditingPending(persisted); setRemovedEditingFileIds([]);
@@ -350,7 +350,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]);
         }
       } else {
-        const result = await api.sendMessage(id, submittedMessage, files);
+        const result = await api.sendMessage(id, message, files, askAgentQuote);
         if (result.needsInstruction) setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
       }
       setInput(""); setAskAgentQuote(""); setFiles([]);
@@ -366,7 +366,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     try {
       const result = await api.editPendingPrompt(selectedId, prompt.id);
       editingPendingRef.current = result.editingPrompt;
-      setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setAskAgentQuote(""); setInput(result.editingPrompt.content);
+      setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setAskAgentQuote(result.editingPrompt.quote_excerpt ?? ""); setInput(result.editingPrompt.content);
       if (selectedModel !== prompt.agent_model || reasoningEffort !== prompt.reasoning_effort) {
         await persistAgentSelection({ model: prompt.agent_model, reasoningEffort: prompt.reasoning_effort });
       }
@@ -379,9 +379,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (!selectedId || !editingPending || submitting) return;
     setSubmitting(true); setError("");
     try {
-      if (editingPending.content.trim()) await api.restorePendingPrompt(selectedId, editingPending.id);
+      if (editingPending.content.trim() || editingPending.quote_excerpt) await api.restorePendingPrompt(selectedId, editingPending.id);
       else await api.deletePendingPrompt(selectedId, editingPending.id);
-      editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setFiles([]);
+      editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setAskAgentQuote(""); setFiles([]);
       setNotice("");
       await reconcile(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "取消编辑失败"); }
@@ -648,7 +648,10 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
               if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
               return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
             } }}
-          >{sanitizeAgentMarkdown(message.content, citationFiles)}</ReactMarkdown></div> : <p data-agent-selectable="true">{message.content}</p>}
+          >{sanitizeAgentMarkdown(message.content, citationFiles)}</ReactMarkdown></div> : <>
+            {message.quote_excerpt && <div className="message-reference" title={message.quote_excerpt}><CornerUpLeft size={14} /><span><strong>引用</strong>{message.quote_excerpt}</span></div>}
+            {message.content && <p data-agent-selectable="true">{message.content}</p>}
+          </>}
           {message.files.length > 0 && <div className="file-grid">{message.files.map((file) => <FileCard key={file.id} file={file} />)}</div>}
         </div>
       </article>)}
@@ -761,8 +764,9 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
         <button type="button" className="pending-drag-handle" draggable={!busy}
           onDragStart={(event) => { setDraggingId(prompt.id); event.dataTransfer.effectAllowed = "move"; }}
           onDragEnd={() => setDraggingId(null)} title="拖动调整顺序" aria-label="拖动调整顺序"><GripVertical size={17} /></button>
-        <div className="pending-queue-copy" title={prompt.content || prompt.files.map((file) => file.original_name).join("、")}>
-          <span>{prompt.content || prompt.files.map((file) => file.original_name).join("、") || "附件任务"}</span>
+        <div className="pending-queue-copy" title={prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、")}>
+          <span>{prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、") || "附件任务"}</span>
+          {prompt.quote_excerpt && <small><CornerUpLeft size={11} />含引用</small>}
           {prompt.files.length > 0 && <small><Paperclip size={11} />{prompt.files.length} 个附件</small>}
         </div>
         <div className="pending-queue-actions">
@@ -1013,7 +1017,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     hasAttachments: files.length > 0 || hasRetainedEditingFile,
     voiceActive: voiceState !== "idle",
   });
-  const awaitingInstruction = Boolean(editingPending && !editingPending.content.trim());
+  const awaitingInstruction = Boolean(editingPending && !editingPending.content.trim() && !editingPending.quote_excerpt);
   return <div className="composer-wrap">
     {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={submitting} canSteer={canSteer}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}

@@ -10,6 +10,7 @@ import multer from "multer";
 import { loadConfig, type AppConfig } from "./config.js";
 import { CodexRunner, extractLeakedAutoTitleAnswer } from "./codex-runner.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
+import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { AppDatabase, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, type AgentOptions, type AgentSelection } from "./model-options.js";
@@ -123,6 +124,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   }
 
+  function submittedQuoteExcerpt(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    return normalizeAskAgentSelection(value).slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1) || null;
+  }
+
+  function agentPrompt(content: string, quoteExcerpt?: string | null): string {
+    return quoteExcerpt ? buildAskAgentDraft(content, quoteExcerpt) : content;
+  }
+
   async function stopConversationJobs(conversationId: string): Promise<void> {
     for (const job of db.listActiveJobsForConversation(conversationId)) {
       if (job.status === "queued" && db.cancelQueuedJob(job.id)) {
@@ -169,7 +179,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         return;
       }
       const selection = repairAgentSelection(optionsForUser(conversation.user_id), job.agent_model, job.reasoning_effort);
-      await runner.run(job.id, conversation.id, message.content, db.listFilesForMessage(message.id), selection);
+      await runner.run(job.id, conversation.id, agentPrompt(message.content, message.quote_excerpt), db.listFilesForMessage(message.id), selection);
     } finally {
       publishQueuePositions();
       await pumpQueue();
@@ -521,12 +531,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
-    if (!prompt && uploaded.length === 0) return res.status(400).json({ error: "请输入内容或上传文件。" });
+    const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
+    if (!prompt && !quoteExcerpt && uploaded.length === 0) return res.status(400).json({ error: "请输入内容、添加引用或上传文件。" });
     const selection = conversationAgentSelection(conversation);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0];
 
-    if (!prompt) {
-      if (editingPrompt?.content.trim()) {
+    if (!prompt && !quoteExcerpt) {
+      if (editingPrompt?.content.trim() || editingPrompt?.quote_excerpt) {
         removeUnregisteredUploads(uploaded);
         return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
       }
@@ -542,7 +553,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
 
     if (editingPrompt) {
-      if (editingPrompt.content.trim()) {
+      if (editingPrompt.content.trim() || editingPrompt.quote_excerpt) {
         removeUnregisteredUploads(uploaded);
         return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
       }
@@ -551,21 +562,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         return res.status(400).json({ error: "单条任务最多包含 12 个附件。" });
       }
       registerPendingUploads(conversation.id, editingPrompt.id, uploaded);
-      const updated = db.updatePendingPrompt(editingPrompt.id, prompt, selection);
+      const updated = db.updatePendingPrompt(editingPrompt.id, prompt, selection, quoteExcerpt);
       if (!updated) return res.status(409).json({ error: "等待指令的文件状态已经变化，请刷新后重试。" });
       if (config.queueAutoStart) await pumpQueue();
       return res.status(202).json({ pendingPrompt: db.getPendingPrompt(updated.id) ?? null, queued: true });
     }
 
     if (db.listActiveJobsForConversation(conversation.id).length > 0 || db.listPendingPrompts(conversation.id).length > 0) {
-      const pendingPrompt = db.createPendingPrompt(newId(), conversation.id, prompt, selection);
+      const pendingPrompt = db.createPendingPrompt(newId(), conversation.id, prompt, selection, quoteExcerpt);
       registerPendingUploads(conversation.id, pendingPrompt.id, uploaded);
       return res.status(202).json({ pendingPrompt: db.getPendingPrompt(pendingPrompt.id), queued: true });
     }
 
     const messageId = newId();
     const createdAt = new Date().toISOString();
-    db.addMessage({ id: messageId, conversation_id: conversation.id, role: "user", content: prompt, created_at: createdAt });
+    db.addMessage({ id: messageId, conversation_id: conversation.id, role: "user", content: prompt, quote_excerpt: quoteExcerpt, created_at: createdAt });
     const fileRows = uploaded.map((file) => {
       const row = {
         id: newId(), conversation_id: conversation.id, message_id: messageId, pending_prompt_id: null,
@@ -609,7 +620,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
     const prompt = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!prompt || prompt.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
-    if (!prompt.content.trim()) return res.status(409).json({ error: "请先输入具体操作，或者清除这批待处理文件。" });
+    if (!prompt.content.trim() && !prompt.quote_excerpt) return res.status(409).json({ error: "请先输入具体操作，或者清除这批待处理文件。" });
     const restored = db.restorePendingPrompt(prompt.id);
     if (!restored) return res.status(409).json({ error: "该任务当前不在编辑状态。" });
     if (config.queueAutoStart) await pumpQueue();
@@ -625,6 +636,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!pending || pending.conversation_id !== conversation.id) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "待发送任务不存在。" }); }
     if (pending.status !== "editing") { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "请先点击编辑。" }); }
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
+    const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
     let removedFileIds: string[] = [];
     try {
       const raw = typeof req.body?.removedFileIds === "string" ? JSON.parse(req.body.removedFileIds) : [];
@@ -636,7 +648,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "单条任务最多包含 12 个附件。" });
     }
-    if (!prompt && retainedCount === 0 && uploaded.length === 0) {
+    if (!prompt && !quoteExcerpt && retainedCount === 0 && uploaded.length === 0) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "请至少保留一个文件，或者输入具体操作。" });
     }
@@ -647,11 +659,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
     registerPendingUploads(conversation.id, pending.id, uploaded);
     const selection = conversationAgentSelection(conversation);
-    const updated = prompt
-      ? db.updatePendingPrompt(pending.id, prompt, selection)
+    const updated = prompt || quoteExcerpt
+      ? db.updatePendingPrompt(pending.id, prompt, selection, quoteExcerpt)
       : db.updateEditingPendingPrompt(pending.id, "", selection);
     if (!updated) return res.status(409).json({ error: "待发送队列已经变化，请刷新后重试。" });
-    if (!prompt) {
+    if (!prompt && !quoteExcerpt) {
       return res.status(202).json({ pendingPrompt: db.getPendingPrompt(pending.id) ?? null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null, needsInstruction: true, guidance: FILE_INSTRUCTION_GUIDANCE });
     }
     if (config.queueAutoStart) await pumpQueue();
@@ -679,7 +691,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const running = db.listActiveJobsForConversation(conversation.id).find((job) => job.status === "running");
     if (!running) return res.status(409).json({ error: "当前任务尚未进入可引导状态。" });
     try {
-      const turnId = await runner.steer(running.id, pending.content, pending.files);
+      const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
       const message = db.materializeSteeredPrompt(pending.id, newId());
       if (!message) throw new Error("引导已送达，但本地记录队列发生变化，请刷新确认。 ");
       return res.json({ ok: true, turnId, message });

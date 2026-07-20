@@ -325,6 +325,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .message.user .message-meta { flex-direction: row-reverse; }
 .message-body > p { margin: 0; white-space: pre-wrap; line-height: 1.68; }
 .message.user .message-body > p { padding: .75em .9375em; border-radius: 15px 5px 15px 15px; color: #fff; background: linear-gradient(145deg, #36458a, #20264d); box-shadow: 0 8px 24px rgba(15, 17, 32, .17); }
+.message-reference { min-width: 0; display: flex; align-items: center; gap: 7px; margin: 0 0 6px auto; padding: 7px 10px; border: 1px solid #d6dae8; border-radius: 11px; color: #62687b; background: #f5f6fa; box-shadow: 0 4px 12px rgba(15, 17, 32, .04); font-size: 11px; line-height: 1.35; }
+.message-reference > svg { flex: 0 0 auto; color: var(--indigo); }
+.message-reference > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-reference strong { margin-right: 6px; color: #343c70; font-size: 10px; }
 .message.user .message-body > p, .message.assistant .markdown { font-size: var(--chat-font-size, 16px); }
 .markdown { line-height: 1.72; overflow-wrap: anywhere; }
 .markdown > :first-child { margin-top: 0; }
@@ -617,6 +621,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .live-label { color: #abb5ee; }
 :root[data-theme="dark"] .message.assistant .markdown { border-color: #373940; background: var(--paper); box-shadow: 0 7px 22px rgba(0, 0, 0, .16); }
 :root[data-theme="dark"] .message.user .message-body > p { color: #f3f3f5; background: linear-gradient(145deg, #363842, #2b2c33); box-shadow: 0 8px 24px rgba(0, 0, 0, .24); }
+:root[data-theme="dark"] .message-reference { border-color: #41434b; color: #b7b9c1; background: #25262b; box-shadow: 0 4px 12px rgba(0, 0, 0, .14); }
+:root[data-theme="dark"] .message-reference > svg { color: #aeb9f5; }
+:root[data-theme="dark"] .message-reference strong { color: #d7dcff; }
 :root[data-theme="dark"] .message.user .message-avatar { border-color: #626a9d; background: linear-gradient(145deg, #4f598f, #343b69); }
 :root[data-theme="dark"] .markdown a { color: #b9c3ff; text-decoration-color: rgba(185, 195, 255, .46); }
 :root[data-theme="dark"] .markdown blockquote { border-left-color: #626674; }
