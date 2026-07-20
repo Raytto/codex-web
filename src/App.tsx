@@ -694,7 +694,7 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
           <div><span>{activity.label}</span>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}
             {activity.kind === "file" && activity.files?.length ? <small>{activity.files.map((file) => file.split(/[\\/]/).at(-1)).join("、")}</small> : null}
             {["search", "tool"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
-            {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>查看技术细节</summary><code>{activity.detail}</code></details> : null}
+            {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>{activity.actionCount && activity.actionCount > 1 ? `查看 ${activity.actionCount} 个技术步骤` : "查看技术细节"}</summary><code>{activity.groupedDetails?.join("\n\n") || activity.detail}</code></details> : null}
           </div>
         </div>) : <p className="process-journal-empty">正在建立执行方向…</p>}</div>
   </div>;

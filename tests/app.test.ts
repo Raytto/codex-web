@@ -195,6 +195,7 @@ test("running work journal retains every important direction and compacts repeat
     { seq: 1, kind: "reasoning", label: "模型思路摘要", detail: "先确认数据口径" },
     { seq: 2, kind: "command", label: "正在读取并核对资料", detail: "rg sales" },
     { seq: 3, kind: "command", label: "资料读取与核对完成", detail: "rg sales" },
+    { seq: 31, kind: "command", label: "质量验证完成", detail: "npm test" },
     { seq: 4, kind: "update", label: "阶段反馈", detail: "已确认按自然月统计" },
     { seq: 5, kind: "file", label: "已更新文件", files: ["outputs/report.xlsx"] },
     { seq: 6, kind: "file", label: "已更新文件", files: ["outputs/report.xlsx"] },
@@ -202,6 +203,9 @@ test("running work journal retains every important direction and compacts repeat
     { seq: 8, kind: "status", label: "工作已完成，正在整理结果" },
   ]);
   assert.deepEqual(journal.map((event) => event.seq), [1, 3, 4, 5, 7]);
+  assert.equal(journal[1].label, "运行了 2 个本机步骤");
+  assert.equal(journal[1].actionCount, 2);
+  assert.deepEqual(journal[1].groupedDetails, ["rg sales", "npm test"]);
   assert.deepEqual(journal.filter((event) => ["reasoning", "update"].includes(event.kind ?? "")).map((event) => event.detail), [
     "先确认数据口径", "已确认按自然月统计", "再验证汇总结果",
   ]);
