@@ -142,6 +142,14 @@ test("selected message text can be quoted into a focused Agent question", () => 
   assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-reference/);
 });
 
+test("pending queue stays translucent and vertically compact in both themes", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(styles, /\.pending-queue \{[^}]*background: rgba\(255, 255, 255, \.72\);[^}]*backdrop-filter: blur\(10px\)/);
+  assert.match(styles, /\.pending-queue-heading \{[^}]*min-height: 26px;[^}]*padding: 4px 9px 3px;/);
+  assert.match(styles, /\.pending-queue-item \{[^}]*min-height: 34px;[^}]*padding: 2px 4px 2px 0;/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.pending-queue \{[^}]*background: rgba\(40, 41, 46, \.72\);/);
+});
+
 test("live updates pause while reading older paged messages", () => {
   assert.equal(resolveScrollFollow({ previousScrollTop: 500, scrollTop: 496, scrollHeight: 1000, clientHeight: 500, following: true }), false);
   assert.equal(resolveScrollFollow({ previousScrollTop: 420, scrollTop: 420, scrollHeight: 1080, clientHeight: 500, following: true }), true);

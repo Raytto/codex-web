@@ -407,23 +407,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   padding: 45px 0 12px;
   background: linear-gradient(transparent, var(--canvas) 37%);
 }
-.pending-queue { margin-bottom: 8px; overflow: hidden; border: 1px solid rgba(45, 54, 102, .14); border-radius: 14px; background: rgba(255, 255, 255, .98); box-shadow: 0 12px 32px rgba(15, 17, 32, .1); backdrop-filter: blur(12px); }
-.pending-queue-heading { min-height: 32px; display: flex; align-items: center; gap: 8px; padding: 7px 11px 5px; color: #6f7486; font-size: 10px; }
+.pending-queue { margin-bottom: 7px; overflow: hidden; border: 1px solid rgba(45, 54, 102, .16); border-radius: 13px; background: rgba(255, 255, 255, .72); box-shadow: 0 10px 28px rgba(15, 17, 32, .09); -webkit-backdrop-filter: blur(10px) saturate(1.08); backdrop-filter: blur(10px) saturate(1.08); }
+.pending-queue-heading { min-height: 26px; display: flex; align-items: center; gap: 6px; padding: 4px 9px 3px; color: #6f7486; font-size: 9px; }
 .pending-queue-heading strong { color: #313a70; font-size: 11px; }
 .pending-queue-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pending-queue-list { max-height: 176px; overflow-y: auto; padding: 0 6px 6px; }
-.pending-queue-item { min-height: 46px; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 5px; padding: 5px 6px 5px 2px; border-top: 1px solid #eef0f5; border-radius: 9px; transition: opacity .14s ease, background .14s ease, transform .14s ease; }
+.pending-queue-list { max-height: 146px; overflow-y: auto; padding: 0 4px 4px; }
+.pending-queue-item { min-height: 34px; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 3px; padding: 2px 4px 2px 0; border-top: 1px solid rgba(45, 54, 102, .09); border-radius: 8px; transition: opacity .14s ease, background .14s ease, transform .14s ease; }
 .pending-queue-item:first-child { border-top-color: transparent; }
-.pending-queue-item:hover { background: #f7f8fc; }
+.pending-queue-item:hover { background: rgba(247, 248, 252, .72); }
 .pending-queue-item.dragging { opacity: .45; transform: scale(.99); }
-.pending-drag-handle { width: 26px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; color: #a2a6b5; background: transparent; cursor: grab; }
+.pending-drag-handle { width: 22px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; color: #a2a6b5; background: transparent; cursor: grab; }
 .pending-drag-handle:active { cursor: grabbing; }
-.pending-queue-copy { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.pending-queue-copy { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .pending-queue-copy > span { min-width: 0; overflow: hidden; color: #2d3246; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .pending-queue-copy small { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; color: #9296a5; white-space: nowrap; font-size: 9px; }
-.pending-queue-actions { display: flex; align-items: center; gap: 2px; }
-.pending-queue-actions button { min-width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 6px; border: 0; border-radius: 7px; color: #74798a; background: transparent; cursor: pointer; font-size: 10px; }
-.pending-queue-actions button:hover:not(:disabled) { color: #303b79; background: #e9ecf6; }
+.pending-queue-actions { display: flex; align-items: center; gap: 1px; }
+.pending-queue-actions button { min-width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 3px; padding: 0 4px; border: 0; border-radius: 6px; color: #74798a; background: transparent; cursor: pointer; font-size: 10px; }
+.pending-queue-actions button:hover:not(:disabled) { color: #303b79; background: rgba(233, 236, 246, .8); }
 .pending-queue-actions button:disabled { opacity: .38; cursor: default; }
 .pending-queue-actions .steer-action { color: #43518d; font-weight: 700; }
 .editing-pending-banner { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; padding: 6px 9px 6px 11px; border: 1px solid #ccd2e8; border-radius: 11px; color: #334078; background: #f5f6fb; box-shadow: 0 8px 22px rgba(15, 17, 32, .06); font-size: 10px; }
@@ -679,11 +679,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .technical-detail { color: #a2a4ac; }
 :root[data-theme="dark"] .technical-detail code { border-color: #43454d; color: #c7c8ce; background: #1d1e22; }
 
-:root[data-theme="dark"] .pending-queue { border-color: #41434c; background: rgba(40, 41, 46, .98); box-shadow: 0 12px 32px rgba(0, 0, 0, .3); }
+:root[data-theme="dark"] .pending-queue { border-color: rgba(115, 119, 135, .48); background: rgba(40, 41, 46, .72); box-shadow: 0 10px 28px rgba(0, 0, 0, .26); }
 :root[data-theme="dark"] .pending-queue-heading { color: #a7a9b2; }
 :root[data-theme="dark"] .pending-queue-heading strong { color: #d9deff; }
-:root[data-theme="dark"] .pending-queue-item { border-top-color: #3a3c43; }
-:root[data-theme="dark"] .pending-queue-item:hover { background: #303137; }
+:root[data-theme="dark"] .pending-queue-item { border-top-color: rgba(135, 138, 150, .24); }
+:root[data-theme="dark"] .pending-queue-item:hover { background: rgba(61, 63, 71, .7); }
 :root[data-theme="dark"] .pending-drag-handle { color: #999ba4; }
 :root[data-theme="dark"] .pending-queue-copy > span { color: #e2e3e7; }
 :root[data-theme="dark"] .pending-queue-copy small { color: #999ba3; }
