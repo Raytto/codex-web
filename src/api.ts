@@ -52,12 +52,15 @@ export type ConversationDetail = {
   conversation: Conversation;
   agentSelection: AgentSelection;
   messages: Message[];
+  messagePage: MessagePage;
   pendingPrompts: PendingPrompt[];
   editingPrompt: PendingPrompt | null;
   activeJob: Job | null;
   latestJob: Job | null;
   jobEvents: JobEvent[];
 };
+export type MessagePage = { hasMore: boolean; nextCursor: string | null };
+export type ConversationMessagesPage = { messages: Message[]; messagePage: MessagePage };
 export type PendingMutationResponse = {
   job?: Job;
   pendingPrompt?: PendingPrompt | null;
@@ -97,6 +100,9 @@ export const api = {
   }),
   createConversation: () => request<{ conversation: Conversation; agentSelection: AgentSelection }>("/conversations", { method: "POST" }),
   conversation: (id: string) => request<ConversationDetail>(`/conversations/${id}`),
+  conversationMessages: (id: string, before: string) => request<ConversationMessagesPage>(
+    `/conversations/${id}/messages?before=${encodeURIComponent(before)}`,
+  ),
   renameConversation: (id: string, title: string) => request<{ conversation: Conversation }>(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteConversation: (id: string) => request<void>(`/conversations/${id}`, { method: "DELETE" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),

@@ -24,6 +24,9 @@ import { isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
+import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
+import { mergeMessagePages, preservePrependedScrollTop } from "../src/message-history.js";
+import { resolveScrollFollow } from "../src/scroll-follow.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../src/recovery.js";
 import { normalizeThemePreference, resolveTheme, THEME_PREFERENCE_KEY } from "../src/theme.js";
@@ -94,6 +97,52 @@ test("appearance setting supports light, dark, and live system preference", () =
   assert.ok(contrast(color("ink"), color("canvas")) >= 7);
   assert.ok(contrast(color("ink-soft"), color("canvas")) >= 4.5);
   assert.ok(contrast(color("indigo"), color("paper")) >= 4.5);
+});
+
+test("selected message text can be quoted into a focused Agent question", () => {
+  assert.equal(normalizeAskAgentSelection("  第一行  \r\n\r\n\r\n第二行  \n"), "第一行\n\n第二行");
+  assert.equal(buildAskAgentDraft("", "第一行\n第二行"), "请结合以下引用回答我的问题：\n\n> 第一行\n> 第二行\n\n请解释这段引用。");
+  assert.equal(buildAskAgentDraft("已有草稿", "引用"), "请结合以下引用回答我的问题：\n\n> 引用\n\n我的问题：\n已有草稿");
+  const capped = buildAskAgentDraft("", "很".repeat(ASK_AGENT_SELECTION_MAX_CHARS + 50));
+  assert.match(capped, /引用内容过长，已截断/);
+  assert.ok(capped.length < ASK_AGENT_SELECTION_MAX_CHARS + 100);
+
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /data-agent-selectable="true"/);
+  assert.match(appSource, /document\.addEventListener\("selectionchange", update\)/);
+  assert.match(appSource, /询问 Agent/);
+  assert.match(appSource, /className="ask-agent-reference"/);
+  assert.match(appSource, /setAskAgentQuote\(normalized\.slice/);
+  assert.match(appSource, /submittedMessage = askAgentQuote \? buildAskAgentDraft/);
+  assert.match(appSource, /focusRequest=\{composerFocusRequest\}/);
+  assert.match(styles, /\.ask-agent-selection \{[^}]*position: fixed;[^}]*touch-action: manipulation/);
+  assert.match(styles, /\.ask-agent-reference \{/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-selection/);
+  assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-reference/);
+});
+
+test("live updates pause while reading older paged messages", () => {
+  assert.equal(resolveScrollFollow({ previousScrollTop: 500, scrollTop: 496, scrollHeight: 1000, clientHeight: 500, following: true }), false);
+  assert.equal(resolveScrollFollow({ previousScrollTop: 420, scrollTop: 420, scrollHeight: 1080, clientHeight: 500, following: true }), true);
+  assert.equal(resolveScrollFollow({ previousScrollTop: 500, scrollTop: 510, scrollHeight: 1080, clientHeight: 500, following: false }), true);
+  const newest = [
+    { id: "m3", created_at: "2026-07-20T00:00:03.000Z", content: "3" },
+    { id: "m4", created_at: "2026-07-20T00:00:04.000Z", content: "4" },
+  ];
+  const older = [
+    { id: "m1", created_at: "2026-07-20T00:00:01.000Z", content: "1" },
+    { id: "m2", created_at: "2026-07-20T00:00:02.000Z", content: "2" },
+    { id: "m3", created_at: "2026-07-20T00:00:03.000Z", content: "updated" },
+  ];
+  assert.deepEqual(mergeMessagePages(newest, older).map((message) => [message.id, message.content]), [
+    ["m1", "1"], ["m2", "2"], ["m3", "updated"], ["m4", "4"],
+  ]);
+  assert.equal(preservePrependedScrollTop(40, 900, 1350), 490);
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.doesNotMatch(appSource, /scrollIntoView/);
+  assert.match(appSource, /messages\.scrollTop <= 80/);
+  assert.match(appSource, /conversationMessages\(conversationId, before\)/);
 });
 
 test("progress labels do not report intermediate agent messages as complete", () => {
@@ -1174,6 +1223,41 @@ test("job progress events refresh the job activity timestamp", (context) => {
   db.appendEvent(jobId, "progress", { label: "still working" });
   assert.equal(db.getJob(jobId)?.updated_at, db.listEvents(jobId)[0].created_at);
   assert.notEqual(db.getJob(jobId)?.updated_at, "2000-01-01T00:00:00.000Z");
+});
+
+test("conversation history loads the newest page first and older pages on demand", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-message-pages-test-"));
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
+    username: "owner", passwordHash: bcrypt.hashSync("Correct-Horse-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const agent = request.agent(instance.app);
+  await agent.post("/codex-web/api/auth/login").send({ username: "owner", password: "Correct-Horse-2026!" }).expect(200);
+
+  const conversationId = crypto.randomUUID();
+  instance.db.createConversation(conversationId, "paged history");
+  const ids = Array.from({ length: 65 }, (_, index) => `message-${String(index).padStart(3, "0")}`);
+  ids.forEach((id, index) => instance.db.addMessage({
+    id,
+    conversation_id: conversationId,
+    role: index % 2 ? "assistant" : "user",
+    content: `message ${index}`,
+    created_at: new Date(Date.UTC(2026, 6, 20, 0, 0, index)).toISOString(),
+  }));
+
+  const first = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
+  assert.deepEqual(first.body.messages.map((message: { id: string }) => message.id), ids.slice(35));
+  assert.deepEqual(first.body.messagePage, { hasMore: true, nextCursor: ids[35] });
+  const second = await agent.get(`/codex-web/api/conversations/${conversationId}/messages?before=${ids[35]}`).expect(200);
+  assert.deepEqual(second.body.messages.map((message: { id: string }) => message.id), ids.slice(5, 35));
+  assert.deepEqual(second.body.messagePage, { hasMore: true, nextCursor: ids[5] });
+  const third = await agent.get(`/codex-web/api/conversations/${conversationId}/messages?before=${ids[5]}`).expect(200);
+  assert.deepEqual(third.body.messages.map((message: { id: string }) => message.id), ids.slice(0, 5));
+  assert.deepEqual(third.body.messagePage, { hasMore: false, nextCursor: null });
+  await agent.get(`/codex-web/api/conversations/${conversationId}/messages`).expect(400);
+  await agent.get(`/codex-web/api/conversations/${conversationId}/messages?before=missing-message`).expect(400);
 });
 
 test("conversation detail restores running progress and terminal SSE replay", async (context) => {

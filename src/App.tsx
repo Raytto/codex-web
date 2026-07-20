@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type FormEvent, type KeyboardEvent, type SetStateAction } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type FormEvent, type KeyboardEvent, type SetStateAction } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -14,6 +14,9 @@ import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
 import { resolveAccountIdentity } from "./account-identity";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
 import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, type ThemePreference } from "./theme";
+import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "./ask-agent-selection";
+import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
+import { resolveScrollFollow } from "./scroll-follow";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 
@@ -78,6 +81,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [input, setInput] = useState("");
+  const [askAgentQuote, setAskAgentQuote] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [editingPending, setEditingPending] = useState<PendingPrompt | null>(null);
   const [removedEditingFileIds, setRemovedEditingFileIds] = useState<string[]>([]);
@@ -94,7 +98,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
   const [chatFontSize, setChatFontSize] = useState(() => normalizeChatFontSize(session.chatFontSize, CHAT_FONT_SIZE_DEFAULT));
   const [fontSizeSaving, setFontSizeSaving] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const autoFollowRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const loadingOlderMessagesRef = useRef(false);
+  const prependScrollRestoreRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const connectedJobRef = useRef<string | null>(null);
   const selectedIdRef = useRef<string | null>(selectedId);
@@ -103,13 +113,26 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   selectedIdRef.current = selectedId;
   editingPendingRef.current = editingPending;
 
+  function askAgentAbout(selectedText: string) {
+    const normalized = normalizeAskAgentSelection(selectedText);
+    if (!normalized) return;
+    setAskAgentQuote(normalized.slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1));
+    setComposerFocusRequest((request) => request + 1);
+  }
+
   const refreshList = useCallback(async () => {
     const result = await api.conversations(); setConversations(result.conversations); return result.conversations;
   }, []);
   const refreshDetail = useCallback(async (id: string) => {
     const result = await api.conversation(id);
     if (selectedIdRef.current !== id) return result;
-    setDetail(result);
+    setDetail((current) => current?.conversation.id === id
+      ? {
+          ...result,
+          messages: mergeMessagePages(current.messages, result.messages),
+          messagePage: current.messagePage,
+        }
+      : result);
     setSelectedModel(result.agentSelection.model);
     setReasoningEffort(result.agentSelection.reasoningEffort);
     setJob(result.activeJob);
@@ -148,11 +171,16 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "模型选项加载失败"));
   }, []);
   useEffect(() => {
+    autoFollowRef.current = true;
+    lastScrollTopRef.current = 0;
+    loadingOlderMessagesRef.current = false;
+    prependScrollRestoreRef.current = null;
+    setLoadingOlderMessages(false);
     if (!selectedId) {
       window.localStorage.removeItem(SELECTED_CONVERSATION_KEY);
       eventSourceRef.current?.close(); connectedJobRef.current = null;
       setDetail(null); setJob(null); setSending(false); setActivities([]);
-      setEditingPending(null); setRemovedEditingFileIds([]);
+      setEditingPending(null); setRemovedEditingFileIds([]); setAskAgentQuote("");
       if (agentOptions) {
         setSelectedModel(agentOptions.selection.model);
         setReasoningEffort(agentOptions.selection.reasoningEffort);
@@ -161,7 +189,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
     window.localStorage.setItem(SELECTED_CONVERSATION_KEY, selectedId);
     eventSourceRef.current?.close(); connectedJobRef.current = null; setActivities([]);
-    editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setFiles([]);
+    editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setAskAgentQuote(""); setFiles([]);
     void reconcile(selectedId);
     setSidebarOpen(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -180,7 +208,69 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [detail?.messages.length, activities.length, sending]);
+  useLayoutEffect(() => {
+    const restore = prependScrollRestoreRef.current;
+    if (!restore) return;
+    prependScrollRestoreRef.current = null;
+    const messages = messagesRef.current;
+    if (!messages) return;
+    messages.scrollTop = preservePrependedScrollTop(restore.scrollTop, restore.scrollHeight, messages.scrollHeight);
+    lastScrollTopRef.current = messages.scrollTop;
+    autoFollowRef.current = false;
+  }, [detail?.messages.length]);
+  useEffect(() => {
+    if (!autoFollowRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const messages = messagesRef.current;
+      if (!messages || !autoFollowRef.current) return;
+      messages.scrollTop = messages.scrollHeight;
+      lastScrollTopRef.current = messages.scrollTop;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [detail?.messages.length, activities, sending]);
+
+  function handleMessagesScroll(event: React.UIEvent<HTMLDivElement>) {
+    const messages = event.currentTarget;
+    const scrollingUp = messages.scrollTop < lastScrollTopRef.current - 1;
+    autoFollowRef.current = resolveScrollFollow({
+      previousScrollTop: lastScrollTopRef.current,
+      scrollTop: messages.scrollTop,
+      scrollHeight: messages.scrollHeight,
+      clientHeight: messages.clientHeight,
+      following: autoFollowRef.current,
+    });
+    lastScrollTopRef.current = messages.scrollTop;
+    if (scrollingUp && messages.scrollTop <= 80) void loadOlderMessages();
+  }
+
+  async function loadOlderMessages() {
+    const current = detail;
+    const conversationId = current?.conversation.id;
+    const before = current?.messagePage.nextCursor;
+    if (!conversationId || !current.messagePage.hasMore || !before || loadingOlderMessagesRef.current) return;
+    loadingOlderMessagesRef.current = true;
+    setLoadingOlderMessages(true);
+    try {
+      const result = await api.conversationMessages(conversationId, before);
+      if (selectedIdRef.current !== conversationId) return;
+      const messages = messagesRef.current;
+      prependScrollRestoreRef.current = messages
+        ? { scrollTop: messages.scrollTop, scrollHeight: messages.scrollHeight }
+        : null;
+      setDetail((latest) => latest?.conversation.id === conversationId
+        ? {
+            ...latest,
+            messages: mergeMessagePages(result.messages, latest.messages),
+            messagePage: result.messagePage,
+          }
+        : latest);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "更早消息加载失败");
+    } finally {
+      loadingOlderMessagesRef.current = false;
+      if (selectedIdRef.current === conversationId) setLoadingOlderMessages(false);
+    }
+  }
 
   function connectJob(activeJob: Job) {
     if (connectedJobRef.current === activeJob.id && eventSourceRef.current?.readyState !== EventSource.CLOSED) return;
@@ -238,8 +328,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function send(message = input) {
+    const submittedMessage = askAgentQuote ? buildAskAgentDraft(message, askAgentQuote) : message;
     const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
-    if ((!message.trim() && files.length === 0 && !hasRetainedEditingFile) || submitting || selectionSaving) return;
+    if ((!submittedMessage.trim() && files.length === 0 && !hasRetainedEditingFile) || submitting || selectionSaving) return;
     setError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
     try {
@@ -250,7 +341,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         selectedIdRef.current = id; setSelectedId(id);
       }
       if (editingPending) {
-        const result = await api.updatePendingPrompt(id, editingPending.id, message, files, removedEditingFileIds);
+        const result = await api.updatePendingPrompt(id, editingPending.id, submittedMessage, files, removedEditingFileIds);
         if (result.needsInstruction) {
           const persisted = result.editingPrompt ?? result.pendingPrompt ?? editingPending;
           editingPendingRef.current = persisted; setEditingPending(persisted); setRemovedEditingFileIds([]);
@@ -259,10 +350,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]);
         }
       } else {
-        const result = await api.sendMessage(id, message, files);
+        const result = await api.sendMessage(id, submittedMessage, files);
         if (result.needsInstruction) setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
       }
-      setInput(""); setFiles([]);
+      setInput(""); setAskAgentQuote(""); setFiles([]);
       await reconcile(id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "发送失败");
@@ -275,7 +366,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     try {
       const result = await api.editPendingPrompt(selectedId, prompt.id);
       editingPendingRef.current = result.editingPrompt;
-      setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setInput(result.editingPrompt.content);
+      setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setAskAgentQuote(""); setInput(result.editingPrompt.content);
       if (selectedModel !== prompt.agent_model || reasoningEffort !== prompt.reasoning_effort) {
         await persistAgentSelection({ model: prompt.agent_model, reasoningEffort: prompt.reasoning_effort });
       }
@@ -459,10 +550,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
     <main className="workspace">
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
-      {detail ? <Chat detail={detail} activities={activities} sending={sending} endRef={endRef} userInitials={account.initials} chatFontSize={chatFontSize} /> : <Welcome onSuggestion={(text) => setInput(text)} />}
+      {detail ? <Chat detail={detail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} /> : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
-      <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} files={files} setFiles={setFiles} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
+      <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
         conversationId={selectedId}
         pendingPrompts={detail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -489,15 +580,66 @@ function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
   </div></section>;
 }
 
-function Chat({ detail, activities, sending, endRef, userInitials, chatFontSize }: { detail: ConversationDetail; activities: JobEvent[]; sending: boolean; endRef: React.RefObject<HTMLDivElement | null>; userInitials: string; chatFontSize: number }) {
+type AskAgentSelection = { text: string; left: number; top: number; below: boolean };
+
+function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize }: { detail: ConversationDetail; activities: JobEvent[]; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
-  return <section className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">{detail.messages.length} 条消息</span><button className="icon-button" aria-label="更多"><MoreHorizontal size={20} /></button></div></div>
-    <div className="messages" style={{ "--chat-font-size": `${chatFontSize}px` } as CSSProperties}>
+  const chatRef = useRef<HTMLElement>(null);
+  const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
+
+  useEffect(() => {
+    let frame = 0;
+    const clear = () => setAskSelection(null);
+    const selectableParent = (node: Node | null) => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      return element?.closest<HTMLElement>("[data-agent-selectable]") ?? null;
+    };
+    const update = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed || selection.rangeCount === 0) return clear();
+        const text = normalizeAskAgentSelection(selection.toString());
+        if (!text) return clear();
+        const range = selection.getRangeAt(0);
+        const start = selectableParent(range.startContainer);
+        const end = selectableParent(range.endContainer);
+        if (!start || start !== end || !chatRef.current?.contains(start)) return clear();
+        const rect = range.getBoundingClientRect();
+        if (!rect.width && !rect.height) return clear();
+        const horizontalInset = 72;
+        const left = Math.min(window.innerWidth - horizontalInset, Math.max(horizontalInset, rect.left + rect.width / 2));
+        const below = window.innerHeight - rect.bottom >= 64;
+        setAskSelection({ text, left, top: below ? rect.bottom + 10 : rect.top - 10, below });
+      });
+    };
+    document.addEventListener("selectionchange", update);
+    window.addEventListener("resize", clear);
+    const messages = messagesRef.current;
+    messages?.addEventListener("scroll", clear, { passive: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("selectionchange", update);
+      window.removeEventListener("resize", clear);
+      messages?.removeEventListener("scroll", clear);
+    };
+  }, [detail.conversation.id]);
+
+  function useSelectedText() {
+    if (!askSelection) return;
+    onAskAgent(askSelection.text);
+    setAskSelection(null);
+    window.getSelection()?.removeAllRanges();
+  }
+
+  return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span><button className="icon-button" aria-label="更多"><MoreHorizontal size={20} /></button></div></div>
+    <div ref={messagesRef} className="messages" onScroll={onMessagesScroll} style={{ "--chat-font-size": `${chatFontSize}px` } as CSSProperties}>
+      {detail.messagePage.hasMore && <div className="history-loader" aria-live="polite">{loadingOlderMessages ? <><LoaderCircle className="spin" size={14} /><span>正在加载更早消息…</span></> : <span>向上滚动加载更早消息</span>}</div>}
       {detail.messages.map((message) => <article className={`message ${message.role}`} key={message.id}>
         <div className="message-avatar">{message.role === "assistant" ? <Zap size={15} /> : userInitials}</div>
         <div className="message-body">
           <div className="message-meta"><span className="message-name">{message.role === "assistant" ? "Codex Web" : "你"}</span><time dateTime={message.created_at} title={formatFullDateTime(message.created_at)}>{formatMessageDateTime(message.created_at)}</time></div>
-          {message.role === "assistant" ? <div className="markdown"><ReactMarkdown
+          {message.role === "assistant" ? <div className="markdown" data-agent-selectable="true"><ReactMarkdown
             remarkPlugins={[remarkGfm]}
             urlTransform={(url) => isLocalMarkdownUrl(url) ? url : defaultUrlTransform(url)}
             components={{ a: ({ href, children }) => {
@@ -506,13 +648,13 @@ function Chat({ detail, activities, sending, endRef, userInitials, chatFontSize 
               if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
               return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
             } }}
-          >{sanitizeAgentMarkdown(message.content, citationFiles)}</ReactMarkdown></div> : <p>{message.content}</p>}
+          >{sanitizeAgentMarkdown(message.content, citationFiles)}</ReactMarkdown></div> : <p data-agent-selectable="true">{message.content}</p>}
           {message.files.length > 0 && <div className="file-grid">{message.files.map((file) => <FileCard key={file.id} file={file} />)}</div>}
         </div>
       </article>)}
       {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel activities={activities} /></div></article>}
-      <div ref={endRef} />
-    </div>
+      <div />
+    </div>{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }}><Zap size={14} /><span>询问 Agent</span></button>}
   </section>;
 }
 
@@ -633,10 +775,13 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
   </section>;
 }
 
-function Composer({ conversationId, input, setInput, files, setFiles, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
+function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
   conversationId: string | null;
   input: string;
   setInput: (value: string) => void;
+  askAgentQuote: string;
+  onClearAskAgentQuote: () => void;
+  focusRequest: number;
   files: File[];
   setFiles: Dispatch<SetStateAction<File[]>>;
   sending: boolean;
@@ -678,6 +823,8 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
   const sendAfterTranscriptionRef = useRef(false);
   const discardRecordingRef = useRef(false);
   const waveformRef = useRef<HTMLCanvasElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const handledFocusRequestRef = useRef(focusRequest);
   const inputRef = useRef(input);
   const filesRef = useRef(files);
   const editingPendingRef = useRef(editingPending);
@@ -695,6 +842,18 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     releaseAudio();
   }, []);
+
+  useEffect(() => {
+    if (focusRequest === handledFocusRequestRef.current) return;
+    handledFocusRequestRef.current = focusRequest;
+    const frame = window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusRequest]);
 
   function releaseAudio() {
     if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
@@ -850,7 +1009,7 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
   const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
   const primaryAction = chooseComposerPrimaryAction({
     running: Boolean(sending && onCancel),
-    hasText: Boolean(input.trim()),
+    hasText: Boolean(input.trim() || askAgentQuote),
     hasAttachments: files.length > 0 || hasRetainedEditingFile,
     voiceActive: voiceState !== "idle",
   });
@@ -860,6 +1019,7 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div className="composer" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); addFiles(e.dataTransfer.files); }}>
+    {askAgentQuote && <div className="ask-agent-reference" title={askAgentQuote}><CornerUpLeft size={15} /><span>{askAgentQuote}</span><button type="button" onClick={onClearAskAgentQuote} aria-label="移除引用" title="移除引用"><X size={14} /></button></div>}
     {editingPending && editingPending.files.length > 0 && <div className="editing-pending-files">{editingPending.files.map((file) => {
       const removed = removedEditingFileIds.includes(file.id);
       return <span key={file.id} className={removed ? "removed" : ""}><FileIcon size={14} />{file.original_name}<button type="button" onClick={() => removed ? onRestoreEditingFile(file.id) : onRemoveEditingFile(file.id)} title={removed ? "恢复附件" : "移除附件"}>{removed ? <Plus size={13} /> : <X size={13} />}</button></span>;
@@ -867,7 +1027,7 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} />{file.name}<button onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
-    <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
+    <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
     {voiceState !== "idle" && <div className={`voice-panel ${voiceState}`}>
       {voiceState === "recording" ? <><button type="button" className="voice-cancel" onClick={cancelRecording} title="取消录音"><X size={15} /></button><canvas ref={waveformRef} aria-label="实时音量波形" /><time>{formatVoiceDuration(voiceElapsed)}</time><button type="button" className="voice-stop" onClick={() => finishRecording(false)} title="停止并转成文字"><Square size={12} fill="currentColor" /></button></> : <><LoaderCircle className="spin" size={17} /><span>正在识别语音…</span></>}
     </div>}
@@ -879,7 +1039,7 @@ function Composer({ conversationId, input, setInput, files, setFiles, sending, s
         {voiceEnabled && voiceState === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving} title="录音输入" aria-label="录音输入"><Mic size={18} /></button>}
         {primaryAction === "stop" && onCancel
           ? <button type="button" className="send-button stop" onClick={onCancel} title="停止当前显示的任务" aria-label="停止当前显示的任务"><Square size={15} fill="currentColor" /></button>
-          : <button type="button" className="send-button" onClick={() => voiceState === "recording" ? finishRecording(true) : onSend()} disabled={submitting || selectionSaving || voiceState === "transcribing" || (voiceState !== "recording" && !input.trim() && files.length === 0 && !hasRetainedEditingFile)} title={voiceState === "recording" ? "识别语音并发送" : "发送"} aria-label={voiceState === "recording" ? "识别语音并发送" : "发送"}>{submitting || voiceState === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
+          : <button type="button" className="send-button" onClick={() => voiceState === "recording" ? finishRecording(true) : onSend()} disabled={submitting || selectionSaving || voiceState === "transcribing" || (voiceState !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile)} title={voiceState === "recording" ? "识别语音并发送" : "发送"} aria-label={voiceState === "recording" ? "识别语音并发送" : "发送"}>{submitting || voiceState === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
   </div><p className="composer-note">任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。</p></div>;

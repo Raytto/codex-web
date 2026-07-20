@@ -54,6 +54,12 @@ export type FileRow = {
   created_at: string;
 };
 
+export type MessagePage = {
+  messages: Array<MessageRow & { files: FileRow[] }>;
+  hasMore: boolean;
+  nextCursor: string | null;
+};
+
 export type PendingPromptRow = {
   id: string;
   conversation_id: string;
@@ -381,6 +387,41 @@ export class AppDatabase {
       ...message,
       files: files.filter((file) => file.message_id === message.id && (file.kind === "upload" || isDeliverablePath(file.relative_path))),
     }));
+  }
+
+  listMessagesPage(conversationId: string, beforeMessageId?: string, limit = 30): MessagePage | undefined {
+    const pageSize = Math.min(100, Math.max(1, Math.trunc(limit)));
+    let newestFirst: MessageRow[];
+    if (beforeMessageId) {
+      const cursor = this.getMessage(beforeMessageId);
+      if (!cursor || cursor.conversation_id !== conversationId) return undefined;
+      newestFirst = this.sqlite.prepare(`
+        SELECT * FROM messages
+        WHERE conversation_id=? AND (created_at<? OR (created_at=? AND id<?))
+        ORDER BY created_at DESC,id DESC LIMIT ?
+      `).all(conversationId, cursor.created_at, cursor.created_at, cursor.id, pageSize + 1) as MessageRow[];
+    } else {
+      newestFirst = this.sqlite.prepare(`
+        SELECT * FROM messages WHERE conversation_id=?
+        ORDER BY created_at DESC,id DESC LIMIT ?
+      `).all(conversationId, pageSize + 1) as MessageRow[];
+    }
+
+    const hasMore = newestFirst.length > pageSize;
+    const messages = newestFirst.slice(0, pageSize).reverse();
+    if (messages.length === 0) return { messages: [], hasMore: false, nextCursor: null };
+    const placeholders = messages.map(() => "?").join(",");
+    const files = this.sqlite.prepare(`
+      SELECT * FROM files WHERE conversation_id=? AND message_id IN (${placeholders}) ORDER BY created_at,id
+    `).all(conversationId, ...messages.map((message) => message.id)) as FileRow[];
+    return {
+      messages: messages.map((message) => ({
+        ...message,
+        files: files.filter((file) => file.message_id === message.id && (file.kind === "upload" || isDeliverablePath(file.relative_path))),
+      })),
+      hasMore,
+      nextCursor: hasMore ? messages[0].id : null,
+    };
   }
 
   addFile(file: FileRow): void {

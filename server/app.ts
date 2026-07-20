@@ -11,12 +11,13 @@ import { loadConfig, type AppConfig } from "./config.js";
 import { CodexRunner, extractLeakedAutoTitleAnswer } from "./codex-runner.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
-import { AppDatabase, type ConversationRow, type FileRow, type JobRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
+import { AppDatabase, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
 
 const COOKIE_NAME = "cww_session";
+const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
 const FILE_INSTRUCTION_GUIDANCE = "文件已上传，请输入具体操作，例如“把图片背景改为白色”或“汇总这些表格”。收到明确指令后才会开始处理。";
 type AuthenticatedRequest = Request & { appSession?: SessionRow };
 
@@ -51,6 +52,17 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       db.updateConversation(conversation.id, { agentSelection: selection });
     }
     return selection;
+  }
+
+  function safeConversationMessages(conversation: ConversationRow, messages: Array<MessageRow & { files: FileRow[] }>) {
+    const citationFiles = db.listFiles(conversation.id);
+    return messages.map((message) => {
+      if (message.role !== "assistant") return message;
+      const visibleContent = conversation.title_source === "ai"
+        ? extractLeakedAutoTitleAnswer(message.content) ?? message.content
+        : message.content;
+      return { ...message, content: sanitizeAgentMarkdown(visibleContent, citationFiles) };
+    });
   }
 
   function saveAgentSelection(userId: string, rawModel: unknown, rawEffort: unknown, conversation?: ConversationRow): AgentSelection {
@@ -327,22 +339,39 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const jobEvents = latestJob
       ? db.listEvents(latestJob.id).map((event) => ({ seq: event.seq, type: event.event_type, created_at: event.created_at, ...JSON.parse(event.payload) }))
       : [];
-    const messages = db.listMessages(conversation.id);
-    const citationFiles = messages.flatMap((message) => message.files);
-    const safeMessages = messages.map((message) => {
-      if (message.role !== "assistant") return message;
-      const visibleContent = conversation.title_source === "ai"
-        ? extractLeakedAutoTitleAnswer(message.content) ?? message.content
-        : message.content;
-      return { ...message, content: sanitizeAgentMarkdown(visibleContent, citationFiles) };
-    });
+    const messagePage = db.listMessagesPage(conversation.id, undefined, CONVERSATION_MESSAGE_PAGE_SIZE)!;
+    const safeMessages = safeConversationMessages(conversation, messagePage.messages);
     const agentSelection = conversationAgentSelection(conversation);
     const activeJob = latestJob && ["queued", "running"].includes(latestJob.status)
       ? { ...latestJob, queuePosition: db.getQueuePosition(latestJob.id) }
       : null;
     const pendingPrompts = db.listPendingPrompts(conversation.id);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0] ?? null;
-    return res.json({ conversation, agentSelection, messages: safeMessages, pendingPrompts, editingPrompt, activeJob, latestJob, jobEvents });
+    return res.json({
+      conversation,
+      agentSelection,
+      messages: safeMessages,
+      messagePage: { hasMore: messagePage.hasMore, nextCursor: messagePage.nextCursor },
+      pendingPrompts,
+      editingPrompt,
+      activeJob,
+      latestJob,
+      jobEvents,
+    });
+  });
+
+  api.get("/conversations/:id/messages", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    const before = typeof req.query.before === "string" ? req.query.before : "";
+    if (!before) return res.status(400).json({ error: "缺少消息游标。" });
+    const messagePage = db.listMessagesPage(conversation.id, before, CONVERSATION_MESSAGE_PAGE_SIZE);
+    if (!messagePage) return res.status(400).json({ error: "消息游标无效。" });
+    return res.json({
+      messages: safeConversationMessages(conversation, messagePage.messages),
+      messagePage: { hasMore: messagePage.hasMore, nextCursor: messagePage.nextCursor },
+    });
   });
 
   api.patch("/conversations/:id", (req, res) => {

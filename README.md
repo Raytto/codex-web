@@ -16,6 +16,8 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Forced cancellation of running or queued work when a conversation is deleted
 - Automatic short task titles, with manual titles taking precedence
 - Light, dark, and system-following appearance modes
+- Select message text and attach it as a removable quote chip to a new Agent question
+- Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
 - A dedicated Unix identity for the Codex worker inside the container
 
