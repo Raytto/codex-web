@@ -201,17 +201,23 @@ test("running work journal retains every important direction and compacts repeat
     { seq: 6, kind: "file", label: "已更新文件", files: ["outputs/report.xlsx"] },
     { seq: 7, kind: "reasoning", label: "模型思路摘要", detail: "再验证汇总结果" },
     { seq: 8, kind: "status", label: "工作已完成，正在整理结果" },
+    { seq: 9, kind: "update", label: "阶段反馈", detail: "桌面检查通过，继续检查手机布局" },
   ]);
-  assert.deepEqual(journal.map((event) => event.seq), [1, 3, 4, 5, 7]);
+  assert.deepEqual(journal.map((event) => event.seq), [1, 3, 4, 5, 7, 9]);
   assert.equal(journal[1].label, "运行了 2 个本机步骤");
   assert.equal(journal[1].actionCount, 2);
   assert.deepEqual(journal[1].groupedDetails, ["rg sales", "npm test"]);
   assert.deepEqual(journal.filter((event) => ["reasoning", "update"].includes(event.kind ?? "")).map((event) => event.detail), [
-    "先确认数据口径", "已确认按自然月统计", "再验证汇总结果",
+    "先确认数据口径", "已确认按自然月统计", "再验证汇总结果", "桌面检查通过，继续检查手机布局",
   ]);
+  assert.equal(journal.filter((event) => event.kind === "update").length, 2);
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
-  assert.match(appSource, /journal\.map/);
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.doesNotMatch(appSource, /compactActivitySteps\(activities\)\.slice/);
+  assert.match(appSource, /stageFeedback = journal\.filter\(\(activity\) => activity\.kind === "update"\)/);
+  assert.match(appSource, /scrollingJournal = journal\.filter\(\(activity\) => activity\.kind !== "update"\)/);
+  assert.match(appSource, /stageFeedback\.map/);
+  assert.match(styles, /\.process-journal-pinned \{ position: sticky;/);
   assert.match(appSource, /\{sending && <article className="message assistant running"/);
   assert.match(appSource, /完成前持续保留，可随时引导/);
 });
