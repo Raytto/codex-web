@@ -234,6 +234,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 
 .workspace { position: relative; min-width: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--canvas); }
 .mobile-header, .mobile-only { display: none; }
+.conversation-loading { min-height: 0; flex: 1; display: grid; place-content: center; justify-items: center; gap: 11px; padding-bottom: 8vh; color: var(--indigo); background: var(--canvas); }
+.conversation-loading span { color: var(--muted); font-size: 12px; font-weight: 650; }
 .welcome {
   flex: 1;
   display: grid;
@@ -607,6 +609,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
     radial-gradient(circle at 78% 0, rgba(112, 126, 203, .08), transparent 27rem),
     linear-gradient(180deg, rgba(40, 41, 46, .34), rgba(23, 24, 27, 0));
 }
+:root[data-theme="dark"] .conversation-loading { color: #b9c3ff; background: var(--canvas); }
+:root[data-theme="dark"] .conversation-loading span { color: #9fa1aa; }
 :root[data-theme="dark"] .suggestions button { border-color: #393b43; background: var(--paper); box-shadow: 0 8px 24px rgba(0, 0, 0, .16); }
 :root[data-theme="dark"] .suggestions button:hover { border-color: #62697f; background: #292a2f; box-shadow: 0 14px 34px rgba(0, 0, 0, .23); }
 :root[data-theme="dark"] .messages {

@@ -99,6 +99,15 @@ test("appearance setting supports light, dark, and live system preference", () =
   assert.ok(contrast(color("indigo"), color("paper")) >= 4.5);
 });
 
+test("switching conversations hides stale detail until the selected task loads", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /currentDetail = detail\?\.conversation\.id === selectedId \? detail : null/);
+  assert.match(appSource, /loadingConversation \? <ConversationLoading \/>/);
+  assert.match(appSource, /\(!selectedId \|\| currentDetail\) && <Composer/);
+  assert.match(appSource, /role="status" aria-live="polite"/);
+  assert.match(styles, /\.conversation-loading \{[^}]*place-content: center;/);
+});
 test("closed mobile sidebar is not painted as an offscreen shadow layer", () => {
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   const mobileBlock = styles.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";

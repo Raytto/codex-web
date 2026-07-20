@@ -494,6 +494,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   const filtered = useMemo(() => conversations.filter((item) => item.title.toLowerCase().includes(query.toLowerCase())), [conversations, query]);
+  const currentDetail = detail?.conversation.id === selectedId ? detail : null;
+  const loadingConversation = Boolean(selectedId && !currentDetail);
   const account = resolveAccountIdentity(session);
 
   return <div className="shell">
@@ -550,12 +552,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
     <main className="workspace">
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
-      {detail ? <Chat detail={detail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} /> : <Welcome onSuggestion={(text) => setInput(text)} />}
+      {currentDetail ? <Chat detail={currentDetail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} />
+        : loadingConversation ? <ConversationLoading />
+        : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
-      <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
+      {(!selectedId || currentDetail) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
         conversationId={selectedId}
-        pendingPrompts={detail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
+        pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
         onModelChange={changeModel} onReasoningChange={changeReasoning}
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
@@ -563,9 +567,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         canSteer={job?.status === "running"} onCancelPendingEdit={() => void cancelPendingEdit()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
-        onSend={(message) => void send(message)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />
+        onSend={(message) => void send(message)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
     </main>
   </div>;
+}
+
+function ConversationLoading() {
+  return <section className="conversation-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={23} /><span>正在加载任务…</span></section>;
 }
 
 function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
