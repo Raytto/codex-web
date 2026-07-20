@@ -225,7 +225,9 @@ test("running work journal retains every important direction and compacts repeat
   assert.match(appSource, /stageFeedback = journal\.filter\(\(activity\) => activity\.kind === "update"\)/);
   assert.match(appSource, /scrollingJournal = journal\.filter\(\(activity\) => activity\.kind !== "update"\)/);
   assert.match(appSource, /stageFeedback\.map/);
-  assert.match(styles, /\.process-journal-pinned \{ position: sticky;/);
+  assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*max-height: min\(48vh, 430px\);[^}]*overflow-y: auto;/);
+  assert.match(styles, /\.process-journal-pinned \{ position: sticky; top: 0;/);
+  assert.match(styles, /@media \(max-width: 720px\)[\s\S]*?\.process-journal \{ max-height: min\(46dvh, 360px\); \}/);
   assert.match(appSource, /\{sending && <article className="message assistant running"/);
   assert.match(appSource, /完成前持续保留，可随时引导/);
 });
