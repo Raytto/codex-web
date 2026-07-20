@@ -238,11 +238,10 @@ test("running work journal retains every important direction and compacts repeat
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.doesNotMatch(appSource, /compactActivitySteps\(activities\)\.slice/);
-  assert.match(appSource, /stageFeedback = journal\.filter\(\(activity\) => activity\.kind === "update"\)/);
-  assert.match(appSource, /scrollingJournal = journal\.filter\(\(activity\) => activity\.kind !== "update"\)/);
-  assert.match(appSource, /stageFeedback\.map/);
+  assert.match(appSource, /journal\.map\(\(activity, index\) => isNarrativeActivity\(activity\)/);
+  assert.doesNotMatch(appSource, /stageFeedback|process-journal-pinned/);
   assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*max-height: min\(48vh, 430px\);[^}]*overflow-y: auto;/);
-  assert.match(styles, /\.process-journal-pinned \{ position: sticky; top: 0;/);
+  assert.doesNotMatch(styles, /\.process-journal-pinned|position: sticky;/);
   assert.match(styles, /@media \(max-width: 720px\)[\s\S]*?\.process-journal \{ max-height: min\(46dvh, 360px\); \}/);
   assert.match(appSource, /\{sending && <article className="message assistant running"/);
   assert.match(appSource, /完成前持续保留，可随时引导/);
@@ -1311,6 +1310,20 @@ test("selection and activity recovery reject stale conversations and deduplicate
   ]).map((event) => [event.seq, event.label ?? event.type]), [[1, "new"], [2, "done"]]);
   assert.equal(isTerminalJob({ id: "j", conversation_id: "valid", status: "cancelled" }), true);
   assert.equal(isTerminalJob({ id: "j", conversation_id: "valid", status: "running" }), false);
+});
+
+test("activity recovery keeps five expired stage updates above the rolling event window", () => {
+  const events = Array.from({ length: 62 }, (_, index) => {
+    const seq = index + 1;
+    return seq <= 6 || seq === 62
+      ? { seq, type: "progress", kind: "update", label: "阶段反馈", detail: `阶段 ${seq}` }
+      : { seq, type: "progress", kind: "command", label: `步骤 ${seq}`, detail: `command ${seq}` };
+  });
+  const retained = mergeJobEvents([], events);
+  assert.deepEqual(retained.slice(0, 5).map((event) => event.seq), [2, 3, 4, 5, 6]);
+  assert.deepEqual(retained.slice(5).map((event) => event.seq), Array.from({ length: 50 }, (_, index) => index + 13));
+  assert.equal(retained.filter((event) => event.kind === "update").length, 6);
+  assert.equal(retained.at(-1)?.seq, 62);
 });
 
 test("job finalization makes job and conversation terminal atomically", (context) => {

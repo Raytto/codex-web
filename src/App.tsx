@@ -138,7 +138,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setReasoningEffort(result.agentSelection.reasoningEffort);
     setJob(result.activeJob);
     setSending(Boolean(result.activeJob));
-    setActivities(result.jobEvents);
+    setActivities(mergeJobEvents([], result.jobEvents));
     if (result.editingPrompt && editingPendingRef.current?.id !== result.editingPrompt.id) {
       setEditingPending(result.editingPrompt);
       setRemovedEditingFileIds([]);
@@ -677,19 +677,14 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
   const retrying = !queued && latestStatus?.status === "retrying";
   const plan = activities.findLast((activity) => activity.kind === "todo" && Boolean(activity.items?.length));
   const journal = buildProcessJournal(activities);
-  const stageFeedback = journal.filter((activity) => activity.kind === "update");
-  const scrollingJournal = journal.filter((activity) => activity.kind !== "update");
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
   return <div className="activity-card" role="status" aria-live="polite">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始") : retrying ? latestStatus.label : "完成前持续保留，可随时引导"}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
-    <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 全程保留` : "实时更新"}</span></div>
-    <div className="process-journal">{stageFeedback.length > 0 && <div className="process-journal-pinned" aria-label="阶段反馈">
-      {stageFeedback.map((activity, index) => <ProcessJournalNote activity={activity} key={activity.seq ?? `update-${index}`} />)}
-    </div>}
-    {journal.length ? scrollingJournal.map((activity, index) => isNarrativeActivity(activity)
+    <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
+    <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
       ? <ProcessJournalNote activity={activity} key={activity.seq ?? `${activity.kind}-${index}`} />
       : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
           {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
