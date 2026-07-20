@@ -239,6 +239,7 @@ test("structured first-turn responses separate the visible answer from a short t
   assert.equal(extractLeakedAutoTitleAnswer('```json\n{"answer":"正常回复","title":"后续测试"}\n```'), "正常回复");
   assert.equal(extractLeakedAutoTitleAnswer('{"answer":"用户要求的 JSON","title":"标题","extra":true}'), null);
   assert.equal(extractLeakedAutoTitleAnswer('{"answer":"用户要求的 JSON","title":"这是一个明显超过十个字符的普通字段值"}'), null);
+  assert.equal(extractLeakedAutoTitleAnswer('{"answer":"正常回复","title":"NAS 双出口抖动已停止"}', true), "正常回复");
 });
 
 test("transient upstream failures use bounded 15/45/120 retry policy", async () => {
@@ -1230,13 +1231,13 @@ test("AI-titled conversations hide repeated title envelopes without rewriting au
   await agent.post("/codex-web/api/auth/login").send({ username: "owner", password: "Correct-Horse-2026!" }).expect(200);
 
   const conversationId = crypto.randomUUID();
-  const raw = '{"answer":"已收到：asdf。未生成任何文件。","title":"输入测试"}';
+  const raw = '{"answer":"已确认：双出口抖动已经停止。\\n\\n连续检查均正常。","title":"NAS 双出口抖动已停止"}';
   instance.db.createConversation(conversationId, "新任务");
   assert.equal(instance.db.setAiConversationTitleIfDefault(conversationId, "会话测试"), true);
   instance.db.addMessage({ id: crypto.randomUUID(), conversation_id: conversationId, role: "assistant", content: raw, created_at: new Date().toISOString() });
 
   const response = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
-  assert.equal(response.body.messages[0].content, "已收到：asdf。未生成任何文件。");
+  assert.equal(response.body.messages[0].content, "已确认：双出口抖动已经停止。\n\n连续检查均正常。");
   assert.equal(instance.db.listMessages(conversationId)[0].content, raw);
 });
 

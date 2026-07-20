@@ -60,7 +60,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return messages.map((message) => {
       if (message.role !== "assistant") return message;
       const visibleContent = conversation.title_source === "ai"
-        ? extractLeakedAutoTitleAnswer(message.content) ?? message.content
+        ? extractLeakedAutoTitleAnswer(message.content, true) ?? message.content
         : message.content;
       return { ...message, content: sanitizeAgentMarkdown(visibleContent, citationFiles) };
     });

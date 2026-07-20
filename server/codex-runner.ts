@@ -47,11 +47,12 @@ function parseAutoTitleEnvelope(raw: string): AutoTitleEnvelope | null {
   }
 }
 
-export function extractLeakedAutoTitleAnswer(raw: string): string | null {
+export function extractLeakedAutoTitleAnswer(raw: string, tolerateSchemaTitleOverflow = false): string | null {
   const envelope = parseAutoTitleEnvelope(raw);
   if (!envelope) return null;
   const title = envelope.title.trim();
-  if (!title || Array.from(title).length > 10 || /[\r\n]/.test(title)) return null;
+  const maxTitleLength = tolerateSchemaTitleOverflow ? 80 : AUTO_TITLE_OUTPUT_SCHEMA.properties.title.maxLength;
+  if (!title || Array.from(title).length > maxTitleLength || /[\r\n]/.test(title)) return null;
   return envelope.answer;
 }
 
@@ -200,7 +201,7 @@ export class CodexRunner {
       const createdAt = new Date().toISOString();
       const titledResponse = shouldGenerateTitle ? parseAutoTitleResponse(rawFinalResponse, prompt) : null;
       const finalResponse = titledResponse?.answer
-        ?? (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse) : null)
+        ?? (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse, true) : null)
         ?? rawFinalResponse;
       const safeFinalResponse = sanitizeAgentMarkdown(finalResponse, this.db.listFiles(conversationId));
       this.db.addMessage({
