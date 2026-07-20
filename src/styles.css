@@ -325,7 +325,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .message.user .message-avatar { grid-column: 2; grid-row: 1; color: #fff; border-color: rgba(72, 85, 156, .48); background: linear-gradient(145deg, #4a58a0, #28336b); }
 .message.user .message-body { grid-column: 1; grid-row: 1; max-width: min(640px, 78%); justify-self: end; }
 .message.user .message-meta { flex-direction: row-reverse; }
-.message-body > p { margin: 0; white-space: pre-wrap; line-height: 1.68; }
+.message-body > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.68; }
 .message.user .message-body > p { padding: .75em .9375em; border-radius: 15px 5px 15px 15px; color: #fff; background: linear-gradient(145deg, #36458a, #20264d); box-shadow: 0 8px 24px rgba(15, 17, 32, .17); }
 .message-reference { min-width: 0; display: flex; align-items: center; gap: 7px; margin: 0 0 6px auto; padding: 7px 10px; border: 1px solid #d6dae8; border-radius: 11px; color: #62687b; background: #f5f6fa; box-shadow: 0 4px 12px rgba(15, 17, 32, .04); font-size: 11px; line-height: 1.35; }
 .message-reference > svg { flex: 0 0 auto; color: var(--indigo); }

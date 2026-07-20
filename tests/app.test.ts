@@ -100,6 +100,10 @@ test("appearance setting supports light, dark, and live system preference", () =
   assert.ok(contrast(color("indigo"), color("paper")) >= 4.5);
 });
 
+test("user messages wrap long unbroken input inside their bubble", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(styles, /\.message-body > p \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;[^}]*word-break: break-word;/);
+});
 test("switching conversations hides stale detail until the selected task loads", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
