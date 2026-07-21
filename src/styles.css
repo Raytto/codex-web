@@ -411,7 +411,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .pending-queue-heading { min-height: 26px; display: flex; align-items: center; gap: 6px; padding: 4px 9px 3px; color: #6f7486; font-size: 9px; }
 .pending-queue-heading strong { color: #313a70; font-size: 11px; }
 .pending-queue-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pending-queue-list { max-height: 146px; overflow-y: auto; padding: 0 4px 4px; }
+.pending-queue-list { max-height: 174px; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding: 0 4px 4px; touch-action: pan-y; -webkit-overflow-scrolling: touch; }
 .pending-queue-item { min-height: 34px; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 3px; padding: 2px 4px 2px 0; border-top: 1px solid rgba(45, 54, 102, .09); border-radius: 8px; transition: opacity .14s ease, background .14s ease, transform .14s ease; }
 .pending-queue-item:first-child { border-top-color: transparent; }
 .pending-queue-item:hover { background: rgba(247, 248, 252, .72); }
@@ -426,6 +426,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .pending-queue-actions button:hover:not(:disabled) { color: #303b79; background: rgba(233, 236, 246, .8); }
 .pending-queue-actions button:disabled { opacity: .38; cursor: default; }
 .pending-queue-actions .steer-action { color: #43518d; font-weight: 700; }
+.workspace.has-pending-queue .composer-wrap { position: relative; left: auto; bottom: auto; flex: 0 0 auto; align-self: center; transform: none; padding: 7px 0 12px; background: var(--canvas); }
+.workspace.has-pending-queue .messages { padding-bottom: 24px; }
 .editing-pending-banner { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; padding: 6px 9px 6px 11px; border: 1px solid #ccd2e8; border-radius: 11px; color: #334078; background: #f5f6fb; box-shadow: 0 8px 22px rgba(15, 17, 32, .06); font-size: 10px; }
 .editing-pending-banner span, .editing-pending-banner button { display: inline-flex; align-items: center; gap: 5px; }
 .editing-pending-banner.awaiting-instruction { border-color: #c7d7ca; color: #28563a; background: #f1f8f3; }
