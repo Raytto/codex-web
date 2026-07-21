@@ -33,6 +33,8 @@ import { normalizeThemePreference, resolveTheme, THEME_PREFERENCE_KEY } from "..
 import type { Conversation, WorkFile } from "../src/api.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-context.js";
 import { buildProcessJournal } from "../src/process-journal.js";
+import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, detectOptionalAgentCapabilities } from "../server/optional-capabilities.js";
+import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../server/cancellation-summary.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -155,7 +157,7 @@ test("selected message text can be quoted into a focused Agent question", () => 
   assert.match(appSource, /className="ask-agent-reference"/);
   assert.match(appSource, /setAskAgentQuote\(normalized\.slice/);
   assert.doesNotMatch(appSource, /buildAskAgentDraft/);
-  assert.match(appSource, /api\.sendMessage\(id, message, files, askAgentQuote\)/);
+  assert.match(appSource, /api\.sendMessage\(id, message, useComposerDraft \? \[\] : files, askAgentQuote, useComposerDraft\)/);
   assert.match(appSource, /className="message-reference"/);
   assert.match(appSource, /focusRequest=\{composerFocusRequest\}/);
   assert.match(styles, /\.ask-agent-selection \{[^}]*position: fixed;[^}]*touch-action: manipulation/);
@@ -257,6 +259,14 @@ test("running work journal retains every important direction and compacts repeat
   assert.match(styles, /@media \(max-width: 720px\)[\s\S]*?\.process-journal \{ max-height: min\(46dvh, 360px\); \}/);
   assert.match(appSource, /\{sending && <article className="message assistant running"/);
   assert.match(appSource, /完成前持续保留，可随时引导/);
+});
+
+test("running progress opens at the latest update and follows until the user scrolls upward", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.match(appSource, /<ProcessPanel key=\{detail\.conversation\.id\} activities=\{activities\}/);
+  assert.match(appSource, /journalElement\.scrollTop = journalElement\.scrollHeight/);
+  assert.match(appSource, /journalFollowingRef\.current = resolveScrollFollow/);
+  assert.match(appSource, /ref=\{journalRef\} className="process-journal" onScroll=\{handleJournalScroll\}/);
 });
 
 test("recoverable stream errors remain progress events until the turn completes", async () => {
@@ -380,6 +390,7 @@ test("the owner tenant has a dedicated Unix identity and workers reject cross-te
     networkAccessEnabled: false,
     webSearchMode: "cached",
     codexWindowsSandbox: "elevated",
+    optionalCapabilities: DEFAULT_OPTIONAL_AGENT_CAPABILITIES,
   };
   assert.doesNotThrow(() => validateTenantWorkerRequest(request, owner.userId, tenantRoot));
   assert.throws(() => validateTenantWorkerRequest({ ...request, tenantRoot: path.join(os.tmpdir(), "other") }, owner.userId, tenantRoot), /path mismatch/);
@@ -395,14 +406,14 @@ test("the owner tenant has a dedicated Unix identity and workers reject cross-te
   assert.match(composeSource, /codex-runtime:\/opt\/codex-runtime/);
 });
 
-test("conversation workspace receives managed local spreadsheet instructions without losing custom guidance", (context) => {
+test("conversation workspaces stay concise while tenants receive the managed local spreadsheet skill", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-workspace-guidance-test-"));
   const conversationId = crypto.randomUUID();
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const workspace = ensureWorkspace(root, conversationId);
   const agentsPath = path.join(workspace, "AGENTS.md");
   const initial = fs.readFileSync(agentsPath, "utf8");
-  assert.match(initial, /does not provide `load_workspace_dependencies` or `@oai\/artifact-tool`/);
+  assert.doesNotMatch(initial, /artifact-tool|For local Excel work|Preserve the source workbook/);
   assert.match(initial, /`CWW_SHARED_PYTHON`/);
   assert.match(initial, /`CWW_JOB_RUNTIME`/);
   assert.match(initial, /`CWW_PYTHON_RUNNER`/);
@@ -413,6 +424,10 @@ test("conversation workspace receives managed local spreadsheet instructions wit
   const updated = fs.readFileSync(agentsPath, "utf8");
   assert.match(updated, /Keep this custom instruction/);
   assert.equal(updated.match(/codex-web-managed-start/g)?.length, 1);
+  const tenant = ensureTenant(path.join(root, "tenants"), LEGACY_USER_ID);
+  const skillPath = path.join(tenant.codexHome, "skills", "local-spreadsheets", "SKILL.md");
+  assert.equal(fs.existsSync(skillPath), true);
+  assert.match(fs.readFileSync(skillPath, "utf8"), /openpyxl and pandas/);
 });
 
 test("agent turn context keeps only current intent, attachments, and conditional safety", () => {
@@ -423,11 +438,25 @@ test("agent turn context keeps only current intent, attachments, and conditional
   });
   assert.match(withFile, /^请汇总\n\n本轮附件：/);
   assert.match(withFile, /成绩表\.xlsx: uploads\/abc\.xlsx/);
+  assert.match(withFile, /\$local-spreadsheets/);
   assert.doesNotMatch(withFile, /租户边界|Python 环境策略|绝对路径|answer,title|outputs 中只能/);
   const isolated = buildAgentTurnPrompt({ userPrompt: "检查脚本", attachments: [], isolationReason: "检测到脚本" });
   assert.match(isolated, /离线隔离/);
   assert.match(isolated, /不执行不受信任/);
   assert.equal(buildAgentSteerPrompt("改成蓝色", []), "实时调整当前任务：改成蓝色");
+  assert.doesNotMatch(buildAgentTurnPrompt({ userPrompt: "普通任务", attachments: [] }), /Excel attachment rules/);
+  const resumed = buildAgentTurnPrompt({ userPrompt: "继续", attachments: [], interruptedContext: `> **${USER_CANCELLED_TASK_MARKER}** retained` });
+  assert.match(resumed, /<interrupted_task_context>[\s\S]*retained[\s\S]*<\/interrupted_task_context>/);
+});
+
+test("optional agent capabilities stay off until the conversation explicitly asks for them", () => {
+  assert.deepEqual(detectOptionalAgentCapabilities(["summarize this file"]), DEFAULT_OPTIONAL_AGENT_CAPABILITIES);
+  assert.deepEqual(detectOptionalAgentCapabilities(["请使用子代理并行处理", "enable Gmail connector"]), {
+    apps: true, remotePlugin: true, goals: false, multiAgent: true,
+  });
+  const config = buildOptionalCapabilityConfig(DEFAULT_OPTIONAL_AGENT_CAPABILITIES) as { features: Record<string, boolean>; plugins: Record<string, { enabled: boolean }> };
+  assert.equal(Object.values(config.features).every((enabled) => !enabled), true);
+  assert.equal(config.plugins["spreadsheets@openai-primary-runtime"].enabled, false);
 });
 
 test("each job gets an isolated runtime directory without traversing stale siblings", (context) => {
@@ -788,12 +817,20 @@ test("conversation stop cancels every active job and deletion preserves audit ro
   instance.db.createJob(runningJobId, conversationId, messageId);
   instance.db.updateJob(runningJobId, "running");
   instance.db.updateConversation(conversationId, { status: "running" });
-  instance.db.appendEvent(runningJobId, "progress", { label: "saved diagnostic event" });
+  instance.db.appendEvent(runningJobId, "progress", { kind: "update", label: "stage update", detail: "finished environment inspection" });
+  instance.db.appendEvent(runningJobId, "progress", { kind: "command", label: "configuration checked", detail: "private command omitted" });
 
   await agent.post(`/codex-web/api/conversations/${conversationId}/cancel`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
   assert.equal(instance.db.getJob(queuedJobId)?.status, "cancelled");
   assert.equal(instance.db.getJob(runningJobId)?.status, "cancelled");
   assert.equal(instance.db.getConversationForUser(conversationId, LEGACY_USER_ID)?.id, conversationId);
+  const stoppedSummary = instance.db.listMessages(conversationId).at(-1)!;
+  assert.equal(stoppedSummary.role, "assistant");
+  assert.match(stoppedSummary.content, new RegExp(USER_CANCELLED_TASK_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(stoppedSummary.content, /finished environment inspection/);
+  assert.match(stoppedSummary.content, /configuration checked/);
+  assert.doesNotMatch(stoppedSummary.content, /private command/);
+  assert.equal(latestUserCancellationContext(instance.db.listMessages(conversationId)), stoppedSummary.content);
 
   const deletionJobId = crypto.randomUUID();
   instance.db.createJob(deletionJobId, conversationId, messageId);
@@ -829,18 +866,18 @@ test("conversation stop cancels every active job and deletion preserves audit ro
   const retained = instance.db.getConversation(conversationId);
   assert.ok(retained?.deleted_at);
   assert.equal(instance.db.listConversations(LEGACY_USER_ID).some((row) => row.id === conversationId), false);
-  assert.equal(instance.db.listMessages(conversationId).length, 1);
+  assert.equal(instance.db.listMessages(conversationId).length, 2);
   assert.equal(instance.db.listFiles(conversationId).length, 1);
   assert.equal(instance.db.getJob(deletionJobId)?.status, "cancelled");
   assert.equal(instance.db.listPendingPrompts(conversationId).length, 0);
   assert.equal(instance.db.listPendingPrompts(conversationId, "editing").length, 0);
-  assert.ok(instance.db.listEvents(runningJobId).some((event) => JSON.parse(event.payload).label === "saved diagnostic event"));
+  assert.ok(instance.db.listEvents(runningJobId).some((event) => JSON.parse(event.payload).detail === "finished environment inspection"));
   assert.equal(fs.existsSync(workspace), false);
   assert.equal(fs.existsSync(pendingAbsolute), false);
   assert.equal(fs.existsSync(storedAbsolute), false);
   assert.equal(fs.existsSync(sessionFile), false);
   await instance.pumpQueue();
-  assert.deepEqual(instance.db.listMessages(conversationId).map((message) => message.content), ["keep for audit"]);
+  assert.deepEqual(instance.db.listMessages(conversationId).map((message) => message.content), ["keep for audit", stoppedSummary.content]);
   await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(404);
   await agent.get(`/codex-web/api/files/${fileId}`).expect(404);
   await agent.get(`/codex-web/api/jobs/${deletionJobId}/events`).expect(404);
@@ -910,6 +947,70 @@ test("web users have isolated conversations, files, jobs, settings, and tenant d
   await owner.get(`/codex-web/api/jobs/${memberJobId}/events`).expect(404);
   await owner.post(`/codex-web/api/jobs/${memberJobId}/cancel`).set("X-CSRF-Token", ownerLogin.body.csrfToken).expect(404);
   await member.post(`/codex-web/api/jobs/${memberJobId}/cancel`).set("X-CSRF-Token", memberLogin.body.csrfToken).expect(200);
+});
+
+test("composer drafts and attachments survive browser sessions and are consumed atomically", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-composer-draft-test-"));
+  const tenantRoot = path.join(root, "tenants");
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot, queueAutoStart: false,
+    username: "owner", passwordHash: bcrypt.hashSync("Draft-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+
+  const firstBrowser = request.agent(instance.app);
+  const firstLogin = await firstBrowser.post("/codex-web/api/auth/login").send({ username: "owner", password: "Draft-Password-2026!" }).expect(200);
+  const created = await firstBrowser.post("/codex-web/api/conversations").set("X-CSRF-Token", firstLogin.body.csrfToken).expect(201);
+  const conversationId = created.body.conversation.id as string;
+
+  await firstBrowser.put(`/codex-web/api/conversations/${conversationId}/draft`)
+    .set("X-CSRF-Token", firstLogin.body.csrfToken)
+    .send({ content: "unfinished draft", quoteExcerpt: "quoted context" }).expect(200);
+  const uploaded = await firstBrowser.post(`/codex-web/api/conversations/${conversationId}/draft/files`)
+    .set("X-CSRF-Token", firstLogin.body.csrfToken)
+    .attach("files", Buffer.from("draft attachment"), { filename: "draft.txt", contentType: "text/plain" })
+    .expect(201);
+  const draftFile = uploaded.body.composerDraft.files[0] as { id: string; relative_path: string };
+  const uploadedPath = path.join(ensureTenantWorkspace(tenantRoot, LEGACY_USER_ID, conversationId), draftFile.relative_path);
+  assert.equal(fs.existsSync(uploadedPath), true);
+
+  const secondBrowser = request.agent(instance.app);
+  const secondLogin = await secondBrowser.post("/codex-web/api/auth/login").send({ username: "owner", password: "Draft-Password-2026!" }).expect(200);
+  let detail = await secondBrowser.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.composerDraft.content, "unfinished draft");
+  assert.equal(detail.body.composerDraft.quote_excerpt, "quoted context");
+  assert.deepEqual(detail.body.composerDraft.files.map((file: { original_name: string }) => file.original_name), ["draft.txt"]);
+
+  await secondBrowser.put(`/codex-web/api/conversations/${conversationId}/draft`)
+    .set("X-CSRF-Token", secondLogin.body.csrfToken)
+    .send({ content: "continued on another device", quoteExcerpt: "" }).expect(200);
+  detail = await firstBrowser.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.composerDraft.content, "continued on another device");
+
+  await secondBrowser.post(`/codex-web/api/conversations/${conversationId}/messages`)
+    .set("X-CSRF-Token", secondLogin.body.csrfToken)
+    .field("message", "continued on another device")
+    .field("quoteExcerpt", "")
+    .field("useComposerDraft", "true")
+    .expect(202);
+  assert.equal(instance.db.getComposerDraft(conversationId), undefined);
+  const messages = instance.db.listMessages(conversationId);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].content, "continued on another device");
+  assert.deepEqual(messages[0].files.map((file) => file.original_name), ["draft.txt"]);
+  assert.equal(instance.db.getFile(draftFile.id)?.message_id, messages[0].id);
+  assert.equal((await firstBrowser.get(`/codex-web/api/conversations/${conversationId}`).expect(200)).body.composerDraft, null);
+
+  const clearable = await firstBrowser.post("/codex-web/api/conversations").set("X-CSRF-Token", firstLogin.body.csrfToken).expect(201);
+  const clearableId = clearable.body.conversation.id as string;
+  const clearUpload = await firstBrowser.post(`/codex-web/api/conversations/${clearableId}/draft/files`)
+    .set("X-CSRF-Token", firstLogin.body.csrfToken)
+    .attach("files", Buffer.from("discard me"), { filename: "discard.txt", contentType: "text/plain" }).expect(201);
+  const clearPath = path.join(ensureTenantWorkspace(tenantRoot, LEGACY_USER_ID, clearableId), clearUpload.body.composerDraft.files[0].relative_path);
+  await firstBrowser.delete(`/codex-web/api/conversations/${clearableId}/draft`).set("X-CSRF-Token", firstLogin.body.csrfToken).expect(204);
+  assert.equal(instance.db.getComposerDraft(clearableId), undefined);
+  assert.equal(fs.existsSync(clearPath), false);
 });
 
 test("file-only submissions persist on the server and wait for a real instruction", async (context) => {

@@ -6,7 +6,7 @@ import {
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
   Trash2, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
+import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
 import { isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -20,6 +20,15 @@ import { resolveScrollFollow } from "./scroll-follow";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
+const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
+
+type DraftSaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
+type DraftUpload = { id: string; name: string };
+type CachedComposerDraft = { content: string; quoteExcerpt: string; composerDraft: ComposerDraft | null };
+
+function composerDraftSignature(content: string, quoteExcerpt: string): string {
+  return `${content}\u0000${quoteExcerpt}`;
+}
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -84,6 +93,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [input, setInput] = useState("");
   const [askAgentQuote, setAskAgentQuote] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [composerDraft, setComposerDraft] = useState<ComposerDraft | null>(null);
+  const [draftUploads, setDraftUploads] = useState<DraftUpload[]>([]);
+  const [draftSaveState, setDraftSaveState] = useState<DraftSaveState>("idle");
   const [editingPending, setEditingPending] = useState<PendingPrompt | null>(null);
   const [removedEditingFileIds, setRemovedEditingFileIds] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
@@ -111,8 +123,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const selectedIdRef = useRef<string | null>(selectedId);
   const editingPendingRef = useRef<PendingPrompt | null>(editingPending);
   const lastEventIdRef = useRef(0);
+  const inputRef = useRef(input);
+  const askAgentQuoteRef = useRef(askAgentQuote);
+  const composerDraftRef = useRef<ComposerDraft | null>(composerDraft);
+  const draftUploadsRef = useRef<DraftUpload[]>(draftUploads);
+  const draftLoadedConversationRef = useRef<string | null>(null);
+  const draftCacheRef = useRef(new Map<string, CachedComposerDraft>());
+  const draftSyncedSignaturesRef = useRef(new Map<string, string>());
+  const draftMutationGenerationRef = useRef(new Map<string, number>());
+  const draftSaveTimerRef = useRef<number | null>(null);
+  const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   selectedIdRef.current = selectedId;
   editingPendingRef.current = editingPending;
+  inputRef.current = input;
+  askAgentQuoteRef.current = askAgentQuote;
+  composerDraftRef.current = composerDraft;
+  draftUploadsRef.current = draftUploads;
 
   function askAgentAbout(selectedText: string) {
     const normalized = normalizeAskAgentSelection(selectedText);
@@ -130,7 +156,30 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setDetail((current) => current?.conversation.id === conversation.id ? { ...current, conversation } : current);
   }, []);
 
+  const persistComposerDraft = useCallback((conversationId: string, content: string, quoteExcerpt: string, keepalive = false) => {
+    const signature = composerDraftSignature(content, quoteExcerpt);
+    const operation = draftSaveQueueRef.current.catch(() => undefined).then(async () => {
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState("saving");
+      const result = await api.saveConversationDraft(conversationId, content, quoteExcerpt, keepalive && new Blob([content, quoteExcerpt]).size < 60_000);
+      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+      draftSyncedSignaturesRef.current.set(conversationId, signature);
+      const cached = draftCacheRef.current.get(conversationId);
+      if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: result.composerDraft });
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
+        composerDraftRef.current = result.composerDraft;
+        setComposerDraft(result.composerDraft);
+        setDraftSaveState(composerDraftSignature(inputRef.current, askAgentQuoteRef.current) === signature ? "saved" : "unsaved");
+      }
+    }).catch((reason) => {
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState("error");
+      throw reason;
+    });
+    draftSaveQueueRef.current = operation.catch(() => undefined);
+    return operation;
+  }, []);
+
   const refreshDetail = useCallback(async (id: string) => {
+    const draftGenerationAtRequest = draftMutationGenerationRef.current.get(id) ?? 0;
     let result = await api.conversation(id);
     if (selectedIdRef.current !== id) return result;
     if (result.conversation.has_unread_result) {
@@ -154,16 +203,67 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setJob(result.activeJob);
     setSending(Boolean(result.activeJob));
     setActivities(mergeJobEvents([], result.jobEvents));
-    if (result.editingPrompt && editingPendingRef.current?.id !== result.editingPrompt.id) {
-      setEditingPending(result.editingPrompt);
-      setRemovedEditingFileIds([]);
-      setFiles([]);
-      setInput(result.editingPrompt.content);
-      setAskAgentQuote(result.editingPrompt.quote_excerpt ?? "");
-    }
-    if (!result.editingPrompt && editingPendingRef.current) {
-      setEditingPending(null);
-      setRemovedEditingFileIds([]);
+    if (result.editingPrompt) {
+      composerDraftRef.current = result.composerDraft;
+      setComposerDraft(result.composerDraft);
+      const cachedDraft = draftCacheRef.current.get(id);
+      if (cachedDraft) draftCacheRef.current.set(id, { ...cachedDraft, composerDraft: result.composerDraft });
+      if (editingPendingRef.current?.id !== result.editingPrompt.id) {
+        editingPendingRef.current = result.editingPrompt;
+        setEditingPending(result.editingPrompt);
+        setRemovedEditingFileIds([]);
+        setFiles([]);
+        setInput(result.editingPrompt.content);
+        setAskAgentQuote(result.editingPrompt.quote_excerpt ?? "");
+      }
+    } else {
+      const wasEditing = Boolean(editingPendingRef.current);
+      if (wasEditing) {
+        editingPendingRef.current = null;
+        setEditingPending(null);
+        setRemovedEditingFileIds([]);
+        draftLoadedConversationRef.current = null;
+      }
+      const cached = draftCacheRef.current.get(id);
+      const shouldRestore = wasEditing || draftLoadedConversationRef.current !== id;
+      if (shouldRestore) {
+        const cachedSignature = cached ? composerDraftSignature(cached.content, cached.quoteExcerpt) : undefined;
+        const cachedIsDirty = Boolean(cached && cachedSignature !== draftSyncedSignaturesRef.current.get(id));
+        const restored = cachedIsDirty ? cached! : {
+          content: result.composerDraft?.content ?? "",
+          quoteExcerpt: result.composerDraft?.quote_excerpt ?? "",
+          composerDraft: result.composerDraft,
+        };
+        draftLoadedConversationRef.current = id;
+        composerDraftRef.current = restored.composerDraft;
+        setComposerDraft(restored.composerDraft);
+        setInput(restored.content);
+        setAskAgentQuote(restored.quoteExcerpt);
+        setFiles([]);
+        draftCacheRef.current.set(id, restored);
+        if (!cachedIsDirty) draftSyncedSignaturesRef.current.set(id, composerDraftSignature(restored.content, restored.quoteExcerpt));
+        setDraftSaveState(cachedIsDirty ? "unsaved" : restored.composerDraft ? "saved" : "idle");
+      } else {
+        const localSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
+        const syncedSignature = draftSyncedSignaturesRef.current.get(id);
+        const serverContent = result.composerDraft?.content ?? "";
+        const serverQuote = result.composerDraft?.quote_excerpt ?? "";
+        const serverSignature = composerDraftSignature(serverContent, serverQuote);
+        const responseIsStale = (draftMutationGenerationRef.current.get(id) ?? 0) !== draftGenerationAtRequest;
+        const serverDraft = responseIsStale ? composerDraftRef.current : result.composerDraft;
+        composerDraftRef.current = serverDraft;
+        setComposerDraft(serverDraft);
+        if (!responseIsStale && localSignature === syncedSignature && serverSignature !== syncedSignature) {
+          setInput(serverContent);
+          setAskAgentQuote(serverQuote);
+          draftSyncedSignaturesRef.current.set(id, serverSignature);
+          draftCacheRef.current.set(id, { content: serverContent, quoteExcerpt: serverQuote, composerDraft: serverDraft });
+          setDraftSaveState(serverDraft ? "saved" : "idle");
+        } else {
+          const current = draftCacheRef.current.get(id);
+          if (current) draftCacheRef.current.set(id, { ...current, composerDraft: serverDraft });
+        }
+      }
     }
     lastEventIdRef.current = result.jobEvents.at(-1)?.seq ?? 0;
     if (result.latestJob?.status === "failed") setError(result.jobEvents.findLast((event) => event.message)?.message || "任务处理失败");
@@ -204,6 +304,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       eventSourceRef.current?.close(); connectedJobRef.current = null;
       setDetail(null); setJob(null); setSending(false); setActivities([]);
       setEditingPending(null); setRemovedEditingFileIds([]); setAskAgentQuote("");
+      composerDraftRef.current = null; setComposerDraft(null); setDraftUploads([]); setDraftSaveState("idle");
+      draftLoadedConversationRef.current = null;
       if (agentOptions) {
         setSelectedModel(agentOptions.selection.model);
         setReasoningEffort(agentOptions.selection.reasoningEffort);
@@ -212,14 +314,59 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
     window.localStorage.setItem(SELECTED_CONVERSATION_KEY, selectedId);
     eventSourceRef.current?.close(); connectedJobRef.current = null; setActivities([]);
-    editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setAskAgentQuote(""); setFiles([]);
+    editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setFiles([]); setDraftUploads([]);
+    const cached = draftCacheRef.current.get(selectedId);
+    draftLoadedConversationRef.current = cached ? selectedId : null;
+    composerDraftRef.current = cached?.composerDraft ?? null;
+    setComposerDraft(cached?.composerDraft ?? null);
+    setInput(cached?.content ?? "");
+    setAskAgentQuote(cached?.quoteExcerpt ?? "");
+    setDraftSaveState(cached ? "unsaved" : "idle");
     void reconcile(selectedId);
     setSidebarOpen(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
   useEffect(() => {
+    if (!selectedId || editingPending || draftLoadedConversationRef.current !== selectedId) return;
+    const signature = composerDraftSignature(input, askAgentQuote);
+    draftCacheRef.current.set(selectedId, { content: input, quoteExcerpt: askAgentQuote, composerDraft: composerDraftRef.current });
+    if (signature === draftSyncedSignaturesRef.current.get(selectedId)) {
+      setDraftSaveState(composerDraftRef.current ? "saved" : "idle");
+      return;
+    }
+    setDraftSaveState("unsaved");
+    if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+    draftSaveTimerRef.current = window.setTimeout(() => {
+      draftSaveTimerRef.current = null;
+      void persistComposerDraft(selectedId, input, askAgentQuote).catch(() => undefined);
+    }, COMPOSER_DRAFT_SAVE_DELAY_MS);
+    return () => {
+      if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    };
+  }, [askAgentQuote, editingPending, input, persistComposerDraft, selectedId]);
+  useEffect(() => () => {
+    if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+    const conversationId = selectedId;
+    if (!conversationId || editingPendingRef.current || draftLoadedConversationRef.current !== conversationId) return;
+    const content = inputRef.current;
+    const quoteExcerpt = askAgentQuoteRef.current;
+    if (composerDraftSignature(content, quoteExcerpt) !== draftSyncedSignaturesRef.current.get(conversationId)) {
+      void persistComposerDraft(conversationId, content, quoteExcerpt, true).catch(() => undefined);
+    }
+  }, [persistComposerDraft, selectedId]);
+  useEffect(() => {
     const resume = () => { if (selectedIdRef.current) void reconcile(selectedIdRef.current); };
-    const visible = () => { if (document.visibilityState === "visible") resume(); };
+    const visible = () => {
+      if (document.visibilityState === "visible") return resume();
+      const conversationId = selectedIdRef.current;
+      if (!conversationId || editingPendingRef.current || draftLoadedConversationRef.current !== conversationId) return;
+      const content = inputRef.current;
+      const quoteExcerpt = askAgentQuoteRef.current;
+      if (composerDraftSignature(content, quoteExcerpt) !== draftSyncedSignaturesRef.current.get(conversationId)) {
+        void persistComposerDraft(conversationId, content, quoteExcerpt, true).catch(() => undefined);
+      }
+    };
     window.addEventListener("focus", resume);
     window.addEventListener("pageshow", resume);
     document.addEventListener("visibilitychange", visible);
@@ -230,7 +377,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       eventSourceRef.current?.close();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [persistComposerDraft]);
   useLayoutEffect(() => {
     const restore = prependScrollRestoreRef.current;
     if (!restore) return;
@@ -351,13 +498,88 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     await refreshList(); setSelectedId(result.conversation.id);
   }
 
+  async function addComposerFiles(incoming: File[]) {
+    if (incoming.length === 0) return;
+    const conversationId = selectedIdRef.current;
+    if (editingPendingRef.current || !conversationId) {
+      setFiles((previous) => [...previous, ...incoming].slice(0, 12));
+      return;
+    }
+    const available = Math.max(0, 12 - (composerDraftRef.current?.files.length ?? 0) - draftUploadsRef.current.length);
+    const accepted = incoming.slice(0, available);
+    if (accepted.length === 0) { setNotice("单个会话草稿最多包含 12 个附件。"); return; }
+    const uploads = accepted.map((file) => ({ id: crypto.randomUUID(), name: file.name }));
+    setDraftUploads((current) => [...current, ...uploads]);
+    setError("");
+    try {
+      const result = await api.uploadConversationDraftFiles(conversationId, accepted);
+      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
+        composerDraftRef.current = result.composerDraft;
+        setComposerDraft(result.composerDraft);
+      }
+      const cached = draftCacheRef.current.get(conversationId);
+      if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: result.composerDraft });
+      else draftCacheRef.current.set(conversationId, {
+        content: conversationId === selectedIdRef.current ? inputRef.current : result.composerDraft.content,
+        quoteExcerpt: conversationId === selectedIdRef.current ? askAgentQuoteRef.current : result.composerDraft.quote_excerpt ?? "",
+        composerDraft: result.composerDraft,
+      });
+      const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
+      setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId) ? "saved" : "unsaved");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "草稿附件上传失败");
+    } finally {
+      const ids = new Set(uploads.map((upload) => upload.id));
+      setDraftUploads((current) => current.filter((upload) => !ids.has(upload.id)));
+    }
+  }
+
+  async function removeComposerDraftFile(file: WorkFile) {
+    const conversationId = selectedIdRef.current;
+    if (!conversationId || !file.id) return;
+    setError("");
+    try {
+      const result = await api.deleteConversationDraftFile(conversationId, file.id);
+      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+      if (selectedIdRef.current !== conversationId || editingPendingRef.current) return;
+      composerDraftRef.current = result.composerDraft;
+      setComposerDraft(result.composerDraft);
+      const cached = draftCacheRef.current.get(conversationId);
+      if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: result.composerDraft });
+      const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
+      setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId)
+        ? result.composerDraft ? "saved" : "idle"
+        : "unsaved");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "删除草稿附件失败"); }
+  }
+
+  async function clearComposerDraft() {
+    const conversationId = selectedIdRef.current;
+    if (!conversationId || editingPendingRef.current || draftUploads.length > 0) return;
+    if (!window.confirm("清空这个会话尚未发送的正文、引用和附件？")) return;
+    if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+    await draftSaveQueueRef.current;
+    try {
+      await api.deleteConversationDraft(conversationId);
+      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+      draftCacheRef.current.delete(conversationId);
+      draftSyncedSignaturesRef.current.set(conversationId, composerDraftSignature("", ""));
+      composerDraftRef.current = null;
+      setComposerDraft(null); setInput(""); setAskAgentQuote(""); setFiles([]); setDraftSaveState("idle");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "清空草稿失败"); }
+  }
+
   async function send(message = input) {
     const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
-    if ((!message.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile) || submitting || selectionSaving) return;
+    const hasComposerDraftFile = Boolean(!editingPending && composerDraft?.files.length);
+    if ((!message.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile && !hasComposerDraftFile) || submitting || selectionSaving) return;
+    if (draftUploads.length > 0) { setNotice("请等待草稿附件上传完成后再发送。"); return; }
     setError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
     try {
       let id = selectedId;
+      const useComposerDraft = Boolean(id && !editingPending);
       if (!id) {
         const created = await api.createConversation(); id = created.conversation.id;
         setSelectedModel(created.agentSelection.model); setReasoningEffort(created.agentSelection.reasoningEffort);
@@ -371,10 +593,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
         } else {
           editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]);
+          draftLoadedConversationRef.current = null;
         }
       } else {
-        const result = await api.sendMessage(id, message, files, askAgentQuote);
+        if (useComposerDraft) {
+          if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+          await draftSaveQueueRef.current;
+          await persistComposerDraft(id, message, askAgentQuote);
+        }
+        const result = await api.sendMessage(id, message, useComposerDraft ? [] : files, askAgentQuote, useComposerDraft);
         if (result.needsInstruction) setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
+        if (useComposerDraft) {
+          draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
+          draftCacheRef.current.delete(id);
+          draftSyncedSignaturesRef.current.set(id, composerDraftSignature("", ""));
+          composerDraftRef.current = null; setComposerDraft(null); setDraftSaveState("idle");
+        }
       }
       setInput(""); setAskAgentQuote(""); setFiles([]);
       await reconcile(id);
@@ -387,9 +621,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (!selectedId || editingPending || submitting) return;
     setError(""); setSubmitting(true);
     try {
+      if (draftLoadedConversationRef.current === selectedId) {
+        if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+        await draftSaveQueueRef.current;
+        await persistComposerDraft(selectedId, inputRef.current, askAgentQuoteRef.current);
+      }
       const result = await api.editPendingPrompt(selectedId, prompt.id);
       editingPendingRef.current = result.editingPrompt;
       setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setAskAgentQuote(result.editingPrompt.quote_excerpt ?? ""); setInput(result.editingPrompt.content);
+      draftLoadedConversationRef.current = null;
       if (selectedModel !== prompt.agent_model || reasoningEffort !== prompt.reasoning_effort) {
         await persistAgentSelection({ model: prompt.agent_model, reasoningEffort: prompt.reasoning_effort });
       }
@@ -405,6 +645,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (editingPending.content.trim() || editingPending.quote_excerpt) await api.restorePendingPrompt(selectedId, editingPending.id);
       else await api.deletePendingPrompt(selectedId, editingPending.id);
       editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setAskAgentQuote(""); setFiles([]);
+      draftLoadedConversationRef.current = null;
       setNotice("");
       await reconcile(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "取消编辑失败"); }
@@ -580,7 +821,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
-      {(!selectedId || currentDetail) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
+      {(!selectedId || currentDetail) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -588,6 +829,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
         canSteer={job?.status === "running"} onCancelPendingEdit={() => void cancelPendingEdit()}
+        onAddFiles={(incoming) => void addComposerFiles(incoming)} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
         onSend={(message) => void send(message)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
@@ -686,13 +928,16 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
           {message.files.length > 0 && <div className="file-grid">{message.files.map((file) => <FileCard key={file.id} file={file} />)}</div>}
         </div>
       </article>)}
-      {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel activities={activities} /></div></article>}
+      {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={detail.conversation.id} activities={activities} /></div></article>}
       <div />
     </div>{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }}><Zap size={14} /><span>询问 Agent</span></button>}
   </section>;
 }
 
 function ProcessPanel({ activities }: { activities: JobEvent[] }) {
+  const journalRef = useRef<HTMLDivElement>(null);
+  const journalFollowingRef = useRef(true);
+  const journalScrollTopRef = useRef(0);
   const latestStatus = activities.findLast((item) => item.type === "status" || item.kind === "status");
   const queueStatus = activities.findLast((activity) => activity.status === "queued");
   const queued = Boolean(queueStatus) && !activities.some((activity) => activity.status === "running");
@@ -700,13 +945,32 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
   const plan = activities.findLast((activity) => activity.kind === "todo" && Boolean(activity.items?.length));
   const journal = buildProcessJournal(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
+
+  useLayoutEffect(() => {
+    const journalElement = journalRef.current;
+    if (!journalElement || !journalFollowingRef.current) return;
+    journalElement.scrollTop = journalElement.scrollHeight;
+    journalScrollTopRef.current = journalElement.scrollTop;
+  }, [activities]);
+
+  function handleJournalScroll(event: React.UIEvent<HTMLDivElement>) {
+    const journalElement = event.currentTarget;
+    journalFollowingRef.current = resolveScrollFollow({
+      previousScrollTop: journalScrollTopRef.current,
+      scrollTop: journalElement.scrollTop,
+      scrollHeight: journalElement.scrollHeight,
+      clientHeight: journalElement.clientHeight,
+      following: journalFollowingRef.current,
+    });
+    journalScrollTopRef.current = journalElement.scrollTop;
+  }
   return <div className="activity-card" role="status" aria-live="polite">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始") : retrying ? latestStatus.label : "完成前持续保留，可随时引导"}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
     <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
-    <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
+    <div ref={journalRef} className="process-journal" onScroll={handleJournalScroll}>{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
       ? <ProcessJournalNote activity={activity} key={activity.seq ?? `${activity.kind}-${index}`} />
       : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
           {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
@@ -804,7 +1068,7 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
   </section>;
 }
 
-function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
+function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
   conversationId: string | null;
   input: string;
   setInput: (value: string) => void;
@@ -813,6 +1077,9 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   focusRequest: number;
   files: File[];
   setFiles: Dispatch<SetStateAction<File[]>>;
+  draftFiles: WorkFile[];
+  draftUploads: DraftUpload[];
+  draftSaveState: DraftSaveState;
   sending: boolean;
   submitting: boolean;
   selectionSaving: boolean;
@@ -831,6 +1098,9 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   onSteerPending: (prompt: PendingPrompt) => void;
   canSteer: boolean;
   onCancelPendingEdit: () => void;
+  onAddFiles: (files: File[]) => void;
+  onRemoveDraftFile: (file: WorkFile) => void;
+  onClearDraft: () => void;
   onRemoveEditingFile: (fileId: string) => void;
   onRestoreEditingFile: (fileId: string) => void;
   onSend: (message?: string) => void;
@@ -856,11 +1126,15 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   const handledFocusRequestRef = useRef(focusRequest);
   const inputRef = useRef(input);
   const filesRef = useRef(files);
+  const draftFilesRef = useRef(draftFiles);
+  const draftUploadsRef = useRef(draftUploads);
   const editingPendingRef = useRef(editingPending);
   const removedEditingFileIdsRef = useRef(removedEditingFileIds);
   const onSendRef = useRef(onSend);
   inputRef.current = input;
   filesRef.current = files;
+  draftFilesRef.current = draftFiles;
+  draftUploadsRef.current = draftUploads;
   editingPendingRef.current = editingPending;
   removedEditingFileIdsRef.current = removedEditingFileIds;
   onSendRef.current = onSend;
@@ -991,7 +1265,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       const retainedNames = (editingPendingRef.current?.files ?? [])
         .filter((file) => !removedEditingFileIdsRef.current.includes(file.id))
         .map((file) => file.original_name);
-      const attachmentNames = [...retainedNames, ...filesRef.current.map((file) => file.name)].slice(0, 12);
+      const attachmentNames = [...retainedNames, ...draftFilesRef.current.map((file) => file.original_name), ...draftUploadsRef.current.map((file) => file.name), ...filesRef.current.map((file) => file.name)].slice(0, 12);
       const result = await api.transcribeAudio(blob, `recording.${extension}`, {
         conversationId: conversationId ?? undefined,
         draftText: inputRef.current,
@@ -1008,8 +1282,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   }
   function addFiles(list: FileList | File[] | null) {
     if (!list) return;
-    const incoming = Array.from(list);
-    setFiles((previous) => [...previous, ...incoming].slice(0, 12));
+    onAddFiles(Array.from(list));
   }
   function pasted(event: ClipboardEvent<HTMLTextAreaElement>) {
     const clipboardFiles = Array.from(event.clipboardData.files);
@@ -1025,7 +1298,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     const timestamp = clipboardTimestamp(new Date());
     const normalized = clipboardFiles.map((file, index) => normalizeClipboardFile(file, timestamp, index));
     addFiles(normalized);
-    const available = Math.max(0, 12 - files.length);
+    const available = Math.max(0, 12 - files.length - draftFiles.length - draftUploads.length);
     const added = Math.min(normalized.length, available);
     setPasteNotice(added > 0 ? `已从剪贴板添加 ${added} 个附件` : "单次最多添加 12 个附件");
     window.clearTimeout(pasteTimer.current);
@@ -1039,10 +1312,17 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   const primaryAction = chooseComposerPrimaryAction({
     running: Boolean(sending && onCancel),
     hasText: Boolean(input.trim() || askAgentQuote),
-    hasAttachments: files.length > 0 || hasRetainedEditingFile,
+    hasAttachments: files.length > 0 || draftFiles.length > 0 || draftUploads.length > 0 || hasRetainedEditingFile,
     voiceActive: voiceState !== "idle",
   });
   const awaitingInstruction = Boolean(editingPending && !editingPending.content.trim() && !editingPending.quote_excerpt);
+  const hasUnsentDraft = !editingPending && Boolean(input || askAgentQuote || draftFiles.length || draftUploads.length);
+  const draftStatusLabel = draftUploads.length > 0 ? "正在上传附件…"
+    : draftSaveState === "saving" ? "正在保存草稿…"
+    : draftSaveState === "unsaved" ? "草稿将在停止输入后自动保存"
+    : draftSaveState === "error" ? "草稿暂未保存，将在继续编辑时重试"
+    : draftSaveState === "saved" || draftFiles.length > 0 ? "草稿已保存到服务器"
+    : "";
   return <div className="composer-wrap">
     {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={submitting} canSteer={canSteer}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}
@@ -1053,6 +1333,8 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       const removed = removedEditingFileIds.includes(file.id);
       return <span key={file.id} className={removed ? "removed" : ""}><FileIcon size={14} />{file.original_name}<button type="button" onClick={() => removed ? onRestoreEditingFile(file.id) : onRemoveEditingFile(file.id)} title={removed ? "恢复附件" : "移除附件"}>{removed ? <Plus size={13} /> : <X size={13} />}</button></span>;
     })}</div>}
+    {!editingPending && draftFiles.length > 0 && <div className="pending-files">{draftFiles.map((file) => <span key={file.id}><FileIcon size={14} />{file.original_name}<button type="button" aria-label={`移除附件 ${file.original_name}`} title="移除附件" onClick={() => onRemoveDraftFile(file)}><X size={13} /></button></span>)}</div>}
+    {!editingPending && draftUploads.length > 0 && <div className="pending-files">{draftUploads.map((file) => <span key={file.id} className="uploading"><LoaderCircle className="spin" size={14} />{file.name}</span>)}</div>}
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} />{file.name}<button onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
@@ -1068,10 +1350,10 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
         {voiceEnabled && voiceState === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving} title="录音输入" aria-label="录音输入"><Mic size={18} /></button>}
         {primaryAction === "stop" && onCancel
           ? <button type="button" className="send-button stop" onClick={onCancel} title="停止当前显示的任务" aria-label="停止当前显示的任务"><Square size={15} fill="currentColor" /></button>
-          : <button type="button" className="send-button" onClick={() => voiceState === "recording" ? finishRecording(true) : onSend()} disabled={submitting || selectionSaving || voiceState === "transcribing" || (voiceState !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile)} title={voiceState === "recording" ? "识别语音并发送" : "发送"} aria-label={voiceState === "recording" ? "识别语音并发送" : "发送"}>{submitting || voiceState === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
+          : <button type="button" className="send-button" onClick={() => voiceState === "recording" ? finishRecording(true) : onSend()} disabled={submitting || selectionSaving || draftUploads.length > 0 || voiceState === "transcribing" || (voiceState !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voiceState === "recording" ? "识别语音并发送" : "发送"} aria-label={voiceState === "recording" ? "识别语音并发送" : "发送"}>{submitting || voiceState === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
-  </div><p className="composer-note">任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。</p></div>;
+  </div><p className="composer-note"><span>{draftStatusLabel || "任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。"}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p></div>;
 }
 
 type SettingMenuOption = { id: string; label: string; description?: string };

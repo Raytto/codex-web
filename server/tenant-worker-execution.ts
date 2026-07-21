@@ -4,6 +4,7 @@ import { startAppServerTurn, type AppServerTurnExecution } from "./app-server-tu
 import { buildCodexEnvironment, buildShellEnvironment, resolvePythonRuntime } from "./python-runtime.js";
 import { summarizeEvent } from "./codex-events.js";
 import type { TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
+import { isOptionalAgentCapabilities } from "./optional-capabilities.js";
 
 type ExecutionCallbacks = {
   signal: AbortSignal;
@@ -40,6 +41,7 @@ export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: Exec
     shellEnvironment: buildShellEnvironment(pythonRuntime, request.runtimeRoot),
     networkAccessEnabled: request.networkAccessEnabled,
     webSearchMode: request.webSearchMode,
+    optionalCapabilities: request.optionalCapabilities,
   }, callbacks);
 }
 
@@ -73,6 +75,7 @@ export function validateTenantWorkerRequest(request: TenantWorkerRunRequest, exp
   if (!/^[0-9a-f-]{36}$/i.test(request.jobId) || !/^[0-9a-f-]{36}$/i.test(request.conversationId)) {
     throw new Error("Invalid worker identifiers");
   }
+  if (!isOptionalAgentCapabilities(request.optionalCapabilities)) throw new Error("Invalid optional capabilities");
   const tenantRoot = path.resolve(expectedTenantRoot);
   const expectedWorkspace = path.join(tenantRoot, "conversations", request.conversationId);
   const expectedRuntime = path.join(expectedWorkspace, ".runtime", "jobs", request.jobId);

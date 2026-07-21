@@ -1,6 +1,6 @@
 # Codex Web
 
-An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations, file uploads and deliverables, server-side task queues, live steering, cancellation, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
+An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, resumable cancellation history, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
 
@@ -11,17 +11,21 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - A responsive React chat interface for Codex CLI
 - Server-persistent queued prompts with reorder, edit, delete, and steer actions
 - Persistent attachments and generated deliverables
+- Server-persistent unsent text, quotes, and attachments, restored across conversations, browsers, and devices
 - Codex thread persistence across browser restarts
 - Soft-deleted conversation audit records while workspace files are removed
-- Forced cancellation of running or queued work when a conversation is deleted
+- Cancellation that retains a concise history of completed work so the next turn can resume from it
 - Automatic short task titles, with manual titles taking precedence
 - A durable live work journal with retained stage feedback and grouped command steps
+- Running work journals open at the newest update and continue following until you scroll upward
 - Unread-result markers for completed conversations until their detail is viewed
 - Light, dark, and system-following appearance modes
 - Select message text and attach it as a removable, server-persisted reference to a new Agent question
 - Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
 - A dedicated Unix identity for the Codex worker inside the container
+- A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
+- Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
 
 ## Requirements
 
@@ -64,7 +68,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 
 6. Open [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/).
 
-State is stored in Docker named volumes. Closing the browser does not remove queued work or attachments.
+State is stored in Docker named volumes. Closing the browser does not remove queued work, attachments, or unsent composer drafts.
 
 ## Optional voice transcription
 

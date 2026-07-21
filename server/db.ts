@@ -48,6 +48,7 @@ export type FileRow = {
   conversation_id: string;
   message_id: string | null;
   pending_prompt_id?: string | null;
+  composer_draft_id?: string | null;
   original_name: string;
   relative_path: string;
   mime_type: string;
@@ -76,6 +77,16 @@ export type PendingPromptRow = {
 };
 
 export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[] };
+
+export type ComposerDraftRow = {
+  conversation_id: string;
+  content: string;
+  quote_excerpt: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ComposerDraftWithFiles = ComposerDraftRow & { files: FileRow[] };
 
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
@@ -177,11 +188,19 @@ export class AppDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS composer_drafts (
+        conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        content TEXT NOT NULL DEFAULT '',
+        quote_excerpt TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
         pending_prompt_id TEXT REFERENCES pending_prompts(id) ON DELETE CASCADE,
+        composer_draft_id TEXT REFERENCES composer_drafts(conversation_id) ON DELETE CASCADE,
         original_name TEXT NOT NULL,
         relative_path TEXT NOT NULL,
         mime_type TEXT NOT NULL,
@@ -250,6 +269,7 @@ export class AppDatabase {
     if (!jobColumns.has("queue_seq")) this.sqlite.exec("ALTER TABLE jobs ADD COLUMN queue_seq INTEGER");
     const fileColumns = this.columnNames("files");
     if (!fileColumns.has("pending_prompt_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN pending_prompt_id TEXT REFERENCES pending_prompts(id) ON DELETE CASCADE");
+    if (!fileColumns.has("composer_draft_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN composer_draft_id TEXT REFERENCES composer_drafts(conversation_id) ON DELETE CASCADE");
     this.sqlite.prepare("UPDATE jobs SET queue_seq=rowid WHERE queue_seq IS NULL").run();
 
     const now = new Date().toISOString();
@@ -282,6 +302,7 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS files_conversation_idx ON files(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS files_pending_prompt_idx ON files(pending_prompt_id, created_at);
+      CREATE INDEX IF NOT EXISTS files_composer_draft_idx ON files(composer_draft_id, created_at);
       CREATE INDEX IF NOT EXISTS pending_prompts_queue_idx ON pending_prompts(conversation_id, status, position);
       CREATE INDEX IF NOT EXISTS jobs_conversation_idx ON jobs(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(status, queue_seq);
@@ -445,8 +466,8 @@ export class AppDatabase {
   }
 
   addFile(file: FileRow): void {
-    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,original_name,relative_path,mime_type,size,kind,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run(
-      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.mime_type, file.size, file.kind, file.created_at,
+    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,relative_path,mime_type,size,kind,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(
+      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.mime_type, file.size, file.kind, file.created_at,
     );
   }
 
@@ -469,6 +490,110 @@ export class AppDatabase {
 
   updateFilePath(id: string, relativePath: string): void {
     this.sqlite.prepare("UPDATE files SET relative_path=? WHERE id=?").run(normalizeStoredRelativePath(relativePath), id);
+  }
+
+  ensureComposerDraft(conversationId: string): ComposerDraftWithFiles {
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO composer_drafts(conversation_id,content,quote_excerpt,created_at,updated_at)
+      VALUES(?,'',NULL,?,?) ON CONFLICT(conversation_id) DO NOTHING
+    `).run(conversationId, now, now);
+    return this.getComposerDraft(conversationId)!;
+  }
+
+  saveComposerDraft(conversationId: string, content: string, quoteExcerpt: string | null): ComposerDraftWithFiles | undefined {
+    const existing = this.getComposerDraft(conversationId);
+    if (!content && !quoteExcerpt && (!existing || existing.files.length === 0)) {
+      if (existing) this.sqlite.prepare("DELETE FROM composer_drafts WHERE conversation_id=?").run(conversationId);
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO composer_drafts(conversation_id,content,quote_excerpt,created_at,updated_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(conversation_id) DO UPDATE SET content=excluded.content,quote_excerpt=excluded.quote_excerpt,updated_at=excluded.updated_at
+    `).run(conversationId, content, quoteExcerpt, now, now);
+    return this.getComposerDraft(conversationId);
+  }
+
+  getComposerDraft(conversationId: string): ComposerDraftWithFiles | undefined {
+    const draft = this.sqlite.prepare("SELECT * FROM composer_drafts WHERE conversation_id=?").get(conversationId) as ComposerDraftRow | undefined;
+    if (!draft) return undefined;
+    const files = this.sqlite.prepare("SELECT * FROM files WHERE composer_draft_id=? ORDER BY created_at,id").all(conversationId) as FileRow[];
+    return { ...draft, files };
+  }
+
+  deleteComposerDraft(conversationId: string): boolean {
+    return this.sqlite.prepare("DELETE FROM composer_drafts WHERE conversation_id=?").run(conversationId).changes > 0;
+  }
+
+  touchComposerDraft(conversationId: string): void {
+    this.sqlite.prepare("UPDATE composer_drafts SET updated_at=? WHERE conversation_id=?").run(new Date().toISOString(), conversationId);
+  }
+
+  pruneEmptyComposerDraft(conversationId: string): void {
+    this.sqlite.prepare(`
+      DELETE FROM composer_drafts
+      WHERE conversation_id=? AND content='' AND quote_excerpt IS NULL
+        AND NOT EXISTS (SELECT 1 FROM files WHERE composer_draft_id=?)
+    `).run(conversationId, conversationId);
+  }
+
+  materializeComposerDraftAsPending(
+    pendingId: string,
+    conversationId: string,
+    content: string,
+    selection: StoredAgentSelection,
+    quoteExcerpt: string | null,
+    status: PendingPromptRow["status"] = "queued",
+  ): PendingPromptWithFiles {
+    const now = new Date().toISOString();
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND status='queued'").get(conversationId) as { value: number };
+      this.sqlite.prepare(`
+        INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+      `).run(pendingId, conversationId, content, quoteExcerpt, selection.model, selection.reasoningEffort, next.value, status, now, now);
+      this.sqlite.prepare("UPDATE files SET pending_prompt_id=?,composer_draft_id=NULL WHERE conversation_id=? AND composer_draft_id=?")
+        .run(pendingId, conversationId, conversationId);
+      this.sqlite.prepare("DELETE FROM composer_drafts WHERE conversation_id=?").run(conversationId);
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getPendingPrompt(pendingId)!;
+  }
+
+  materializeComposerDraftAsJob(
+    messageId: string,
+    jobId: string,
+    conversationId: string,
+    content: string,
+    selection: StoredAgentSelection,
+    quoteExcerpt: string | null,
+  ): JobRow {
+    const now = new Date().toISOString();
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'user',?,?,?)")
+        .run(messageId, conversationId, content, quoteExcerpt, now);
+      this.sqlite.prepare("UPDATE files SET message_id=?,composer_draft_id=NULL WHERE conversation_id=? AND composer_draft_id=?")
+        .run(messageId, conversationId, conversationId);
+      this.sqlite.prepare("DELETE FROM composer_drafts WHERE conversation_id=?").run(conversationId);
+      const next = this.sqlite.prepare("SELECT COALESCE(MAX(queue_seq),0)+1 AS value FROM jobs").get() as { value: number };
+      this.sqlite.prepare(`
+        INSERT INTO jobs(id,conversation_id,message_id,agent_model,reasoning_effort,queue_seq,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,'queued',?,?)
+      `).run(jobId, conversationId, messageId, selection.model, selection.reasoningEffort, next.value, now, now);
+      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversationId);
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getJob(jobId)!;
   }
 
   createPendingPrompt(id: string, conversationId: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles {

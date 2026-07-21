@@ -12,10 +12,11 @@ import { CodexRunner, extractLeakedAutoTitleAnswer } from "./codex-runner.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
-import { AppDatabase, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
+import { AppDatabase, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
+import { buildUserCancellationSummary } from "./cancellation-summary.js";
 
 const COOKIE_NAME = "cww_session";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
@@ -107,6 +108,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   }
 
+  function removeComposerDraftFiles(draft: ComposerDraftWithFiles, userId: string): void {
+    const workspace = ensureTenantWorkspace(config.tenantRoot, userId, draft.conversation_id);
+    for (const file of draft.files) {
+      try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); }
+      catch { /* Missing draft files must not block explicit draft cleanup. */ }
+    }
+  }
+
   function registerPendingUploads(conversationId: string, pendingPromptId: string, uploaded: Express.Multer.File[]): FileRow[] {
     const createdAt = new Date().toISOString();
     return uploaded.map((file) => {
@@ -119,6 +128,23 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       db.addFile(row);
       return row;
     });
+  }
+
+  function registerComposerUploads(conversationId: string, uploaded: Express.Multer.File[]): FileRow[] {
+    db.ensureComposerDraft(conversationId);
+    const createdAt = new Date().toISOString();
+    const rows = uploaded.map((file) => {
+      const row: FileRow = {
+        id: newId(), conversation_id: conversationId, message_id: null, pending_prompt_id: null, composer_draft_id: conversationId,
+        original_name: safeUploadName(file.originalname).displayName,
+        relative_path: path.posix.join("uploads", file.filename), mime_type: file.mimetype || "application/octet-stream",
+        size: file.size, kind: "upload", created_at: createdAt,
+      };
+      db.addFile(row);
+      return row;
+    });
+    db.touchComposerDraft(conversationId);
+    return rows;
   }
 
   function removeUnregisteredUploads(uploaded: Express.Multer.File[]): void {
@@ -137,8 +163,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return quoteExcerpt ? buildAskAgentDraft(content, quoteExcerpt) : content;
   }
 
-  async function stopConversationJobs(conversationId: string): Promise<void> {
-    for (const job of db.listActiveJobsForConversation(conversationId)) {
+  function recordUserCancelledJob(job: JobRow): void {
+    if (db.getJob(job.id)?.status !== "cancelled" || !db.getConversation(job.conversation_id)) return;
+    db.addMessage({
+      id: newId(), conversation_id: job.conversation_id, role: "assistant",
+      content: buildUserCancellationSummary(db.listEvents(job.id)), created_at: new Date().toISOString(),
+    });
+  }
+
+  async function stopConversationJobs(conversationId: string, recordCancellation = true): Promise<void> {
+    const activeJobs = db.listActiveJobsForConversation(conversationId);
+    const runningJobs = activeJobs.filter((job) => job.status === "running");
+    for (const job of activeJobs) {
       if (job.status === "queued" && db.cancelQueuedJob(job.id)) {
         publish(job.id, "done", { status: "cancelled", message: "任务已停止" });
         continue;
@@ -158,6 +194,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (Date.now() >= deadline) throw new Error("相关任务未能在限定时间内停止，请稍后重试。");
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    if (recordCancellation) for (const job of runningJobs) recordUserCancelledJob(job);
   }
 
   function publishQueuePositions(): void {
@@ -361,6 +398,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       : null;
     const pendingPrompts = db.listPendingPrompts(conversation.id);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0] ?? null;
+    const composerDraft = db.getComposerDraft(conversation.id) ?? null;
     return res.json({
       conversation,
       agentSelection,
@@ -368,6 +406,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       messagePage: { hasMore: messagePage.hasMore, nextCursor: messagePage.nextCursor },
       pendingPrompts,
       editingPrompt,
+      composerDraft,
       activeJob,
       latestJob,
       jobEvents,
@@ -438,7 +477,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       // Remove drafts before awaiting cancellation. A running job finishes its
       // queue pump during cancellation, so leaving drafts here could promote one
       // into a real message/job while the conversation is being deleted.
-      await stopConversationJobs(conversation.id);
+      await stopConversationJobs(conversation.id, false);
       for (const file of db.listFiles(conversation.id)) removePersistedDeliverable(config.dataRoot, file.relative_path);
       const tenant = ensureTenant(config.tenantRoot, session.user_id);
       if (conversation.codex_thread_id && !db.isCodexThreadUsedByAnotherActiveConversation(conversation.codex_thread_id, conversation.id)) {
@@ -467,6 +506,61 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       filename(_req, file, callback) { callback(null, safeUploadName(file.originalname).diskName); },
     }),
     limits: { files: 12, fields: 4 },
+  });
+
+  api.put("/conversations/:id/draft", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (deletingConversations.has(conversation.id)) return res.status(409).json({ error: "会话正在删除。" });
+    if (typeof req.body?.content !== "string") return res.status(400).json({ error: "草稿正文无效。" });
+    const content = req.body.content.slice(0, 100_000);
+    const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
+    return res.json({ composerDraft: db.saveComposerDraft(conversation.id, content, quoteExcerpt) ?? null });
+  });
+
+  api.post("/conversations/:id/draft/files", upload.array("files", 12), (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
+    if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
+    if (uploaded.length === 0) return res.status(400).json({ error: "没有收到附件。" });
+    const existing = db.getComposerDraft(conversation.id);
+    if ((existing?.files.length ?? 0) + uploaded.length > 12) {
+      removeUnregisteredUploads(uploaded);
+      return res.status(400).json({ error: "单个会话草稿最多包含 12 个附件。" });
+    }
+    registerComposerUploads(conversation.id, uploaded);
+    return res.status(201).json({ composerDraft: db.getComposerDraft(conversation.id)! });
+  });
+
+  api.delete("/conversations/:id/draft/files/:fileId", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    const file = db.getFileForUser(String(req.params.fileId), session.user_id);
+    if (!file || file.conversation_id !== conversation.id || file.composer_draft_id !== conversation.id) {
+      return res.status(404).json({ error: "草稿附件不存在。" });
+    }
+    const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, conversation.id);
+    try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); } catch {}
+    db.removeFile(file.id);
+    db.pruneEmptyComposerDraft(conversation.id);
+    if (db.getComposerDraft(conversation.id)) db.touchComposerDraft(conversation.id);
+    return res.json({ composerDraft: db.getComposerDraft(conversation.id) ?? null });
+  });
+
+  api.delete("/conversations/:id/draft", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    const draft = db.getComposerDraft(conversation.id);
+    if (draft) {
+      removeComposerDraftFiles(draft, session.user_id);
+      db.deleteComposerDraft(conversation.id);
+    }
+    return res.status(204).end();
   });
 
   const voiceUpload = multer({
@@ -542,11 +636,24 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
     const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
-    if (!prompt && !quoteExcerpt && uploaded.length === 0) return res.status(400).json({ error: "请输入内容、添加引用或上传文件。" });
+    const useComposerDraft = req.body?.useComposerDraft === "true";
+    if (useComposerDraft && uploaded.length > 0) {
+      removeUnregisteredUploads(uploaded);
+      return res.status(400).json({ error: "服务器草稿附件无需重复上传。" });
+    }
+    const composerDraft = useComposerDraft ? db.getComposerDraft(conversation.id) : undefined;
+    const attachmentCount = uploaded.length + (composerDraft?.files.length ?? 0);
+    if (!prompt && !quoteExcerpt && attachmentCount === 0) return res.status(400).json({ error: "请输入内容、添加引用或上传文件。" });
     const selection = conversationAgentSelection(conversation);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0];
 
+    if (useComposerDraft && editingPrompt) return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
+
     if (!prompt && !quoteExcerpt) {
+      if (useComposerDraft) {
+        const awaiting = db.materializeComposerDraftAsPending(newId(), conversation.id, "", selection, null, "editing");
+        return res.status(202).json({ pendingPrompt: awaiting, editingPrompt: awaiting, queued: false, needsInstruction: true, guidance: FILE_INSTRUCTION_GUIDANCE });
+      }
       if (editingPrompt?.content.trim() || editingPrompt?.quote_excerpt) {
         removeUnregisteredUploads(uploaded);
         return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
@@ -579,6 +686,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
 
     if (db.listActiveJobsForConversation(conversation.id).length > 0 || db.listPendingPrompts(conversation.id).length > 0) {
+      if (useComposerDraft) {
+        const pendingPrompt = db.materializeComposerDraftAsPending(newId(), conversation.id, prompt, selection, quoteExcerpt);
+        return res.status(202).json({ pendingPrompt, queued: true });
+      }
       const pendingPrompt = db.createPendingPrompt(newId(), conversation.id, prompt, selection, quoteExcerpt);
       registerPendingUploads(conversation.id, pendingPrompt.id, uploaded);
       return res.status(202).json({ pendingPrompt: db.getPendingPrompt(pendingPrompt.id), queued: true });
@@ -586,6 +697,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
     const messageId = newId();
     const createdAt = new Date().toISOString();
+    if (useComposerDraft) {
+      const job = db.materializeComposerDraftAsJob(messageId, newId(), conversation.id, prompt, selection, quoteExcerpt);
+      const queuePosition = db.getQueuePosition(job.id) ?? 1;
+      publishQueuePositions();
+      res.status(202).json({ job: { ...job, queuePosition }, message: { id: messageId }, queued: true });
+      if (config.queueAutoStart) setImmediate(() => void pumpQueue());
+      return;
+    }
     db.addMessage({ id: messageId, conversation_id: conversation.id, role: "user", content: prompt, quote_excerpt: quoteExcerpt, created_at: createdAt });
     const fileRows = uploaded.map((file) => {
       const row = {
@@ -747,7 +866,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     });
   });
 
-  api.post("/jobs/:id/cancel", (req, res) => {
+  api.post("/jobs/:id/cancel", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const job = db.getJobForUser(String(req.params.id), session.user_id);
     if (!job) return res.status(404).json({ error: "任务不存在。" });
@@ -758,6 +877,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       return res.json({ ok: true });
     }
     if (job.status !== "running" || !runner.cancel(job.id)) return res.status(409).json({ error: "任务已经结束。" });
+    const deadline = Date.now() + 15_000;
+    while (db.getJob(job.id)?.status === "running") {
+      if (Date.now() >= deadline) return res.status(503).json({ error: "任务未能在限定时间内停止，请稍后重试。" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    recordUserCancelledJob(job);
     return res.json({ ok: true });
   });
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local Spreadsheets"
+  short_description: "用 openpyxl 和 pandas 处理本地表格文件"
+  default_prompt: "Use $local-spreadsheets to create or edit this local Excel workbook."

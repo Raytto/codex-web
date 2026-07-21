@@ -23,6 +23,14 @@ export type PendingPrompt = {
   created_at: string;
   updated_at: string;
 };
+export type ComposerDraft = {
+  conversation_id: string;
+  content: string;
+  quote_excerpt: string | null;
+  files: WorkFile[];
+  created_at: string;
+  updated_at: string;
+};
 export type Job = { id: string; status: string; conversation_id: string; queuePosition?: number };
 // The online Codex catalog is authoritative. Keep this open so a newer CLI can
 // expose a new reasoning level without requiring a front-end release first.
@@ -56,6 +64,7 @@ export type ConversationDetail = {
   messagePage: MessagePage;
   pendingPrompts: PendingPrompt[];
   editingPrompt: PendingPrompt | null;
+  composerDraft: ComposerDraft | null;
   activeJob: Job | null;
   latestJob: Job | null;
   jobEvents: JobEvent[];
@@ -108,10 +117,24 @@ export const api = {
   markConversationSeen: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/seen`, { method: "POST" }),
   deleteConversation: (id: string) => request<void>(`/conversations/${id}`, { method: "DELETE" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
-  sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "") => {
+  saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false) => request<{ composerDraft: ComposerDraft | null }>(
+    `/conversations/${id}/draft`,
+    { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive },
+  ),
+  uploadConversationDraftFiles: (id: string, files: File[]) => {
+    const body = new FormData();
+    files.forEach((file) => body.append("files", file));
+    return request<{ composerDraft: ComposerDraft }>(`/conversations/${id}/draft/files`, { method: "POST", body });
+  },
+  deleteConversationDraftFile: (id: string, fileId: string) => request<{ composerDraft: ComposerDraft | null }>(
+    `/conversations/${id}/draft/files/${fileId}`, { method: "DELETE" },
+  ),
+  deleteConversationDraft: (id: string) => request<void>(`/conversations/${id}/draft`, { method: "DELETE" }),
+  sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "", useComposerDraft = false) => {
     const body = new FormData();
     body.set("message", message);
     body.set("quoteExcerpt", quoteExcerpt);
+    if (useComposerDraft) body.set("useComposerDraft", "true");
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body });
   },

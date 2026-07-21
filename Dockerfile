@@ -8,6 +8,7 @@ COPY compose.yaml ./
 COPY src ./src
 COPY server ./server
 COPY tests ./tests
+COPY skills ./skills
 
 FROM source AS test
 RUN apt-get update \
@@ -40,6 +41,7 @@ COPY --from=codex-baked /opt/codex-baked /opt/codex-baked
 COPY package.json ./
 COPY python-runtime ./python-runtime
 COPY scripts ./scripts
+COPY skills ./skills
 
 ENV NODE_ENV=production \
     HOME=/home/cww \
@@ -49,6 +51,7 @@ ENV NODE_ENV=production \
     TZ=Asia/Shanghai
 
 RUN chmod 0755 scripts/*.sh \
+    && chmod -R a+rX /app/skills \
     && PYTHON_RUNTIME_ROOT=/opt/cww-python UV_VERSION="$UV_VERSION" ./scripts/setup-python.sh \
     && rm -rf /opt/cww-python/cache \
     && ln -s /app/scripts/codex-runtime.sh /usr/local/bin/codex \

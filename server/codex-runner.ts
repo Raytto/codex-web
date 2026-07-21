@@ -14,6 +14,8 @@ import type { TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
 import type { AppServerTurnExecution } from "./app-server-turn.js";
 import { isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt, type AgentAttachmentContext } from "./agent-context.js";
+import { detectOptionalAgentCapabilities } from "./optional-capabilities.js";
+import { latestUserCancellationContext } from "./cancellation-summary.js";
 
 type Publish = (jobId: string, eventType: string, payload: unknown) => void;
 
@@ -131,6 +133,12 @@ export class CodexRunner {
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
+      const conversationMessages = this.db.listMessages(conversationId);
+      const interruptedContext = latestUserCancellationContext(conversationMessages);
+      const optionalCapabilities = detectOptionalAgentCapabilities([
+        ...conversationMessages.filter((message) => message.role === "user").map((message) => message.content),
+        prompt,
+      ]);
       this.db.updateJob(jobId, "running");
       this.db.updateConversation(conversationId, { status: "running" });
       this.publish(jobId, "status", { status: "running", label: taskPolicy.isolated ? "正在隔离模式中处理" : "Codex Web 正在处理" });
@@ -138,6 +146,7 @@ export class CodexRunner {
       const effectivePrompt = buildAgentTurnPrompt({
         userPrompt: prompt,
         attachments: this.attachmentContext(uploads, workspace),
+        interruptedContext,
         runtimeWarning: !pythonRuntime.ready
           ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
           : undefined,
@@ -164,6 +173,7 @@ export class CodexRunner {
         networkAccessEnabled: taskPolicy.networkAccessEnabled,
         webSearchMode: taskPolicy.isolated ? "cached" : "live",
         codexWindowsSandbox: this.config.codexWindowsSandbox,
+        optionalCapabilities,
       };
       const callbacks = {
         onThreadStarted: (threadId: string) => {
@@ -252,6 +262,7 @@ export class CodexRunner {
   private attachmentContext(uploads: FileRow[], workspace: string): AgentAttachmentContext[] {
     return uploads.map((file) => ({
       name: file.original_name,
+      mimeType: file.mime_type,
       path: normalizeStoredRelativePath(path.relative(workspace, resolveInside(workspace, file.relative_path))),
     }));
   }

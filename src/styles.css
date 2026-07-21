@@ -479,7 +479,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .send-button:hover:not(:disabled) { transform: translateY(-1px); background: linear-gradient(135deg, #43519b, #1b203f); box-shadow: 0 10px 21px rgba(15, 17, 32, .24); }
 .send-button:disabled { color: #a8abba; background: #eceef4; box-shadow: none; cursor: default; }
 .send-button.stop { background: #8f3942; }
-.composer-note { margin: 8px 0 0; color: #8c8f9c; text-align: center; font-size: 10px; }
+.composer-note { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 0 0; color: #8c8f9c; text-align: center; font-size: 10px; }
+.composer-note button { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.composer-note button:disabled { opacity: .45; cursor: default; }
 .ask-agent-reference { width: fit-content; max-width: min(460px, 100%); min-height: 34px; display: flex; align-items: center; gap: 7px; margin: 1px 4px 7px; padding: 6px 7px 6px 9px; border: 1px solid #d5daeb; border-radius: 11px; color: var(--indigo); background: #f2f4fa; font-size: 11px; font-weight: 700; }
 .ask-agent-reference > svg { flex: 0 0 auto; }
 .ask-agent-reference > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -488,6 +490,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .pending-files { display: flex; gap: 7px; overflow-x: auto; padding: 2px 4px 8px; }
 .editing-pending-files { display: flex; gap: 7px; overflow-x: auto; padding: 2px 4px 8px; }
 .pending-files > span, .editing-pending-files > span { max-width: 240px; flex: 0 0 auto; display: flex; align-items: center; gap: 6px; overflow: hidden; padding: 7px 8px; border: 1px solid #d9dce8; border-radius: 9px; color: #374071; background: #f7f8fc; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.pending-files > span.uploading { opacity: .72; }
 .pending-files button, .editing-pending-files button { display: grid; place-items: center; padding: 0; border: 0; color: #777b8c; background: transparent; cursor: pointer; }
 .editing-pending-files > span.removed { opacity: .55; text-decoration: line-through; }
 .paste-notice { width: fit-content; display: flex; align-items: center; gap: 6px; margin: 0 5px 4px; padding: 5px 8px; border-radius: 8px; color: var(--indigo); background: var(--indigo-pale); font-size: 11px; }

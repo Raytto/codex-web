@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { syncManagedSkills } from "./managed-skills.js";
 
 const LEGACY_WORKSPACE_AGENTS = `# Conversation workspace\n\n- Work only inside this conversation directory unless the user explicitly asks otherwise.\n- User uploads are in uploads/. Save only finished deliverables in outputs/.\n- Put intermediate files, extracted assets, caches, and temporary environments in .runtime/; the service deletes it after every turn.\n- Prefer replying in Chinese unless the user requests another language.\n- Never reveal credentials, authentication files, browser profiles, or unrelated local data.\n- When a task creates useful files, mention only the final filenames the user needs. Do not list process files.\n`;
 
@@ -16,10 +17,7 @@ ${MANAGED_INSTRUCTIONS_START}
 - Put intermediate files, extracted assets, caches, and temporary environments in .runtime/; the service deletes it after every turn.
 - Never reveal credentials, authentication files, browser profiles, or unrelated local data.
 - In replies, mention only final filenames the user needs. Never expose absolute paths or list process files.
-- This web runtime does not provide \`load_workspace_dependencies\` or \`@oai/artifact-tool\`. Do not invoke the artifact-backed Spreadsheets skill here.
 - Use the interpreter in \`CWW_SHARED_PYTHON\`; keep temporary scripts and caches in \`CWW_JOB_RUNTIME\`. Never install into the shared environment. If a required package is missing, invoke \`CWW_PYTHON_RUNNER\` in temporary mode instead.
-- For local Excel work, use the pinned \`openpyxl\`/\`pandas\` packages. Never execute macros or automate a desktop Excel application.
-- Preserve the source workbook by writing a new file under outputs/. For \`.xlsm\`, load with \`keep_vba=True\`; for all workbooks, retain formulas and formatting where possible, reopen the saved file, and verify requested row counts, keys, formulas, and sheet structure before delivery.
 ${MANAGED_INSTRUCTIONS_END}
 `;
 
@@ -75,6 +73,7 @@ export function ensureTenant(tenantRoot: string, userId: string): TenantPaths {
   }
   const globalAgents = path.join(paths.codexHome, "AGENTS.md");
   if (!fs.existsSync(globalAgents)) fs.writeFileSync(globalAgents, GLOBAL_AGENTS, "utf8");
+  syncManagedSkills(paths.codexHome);
   const libraryAgents = path.join(paths.library, "AGENTS.md");
   if (!fs.existsSync(libraryAgents)) fs.writeFileSync(libraryAgents, LIBRARY_AGENTS, "utf8");
   const profile = path.join(paths.library, "PROFILE.md");

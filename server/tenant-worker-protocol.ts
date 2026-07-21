@@ -1,4 +1,5 @@
 import type { AgentSelection } from "./model-options.js";
+import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 
 export type TenantWorkerRunRequest = {
   jobId: string;
@@ -19,6 +20,7 @@ export type TenantWorkerRunRequest = {
   networkAccessEnabled: boolean;
   webSearchMode: "cached" | "live";
   codexWindowsSandbox: "elevated" | "unelevated";
+  optionalCapabilities: OptionalAgentCapabilities;
 };
 
 export type TenantWorkerEvent =

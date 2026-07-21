@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { isRetryableUpstreamError } from "./retry-policy.js";
+import { buildOptionalCapabilityConfig, type OptionalAgentCapabilities } from "./optional-capabilities.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -27,6 +28,7 @@ export type AppServerTurnOptions = {
   webSearchMode: "cached" | "live";
   sandbox?: "workspace-write" | "danger-full-access";
   runtimeWorkspaceRoots?: string[];
+  optionalCapabilities: OptionalAgentCapabilities;
 };
 
 export type AppServerTurnExecution = {
@@ -130,6 +132,7 @@ class AppServerTurnClient {
           hide_agent_reasoning: false,
           show_raw_agent_reasoning: false,
           web_search: this.options.webSearchMode,
+          ...buildOptionalCapabilityConfig(this.options.optionalCapabilities),
         },
       };
       const threadResult = this.options.threadId
