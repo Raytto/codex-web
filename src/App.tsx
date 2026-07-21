@@ -124,9 +124,24 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const refreshList = useCallback(async () => {
     const result = await api.conversations(); setConversations(result.conversations); return result.conversations;
   }, []);
+
+  const syncConversation = useCallback((conversation: Conversation) => {
+    setConversations((current) => current.map((item) => item.id === conversation.id ? conversation : item));
+    setDetail((current) => current?.conversation.id === conversation.id ? { ...current, conversation } : current);
+  }, []);
+
   const refreshDetail = useCallback(async (id: string) => {
-    const result = await api.conversation(id);
+    let result = await api.conversation(id);
     if (selectedIdRef.current !== id) return result;
+    if (result.conversation.has_unread_result) {
+      try {
+        const seen = await api.markConversationSeen(id);
+        result = { ...result, conversation: seen.conversation };
+        syncConversation(seen.conversation);
+      } catch {
+        // Viewing the task must still work if the acknowledgement request is temporarily unavailable.
+      }
+    }
     setDetail((current) => current?.conversation.id === id
       ? {
           ...result,
@@ -153,13 +168,19 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     lastEventIdRef.current = result.jobEvents.at(-1)?.seq ?? 0;
     if (result.latestJob?.status === "failed") setError(result.jobEvents.findLast((event) => event.message)?.message || "任务处理失败");
     return result;
-  }, []);
+  }, [syncConversation]);
 
   useEffect(() => {
     void refreshList().then((items) => {
       const next = chooseSelectedConversation(selectedIdRef.current, items);
       if (next !== selectedIdRef.current) setSelectedId(next);
     });
+  }, [refreshList]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshList().catch(() => undefined);
+    }, 10_000);
+    return () => window.clearInterval(timer);
   }, [refreshList]);
   useEffect(() => {
     window.localStorage.removeItem("codex-web:model");
@@ -306,6 +327,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     try {
       const [value] = await Promise.all([refreshDetail(id), refreshList()]);
       if (selectedIdRef.current !== id) return;
+      syncConversation(value.conversation);
       if (value.activeJob) connectJob(value.activeJob);
       else {
         eventSourceRef.current?.close(); eventSourceRef.current = null; connectedJobRef.current = null;
@@ -510,7 +532,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索任务" /></div>
       <div className="conversation-section"><div className="section-label"><span>任务</span><strong>{filtered.length}</strong></div>
         <div className="conversation-list">
-          {filtered.map((conversation) => <div key={conversation.id} className={`conversation-row ${selectedId === conversation.id ? "active" : ""}`}>
+          {filtered.map((conversation) => <div key={conversation.id} className={`conversation-row ${selectedId === conversation.id ? "active" : ""} ${conversation.has_unread_result ? "unread" : ""}`}>
             <button className="conversation-select" onClick={() => setSelectedId(conversation.id)}>
               <FolderOpen size={16} /><span>{conversation.title}</span>{conversation.status === "running" && <LoaderCircle size={14} className="spin" />}
             </button>

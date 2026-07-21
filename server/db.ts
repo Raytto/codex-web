@@ -26,6 +26,7 @@ export type ConversationRow = {
   agent_model: string | null;
   reasoning_effort: string | null;
   status: "idle" | "running";
+  has_unread_result: number;
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
@@ -151,6 +152,7 @@ export class AppDatabase {
         title_source TEXT NOT NULL DEFAULT 'legacy',
         codex_thread_id TEXT,
         status TEXT NOT NULL DEFAULT 'idle',
+        has_unread_result INTEGER NOT NULL DEFAULT 0,
         deleted_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -232,6 +234,7 @@ export class AppDatabase {
     if (!conversationColumns.has("user_id")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN user_id TEXT REFERENCES users(id)");
     if (!conversationColumns.has("agent_model")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN agent_model TEXT");
     if (!conversationColumns.has("reasoning_effort")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT");
+    if (!conversationColumns.has("has_unread_result")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN has_unread_result INTEGER NOT NULL DEFAULT 0");
     if (!conversationColumns.has("deleted_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN deleted_at TEXT");
     if (!conversationColumns.has("title_source")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'");
     const messageColumns = this.columnNames("messages");
@@ -354,6 +357,13 @@ export class AppDatabase {
       fields.agentSelection.model, fields.agentSelection.reasoningEffort, new Date().toISOString(), id,
     );
     if (fields.status !== undefined) this.sqlite.prepare("UPDATE conversations SET status=?, updated_at=? WHERE id=?").run(fields.status, new Date().toISOString(), id);
+  }
+
+  markConversationResultSeenForUser(id: string, userId: string): ConversationRow | undefined {
+    const conversation = this.getConversationForUser(id, userId);
+    if (!conversation) return undefined;
+    this.sqlite.prepare("UPDATE conversations SET has_unread_result=0 WHERE id=? AND user_id=? AND deleted_at IS NULL").run(id, userId);
+    return this.getConversationForUser(id, userId);
   }
 
   setAiConversationTitleIfDefault(id: string, title: string): boolean {
@@ -730,7 +740,11 @@ export class AppDatabase {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       this.sqlite.prepare("UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?").run(status, error, now, id);
-      this.sqlite.prepare("UPDATE conversations SET status='idle', updated_at=? WHERE id=?").run(now, conversationId);
+      this.sqlite.prepare(`
+        UPDATE conversations
+        SET status='idle', has_unread_result=CASE WHEN ?='completed' THEN 1 ELSE has_unread_result END, updated_at=?
+        WHERE id=?
+      `).run(status, now, conversationId);
       this.sqlite.exec("COMMIT");
     } catch (error) {
       this.sqlite.exec("ROLLBACK");

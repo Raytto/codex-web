@@ -398,6 +398,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ conversation: db.getConversationForUser(conversation.id, session.user_id) });
   });
 
+  api.post("/conversations/:id/seen", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.markConversationResultSeenForUser(String(req.params.id), session.user_id);
+    return conversation ? res.json({ conversation }) : res.status(404).json({ error: "会话不存在。" });
+  });
+
   api.put("/conversations/:id/agent-selection", (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -770,7 +776,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("Content-Type", file.mime_type);
     res.setHeader("Content-Disposition", contentDisposition(inline ? "inline" : "attachment", file.original_name));
-    return res.sendFile(absolute);
+    return res.sendFile(path.basename(absolute), { root: path.dirname(absolute) });
   });
 
   router.use("/api", api);
@@ -778,7 +784,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   if (fs.existsSync(distPath)) router.use(express.static(distPath, { index: false, maxAge: "1h" }));
   router.use((req, res, next) => {
     if (req.method !== "GET" || !req.accepts("html") || !fs.existsSync(path.join(distPath, "index.html"))) return next();
-    return res.sendFile(path.join(distPath, "index.html"));
+    return res.sendFile("index.html", { root: distPath });
   });
   app.get(config.basePath, (_req, res) => res.redirect(308, `${config.basePath}/`));
   app.use(config.basePath || "/", router);

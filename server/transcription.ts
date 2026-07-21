@@ -70,7 +70,7 @@ export class TranscriptionService {
       return;
     }
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.sendFile(filePath);
+    res.sendFile(path.basename(filePath), { root: path.dirname(filePath) });
   }
 
   async transcribe(fileName: string, context: TranscriptionContext = {}): Promise<string> {

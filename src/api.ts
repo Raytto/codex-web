@@ -2,7 +2,7 @@ export const BASE_PATH = "/codex-web";
 
 export type Session = { authenticated: boolean; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; voiceEnabled?: boolean };
 export type Conversation = {
-  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; created_at: string; updated_at: string;
+  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; created_at: string; updated_at: string;
 };
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
@@ -105,6 +105,7 @@ export const api = {
     `/conversations/${id}/messages?before=${encodeURIComponent(before)}`,
   ),
   renameConversation: (id: string, title: string) => request<{ conversation: Conversation }>(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+  markConversationSeen: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/seen`, { method: "POST" }),
   deleteConversation: (id: string) => request<void>(`/conversations/${id}`, { method: "DELETE" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
   sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "") => {

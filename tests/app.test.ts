@@ -127,6 +127,18 @@ test("sidebar task actions remain reachable without shifting on hover", () => {
   assert.match(styles, /\.conversation-row:hover \.row-actions, \.conversation-row:focus-within \.row-actions \{ opacity: 1; pointer-events: auto; \}/);
   assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
 });
+
+test("completed conversations stay visibly unread until their detail is viewed", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /conversation\.has_unread_result \? "unread" : ""/);
+  assert.match(appSource, /result\.conversation\.has_unread_result[\s\S]*?api\.markConversationSeen\(id\)/);
+  assert.match(appSource, /window\.setInterval\([\s\S]*?refreshList\(\)[\s\S]*?10_000/);
+  assert.match(apiSource, /markConversationSeen:[\s\S]*?\/conversations\/\$\{id\}\/seen[\s\S]*?method: "POST"/);
+  assert.match(styles, /\.conversation-row\.unread \.conversation-select::after \{[^}]*background: #38c976;[^}]*content: "";/);
+});
+
 test("selected message text can be quoted into a focused Agent question", () => {
   assert.equal(normalizeAskAgentSelection("  第一行  \r\n\r\n\r\n第二行  \n"), "第一行\n\n第二行");
   assert.equal(buildAskAgentDraft("", "第一行\n第二行"), "请结合以下引用回答我的问题：\n\n> 第一行\n> 第二行\n\n请解释这段引用。");
@@ -539,6 +551,7 @@ test("legacy databases gain durable selections and preserve existing titles", (c
   const first = new AppDatabase(root);
   assert.equal(first.getConversation("legacy")?.agent_model, null);
   assert.equal(first.getConversation("legacy")?.title_source, "legacy");
+  assert.equal(first.getConversation("legacy")?.has_unread_result, 0);
   const freshId = crypto.randomUUID();
   first.createConversation(freshId, "新任务");
   assert.equal(first.getConversation(freshId)?.title_source, "default");
@@ -646,12 +659,21 @@ test("single-user login and CSRF protection", async (context) => {
   const created = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
   assert.equal(created.body.conversation.title, "新任务");
   assert.equal(created.body.conversation.title_source, "default");
+  assert.equal(created.body.conversation.has_unread_result, 0);
   assert.deepEqual(created.body.agentSelection, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
   await agent.put(`/codex-web/api/conversations/${created.body.conversation.id}/agent-selection`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .send({ model: "gpt-5.6-luna", reasoningEffort: "low" }).expect(200);
   const second = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
   assert.deepEqual(second.body.agentSelection, { model: "gpt-5.6-luna", reasoningEffort: "low" });
+  const unreadJobId = crypto.randomUUID();
+  instance.db.createJob(unreadJobId, created.body.conversation.id);
+  instance.db.finishJob(unreadJobId, created.body.conversation.id, "completed");
+  assert.equal((await agent.get("/codex-web/api/conversations").expect(200)).body.conversations.find((row: { id: string }) => row.id === created.body.conversation.id).has_unread_result, 1);
+  await agent.post(`/codex-web/api/conversations/${created.body.conversation.id}/seen`).expect(403);
+  const seen = await agent.post(`/codex-web/api/conversations/${created.body.conversation.id}/seen`)
+    .set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.equal(seen.body.conversation.has_unread_result, 0);
   const renamed = await agent.patch(`/codex-web/api/conversations/${second.body.conversation.id}`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .send({ title: "我的自定义标题" }).expect(200);
@@ -707,21 +729,21 @@ test("quoted selections stay outside the visible message body and survive the pe
   });
   context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const agent = request.agent(instance.app);
-  const login = await agent.post("/api/auth/login").send({ username: "pp", password: "Quote-Password-2026!" }).expect(200);
-  const created = await agent.post("/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
+  const login = await agent.post("/codex-web/api/auth/login").send({ username: "pp", password: "Quote-Password-2026!" }).expect(200);
+  const created = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
   const conversationId = created.body.conversation.id as string;
 
-  await agent.post(`/api/conversations/${conversationId}/messages`)
+  await agent.post(`/codex-web/api/conversations/${conversationId}/messages`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .field("message", "这和上一段有什么关系？")
     .field("quoteExcerpt", "  被引用的第一行\r\n被引用的第二行  ")
     .expect(202);
-  let detail = await agent.get(`/api/conversations/${conversationId}`).expect(200);
+  let detail = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
   assert.equal(detail.body.messages[0].content, "这和上一段有什么关系？");
   assert.equal(detail.body.messages[0].quote_excerpt, "被引用的第一行\n被引用的第二行");
   assert.doesNotMatch(detail.body.messages[0].content, /请结合以下引用|被引用的第一行/);
 
-  const queued = await agent.post(`/api/conversations/${conversationId}/messages`)
+  const queued = await agent.post(`/codex-web/api/conversations/${conversationId}/messages`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .field("message", "")
     .field("quoteExcerpt", "只引用、不写正文")
@@ -730,16 +752,16 @@ test("quoted selections stay outside the visible message body and survive the pe
   assert.equal(queued.body.pendingPrompt.quote_excerpt, "只引用、不写正文");
 
   const pendingId = queued.body.pendingPrompt.id as string;
-  await agent.post(`/api/conversations/${conversationId}/pending-prompts/${pendingId}/edit`)
+  await agent.post(`/codex-web/api/conversations/${conversationId}/pending-prompts/${pendingId}/edit`)
     .set("X-CSRF-Token", login.body.csrfToken).expect(200);
-  await agent.post(`/api/conversations/${conversationId}/pending-prompts/${pendingId}/restore`)
+  await agent.post(`/codex-web/api/conversations/${conversationId}/pending-prompts/${pendingId}/restore`)
     .set("X-CSRF-Token", login.body.csrfToken).expect(200);
   const materialized = instance.db.materializePendingPrompt(pendingId, crypto.randomUUID(), crypto.randomUUID());
   assert.ok(materialized?.message_id);
   const quotedMessage = instance.db.getMessage(materialized!.message_id!);
   assert.equal(quotedMessage?.content, "");
   assert.equal(quotedMessage?.quote_excerpt, "只引用、不写正文");
-  detail = await agent.get(`/api/conversations/${conversationId}`).expect(200);
+  detail = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
   assert.equal(detail.body.messages.at(-1).quote_excerpt, "只引用、不写正文");
 });
 
@@ -859,6 +881,8 @@ test("web users have isolated conversations, files, jobs, settings, and tenant d
   assert.deepEqual(memberList.body.conversations.map((row: { id: string }) => row.id), [memberConversation.body.conversation.id]);
   await owner.get(`/codex-web/api/conversations/${memberConversation.body.conversation.id}`).expect(404);
   await member.get(`/codex-web/api/conversations/${ownerConversation.body.conversation.id}`).expect(404);
+  await owner.post(`/codex-web/api/conversations/${memberConversation.body.conversation.id}/seen`)
+    .set("X-CSRF-Token", ownerLogin.body.csrfToken).expect(404);
 
   instance.db.setAgentSelectionPreference({ model: "gpt-5.6-terra", reasoningEffort: "high" }, memberId);
   assert.notDeepEqual(instance.db.getAgentSelectionPreference(LEGACY_USER_ID), instance.db.getAgentSelectionPreference(memberId));
@@ -1342,6 +1366,7 @@ test("job finalization makes job and conversation terminal atomically", (context
     db.finishJob(jobId, conversationId, status, status === "failed" ? "boom" : null);
     assert.equal(db.getJob(jobId)?.status, status);
     assert.equal(db.getConversation(conversationId)?.status, "idle");
+    assert.equal(db.getConversation(conversationId)?.has_unread_result, status === "completed" ? 1 : 0);
     assert.equal(db.getActiveJobForConversation(conversationId), undefined);
     assert.equal(db.listEvents(jobId).length, 1);
     if (status === "completed") assert.equal(db.listMessages(conversationId).at(-1)?.content, "result");
