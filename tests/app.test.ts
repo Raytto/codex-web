@@ -116,6 +116,13 @@ test("closed mobile sidebar is not painted as an offscreen shadow layer", () => 
   assert.match(mobileBlock, /\.sidebar\.open \{[^}]*visibility: visible;[^}]*pointer-events: auto;[^}]*box-shadow:/);
   assert.match(styles, /:root\[data-theme="dark"\] \.sidebar:not\(\.open\) \{ box-shadow: none; \}/);
 });
+
+test("sidebar task actions remain reachable without shifting on hover", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(styles, /\.row-actions \{[^}]*display: flex;[^}]*opacity: 0;[^}]*pointer-events: none;/);
+  assert.match(styles, /\.conversation-row:hover \.row-actions, \.conversation-row:focus-within \.row-actions \{ opacity: 1; pointer-events: auto; \}/);
+  assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
+});
 test("selected message text can be quoted into a focused Agent question", () => {
   assert.equal(normalizeAskAgentSelection("  第一行  \r\n\r\n\r\n第二行  \n"), "第一行\n\n第二行");
   assert.equal(buildAskAgentDraft("", "第一行\n第二行"), "请结合以下引用回答我的问题：\n\n> 第一行\n> 第二行\n\n请解释这段引用。");

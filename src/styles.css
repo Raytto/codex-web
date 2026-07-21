@@ -193,8 +193,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .conversation-select > svg { flex: 0 0 auto; color: #b9bdcc; }
 .conversation-row.active .conversation-select > svg { color: var(--amber); }
 .conversation-select span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
-.row-actions { display: none; align-items: center; padding-right: 5px; }
-.conversation-row:hover .row-actions, .conversation-row.active .row-actions { display: flex; }
+.row-actions { display: flex; align-items: center; padding-right: 5px; opacity: 0; pointer-events: none; transition: opacity .14s ease; }
+.conversation-row:hover .row-actions, .conversation-row:focus-within .row-actions { opacity: 1; pointer-events: auto; }
 .row-actions button { display: grid; place-items: center; padding: 5px; border: 0; border-radius: 7px; color: #bfc2cf; background: transparent; cursor: pointer; }
 .row-actions button:hover { color: #fff; background: rgba(255, 255, 255, .1); }
 .empty-list { padding: 24px 10px; color: #969aab; text-align: center; font-size: 12px; }
@@ -500,6 +500,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 @media (max-width: 920px) {
   .suggestions { grid-template-columns: repeat(2, 1fr); }
   .welcome { padding-bottom: 190px; }
+}
+
+@media (hover: none) {
+  .row-actions { opacity: 1; pointer-events: auto; }
 }
 
 @media (max-width: 720px) {
