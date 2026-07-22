@@ -935,9 +935,6 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
 }
 
 function ProcessPanel({ activities }: { activities: JobEvent[] }) {
-  const journalRef = useRef<HTMLDivElement>(null);
-  const journalFollowingRef = useRef(true);
-  const journalScrollTopRef = useRef(0);
   const latestStatus = activities.findLast((item) => item.type === "status" || item.kind === "status");
   const queueStatus = activities.findLast((activity) => activity.status === "queued");
   const queued = Boolean(queueStatus) && !activities.some((activity) => activity.status === "running");
@@ -946,31 +943,13 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
   const journal = buildProcessJournal(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
 
-  useLayoutEffect(() => {
-    const journalElement = journalRef.current;
-    if (!journalElement || !journalFollowingRef.current) return;
-    journalElement.scrollTop = journalElement.scrollHeight;
-    journalScrollTopRef.current = journalElement.scrollTop;
-  }, [activities]);
-
-  function handleJournalScroll(event: React.UIEvent<HTMLDivElement>) {
-    const journalElement = event.currentTarget;
-    journalFollowingRef.current = resolveScrollFollow({
-      previousScrollTop: journalScrollTopRef.current,
-      scrollTop: journalElement.scrollTop,
-      scrollHeight: journalElement.scrollHeight,
-      clientHeight: journalElement.clientHeight,
-      following: journalFollowingRef.current,
-    });
-    journalScrollTopRef.current = journalElement.scrollTop;
-  }
   return <div className="activity-card" role="status" aria-live="polite">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始") : retrying ? latestStatus.label : "完成前持续保留，可随时引导"}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
     <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
-    <div ref={journalRef} className="process-journal" onScroll={handleJournalScroll}>{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
+    <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
       ? <ProcessJournalNote activity={activity} key={activity.seq ?? `${activity.kind}-${index}`} />
       : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
           {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}

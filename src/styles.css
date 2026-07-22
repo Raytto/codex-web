@@ -375,7 +375,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .process-plan li.completed > span { border-color: #aeb7dc; color: #fff; background: #5b68a6; }
 .process-plan li.current { color: #29356f; font-weight: 650; }
 .process-plan li.current > span { border-color: #aeb7dc; color: #46538f; background: #eef0f8; }
-.process-journal { position: relative; max-height: min(48vh, 430px); overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; isolation: isolate; border-top: 1px solid #e1e4ed; padding-top: 3px; -webkit-overflow-scrolling: touch; }
+.process-journal { position: relative; overflow-x: hidden; isolation: isolate; border-top: 1px solid #e1e4ed; padding-top: 3px; }
 .process-journal-note { margin: 11px 2px 13px; padding: 1px 4px 1px 11px; border-left: 3px solid #c8cee7; }
 .process-journal-note header { display: flex; align-items: center; gap: 6px; color: #33407d; font-size: 10px; }
 .process-journal-note header time { margin-left: auto; color: #a0a3b0; font-size: 9px; font-weight: 400; }
@@ -528,7 +528,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .message-avatar { width: 29px; height: 29px; }
   .message.user .message-body { max-width: 88%; }
   .message.assistant .markdown { padding: 13px 14px; }
-  .process-journal { max-height: min(46dvh, 360px); }
   .composer-wrap { width: calc(100% - 20px); padding-bottom: 9px; }
   .pending-queue-copy small { display: none; }
   .pending-queue-actions .steer-action span { display: none; }

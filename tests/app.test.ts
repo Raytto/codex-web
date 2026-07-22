@@ -254,19 +254,18 @@ test("running work journal retains every important direction and compacts repeat
   assert.doesNotMatch(appSource, /compactActivitySteps\(activities\)\.slice/);
   assert.match(appSource, /journal\.map\(\(activity, index\) => isNarrativeActivity\(activity\)/);
   assert.doesNotMatch(appSource, /stageFeedback|process-journal-pinned/);
-  assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*max-height: min\(48vh, 430px\);[^}]*overflow-y: auto;/);
+  assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*overflow-x: hidden;[^}]*border-top:/);
+  assert.doesNotMatch(styles, /\.process-journal \{[^}]*max-height:|\.process-journal \{[^}]*overflow-y: auto|\.process-journal \{[^}]*overscroll-behavior-y:/);
   assert.doesNotMatch(styles, /\.process-journal-pinned|position: sticky;/);
-  assert.match(styles, /@media \(max-width: 720px\)[\s\S]*?\.process-journal \{ max-height: min\(46dvh, 360px\); \}/);
   assert.match(appSource, /\{sending && <article className="message assistant running"/);
   assert.match(appSource, /完成前持续保留，可随时引导/);
 });
 
-test("running progress opens at the latest update and follows until the user scrolls upward", () => {
+test("running progress expands inline without a nested vertical scroller", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   assert.match(appSource, /<ProcessPanel key=\{detail\.conversation\.id\} activities=\{activities\}/);
-  assert.match(appSource, /journalElement\.scrollTop = journalElement\.scrollHeight/);
-  assert.match(appSource, /journalFollowingRef\.current = resolveScrollFollow/);
-  assert.match(appSource, /ref=\{journalRef\} className="process-journal" onScroll=\{handleJournalScroll\}/);
+  assert.match(appSource, /<div className="process-journal">\{journal\.length/);
+  assert.doesNotMatch(appSource, /journalElement|journalFollowingRef|handleJournalScroll/);
 });
 
 test("recoverable stream errors remain progress events until the turn completes", async () => {
