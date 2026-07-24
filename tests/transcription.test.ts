@@ -62,6 +62,59 @@ test("Qwen Omni streams mixed-language text with bounded spelling context", asyn
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("Qwen Omni retries transient HTTP and connection failures within a bounded attempt budget", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-"));
+  const warnings = t.mock.method(console, "warn", () => undefined);
+  let calls = 0;
+  const fakeFetch = (async () => {
+    calls += 1;
+    if (calls === 1) return new Response("temporarily unavailable", { status: 503, headers: { "x-request-id": "voice-retry-test" } });
+    if (calls === 2) throw new DOMException("timed out", "TimeoutError");
+    return new Response('data: {"choices":[{"delta":{"content":"恢复成功"}}]}\n\ndata: [DONE]\n\n');
+  }) as typeof fetch;
+  try {
+    const service = new TranscriptionService(
+      testConfig(root),
+      fakeFetch,
+      async () => undefined,
+      async () => [],
+      [0, 0],
+    );
+    const fileName = `${crypto.randomUUID()}.wav`;
+    fs.writeFileSync(path.join(service.audioRoot, fileName), Buffer.from("wav-test"));
+    assert.equal(await service.transcribe(fileName), "恢复成功");
+    assert.equal(calls, 3);
+    assert.equal(warnings.mock.callCount(), 2);
+    assert.equal(warnings.mock.calls[0].arguments[1].upstreamStatus, 503);
+    assert.equal(warnings.mock.calls[0].arguments[1].requestId, "voice-retry-test");
+    assert.equal(warnings.mock.calls[1].arguments[1].errorName, "TimeoutError");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Qwen Omni does not retry permanent upstream errors", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-"));
+  const warnings = t.mock.method(console, "warn", () => undefined);
+  let calls = 0;
+  const fakeFetch = (async () => {
+    calls += 1;
+    return new Response("unauthorized", { status: 401 });
+  }) as typeof fetch;
+  try {
+    const service = new TranscriptionService(
+      testConfig(root),
+      fakeFetch,
+      async () => undefined,
+      async () => [],
+      [0, 0],
+    );
+    const fileName = `${crypto.randomUUID()}.wav`;
+    fs.writeFileSync(path.join(service.audioRoot, fileName), Buffer.from("wav-test"));
+    await assert.rejects(() => service.transcribe(fileName), /语音识别服务暂时不可用/);
+    assert.equal(calls, 1);
+    assert.equal(warnings.mock.callCount(), 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("temporary audio URLs require an unexpired HMAC signature", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-"));
   try {

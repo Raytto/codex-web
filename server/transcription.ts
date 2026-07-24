@@ -9,6 +9,8 @@ import type { AppConfig } from "./config.js";
 const execFileAsync = promisify(execFile);
 const AUDIO_NAME = /^[0-9a-f-]{36}\.(webm|ogg|mp4|mp3|wav|aac|flac)$/;
 const MAX_SIGNED_LIFETIME_SECONDS = 5 * 60;
+const TRANSCRIPTION_ATTEMPT_TIMEOUT_MS = 30_000;
+export const TRANSCRIPTION_RETRY_DELAYS_MS = [600, 1_800] as const;
 const OMNI_TRANSCRIPTION_PROMPT = [
   "你是严格的语音转写器。请逐字转写音频中的有效人声。",
   "保持原始中文和英文，尤其保留人名、文件名、代码、产品名、模型名和英文缩写的原文；不要翻译、回答、总结、润色或补写。",
@@ -57,6 +59,7 @@ export class TranscriptionService {
     private readonly fetchImpl: FetchLike = fetch,
     private readonly convertAudio: AudioConverter = convertAudioToWav,
     private readonly imagePreparer: TranscriptionImagePreparer = prepareTranscriptionImages,
+    private readonly retryDelaysMs: readonly number[] = TRANSCRIPTION_RETRY_DELAYS_MS,
   ) {
     this.audioRoot = path.join(config.dataRoot, "voice-input");
     fs.mkdirSync(this.audioRoot, { recursive: true, mode: 0o700 });
@@ -172,35 +175,62 @@ export class TranscriptionService {
   }
 
   private async requestTranscript(url: string, init: RequestInit): Promise<string> {
-    let response: globalThis.Response;
-    try {
-      response = await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(this.config.transcriptionTimeoutMs) });
-    } catch {
-      throw new TranscriptionError("暂时无法连接语音识别服务，请稍后重试。", 503);
-    }
-    if (!response.ok) {
-      try { await response.body?.cancel(); } catch {}
-      const status = response.status === 429 ? 429 : response.status >= 500 ? 503 : 502;
-      throw new TranscriptionError(response.status === 429 ? "语音识别请求过于频繁，请稍后再试。" : "语音识别服务暂时不可用，请稍后重试。", status);
-    }
-    if (!response.body) throw new TranscriptionError("阿里云返回了空的识别结果，请重试。");
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let transcript = "";
-    try {
-      for await (const chunk of response.body) {
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-        for (const line of lines) transcript += textFromSseLine(line);
+    const deadline = Date.now() + this.config.transcriptionTimeoutMs;
+    for (let attempt = 0; ; attempt += 1) {
+      let response: globalThis.Response;
+      try {
+        const remainingMs = Math.max(1, deadline - Date.now());
+        response = await this.fetchImpl(url, {
+          ...init,
+          signal: AbortSignal.timeout(Math.min(TRANSCRIPTION_ATTEMPT_TIMEOUT_MS, remainingMs)),
+        });
+      } catch (error) {
+        if (await this.retryTransientFailure(attempt, deadline, {
+          kind: "connection",
+          errorName: error instanceof Error ? error.name : "unknown",
+        })) continue;
+        throw new TranscriptionError("暂时无法连接语音识别服务，请稍后重试。", 503);
       }
-      buffer += decoder.decode();
-      for (const line of buffer.split(/\r?\n/)) transcript += textFromSseLine(line);
-    } catch {
-      throw new TranscriptionError("语音识别连接中断，请稍后重试。", 503);
+      if (!response.ok) {
+        try { await response.body?.cancel(); } catch {}
+        if (isRetryableTranscriptionStatus(response.status) && await this.retryTransientFailure(attempt, deadline, {
+          kind: "http",
+          upstreamStatus: response.status,
+          requestId: transcriptionRequestId(response),
+        })) continue;
+        const status = response.status === 429 ? 429 : response.status >= 500 ? 503 : 502;
+        throw new TranscriptionError(response.status === 429 ? "语音识别请求过于频繁，请稍后再试。" : "语音识别服务暂时不可用，请稍后重试。", status);
+      }
+      if (!response.body) throw new TranscriptionError("阿里云返回了空的识别结果，请重试。");
+
+      try {
+        return (await transcriptFromSse(response)).trim();
+      } catch (error) {
+        if (await this.retryTransientFailure(attempt, deadline, {
+          kind: "stream",
+          errorName: error instanceof Error ? error.name : "unknown",
+          requestId: transcriptionRequestId(response),
+        })) continue;
+        throw new TranscriptionError("语音识别连接中断，请稍后重试。", 503);
+      }
     }
-    return transcript.trim();
+  }
+
+  private async retryTransientFailure(
+    attempt: number,
+    deadline: number,
+    diagnostic: Record<string, unknown>,
+  ): Promise<boolean> {
+    const delayMs = this.retryDelaysMs[attempt];
+    if (delayMs === undefined || Date.now() + delayMs >= deadline) return false;
+    console.warn("[voice-transcription] transient upstream failure; retrying", {
+      ...diagnostic,
+      retryAttempt: attempt + 1,
+      retryMaxAttempts: this.retryDelaysMs.length,
+      retryDelayMs: delayMs,
+    });
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    return true;
   }
 
   private sign(fileName: string, expires: number): string {
@@ -211,6 +241,29 @@ export class TranscriptionService {
     if (!/^[0-9a-f]{64}$/.test(signature)) return false;
     return crypto.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(this.sign(fileName, expires), "hex"));
   }
+}
+
+async function transcriptFromSse(response: globalThis.Response): Promise<string> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let transcript = "";
+  for await (const chunk of response.body!) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) transcript += textFromSseLine(line);
+  }
+  buffer += decoder.decode();
+  for (const line of buffer.split(/\r?\n/)) transcript += textFromSseLine(line);
+  return transcript;
+}
+
+function isRetryableTranscriptionStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function transcriptionRequestId(response: globalThis.Response): string | undefined {
+  return response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? undefined;
 }
 
 export const AUDIO_MIME_EXTENSIONS: Readonly<Record<string, string>> = {
