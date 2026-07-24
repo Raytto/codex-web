@@ -1,6 +1,6 @@
 # Codex Web
 
-An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, resumable cancellation history, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
+An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, resumable interruption history, conversation archiving, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
 
@@ -14,15 +14,22 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Server-persistent unsent text, quotes, and attachments, restored across conversations, browsers, and devices
 - Codex thread persistence across browser restarts
 - Soft-deleted conversation audit records while workspace files are removed
+- Archive and restore completed conversations without deleting their history or files
 - Cancellation that retains a concise history of completed work so the next turn can resume from it
+- Explicit interrupted-task messages after an unexpected service restart, without unsafe automatic retries
+- Graceful container shutdown that drains in-flight Codex work and leaves queued tasks persisted
 - Automatic short task titles, with manual titles taking precedence
 - A durable live work journal with retained stage feedback and grouped command steps
 - Running work journals expand inline with the page instead of creating a nested vertical scroller
 - Unread-result markers for completed conversations until their detail is viewed
+- Distinct running and queued indicators, plus a stable overflow menu for task actions
+- A 500 MiB Codex rollout warning that suggests archiving very long conversations
 - Light, dark, and system-following appearance modes
 - Select message text and attach it as a removable, server-persisted reference to a new Agent question
 - Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
+- Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
+- A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
@@ -132,6 +139,8 @@ stateDiagram-v2
     Running --> Completed: final response persisted
     Running --> Cancelled: user stops task
     Cancelled --> Queued: continue from retained summary
+    Completed --> Archived: archive
+    Archived --> Completed: restore
     Completed --> [*]
 ```
 
@@ -185,13 +194,15 @@ For the public build, the web process has no Docker socket, host filesystem moun
 
 6. Open [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/).
 
-State is stored in Docker named volumes. Closing the browser does not remove queued work, attachments, or unsent composer drafts.
+State is stored in Docker named volumes. Closing the browser does not remove queued work, attachments, unsent composer drafts, or archived conversations.
 
 ## Optional voice transcription
 
 Set `DASHSCOPE_API_KEY` and an HTTPS `PUBLIC_BASE_URL` in `.env` to enable the microphone button. The default model is `qwen3.5-omni-plus`; you can override it with `DASHSCOPE_ASR_MODEL`. Microphone access requires a secure browser context.
 
 Audio is uploaded to your server first and then sent to the DashScope endpoint configured by `DASHSCOPE_BASE_URL`. Leave the key empty to disable the feature completely.
+
+The optional spelling/topic context is bounded to about 500 tokens by default and shared across the draft, attachment names, the first 16 KiB of text attachments, recent messages, fixed technical terms, and up to two small images. Large unsent files are never copied wholesale into the transcription request. Tune the limits with `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`, `TRANSCRIPTION_CONTEXT_MAX_IMAGES`, and `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES`.
 
 ## Reverse proxy
 

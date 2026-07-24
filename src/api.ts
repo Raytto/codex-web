@@ -2,7 +2,7 @@ export const BASE_PATH = "/codex-web";
 
 export type Session = { authenticated: boolean; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; voiceEnabled?: boolean };
 export type Conversation = {
-  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; created_at: string; updated_at: string;
+  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; has_pending_work: number; rollout_bytes: number | null; archived_at: string | null; created_at: string; updated_at: string;
 };
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
@@ -68,6 +68,7 @@ export type ConversationDetail = {
   activeJob: Job | null;
   latestJob: Job | null;
   jobEvents: JobEvent[];
+  rolloutBytes: number | null;
 };
 export type MessagePage = { hasMore: boolean; nextCursor: string | null };
 export type ConversationMessagesPage = { messages: Message[]; messagePage: MessagePage };
@@ -100,6 +101,7 @@ export const api = {
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   conversations: () => request<{ conversations: Conversation[] }>("/conversations"),
+  archivedConversations: (query = "") => request<{ conversations: Conversation[] }>(`/conversations/archived${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   agentOptions: () => request<AgentOptions>("/agent-options"),
   updateAgentSelection: (selection: AgentSelection, conversationId?: string) => request<{ selection: AgentSelection }>(
     conversationId ? `/conversations/${conversationId}/agent-selection` : "/agent-selection",
@@ -116,6 +118,8 @@ export const api = {
   renameConversation: (id: string, title: string) => request<{ conversation: Conversation }>(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   markConversationSeen: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/seen`, { method: "POST" }),
   deleteConversation: (id: string) => request<void>(`/conversations/${id}`, { method: "DELETE" }),
+  archiveConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/archive`, { method: "POST" }),
+  restoreConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/restore`, { method: "POST" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
   saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft`,

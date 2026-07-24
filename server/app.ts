@@ -99,6 +99,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const voiceEnabled = Boolean(config.dashscopeApiKey && config.publicBaseUrl.startsWith("https://"));
   const deletingConversations = new Set<string>();
   let queuePumpBusy = false;
+  let shuttingDown = false;
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
     const workspace = ensureTenantWorkspace(config.tenantRoot, userId, prompt.conversation_id);
@@ -228,10 +229,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   async function pumpQueue(): Promise<void> {
-    if (queuePumpBusy) return;
+    if (queuePumpBusy || shuttingDown) return;
     queuePumpBusy = true;
     try {
       for (;;) {
+        if (shuttingDown) break;
         let job = db.getNextRunnableQueuedJob();
         if (!job) {
           const pending = db.getNextDispatchablePendingPrompt();
@@ -352,6 +354,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ conversations: db.listConversations(session.user_id) });
   });
 
+  api.get("/conversations/archived", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const query = typeof req.query.query === "string" ? req.query.query : "";
+    return res.json({ conversations: db.listArchivedConversations(session.user_id, query) });
+  });
+
   api.get("/agent-options", (_req, res) => {
     const session = res.locals.session as SessionRow;
     const options = optionsForUser(session.user_id);
@@ -382,10 +390,38 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     res.status(201).json({ conversation: db.createConversation(id, "新任务", agentSelection, session.user_id), agentSelection });
   });
 
-  api.get("/conversations/:id", (req, res) => {
+  api.post("/conversations/:id/archive", (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (conversation.archived_at) return res.json({ conversation });
+    const hasWork = conversation.status === "running"
+      || db.listActiveJobsForConversation(conversation.id).length > 0
+      || db.listPendingPrompts(conversation.id).length > 0
+      || db.listPendingPrompts(conversation.id, "editing").length > 0;
+    if (hasWork) return res.status(409).json({ error: "会话仍在运行或有待发送任务，请处理完成后再归档。" });
+    const archived = db.archiveConversationForUser(conversation.id, session.user_id);
+    return archived ? res.json({ conversation: archived }) : res.status(409).json({ error: "会话归档状态已经变化。" });
+  });
+
+  api.post("/conversations/:id/restore", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (!conversation.archived_at) return res.json({ conversation });
+    const restored = db.restoreConversationForUser(conversation.id, session.user_id);
+    return restored ? res.json({ conversation: restored }) : res.status(409).json({ error: "会话归档状态已经变化。" });
+  });
+
+  api.get("/conversations/:id", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    let conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    const rolloutBytes = runner.conversationRolloutBytes(conversation.id);
+    if (rolloutBytes !== conversation.rollout_bytes) {
+      db.setConversationRolloutBytes(conversation.id, rolloutBytes);
+      conversation = db.getConversationForUser(conversation.id, session.user_id)!;
+    }
     const latestJob = db.getLatestJobForConversation(conversation.id) ?? null;
     const jobEvents = latestJob
       ? db.listEvents(latestJob.id).map((event) => ({ seq: event.seq, type: event.event_type, created_at: event.created_at, ...JSON.parse(event.payload) }))
@@ -410,6 +446,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       activeJob,
       latestJob,
       jobEvents,
+      rolloutBytes,
     });
   });
 
@@ -447,6 +484,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (conversation.archived_at) return res.status(409).json({ error: "会话已归档，请恢复后再修改。" });
     try { return res.json({ selection: saveAgentSelection(session.user_id, req.body?.model, req.body?.reasoningEffort, conversation) }); }
     catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "模型选项无效。" }); }
   });
@@ -499,7 +537,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         try {
           const session = (req as AuthenticatedRequest).appSession;
           const conversationId = String(req.params.id);
-          if (!session || deletingConversations.has(conversationId) || !db.getConversationForUser(conversationId, session.user_id)) throw new Error("会话不存在");
+          const conversation = session ? db.getConversationForUser(conversationId, session.user_id) : undefined;
+          if (!session || deletingConversations.has(conversationId) || !conversation || conversation.archived_at) throw new Error("会话不存在或已归档");
           callback(null, path.join(ensureTenantWorkspace(config.tenantRoot, session.user_id, String(req.params.id)), "uploads"));
         } catch (error) { callback(error as Error, ""); }
       },
@@ -512,6 +551,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (conversation.archived_at) return res.status(409).json({ error: "会话已归档，请恢复后再继续编辑。" });
     if (deletingConversations.has(conversation.id)) return res.status(409).json({ error: "会话正在删除。" });
     if (typeof req.body?.content !== "string") return res.status(400).json({ error: "草稿正文无效。" });
     const content = req.body.content.slice(0, 100_000);
@@ -524,6 +564,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
+    if (conversation.archived_at) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话已归档，请恢复后再继续编辑。" }); }
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     if (uploaded.length === 0) return res.status(400).json({ error: "没有收到附件。" });
     const existing = db.getComposerDraft(conversation.id);
@@ -603,9 +644,25 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const recentMessages = conversation
         ? db.listMessages(conversation.id).slice(-4).map((message) => ({ role: message.role, content: message.content }))
         : [];
+      const attachments = conversation ? (() => {
+        const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, conversation.id);
+        const available = db.listFiles(conversation.id).filter((candidate) => candidate.kind === "upload").reverse();
+        const used = new Set<string>();
+        return attachmentNames.flatMap((name) => {
+          const row = available.find((candidate) => !used.has(candidate.id) && candidate.original_name === name);
+          if (!row) return [];
+          used.add(row.id);
+          try {
+            const filePath = resolveInside(workspace, row.relative_path);
+            if (!fs.existsSync(filePath)) return [];
+            return [{ name: row.original_name, filePath, mimeType: row.mime_type, size: row.size }];
+          } catch { return []; }
+        });
+      })() : [];
       const text = await transcription.transcribe(file.filename, {
         draftText: typeof req.body?.draftText === "string" ? req.body.draftText : "",
         attachmentNames,
+        attachments,
         recentMessages,
       });
       return res.json({ text });
@@ -633,6 +690,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
+    if (conversation.archived_at) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话已归档，请恢复后再继续发送。" }); }
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
     const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
@@ -920,7 +978,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   });
 
   if (config.queueAutoStart) setImmediate(() => void pumpQueue());
-  return { app, db, runner, config, pumpQueue };
+  return {
+    app, db, runner, config, pumpQueue,
+    beginShutdown: () => { shuttingDown = true; },
+  };
 }
 
 export function migrateExistingOutputFiles(config: AppConfig, db: AppDatabase): number {

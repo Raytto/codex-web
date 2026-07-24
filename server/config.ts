@@ -31,11 +31,19 @@ export type AppConfig = {
   dashscopeModel: string;
   transcriptionPollMs: number;
   transcriptionTimeoutMs: number;
+  transcriptionContextTokenBudget: number;
+  transcriptionContextMaxImages: number;
+  transcriptionContextMaxImageBytes: number;
 };
 
 function normalizeBasePath(value: string): string {
   const normalized = `/${value}`.replace(/\/+/g, "/").replace(/\/$/, "");
   return normalized === "/" ? "" : normalized;
+}
+
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback;
 }
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -67,6 +75,18 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     dashscopeModel: overrides.dashscopeModel ?? (process.env.DASHSCOPE_ASR_MODEL || "qwen3.5-omni-plus"),
     transcriptionPollMs: overrides.transcriptionPollMs ?? Number(process.env.TRANSCRIPTION_POLL_MS ?? 2000),
     transcriptionTimeoutMs: overrides.transcriptionTimeoutMs ?? Number(process.env.TRANSCRIPTION_TIMEOUT_MS ?? 120000),
+    transcriptionContextTokenBudget: boundedInteger(
+      overrides.transcriptionContextTokenBudget ?? process.env.TRANSCRIPTION_CONTEXT_TOKEN_BUDGET,
+      500, 100, 4000,
+    ),
+    transcriptionContextMaxImages: boundedInteger(
+      overrides.transcriptionContextMaxImages ?? process.env.TRANSCRIPTION_CONTEXT_MAX_IMAGES,
+      2, 0, 4,
+    ),
+    transcriptionContextMaxImageBytes: boundedInteger(
+      overrides.transcriptionContextMaxImageBytes ?? process.env.TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES,
+      2 * 1024 * 1024, 64 * 1024, 7 * 1024 * 1024,
+    ),
   };
 }
 

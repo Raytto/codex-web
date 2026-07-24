@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type FormEvent, type KeyboardEvent, type SetStateAction } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  ArrowUp, Bot, Check, ChevronDown, Download, File as FileIcon, FileImage, FileText, FolderOpen,
+  Archive, ArrowUp, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
-  Trash2, X, Zap,
+  RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
 import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
 import { isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
@@ -18,6 +19,7 @@ import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection } from "./ask
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
+import { formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
@@ -109,6 +111,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
   const [selectionSaving, setSelectionSaving] = useState(false);
   const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
+  const [taskMenu, setTaskMenu] = useState<{ conversationId: string; top: number; left: number } | null>(null);
+  const [archivedDialogOpen, setArchivedDialogOpen] = useState(false);
+  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
+  const [archivedLoading, setArchivedLoading] = useState(false);
   const [chatFontSize, setChatFontSize] = useState(() => normalizeChatFontSize(session.chatFontSize, CHAT_FONT_SIZE_DEFAULT));
   const [fontSizeSaving, setFontSizeSaving] = useState(false);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
@@ -697,6 +703,77 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     await api.renameConversation(conversation.id, title); await refreshList(); if (selectedId === conversation.id) await refreshDetail(conversation.id);
   }
 
+  function toggleTaskMenu(conversation: Conversation, button: HTMLButtonElement) {
+    if (taskMenu?.conversationId === conversation.id) {
+      setTaskMenu(null);
+      return;
+    }
+    const bounds = button.getBoundingClientRect();
+    const width = 156;
+    const height = 126;
+    const top = bounds.bottom + 6 + height <= window.innerHeight - 8
+      ? bounds.bottom + 6
+      : Math.max(8, bounds.top - height - 6);
+    const left = Math.max(8, Math.min(bounds.right - width, window.innerWidth - width - 8));
+    setTaskMenu({ conversationId: conversation.id, top, left });
+  }
+
+  useEffect(() => {
+    if (!taskMenu) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (event.target instanceof Element && !event.target.closest("[data-task-menu]")) setTaskMenu(null);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setTaskMenu(null);
+    };
+    const closeOnResize = () => setTaskMenu(null);
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnResize);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnResize);
+    };
+  }, [taskMenu]);
+
+  async function openArchivedConversations() {
+    setAccountSettingsOpen(false);
+    setArchivedDialogOpen(true);
+    setArchivedLoading(true);
+    setError("");
+    try {
+      const result = await api.archivedConversations();
+      setArchivedConversations(result.conversations);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "读取已归档任务失败");
+    } finally {
+      setArchivedLoading(false);
+    }
+  }
+
+  async function archiveConversation(conversation: Conversation) {
+    setTaskMenu(null);
+    try {
+      await api.archiveConversation(conversation.id);
+      await refreshList();
+      if (selectedId === conversation.id) await refreshDetail(conversation.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "归档失败");
+    }
+  }
+
+  async function restoreConversation(conversation: Conversation) {
+    try {
+      await api.restoreConversation(conversation.id);
+      setArchivedConversations((current) => current.filter((item) => item.id !== conversation.id));
+      await refreshList();
+      if (selectedId === conversation.id) await refreshDetail(conversation.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "恢复失败");
+    }
+  }
+
   async function logout() { try { await api.logout(); } finally { onLogout(); } }
 
   async function persistAgentSelection(selection: { model: string; reasoningEffort: ReasoningEffort }) {
@@ -760,6 +837,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const filtered = useMemo(() => conversations.filter((item) => item.title.toLowerCase().includes(query.toLowerCase())), [conversations, query]);
   const currentDetail = detail?.conversation.id === selectedId ? detail : null;
   const loadingConversation = Boolean(selectedId && !currentDetail);
+  const taskMenuConversation = taskMenu ? conversations.find((conversation) => conversation.id === taskMenu.conversationId) : undefined;
   const account = resolveAccountIdentity(session);
 
   return <div className="shell">
@@ -772,14 +850,18 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <button className="new-task" onClick={() => void newConversation()}><Plus size={17} />新建任务</button>
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索任务" /></div>
       <div className="conversation-section"><div className="section-label"><span>任务</span><strong>{filtered.length}</strong></div>
-        <div className="conversation-list">
-          {filtered.map((conversation) => <div key={conversation.id} className={`conversation-row ${selectedId === conversation.id ? "active" : ""} ${conversation.has_unread_result ? "unread" : ""}`}>
+        <div className="conversation-list" onScroll={() => setTaskMenu(null)}>
+          {filtered.map((conversation) => <div key={conversation.id} className={`conversation-row ${selectedId === conversation.id ? "active" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""}`}>
             <button className="conversation-select" onClick={() => setSelectedId(conversation.id)}>
-              <FolderOpen size={16} /><span>{conversation.title}</span>{conversation.status === "running" && <LoaderCircle size={14} className="spin" />}
+              <FolderOpen size={16} /><span>{conversation.title}</span>
+              {conversation.status === "running"
+                ? <LoaderCircle size={14} className="spin" role="img" aria-label="正在执行" />
+                : Boolean(conversation.has_pending_work)
+                  ? <CircleDashed size={14} className="conversation-waiting" role="img" aria-label="等待发送" />
+                  : null}
             </button>
             <div className="row-actions">
-              <button aria-label="重命名" onClick={() => void renameConversation(conversation)}><Pencil size={14} /></button>
-              <button aria-label="删除" onClick={() => void deleteConversation(conversation)}><Trash2 size={14} /></button>
+              <button type="button" className="task-menu-trigger" data-task-menu aria-label={`任务 ${conversation.title} 操作`} aria-haspopup="menu" aria-expanded={taskMenu?.conversationId === conversation.id} title="任务操作" onClick={(event) => toggleTaskMenu(conversation, event.currentTarget)}><MoreHorizontal size={15} /></button>
             </div>
           </div>)}
           {filtered.length === 0 && <div className="empty-list">{query ? "没有匹配任务" : "还没有任务"}</div>}
@@ -804,6 +886,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
               <button type="button" aria-label="外观跟随系统" aria-pressed={themePreference === "system"} onClick={() => onThemePreferenceChange("system")}><Monitor size={16} /><span>系统</span></button>
             </div>
           </div>
+          <button type="button" className="account-settings-archive" onClick={() => void openArchivedConversations()}><Archive size={15} /><span>已归档任务</span></button>
         </section>}
         <div className="account-row">
           <button className="account-profile" type="button" aria-expanded={accountSettingsOpen} onClick={() => setAccountSettingsOpen((open) => !open)}>
@@ -814,6 +897,34 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </div>
     </aside>
 
+    {taskMenu && taskMenuConversation && createPortal(<div
+      className="task-menu-panel"
+      data-task-menu
+      role="menu"
+      aria-label={`任务 ${taskMenuConversation.title} 操作`}
+      style={{ top: taskMenu.top, left: taskMenu.left }}
+    >
+      <button type="button" role="menuitem" onClick={() => void archiveConversation(taskMenuConversation)}><Archive size={16} /><span>归档</span></button>
+      <button type="button" role="menuitem" onClick={() => { setTaskMenu(null); void renameConversation(taskMenuConversation); }}><Pencil size={16} /><span>重命名</span></button>
+      <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>
+    </div>, document.body)}
+
+    {archivedDialogOpen && createPortal(<div className="archive-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setArchivedDialogOpen(false); }}>
+      <section className="archive-dialog" role="dialog" aria-modal="true" aria-label="已归档任务">
+        <header><div><Archive size={19} /><strong>已归档任务</strong></div><button type="button" className="icon-button" aria-label="关闭" onClick={() => setArchivedDialogOpen(false)}><X size={18} /></button></header>
+        <div className="archived-conversation-list">
+          {archivedLoading ? <div className="archived-conversation-empty"><LoaderCircle className="spin" size={18} /><span>正在加载…</span></div>
+            : archivedConversations.length === 0 ? <div className="archived-conversation-empty">还没有已归档任务</div>
+            : archivedConversations.map((conversation) => <div className="archived-conversation-row" key={conversation.id}>
+                <button type="button" className="archived-conversation-open" onClick={() => { setSelectedId(conversation.id); setArchivedDialogOpen(false); }}>
+                  <Archive size={17} /><span><strong>{conversation.title}</strong><small>{formatMessageDateTime(conversation.archived_at ?? conversation.updated_at)}</small></span>
+                </button>
+                <button type="button" className="archived-conversation-restore" aria-label={`恢复 ${conversation.title}`} title="恢复" onClick={() => void restoreConversation(conversation)}><RotateCcw size={16} /></button>
+              </div>)}
+        </div>
+      </section>
+    </div>, document.body)}
+
     <main className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
       {currentDetail ? <Chat detail={currentDetail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} />
@@ -821,7 +932,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
-      {(!selectedId || currentDetail) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
+      {currentDetail?.conversation.archived_at && <div className="archived-conversation-banner"><Archive size={15} /><span>这个任务已归档，历史内容仍可查看。</span><button type="button" onClick={() => void restoreConversation(currentDetail.conversation)}>恢复任务</button></div>}
+      {(!selectedId || (currentDetail && !currentDetail.conversation.archived_at)) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -905,7 +1017,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
     window.getSelection()?.removeAllRanges();
   }
 
-  return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span><button className="icon-button" aria-label="更多"><MoreHorizontal size={20} /></button></div></div>
+  return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span>{shouldWarnAboutRollout(detail.rolloutBytes) && <details className="rollout-warning"><summary className="icon-button" aria-label="会话历史容量提醒"><TriangleAlert size={19} /><span /></summary><div className="rollout-warning-panel"><strong>会话历史已达 {formatRolloutBytes(detail.rolloutBytes!)}</strong><p>超长会话会增加加载和续接成本。建议完成当前任务后归档，并新建任务继续。</p></div></details>}<button className="icon-button" aria-label="更多"><MoreHorizontal size={20} /></button></div></div>
     <div ref={messagesRef} className="messages" onScroll={onMessagesScroll} style={{ "--chat-font-size": `${chatFontSize}px` } as CSSProperties}>
       {detail.messagePage.hasMore && <div className="history-loader" aria-live="polite">{loadingOlderMessages ? <><LoaderCircle className="spin" size={14} /><span>正在加载更早消息…</span></> : <span>向上滚动加载更早消息</span>}</div>}
       {detail.messages.map((message) => <article className={`message ${message.role}`} key={message.id}>

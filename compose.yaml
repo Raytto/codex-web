@@ -40,7 +40,8 @@ services:
     pids_limit: 1024
     mem_limit: 8g
     cpus: 3.5
-    stop_grace_period: 2m
+    # Let SIGTERM drain in-flight Codex jobs before Docker sends SIGKILL.
+    stop_grace_period: 30m
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/codex-web/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 20s

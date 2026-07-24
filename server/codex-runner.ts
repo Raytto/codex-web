@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import type { AppConfig } from "./config.js";
 import { AppDatabase, type FileRow } from "./db.js";
-import { ensureTenant, ensureTenantWorkspace, newId, normalizeStoredRelativePath, persistDeliverable, resolveInside, snapshotDeliverables } from "./paths.js";
+import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, newId, normalizeStoredRelativePath, persistDeliverable, resolveInside, snapshotDeliverables } from "./paths.js";
 import { cleanupJobRuntime, prepareJobRuntime, resolvePythonRuntime } from "./python-runtime.js";
 import { assessTaskPolicy } from "./task-policy.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
@@ -94,6 +94,16 @@ export class CodexRunner {
     this.directExecutions.get(jobId)?.interrupt();
     this.workerClient?.cancel(jobId);
     return true;
+  }
+
+  get activeJobCount(): number {
+    return this.abortControllers.size;
+  }
+
+  conversationRolloutBytes(conversationId: string): number | null {
+    const conversation = this.db.getConversation(conversationId);
+    if (!conversation?.codex_thread_id) return null;
+    return codexThreadRolloutBytes(ensureTenant(this.config.tenantRoot, conversation.user_id).codexHome, conversation.codex_thread_id);
   }
 
   async steer(jobId: string, prompt: string, uploads: FileRow[]): Promise<string> {

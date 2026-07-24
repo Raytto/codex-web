@@ -16,9 +16,9 @@ while (($#)); do
   esac
 done
 
-: "${CWW_UV:?This helper must run inside a ChatGPT Work task.}"
-: "${CWW_SHARED_PYTHON:?This helper must run inside a ChatGPT Work task.}"
-: "${CWW_JOB_RUNTIME:?This helper must run inside a ChatGPT Work task.}"
+: "${CWW_UV:?This helper must run inside a Codex Web task.}"
+: "${CWW_SHARED_PYTHON:?This helper must run inside a Codex Web task.}"
+: "${CWW_JOB_RUNTIME:?This helper must run inside a Codex Web task.}"
 [[ -n "$script" ]] || { echo "--script is required" >&2; exit 2; }
 
 if [[ "$mode" == "shared" ]]; then

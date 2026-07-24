@@ -1,6 +1,6 @@
 # Codex Web
 
-Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。它提供持久化会话、未发送草稿、附件与交付文件、服务器端任务排队、实时引导、可续接的终止记录、完整工作记录、完成任务未读提示、引用提问、自动命名、字号调节以及可选的语音转写。
+Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。它提供持久化会话、未发送草稿、附件与交付文件、服务器端任务排队、实时引导、可续接的终止/中断记录、会话归档、完整工作记录、完成任务未读提示、引用提问、自动命名、字号调节以及可选的语音转写。
 
 > 本项目由社区独立开发，与 OpenAI 没有关联，也未获得 OpenAI 的背书或支持。
 
@@ -24,9 +24,11 @@ docker compose exec --user 11001:11001 \
   app codex login --device-auth
 ```
 
-打开 [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/) 即可使用。队列、附件、会话、Codex 线程，以及输入框中尚未发送的正文、引用和附件都保存在服务器端；切换会话、关闭浏览器或换设备后仍可继续编辑。
+打开 [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/) 即可使用。队列、附件、会话、归档记录、Codex 线程，以及输入框中尚未发送的正文、引用和附件都保存在服务器端；切换会话、关闭浏览器或换设备后仍可继续编辑。
 
-运行中的工作记录不再形成独立的纵向滚动区，而是按照现有记录上限随页面自然展开。用户终止任务后，关键执行过程会保留为一条历史消息，下一轮可从终止处继续。本地 Excel 附件由托管的 openpyxl/pandas 技能处理，详细 Excel 规则只在本轮确实包含对应附件时注入。Apps、连接器、Goals 和多代理能力默认关闭，仅在用户明确提出时启用。
+运行中的工作记录不再形成独立的纵向滚动区，而是按照现有记录上限随页面自然展开。排队与运行状态使用不同图标；任务操作收进稳定的菜单。用户终止任务后，关键执行过程会保留为历史消息；服务意外重启也会明确标记未完成任务，避免把中断误认为完成或自动重复执行。容器正常停止时会等待在途任务结束，已排队任务继续保存在服务器。
+
+已完成的会话可以无损归档和恢复；当 Codex rollout 达到 500 MiB 时，界面会提示新建任务以控制超长上下文成本。移动 Safari 使用固定应用外壳，只让内容区滚动。本地 Excel 附件由托管的 openpyxl/pandas 技能处理，详细 Excel 规则只在本轮确实包含对应附件时注入。Apps、连接器、Goals 和多代理能力默认关闭，仅在用户明确提出时启用。
 
 ## 这套工程解决什么问题
 
@@ -138,6 +140,8 @@ stateDiagram-v2
     Running --> Completed: 最终回复持久化
     Running --> Cancelled: 用户停止
     Cancelled --> Queued: 从保留摘要继续
+    Completed --> Archived: 归档
+    Archived --> Completed: 恢复
     Completed --> [*]
 ```
 
@@ -153,6 +157,8 @@ stateDiagram-v2
 ## 可选语音输入
 
 在 `.env` 中设置你自己的 `DASHSCOPE_API_KEY` 和 HTTPS `PUBLIC_BASE_URL` 后，页面会显示麦克风按钮。默认使用 `qwen3.5-omni-plus`，可通过 `DASHSCOPE_ASR_MODEL` 修改。未设置 Key 时语音功能完全关闭。
+
+语音模型使用的额外拼写/话题上下文默认限制为约 500 token，由草稿、附件名、文本附件开头 16 KiB、最近对话、固定技术词和最多两张小图片共同分配；未发送的大文件不会整份进入转写请求。可通过 `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`、`TRANSCRIPTION_CONTEXT_MAX_IMAGES` 和 `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES` 调整。
 
 公网部署请配置 HTTPS；浏览器通常只允许在 HTTPS 或 localhost 页面调用麦克风。
 

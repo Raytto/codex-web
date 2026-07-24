@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 if (-not $env:CWW_UV -or -not $env:CWW_SHARED_PYTHON -or -not $env:CWW_JOB_RUNTIME) {
-  throw "This helper must run inside a ChatGPT Work task."
+  throw "This helper must run inside a Codex Web task."
 }
 
 if ($Mode -eq "Shared") {

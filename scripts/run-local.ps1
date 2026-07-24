@@ -6,7 +6,7 @@ Set-Location $project
 
 while ($true) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -LiteralPath (Join-Path $logDirectory "launcher.log") -Value "[$timestamp] starting ChatGPT Work"
+    Add-Content -LiteralPath (Join-Path $logDirectory "launcher.log") -Value "[$timestamp] starting Codex Web"
     & "C:\Program Files\nodejs\node.exe" (Join-Path $project "dist-server\server\index.js")
     $exitCode = $LASTEXITCODE
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"

@@ -13,7 +13,7 @@ import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
 import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
-import { ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveInside, safeUploadName } from "../server/paths.js";
+import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveInside, safeUploadName } from "../server/paths.js";
 import { buildShellEnvironment, cleanupJobRuntime, prepareJobRuntime } from "../server/python-runtime.js";
 import { assessTaskPolicy } from "../server/task-policy.js";
 import { listTenantIdentities, tenantIdentityForUser } from "../server/tenant-identities.js";
@@ -35,6 +35,7 @@ import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-con
 import { buildProcessJournal } from "../src/process-journal.js";
 import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, detectOptionalAgentCapabilities } from "../server/optional-capabilities.js";
 import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../server/cancellation-summary.js";
+import { formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -111,7 +112,7 @@ test("switching conversations hides stale detail until the selected task loads",
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /currentDetail = detail\?\.conversation\.id === selectedId \? detail : null/);
   assert.match(appSource, /loadingConversation \? <ConversationLoading \/>/);
-  assert.match(appSource, /\(!selectedId \|\| currentDetail\) && <Composer/);
+  assert.match(appSource, /\(!selectedId \|\| \(currentDetail && !currentDetail\.conversation\.archived_at\)\) && <Composer/);
   assert.match(appSource, /role="status" aria-live="polite"/);
   assert.match(styles, /\.conversation-loading \{[^}]*place-content: center;/);
 });
@@ -123,11 +124,32 @@ test("closed mobile sidebar is not painted as an offscreen shadow layer", () => 
   assert.match(styles, /:root\[data-theme="dark"\] \.sidebar:not\(\.open\) \{ box-shadow: none; \}/);
 });
 
-test("sidebar task actions remain reachable without shifting on hover", () => {
+test("sidebar task actions collapse into a stable overflow menu", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(styles, /\.row-actions \{[^}]*display: flex;[^}]*opacity: 0;[^}]*pointer-events: none;/);
-  assert.match(styles, /\.conversation-row:hover \.row-actions, \.conversation-row:focus-within \.row-actions \{ opacity: 1; pointer-events: auto; \}/);
+  const rowActions = appSource.match(/<div className="row-actions">([\s\S]*?)<\/div>/)?.[1] ?? "";
+  assert.match(rowActions, /className="task-menu-trigger"[\s\S]*?<MoreHorizontal/);
+  assert.doesNotMatch(rowActions, /<Pencil|<Trash2/);
+  assert.match(appSource, /className="task-menu-panel"[\s\S]*?<Archive[\s\S]*?<Pencil[\s\S]*?<Trash2/);
+  assert.match(styles, /\.row-actions \{[^}]*width: 30px;[^}]*flex: 0 0 30px;[^}]*opacity: 0;[^}]*pointer-events: none;/);
+  assert.match(styles, /\.conversation-row:hover \.row-actions, \.conversation-row:focus-within \.row-actions, \.conversation-row\.menu-open \.row-actions \{ opacity: 1; pointer-events: auto; \}/);
   assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
+});
+
+test("mobile Safari keeps the app shell fixed while only inner regions scroll", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(styles, /html, body, #root \{[^}]*overflow: hidden;[^}]*overscroll-behavior: none;/);
+  assert.match(styles, /body \{[^}]*position: fixed;[^}]*inset: 0;[^}]*height: 100dvh;/);
+  assert.match(styles, /#root \{[^}]*width: 100%;/);
+  assert.match(styles, /\.messages \{[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
+});
+
+test("rollout capacity warning uses a 500 MiB threshold and readable binary units", () => {
+  assert.equal(ROLLOUT_WARNING_BYTES, 524_288_000);
+  assert.equal(shouldWarnAboutRollout(ROLLOUT_WARNING_BYTES - 1), false);
+  assert.equal(shouldWarnAboutRollout(ROLLOUT_WARNING_BYTES), true);
+  assert.equal(formatRolloutBytes(971_549_720), "926.5 MiB");
+  assert.equal(formatRolloutBytes(1.25 * 1024 ** 3), "1.3 GiB");
 });
 
 test("completed conversations stay visibly unread until their detail is viewed", () => {
@@ -647,6 +669,48 @@ test("risky uploads and execution requests use offline isolation", () => {
   assert.equal(macro.isolated, true);
   assert.equal(macro.networkAccessEnabled, false);
   assert.equal(assessTaskPolicy("请分析这个恶意软件样本", []).isolated, true);
+});
+
+test("conversation archive API keeps history readable, blocks new turns, and restores the sidebar row", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-archive-api-test-"));
+  const tenantRoot = path.join(root, "tenants");
+  const instance = createApp({
+    projectRoot: process.cwd(),
+    dataRoot: path.join(root, "data"),
+    tenantRoot,
+    username: "owner",
+    passwordHash: bcrypt.hashSync("Archive-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+    queueAutoStart: false,
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const agent = request.agent(instance.app);
+  const login = await agent.post("/codex-web/api/auth/login").send({ username: "owner", password: "Archive-Password-2026!" }).expect(200);
+  const csrf = login.body.csrfToken as string;
+  const created = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", csrf).expect(201);
+  const conversationId = created.body.conversation.id as string;
+  const threadId = crypto.randomUUID();
+  instance.db.updateConversation(conversationId, { codexThreadId: threadId });
+  const codexHome = ensureTenant(tenantRoot, LEGACY_USER_ID).codexHome;
+  const sessionDirectory = path.join(codexHome, "sessions", "2026", "07", "24");
+  fs.mkdirSync(sessionDirectory, { recursive: true });
+  const rollout = path.join(sessionDirectory, `rollout-2026-07-24T00-00-00-${threadId}.jsonl`);
+  fs.writeFileSync(rollout, "history", "utf8");
+
+  assert.equal(codexThreadRolloutBytes(codexHome, threadId), 7);
+  const archived = await agent.post(`/codex-web/api/conversations/${conversationId}/archive`).set("X-CSRF-Token", csrf).expect(200);
+  assert.ok(archived.body.conversation.archived_at);
+  assert.equal((await agent.get("/codex-web/api/conversations").expect(200)).body.conversations.length, 0);
+  assert.equal((await agent.get("/codex-web/api/conversations/archived").expect(200)).body.conversations[0].id, conversationId);
+  const detail = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.conversation.id, conversationId);
+  assert.equal(detail.body.rolloutBytes, 7);
+  await agent.post(`/codex-web/api/conversations/${conversationId}/messages`)
+    .set("X-CSRF-Token", csrf).field("message", "不应发送").expect(409);
+
+  const restored = await agent.post(`/codex-web/api/conversations/${conversationId}/restore`).set("X-CSRF-Token", csrf).expect(200);
+  assert.equal(restored.body.conversation.archived_at, null);
+  assert.equal((await agent.get("/codex-web/api/conversations").expect(200)).body.conversations[0].id, conversationId);
 });
 
 test("single-user login and CSRF protection", async (context) => {

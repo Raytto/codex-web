@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -27,6 +28,9 @@ export type ConversationRow = {
   reasoning_effort: string | null;
   status: "idle" | "running";
   has_unread_result: number;
+  has_pending_work: number;
+  rollout_bytes: number | null;
+  archived_at: string | null;
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
@@ -127,6 +131,14 @@ export type StoredAgentSelection = {
 
 type LegacyUserSeed = { username: string; passwordHash: string; displayName?: string };
 
+const conversationSelect = `
+  conversations.*,
+  CASE WHEN
+    EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id AND jobs.status='queued')
+    OR EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id AND pending_prompts.status='queued')
+  THEN 1 ELSE 0 END AS has_pending_work
+`;
+
 export class AppDatabase {
   readonly sqlite: DatabaseSync;
 
@@ -137,9 +149,34 @@ export class AppDatabase {
     this.migrate(legacyUser);
     if (recoverJobs) {
       // A running child process cannot survive an application restart. Queued work is
-      // deliberately retained and the queue pump will resume it in FIFO order.
-      this.sqlite.prepare("UPDATE jobs SET status='interrupted', error=COALESCE(error,'服务重启，原运行任务已中断'), updated_at=? WHERE status='running'").run(new Date().toISOString());
-      this.sqlite.prepare("UPDATE conversations SET status='idle' WHERE status='running'").run();
+      // deliberately retained and the queue pump will resume it in FIFO order. Leave a
+      // visible message and event so interrupted work cannot look silently completed.
+      const interrupted = this.sqlite.prepare(`
+        SELECT job.id,job.conversation_id,conversation.deleted_at
+        FROM jobs job JOIN conversations conversation ON conversation.id=job.conversation_id
+        WHERE job.status='running'
+      `).all() as Array<{ id: string; conversation_id: string; deleted_at: string | null }>;
+      const now = new Date().toISOString();
+      this.sqlite.exec("BEGIN IMMEDIATE");
+      try {
+        for (const job of interrupted) {
+          const error = "服务重启，原运行任务已中断";
+          const event = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(job.id) as { seq: number };
+          this.sqlite.prepare("UPDATE jobs SET status='interrupted',error=COALESCE(error,?),updated_at=? WHERE id=?").run(error, now, job.id);
+          this.sqlite.prepare("INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)")
+            .run(job.id, event.seq, "failed", JSON.stringify({ status: "interrupted", message: error }), now);
+          if (job.deleted_at) continue;
+          this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'assistant',?,NULL,?)")
+            .run(crypto.randomUUID(), job.conversation_id, "上一条任务因服务重启而中断，尚未执行完成。为避免重复产生副作用，系统没有自动重试；请重新发送该任务。", now);
+          this.sqlite.prepare("UPDATE conversations SET status='idle',has_unread_result=1,updated_at=? WHERE id=?")
+            .run(now, job.conversation_id);
+        }
+        this.sqlite.prepare("UPDATE conversations SET status='idle' WHERE status='running'").run();
+        this.sqlite.exec("COMMIT");
+      } catch (error) {
+        this.sqlite.exec("ROLLBACK");
+        throw error;
+      }
     }
   }
 
@@ -164,6 +201,8 @@ export class AppDatabase {
         codex_thread_id TEXT,
         status TEXT NOT NULL DEFAULT 'idle',
         has_unread_result INTEGER NOT NULL DEFAULT 0,
+        rollout_bytes INTEGER,
+        archived_at TEXT,
         deleted_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -254,6 +293,8 @@ export class AppDatabase {
     if (!conversationColumns.has("agent_model")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN agent_model TEXT");
     if (!conversationColumns.has("reasoning_effort")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT");
     if (!conversationColumns.has("has_unread_result")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN has_unread_result INTEGER NOT NULL DEFAULT 0");
+    if (!conversationColumns.has("rollout_bytes")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN rollout_bytes INTEGER");
+    if (!conversationColumns.has("archived_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN archived_at TEXT");
     if (!conversationColumns.has("deleted_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN deleted_at TEXT");
     if (!conversationColumns.has("title_source")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'");
     const messageColumns = this.columnNames("messages");
@@ -299,6 +340,7 @@ export class AppDatabase {
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS conversations_user_idx ON conversations(user_id, updated_at);
       CREATE INDEX IF NOT EXISTS conversations_user_active_idx ON conversations(user_id, deleted_at, updated_at);
+      CREATE INDEX IF NOT EXISTS conversations_user_archived_idx ON conversations(user_id, deleted_at, archived_at);
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS files_conversation_idx ON files(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS files_pending_prompt_idx ON files(pending_prompt_id, created_at);
@@ -350,16 +392,27 @@ export class AppDatabase {
   }
 
   listConversations(userId?: string): ConversationRow[] {
-    if (userId) return this.sqlite.prepare("SELECT * FROM conversations WHERE user_id=? AND deleted_at IS NULL ORDER BY updated_at DESC").all(userId) as ConversationRow[];
-    return this.sqlite.prepare("SELECT * FROM conversations WHERE deleted_at IS NULL ORDER BY updated_at DESC").all() as ConversationRow[];
+    if (userId) return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE user_id=? AND deleted_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC`).all(userId) as ConversationRow[];
+    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE deleted_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC`).all() as ConversationRow[];
+  }
+
+  listArchivedConversations(userId: string, query = ""): ConversationRow[] {
+    const normalized = query.trim().slice(0, 100);
+    if (!normalized) {
+      return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE user_id=? AND deleted_at IS NULL AND archived_at IS NOT NULL ORDER BY archived_at DESC,id LIMIT 100`)
+        .all(userId) as ConversationRow[];
+    }
+    const escaped = normalized.replace(/[\\%_]/g, "\\$&");
+    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE user_id=? AND deleted_at IS NULL AND archived_at IS NOT NULL AND title LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY archived_at DESC,id LIMIT 100`)
+      .all(userId, `%${escaped}%`) as ConversationRow[];
   }
 
   getConversation(id: string): ConversationRow | undefined {
-    return this.sqlite.prepare("SELECT * FROM conversations WHERE id=?").get(id) as ConversationRow | undefined;
+    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE id=?`).get(id) as ConversationRow | undefined;
   }
 
   getConversationForUser(id: string, userId: string): ConversationRow | undefined {
-    return this.sqlite.prepare("SELECT * FROM conversations WHERE id=? AND user_id=? AND deleted_at IS NULL").get(id, userId) as ConversationRow | undefined;
+    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE id=? AND user_id=? AND deleted_at IS NULL`).get(id, userId) as ConversationRow | undefined;
   }
 
   createConversation(id: string, title: string, selection?: StoredAgentSelection, userId = LEGACY_USER_ID): ConversationRow {
@@ -385,6 +438,29 @@ export class AppDatabase {
     if (!conversation) return undefined;
     this.sqlite.prepare("UPDATE conversations SET has_unread_result=0 WHERE id=? AND user_id=? AND deleted_at IS NULL").run(id, userId);
     return this.getConversationForUser(id, userId);
+  }
+
+  archiveConversationForUser(id: string, userId: string): ConversationRow | undefined {
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare(`
+      UPDATE conversations SET archived_at=?
+      WHERE id=? AND user_id=? AND deleted_at IS NULL AND archived_at IS NULL
+    `).run(now, id, userId);
+    return result.changes ? this.getConversationForUser(id, userId) : undefined;
+  }
+
+  restoreConversationForUser(id: string, userId: string): ConversationRow | undefined {
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare(`
+      UPDATE conversations SET archived_at=NULL,updated_at=?
+      WHERE id=? AND user_id=? AND deleted_at IS NULL AND archived_at IS NOT NULL
+    `).run(now, id, userId);
+    return result.changes ? this.getConversationForUser(id, userId) : undefined;
+  }
+
+  setConversationRolloutBytes(id: string, bytes: number | null): void {
+    const normalized = bytes === null || !Number.isFinite(bytes) ? null : Math.max(0, Math.trunc(bytes));
+    this.sqlite.prepare("UPDATE conversations SET rollout_bytes=? WHERE id=? AND deleted_at IS NULL").run(normalized, id);
   }
 
   setAiConversationTitleIfDefault(id: string, title: string): boolean {
@@ -799,6 +875,10 @@ export class AppDatabase {
 
   getRunningJob(): JobRow | undefined {
     return this.sqlite.prepare("SELECT * FROM jobs WHERE status='running' ORDER BY queue_seq LIMIT 1").get() as JobRow | undefined;
+  }
+
+  runningJobCount(): number {
+    return Number((this.sqlite.prepare("SELECT count(1) AS count FROM jobs WHERE status='running'").get() as { count: number }).count);
   }
 
   getNextQueuedJob(): JobRow | undefined {

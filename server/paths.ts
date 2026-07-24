@@ -198,6 +198,28 @@ export function removeCodexThreadFiles(codexHome: string, threadId: string): num
   return removed;
 }
 
+export function codexThreadRolloutBytes(codexHome: string, threadId: string): number | null {
+  if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Invalid Codex thread id");
+  let largest: number | null = null;
+  for (const directoryName of ["sessions", "archived_sessions"]) {
+    const root = path.resolve(codexHome, directoryName);
+    if (!fs.existsSync(root)) continue;
+    const visit = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const absolute = path.resolve(directory, entry.name);
+        if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error("Refusing to inspect unexpected Codex session path");
+        if (entry.isDirectory()) visit(absolute);
+        if (entry.isFile() && entry.name.includes(threadId)) {
+          const size = fs.statSync(absolute).size;
+          largest = largest === null ? size : Math.max(largest, size);
+        }
+      }
+    };
+    visit(root);
+  }
+  return largest;
+}
+
 export async function snapshotWorkspace(root: string): Promise<Map<string, string>> {
   const snapshot = new Map<string, string>();
   async function walk(directory: string): Promise<void> {
