@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import bcrypt from "bcryptjs";
 import request from "supertest";
 import type { ThreadEvent } from "@openai/codex-sdk";
-import { createApp, migrateExistingOutputFiles } from "../server/app.js";
+import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "../server/app.js";
 import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
 import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
@@ -663,6 +663,14 @@ test("browser preview is limited to formats browsers can display directly", () =
   assert.equal(isBrowserPreviewable(file("application/vnd.openxmlformats-officedocument.presentationml.presentation")), false);
 });
 
+test("downloaded text files declare UTF-8 for iOS Safari previews", () => {
+  assert.equal(fileResponseContentType("text/markdown"), "text/markdown; charset=utf-8");
+  assert.equal(fileResponseContentType("text/plain"), "text/plain; charset=utf-8");
+  assert.equal(fileResponseContentType("application/json"), "application/json; charset=utf-8");
+  assert.equal(fileResponseContentType("text/csv; charset=gb18030"), "text/csv; charset=gb18030");
+  assert.equal(fileResponseContentType("application/pdf"), "application/pdf");
+});
+
 test("risky uploads and execution requests use offline isolation", () => {
   assert.deepEqual(assessTaskPolicy("整理表格", [{ original_name: "source.xlsx" }]), { isolated: false, networkAccessEnabled: true });
   const macro = assessTaskPolicy("看看这个文件", [{ original_name: "unknown.xlsm" }]);
@@ -1003,7 +1011,8 @@ test("web users have isolated conversations, files, jobs, settings, and tenant d
     original_name: "private.txt", relative_path: "uploads/private.txt", mime_type: "text/plain", size: 7, kind: "upload", created_at: now,
   });
   await owner.get(`/codex-web/api/files/${memberFileId}`).expect(404);
-  await member.get(`/codex-web/api/files/${memberFileId}`).expect(200);
+  const memberText = await member.get(`/codex-web/api/files/${memberFileId}`).expect(200);
+  assert.match(memberText.headers["content-type"], /^text\/plain;\s*charset=utf-8$/i);
 
   const memberJobId = crypto.randomUUID();
   instance.db.createJob(memberJobId, memberConversation.body.conversation.id, memberMessageId, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });

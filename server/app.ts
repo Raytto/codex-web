@@ -957,7 +957,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const inline = req.query.download !== "1" && (/^image\//.test(file.mime_type) || file.mime_type === "application/pdf" || /^text\/(plain|markdown|csv)/.test(file.mime_type));
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "private, no-store");
-    res.setHeader("Content-Type", file.mime_type);
+    res.setHeader("Content-Type", fileResponseContentType(file.mime_type));
     res.setHeader("Content-Disposition", contentDisposition(inline ? "inline" : "attachment", file.original_name));
     return res.sendFile(path.basename(absolute), { root: path.dirname(absolute) });
   });
@@ -1023,4 +1023,14 @@ function contentDisposition(disposition: "inline" | "attachment", originalName: 
   const fallback = `${asciiStem || "download"}${extension}`;
   const encoded = encodeURIComponent(originalName).replace(/['()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
   return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+export function fileResponseContentType(mimeType: string): string {
+  const normalized = mimeType.trim() || "application/octet-stream";
+  if (/;\s*charset=/i.test(normalized)) return normalized;
+  const baseType = normalized.split(";", 1)[0].trim().toLowerCase();
+  if (baseType.startsWith("text/") || baseType === "application/json" || baseType.endsWith("+json") || baseType === "application/xml" || baseType.endsWith("+xml")) {
+    return `${normalized}; charset=utf-8`;
+  }
+  return normalized;
 }
