@@ -944,6 +944,23 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ ok: true });
   });
 
+  api.get("/files/:id/preview", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.json({
+      file: {
+        id: file.id,
+        original_name: file.original_name,
+        relative_path: file.relative_path,
+        source_path: file.source_path,
+        mime_type: file.mime_type,
+        size: file.size,
+        kind: file.kind,
+      },
+    });
+  });
   api.get("/files/:id", (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);

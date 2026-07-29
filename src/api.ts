@@ -7,6 +7,7 @@ export type Conversation = {
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
 };
+export type FilePreviewMetadata = { file: WorkFile };
 export type Message = {
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; created_at: string; files: WorkFile[];
 };
@@ -177,6 +178,22 @@ export const api = {
     `/conversations/${conversationId}/pending-prompts/${promptId}/steer`, { method: "POST" },
   ),
   cancelJob: (id: string) => request<{ ok: true }>(`/jobs/${id}/cancel`, { method: "POST" }),
+  filePreview: (id: string, signal?: AbortSignal) => request<FilePreviewMetadata>(
+    `/files/${encodeURIComponent(id)}/preview`, { signal },
+  ),
+  fileText: async (file: WorkFile, signal?: AbortSignal) => {
+    const response = await fetch(fileUrl(file), { credentials: "same-origin", signal });
+    const body = await response.text();
+    if (!response.ok) {
+      let message = `文件读取失败 (${response.status})`;
+      try {
+        const parsed = JSON.parse(body) as { error?: unknown };
+        if (typeof parsed.error === "string") message = parsed.error;
+      } catch { /* A non-JSON error body keeps the generic status message. */ }
+      throw new Error(message);
+    }
+    return body.replace(/^\uFEFF/, "");
+  },
 };
 
 export function fileUrl(file: WorkFile, download = false): string {

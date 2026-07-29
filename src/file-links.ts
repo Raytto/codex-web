@@ -1,10 +1,12 @@
-import { fileUrl, type WorkFile } from "./api";
+import { BASE_PATH, fileUrl, type WorkFile } from "./api";
 
 export type ResolvedMessageLink =
+  | { kind: "preview"; href: string }
   | { kind: "download"; href: string }
   | { kind: "unavailable" }
   | { kind: "regular"; href: string };
 
+export type FileReaderKind = "markdown" | "html";
 function decodePath(value: string): string {
   let decoded = value.trim().replace(/^<|>$/g, "");
   for (let index = 0; index < 2; index += 1) {
@@ -41,9 +43,32 @@ export function isLocalMarkdownUrl(url: string): boolean {
 }
 
 export function isBrowserPreviewable(file: WorkFile): boolean {
-  return file.mime_type.startsWith("image/")
-    || file.mime_type === "application/pdf"
-    || /^text\/(?:plain|markdown|csv)/.test(file.mime_type);
+  const mimeType = file.mime_type.split(";", 1)[0].trim().toLowerCase();
+  return mimeType.startsWith("image/")
+    || mimeType === "application/pdf"
+    || /^text\/(?:plain|csv)$/.test(mimeType);
+}
+
+export function fileReaderKind(file: Pick<WorkFile, "original_name" | "mime_type">): FileReaderKind | null {
+  const mimeType = file.mime_type.split(";", 1)[0].trim().toLowerCase();
+  const extension = file.original_name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+  if (mimeType === "text/markdown" || [".md", ".markdown"].includes(extension)) return "markdown";
+  if (mimeType === "text/html" || [".html", ".htm"].includes(extension)) return "html";
+  return null;
+}
+
+export function filePreviewUrl(file: Pick<WorkFile, "id">): string {
+  return `${BASE_PATH}/files/${encodeURIComponent(file.id)}/preview`;
+}
+
+export function filePreviewIdFromPath(pathname: string): string | null {
+  const match = pathname.match(/\/files\/([^/]+)\/preview\/?$/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 export function resolveMessageFileLink(href: string | undefined, files: WorkFile[]): ResolvedMessageLink {
@@ -60,7 +85,11 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
   const basename = folded.split("/").pop() ?? "";
   const named = candidates.find((candidate) => candidate.name && basename === candidate.name);
   const matched = exact ?? named;
-  if (matched) return { kind: "download", href: fileUrl(matched.file, true) };
+  if (matched) {
+    return fileReaderKind(matched.file)
+      ? { kind: "preview", href: filePreviewUrl(matched.file) }
+      : { kind: "download", href: fileUrl(matched.file, true) };
+  }
   if (/^sandbox:/i.test(href) || isLocalMachinePath(href, normalized) || /^(?:outputs|uploads)\//i.test(normalized)) return { kind: "unavailable" };
   return { kind: "regular", href };
 }

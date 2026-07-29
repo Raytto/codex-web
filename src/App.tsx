@@ -3,12 +3,12 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowUp, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
+  Archive, ArrowLeft, ArrowUp, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
   RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
 import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
-import { isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
+import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
 import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
@@ -23,6 +23,7 @@ import { formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
+const FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
 
 type DraftSaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
 type DraftUpload = { id: string; name: string };
@@ -37,6 +38,11 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readStoredThemePreference());
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
+  const previewFileId = filePreviewIdFromPath(window.location.pathname);
+  const expireSession = useCallback(() => {
+    setCsrf();
+    setSession({ authenticated: false });
+  }, []);
 
   useEffect(() => {
     api.session().then((value) => { setCsrf(value.csrfToken); setSession(value); }).finally(() => setLoading(false));
@@ -55,6 +61,7 @@ export default function App() {
 
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
+  if (previewFileId) return <FilePreviewPage fileId={previewFileId} onSessionExpired={expireSession} />;
   return <Workspace session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
 }
 
@@ -82,6 +89,116 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
         <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" size={18} /> : "登录"}</button>
       </form>
       <p className="privacy-note">任务与文件仅在你的本机处理</p>
+    </section>
+  </main>;
+}
+
+function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessionExpired: () => void }) {
+  const [file, setFile] = useState<WorkFile | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const readerKind = file ? fileReaderKind(file) : null;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setError("");
+    setContent(null);
+    void (async () => {
+      try {
+        const metadata = await api.filePreview(fileId, controller.signal);
+        if (controller.signal.aborted) return;
+        setFile(metadata.file);
+        if (!fileReaderKind(metadata.file)) {
+          setError("这个文件不支持站内阅读，请下载后打开。");
+          return;
+        }
+        if (metadata.file.size > FILE_READER_MAX_BYTES) {
+          setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 5 MB 的移动端在线阅读上限，请直接下载。`);
+          return;
+        }
+        const text = await api.fileText(metadata.file, controller.signal);
+        if (!controller.signal.aborted) setContent(text);
+      } catch (reason) {
+        if (controller.signal.aborted) return;
+        const message = reason instanceof Error ? reason.message : "文件读取失败";
+        setError(message);
+        if (message === "请先登录。") onSessionExpired();
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [fileId, onSessionExpired]);
+
+  useEffect(() => {
+    let checking = false;
+    async function verifySession() {
+      if (checking) return;
+      checking = true;
+      try {
+        const current = await api.session();
+        if (!current.authenticated) {
+          setContent(null);
+          setFile(null);
+          onSessionExpired();
+        }
+      } catch {
+        // A transient network failure must not clear an otherwise valid reader.
+      } finally {
+        checking = false;
+      }
+    }
+    const verifyVisibleSession = () => {
+      if (!document.hidden) void verifySession();
+    };
+    const interval = window.setInterval(() => void verifySession(), 60_000);
+    window.addEventListener("focus", verifyVisibleSession);
+    document.addEventListener("visibilitychange", verifyVisibleSession);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", verifyVisibleSession);
+      document.removeEventListener("visibilitychange", verifyVisibleSession);
+    };
+  }, [onSessionExpired]);
+
+  const download = file ? fileUrl(file, true) : "";
+  return <main className={`file-preview-page ${readerKind ?? ""}`}>
+    <header className="file-preview-header">
+      <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
+      <div className="file-preview-title">
+        <FileText size={18} />
+        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? "Markdown 阅读" : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
+      </div>
+      {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
+    </header>
+    <section className="file-preview-body">
+      {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
+      {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
+      {!loading && !error && content !== null && readerKind === "markdown" && <div className="file-preview-scroll">
+        <article className="file-reader-markdown markdown">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            skipHtml
+            urlTransform={defaultUrlTransform}
+            components={{
+              a: ({ href, children }) => href?.startsWith("#")
+                ? <a href={href}>{children}</a>
+                : <a href={href} target="_blank" rel="noreferrer">{children}</a>,
+              img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
+              table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
+            }}
+          >{content}</ReactMarkdown>
+        </article>
+      </div>}
+      {!loading && !error && content !== null && readerKind === "html" && <iframe
+        className="file-reader-html"
+        title={file?.original_name || "HTML 文件预览"}
+        sandbox="allow-popups allow-popups-to-escape-sandbox"
+        referrerPolicy="no-referrer"
+        srcDoc={content}
+      />}
     </section>
   </main>;
 }
@@ -1029,6 +1146,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
             urlTransform={(url) => isLocalMarkdownUrl(url) ? url : defaultUrlTransform(url)}
             components={{ a: ({ href, children }) => {
               const resolved = resolveMessageFileLink(href, message.files);
+              if (resolved.kind === "preview") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
               if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
               if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
               return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
@@ -1105,10 +1223,13 @@ function formatActivityTime(value: string): string {
 
 function FileCard({ file }: { file: WorkFile }) {
   const icon = file.mime_type.startsWith("image/") ? <FileImage size={20} /> : <FileIcon size={20} />;
+  const reader = fileReaderKind(file);
   const previewable = isBrowserPreviewable(file);
   const body = <>{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
   return <div className="file-card">
-    {previewable
+    {reader
+      ? <a href={filePreviewUrl(file)} target="_blank" rel="noreferrer">{body}</a>
+      : previewable
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
     <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>

@@ -20,7 +20,7 @@ import { listTenantIdentities, tenantIdentityForUser } from "../server/tenant-id
 import { consumeTenantTurnEvents, validateTenantWorkerRequest } from "../server/tenant-worker-execution.js";
 import type { TenantWorkerRunRequest } from "../server/tenant-worker-protocol.js";
 import { isRetryableUpstreamError, runWithTransientRetries } from "../server/retry-policy.js";
-import { isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "../src/file-links.js";
+import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "../src/file-links.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
@@ -656,11 +656,35 @@ test("finished outputs are copied to immutable app storage and legacy rows migra
 });
 
 test("browser preview is limited to formats browsers can display directly", () => {
-  const file = (mime_type: string) => ({ mime_type } as WorkFile);
+  const file = (mime_type: string, original_name = "file.bin") => ({ mime_type, original_name } as WorkFile);
   assert.equal(isBrowserPreviewable(file("image/png")), true);
   assert.equal(isBrowserPreviewable(file("application/pdf")), true);
   assert.equal(isBrowserPreviewable(file("text/plain")), true);
+  assert.equal(isBrowserPreviewable(file("text/markdown")), false);
+  assert.equal(isBrowserPreviewable(file("text/html")), false);
   assert.equal(isBrowserPreviewable(file("application/vnd.openxmlformats-officedocument.presentationml.presentation")), false);
+  assert.equal(fileReaderKind(file("text/markdown; charset=utf-8", "report.bin")), "markdown");
+  assert.equal(fileReaderKind(file("application/octet-stream", "report.markdown")), "markdown");
+  assert.equal(fileReaderKind(file("text/html; charset=utf-8", "report.bin")), "html");
+  assert.equal(fileReaderKind(file("application/octet-stream", "report.htm")), "html");
+  assert.equal(fileReaderKind(file("text/plain", "report.txt")), null);
+  assert.equal(filePreviewUrl({ id: "file id" }), "/codex-web/files/file%20id/preview");
+  assert.equal(filePreviewIdFromPath("/codex-web/files/file%20id/preview"), "file id");
+  assert.equal(filePreviewIdFromPath("/codex-web/files/file%20id/preview/"), "file id");
+  assert.equal(filePreviewIdFromPath("/codex-web/files/file%2/preview"), null);
+  assert.equal(filePreviewIdFromPath("/not-a-preview"), null);
+});
+
+test("rich document readers keep Markdown inert and HTML isolated from the app origin", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*>\{content\}<\/ReactMarkdown>/);
+  assert.match(appSource, /sandbox="allow-popups allow-popups-to-escape-sandbox"/);
+  assert.doesNotMatch(appSource, /sandbox="[^"]*allow-scripts/);
+  assert.doesNotMatch(appSource, /sandbox="[^"]*allow-same-origin/);
+  assert.match(appSource, /window\.setInterval\(\(\) => void verifySession\(\), 60_000\)/);
+  assert.match(styles, /@media \(max-width: 720px\)[\s\S]*\.file-reader-markdown\s*\{[\s\S]*font-size:\s*15px/);
+  assert.match(styles, /\.file-reader-table\s*\{[^}]*overflow-x:\s*auto/);
 });
 
 test("downloaded text files declare UTF-8 for iOS Safari previews", () => {
@@ -812,6 +836,40 @@ test("single-user login and CSRF protection", async (context) => {
   assert.equal(download.headers["cache-control"], "private, no-store");
   assert.match(download.headers["content-disposition"], /^attachment; filename="download\.pptx"; filename\*=UTF-8''/);
   assert.match(download.headers["content-disposition"], /%E9%AB%98%E4%B8%89%E7%94%9F%E7%89%A9/);
+
+  const markdownId = crypto.randomUUID();
+  const markdownName = "在线阅读报告.md";
+  const markdownPath = path.join("outputs", markdownName);
+  const markdownBody = "\uFEFF# 中文报告\n\n正文";
+  fs.writeFileSync(path.join(ensureTenant(tenantRoot, LEGACY_USER_ID).conversations, created.body.conversation.id, markdownPath), markdownBody, "utf8");
+  instance.db.addFile({
+    id: markdownId, conversation_id: created.body.conversation.id, message_id: null,
+    original_name: markdownName, relative_path: markdownPath, mime_type: "text/markdown",
+    size: Buffer.byteLength(markdownBody), kind: "output", created_at: new Date().toISOString(),
+  });
+  const markdownPreview = await agent.get(`/codex-web/api/files/${markdownId}/preview`).expect(200);
+  assert.equal(markdownPreview.headers["cache-control"], "private, no-store");
+  assert.equal(markdownPreview.body.file.original_name, markdownName);
+  assert.equal(markdownPreview.body.file.mime_type, "text/markdown");
+  assert.equal(markdownPreview.body.file.conversation_id, undefined);
+  const markdownRaw = await agent.get(`/codex-web/api/files/${markdownId}`).expect(200);
+  assert.match(markdownRaw.headers["content-disposition"], /^inline;/);
+  assert.match(markdownRaw.headers["content-type"], /^text\/markdown; charset=utf-8/);
+
+  const htmlId = crypto.randomUUID();
+  const htmlName = "独立报告.html";
+  const htmlPath = path.join("outputs", htmlName);
+  const htmlBody = '<!doctype html><meta charset="utf-8"><h1>报告</h1><script>top.location="/"</script>';
+  fs.writeFileSync(path.join(ensureTenant(tenantRoot, LEGACY_USER_ID).conversations, created.body.conversation.id, htmlPath), htmlBody, "utf8");
+  instance.db.addFile({
+    id: htmlId, conversation_id: created.body.conversation.id, message_id: null,
+    original_name: htmlName, relative_path: htmlPath, mime_type: "text/html",
+    size: Buffer.byteLength(htmlBody), kind: "output", created_at: new Date().toISOString(),
+  });
+  assert.equal((await agent.get(`/codex-web/api/files/${htmlId}/preview`).expect(200)).body.file.original_name, htmlName);
+  const htmlRaw = await agent.get(`/codex-web/api/files/${htmlId}`).expect(200);
+  assert.match(htmlRaw.headers["content-disposition"], /^attachment;/);
+  await request(instance.app).get(`/codex-web/api/files/${markdownId}/preview`).expect(401);
 
   await agent.post(`/codex-web/api/conversations/${created.body.conversation.id}/messages`)
     .set("X-CSRF-Token", login.body.csrfToken)
@@ -1425,6 +1483,8 @@ test("message file links map only registered safe attachments", () => {
   assert.deepEqual(resolveMessageFileLink("sandbox:/mnt/data/not-registered.xlsx", [file]), { kind: "unavailable" });
   assert.deepEqual(resolveMessageFileLink("D:\\secret\\not-registered.xlsx", [file]), { kind: "unavailable" });
   assert.deepEqual(resolveMessageFileLink("outputs/../secret.xlsx", [file]), { kind: "unavailable" });
+  const markdown = { ...file, id: "file-3", original_name: "report.md", relative_path: "deliverables/file-3/report.md", mime_type: "text/markdown" };
+  assert.deepEqual(resolveMessageFileLink("outputs/report.md", [markdown]), { kind: "preview", href: "/codex-web/files/file-3/preview" });
   assert.deepEqual(resolveMessageFileLink("https://example.com/help", [file]), { kind: "regular", href: "https://example.com/help" });
 });
 
