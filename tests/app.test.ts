@@ -678,6 +678,9 @@ test("browser preview is limited to formats browsers can display directly", () =
 test("rich document readers keep Markdown inert and HTML isolated from the app origin", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /reader === "markdown" && <a className="reader-button"/);
+  assert.match(appSource, /reader === "markdown" \|\| previewable[\s\S]*href=\{fileUrl\(file\)\}/);
+  assert.match(styles, /\.reader-button,[\s\S]*\.download-button\s*\{[^}]*border-left:/);
   assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*>\{content\}<\/ReactMarkdown>/);
   assert.match(appSource, /sandbox="allow-popups allow-popups-to-escape-sandbox"/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-scripts/);
@@ -1484,7 +1487,7 @@ test("message file links map only registered safe attachments", () => {
   assert.deepEqual(resolveMessageFileLink("D:\\secret\\not-registered.xlsx", [file]), { kind: "unavailable" });
   assert.deepEqual(resolveMessageFileLink("outputs/../secret.xlsx", [file]), { kind: "unavailable" });
   const markdown = { ...file, id: "file-3", original_name: "report.md", relative_path: "deliverables/file-3/report.md", mime_type: "text/markdown" };
-  assert.deepEqual(resolveMessageFileLink("outputs/report.md", [markdown]), { kind: "preview", href: "/codex-web/files/file-3/preview" });
+  assert.deepEqual(resolveMessageFileLink("outputs/report.md", [markdown]), { kind: "raw", href: "/codex-web/api/files/file-3" });
   assert.deepEqual(resolveMessageFileLink("https://example.com/help", [file]), { kind: "regular", href: "https://example.com/help" });
 });
 

@@ -403,7 +403,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-card span { min-width: 0; display: grid; gap: 3px; }
 .file-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .file-card small { color: var(--muted); font-size: 10px; }
+.reader-button,
 .download-button { display: grid; place-items: center; padding: 10px; border-left: 1px solid #dfe2ec; color: var(--indigo); }
+.reader-button { background: rgba(72, 85, 156, .035); }
+.reader-button:hover { background: var(--indigo-pale); }
 .file-preview-page { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; background: var(--canvas); }
 .file-preview-header {
   min-width: 0;
@@ -817,7 +820,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .file-card,
 :root[data-theme="dark"] .activity-card { border-color: #3d3f47; background: #27282d; box-shadow: 0 7px 22px rgba(0, 0, 0, .14); }
 :root[data-theme="dark"] .file-card:hover { border-color: #5d6275; background: #2e3036; }
+:root[data-theme="dark"] .reader-button,
 :root[data-theme="dark"] .download-button { border-left-color: #44464e; }
+:root[data-theme="dark"] .reader-button { background: rgba(185, 195, 255, .04); }
+:root[data-theme="dark"] .reader-button:hover { background: #303342; }
 :root[data-theme="dark"] .file-preview-header { border-bottom-color: #303238; background: rgba(23, 24, 27, .94); }
 :root[data-theme="dark"] .file-preview-back,
 :root[data-theme="dark"] .file-preview-download,

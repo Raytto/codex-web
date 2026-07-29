@@ -2,6 +2,7 @@ import { BASE_PATH, fileUrl, type WorkFile } from "./api";
 
 export type ResolvedMessageLink =
   | { kind: "preview"; href: string }
+  | { kind: "raw"; href: string }
   | { kind: "download"; href: string }
   | { kind: "unavailable" }
   | { kind: "regular"; href: string };
@@ -86,9 +87,10 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
   const named = candidates.find((candidate) => candidate.name && basename === candidate.name);
   const matched = exact ?? named;
   if (matched) {
-    return fileReaderKind(matched.file)
-      ? { kind: "preview", href: filePreviewUrl(matched.file) }
-      : { kind: "download", href: fileUrl(matched.file, true) };
+    const readerKind = fileReaderKind(matched.file);
+    if (readerKind === "html") return { kind: "preview", href: filePreviewUrl(matched.file) };
+    if (readerKind === "markdown") return { kind: "raw", href: fileUrl(matched.file) };
+    return { kind: "download", href: fileUrl(matched.file, true) };
   }
   if (/^sandbox:/i.test(href) || isLocalMachinePath(href, normalized) || /^(?:outputs|uploads)\//i.test(normalized)) return { kind: "unavailable" };
   return { kind: "regular", href };

@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowLeft, ArrowUp, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
+  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
   RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
@@ -1147,6 +1147,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
             components={{ a: ({ href, children }) => {
               const resolved = resolveMessageFileLink(href, message.files);
               if (resolved.kind === "preview") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+              if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
               if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
               if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
               return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
@@ -1227,11 +1228,12 @@ function FileCard({ file }: { file: WorkFile }) {
   const previewable = isBrowserPreviewable(file);
   const body = <>{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
   return <div className="file-card">
-    {reader
+    {reader === "html"
       ? <a href={filePreviewUrl(file)} target="_blank" rel="noreferrer">{body}</a>
-      : previewable
+      : reader === "markdown" || previewable
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
+    {reader === "markdown" && <a className="reader-button" href={filePreviewUrl(file)} target="_blank" rel="noreferrer" title="阅读模式" aria-label={`阅读 ${file.original_name}`}><BookOpen size={16} /></a>}
     <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>
   </div>;
 }
