@@ -24,7 +24,7 @@ import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreview
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
-import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
+import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection, visibleSelectionBounds } from "../src/ask-agent-selection.js";
 import { mergeMessagePages, preservePrependedScrollTop } from "../src/message-history.js";
 import { resolveScrollFollow } from "../src/scroll-follow.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
@@ -175,6 +175,8 @@ test("selected message text can be quoted into a focused Agent question", () => 
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /data-agent-selectable="true"/);
   assert.match(appSource, /document\.addEventListener\("selectionchange", update\)/);
+  assert.match(appSource, /messages\?\.addEventListener\("scroll", update/);
+  assert.doesNotMatch(appSource, /messages\?\.addEventListener\("scroll", clear/);
   assert.match(appSource, /询问 Agent/);
   assert.match(appSource, /className="ask-agent-reference"/);
   assert.match(appSource, /setAskAgentQuote\(normalized\.slice/);
@@ -189,6 +191,17 @@ test("selected message text can be quoted into a focused Agent question", () => 
   assert.match(styles, /:root\[data-theme="dark"\] \.ask-agent-reference/);
 });
 
+test("selected message text stays anchored only while it intersects the message viewport", () => {
+  const viewport = { left: 100, top: 50, right: 500, bottom: 450 };
+  assert.deepEqual(visibleSelectionBounds([
+    { left: 80, top: 40, right: 220, bottom: 80 },
+    { left: 140, top: 90, right: 540, bottom: 120 },
+  ], viewport), { left: 100, top: 50, right: 500, bottom: 120 });
+  assert.equal(visibleSelectionBounds([
+    { left: 120, top: -40, right: 300, bottom: 40 },
+    { left: 120, top: 460, right: 300, bottom: 490 },
+  ], viewport), null);
+});
 test("pending queue stays translucent and vertically compact in both themes", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");

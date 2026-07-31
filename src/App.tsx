@@ -15,7 +15,7 @@ import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
 import { resolveAccountIdentity } from "./account-identity";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
 import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, type ThemePreference } from "./theme";
-import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection } from "./ask-agent-selection";
+import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
@@ -1107,23 +1107,35 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
         const start = selectableParent(range.startContainer);
         const end = selectableParent(range.endContainer);
         if (!start || start !== end || !chatRef.current?.contains(start)) return clear();
-        const rect = range.getBoundingClientRect();
-        if (!rect.width && !rect.height) return clear();
-        const horizontalInset = 72;
-        const left = Math.min(window.innerWidth - horizontalInset, Math.max(horizontalInset, rect.left + rect.width / 2));
-        const below = window.innerHeight - rect.bottom >= 64;
-        setAskSelection({ text, left, top: below ? rect.bottom + 10 : rect.top - 10, below });
+        const messages = messagesRef.current;
+        if (!messages) return clear();
+        const messagesRect = messages.getBoundingClientRect();
+        const viewport = {
+          left: Math.max(0, messagesRect.left),
+          top: Math.max(0, messagesRect.top),
+          right: Math.min(window.innerWidth, messagesRect.right),
+          bottom: Math.min(window.innerHeight, messagesRect.bottom),
+        };
+        const rect = visibleSelectionBounds(Array.from(range.getClientRects()), viewport);
+        if (!rect) return clear();
+        const horizontalInset = Math.min(72, (viewport.right - viewport.left) / 2);
+        const left = Math.min(viewport.right - horizontalInset, Math.max(viewport.left + horizontalInset, rect.left + (rect.right - rect.left) / 2));
+        const below = viewport.bottom - rect.bottom >= 56;
+        const top = below
+          ? Math.min(rect.bottom + 10, viewport.bottom - 46)
+          : Math.max(rect.top - 10, viewport.top + 46);
+        setAskSelection({ text, left, top, below });
       });
     };
     document.addEventListener("selectionchange", update);
-    window.addEventListener("resize", clear);
+    window.addEventListener("resize", update);
     const messages = messagesRef.current;
-    messages?.addEventListener("scroll", clear, { passive: true });
+    messages?.addEventListener("scroll", update, { passive: true });
     return () => {
       window.cancelAnimationFrame(frame);
       document.removeEventListener("selectionchange", update);
-      window.removeEventListener("resize", clear);
-      messages?.removeEventListener("scroll", clear);
+      window.removeEventListener("resize", update);
+      messages?.removeEventListener("scroll", update);
     };
   }, [detail.conversation.id]);
 
