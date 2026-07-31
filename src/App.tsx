@@ -18,6 +18,7 @@ import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, 
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
+import { prepareMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 
@@ -98,7 +99,13 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [mathPlugins, setMathPlugins] = useState<{
+    remarkMath: typeof import("remark-math")["default"];
+    rehypeKatex: typeof import("rehype-katex")["default"];
+  } | null>(null);
+  const [mathLoadFailed, setMathLoadFailed] = useState(false);
   const readerKind = file ? fileReaderKind(file) : null;
+  const preparedMath = useMemo(() => content === null ? null : prepareMarkdownMath(content), [content]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -163,13 +170,29 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
     };
   }, [onSessionExpired]);
 
+  useEffect(() => {
+    if (!preparedMath?.hasMath || mathPlugins || mathLoadFailed) return;
+    let active = true;
+    void Promise.all([
+      import("remark-math"),
+      import("rehype-katex"),
+      import("katex/dist/katex.min.css"),
+    ]).then(([remarkModule, rehypeModule]) => {
+      if (active) setMathPlugins({ remarkMath: remarkModule.default, rehypeKatex: rehypeModule.default });
+    }).catch(() => {
+      if (active) setMathLoadFailed(true);
+    });
+    return () => { active = false; };
+  }, [mathLoadFailed, mathPlugins, preparedMath?.hasMath]);
+
   const download = file ? fileUrl(file, true) : "";
+  const mathLoading = Boolean(preparedMath?.hasMath && !mathPlugins && !mathLoadFailed);
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
       <div className="file-preview-title">
         <FileText size={18} />
-        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? "Markdown 阅读" : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
+        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? `Markdown 阅读${mathLoading ? " · 正在排版公式" : mathLoadFailed ? " · 公式组件加载失败" : ""}` : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
       </div>
       {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
     </header>
@@ -179,7 +202,8 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
       {!loading && !error && content !== null && readerKind === "markdown" && <div className="file-preview-scroll">
         <article className="file-reader-markdown markdown">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={mathPlugins ? [remarkGfm, mathPlugins.remarkMath] : [remarkGfm]}
+            rehypePlugins={mathPlugins ? [[mathPlugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
             skipHtml
             urlTransform={defaultUrlTransform}
             components={{
@@ -189,7 +213,7 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
               img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
               table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
             }}
-          >{content}</ReactMarkdown>
+          >{preparedMath?.content ?? content}</ReactMarkdown>
         </article>
       </div>}
       {!loading && !error && content !== null && readerKind === "html" && <iframe

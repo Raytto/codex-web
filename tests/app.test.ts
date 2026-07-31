@@ -24,6 +24,7 @@ import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreview
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
+import { prepareMarkdownMath } from "../src/markdown-math.js";
 import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection, visibleSelectionBounds } from "../src/ask-agent-selection.js";
 import { mergeMessagePages, preservePrependedScrollTop } from "../src/message-history.js";
 import { resolveScrollFollow } from "../src/scroll-follow.js";
@@ -694,13 +695,41 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.match(appSource, /reader === "markdown" && <a className="reader-button"/);
   assert.match(appSource, /reader === "markdown" \|\| previewable[\s\S]*href=\{fileUrl\(file\)\}/);
   assert.match(styles, /\.reader-button,[\s\S]*\.download-button\s*\{[^}]*border-left:/);
-  assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*>\{content\}<\/ReactMarkdown>/);
+  assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*preparedMath\?\.content \?\? content/);
+  assert.match(appSource, /import\("remark-math"\)/);
+  assert.match(appSource, /import\("rehype-katex"\)/);
+  assert.match(appSource, /import\("katex\/dist\/katex\.min\.css"\)/);
+  assert.match(appSource, /rehypePlugins=\{mathPlugins/);
   assert.match(appSource, /sandbox="allow-popups allow-popups-to-escape-sandbox"/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-scripts/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-same-origin/);
   assert.match(appSource, /window\.setInterval\(\(\) => void verifySession\(\), 60_000\)/);
   assert.match(styles, /@media \(max-width: 720px\)[\s\S]*\.file-reader-markdown\s*\{[\s\S]*font-size:\s*15px/);
   assert.match(styles, /\.file-reader-table\s*\{[^}]*overflow-x:\s*auto/);
+  assert.match(styles, /\.file-reader-markdown \.katex-display\s*\{[^}]*overflow-x:\s*auto/);
+});
+
+test("Markdown math preparation supports LaTeX delimiters without rewriting code", () => {
+  const prepared = prepareMarkdownMath([
+    "行内公式：\\(P(D\\mid +)\\)。",
+    "",
+    "\\[",
+    "P(D\\mid +)=\\frac{P(+\\mid D)P(D)}{P(+)}",
+    "\\]",
+    "",
+    "`\\(literal\\)`",
+    "",
+    "```tex",
+    "\\[not rendered\\]",
+    "```",
+  ].join("\n"));
+  assert.equal(prepared.hasMath, true);
+  assert.ok(prepared.content.includes("行内公式：$P(D\\mid +)$。"));
+  assert.ok(prepared.content.includes("\n$$\nP(D\\mid +)=\\frac"));
+  assert.ok(prepared.content.includes("P(+)}\n$$"));
+  assert.ok(prepared.content.includes("`\\(literal\\)`"));
+  assert.ok(prepared.content.includes("```tex\n\\[not rendered\\]\n```"));
+  assert.equal(prepareMarkdownMath("价格是 $5，代码为 `x = $y$`。").hasMath, false);
 });
 
 test("downloaded text files declare UTF-8 for iOS Safari previews", () => {
