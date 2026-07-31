@@ -447,6 +447,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       latestJob,
       jobEvents,
       rolloutBytes,
+      contextUsage: conversation.context_input_tokens === null
+        ? null
+        : {
+            inputTokens: conversation.context_input_tokens,
+            modelContextWindow: conversation.context_window_tokens,
+            updatedAt: conversation.context_usage_updated_at,
+          },
+      packageQuota: db.getConversationCodexQuota(conversation.id),
     });
   });
 
@@ -954,7 +962,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         id: file.id,
         original_name: file.original_name,
         relative_path: file.relative_path,
-        source_path: file.source_path,
         mime_type: file.mime_type,
         size: file.size,
         kind: file.kind,

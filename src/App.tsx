@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen,
+  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
   RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
@@ -20,7 +20,7 @@ import { mergeMessagePages, preservePrependedScrollTop } from "./message-history
 import { resolveScrollFollow } from "./scroll-follow";
 import { prepareMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
-import { formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
+import { formatContextUsage, formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
@@ -1170,7 +1170,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
     window.getSelection()?.removeAllRanges();
   }
 
-  return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span>{shouldWarnAboutRollout(detail.rolloutBytes) && <details className="rollout-warning"><summary className="icon-button" aria-label="会话历史容量提醒"><TriangleAlert size={19} /><span /></summary><div className="rollout-warning-panel"><strong>会话历史已达 {formatRolloutBytes(detail.rolloutBytes!)}</strong><p>超长会话会增加加载和续接成本。建议完成当前任务后归档，并新建任务继续。</p></div></details>}<button className="icon-button" aria-label="更多"><MoreHorizontal size={20} /></button></div></div>
+  return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span>{shouldWarnAboutRollout(detail.rolloutBytes) && <details className="rollout-warning"><summary className="icon-button" aria-label="会话历史容量提醒"><TriangleAlert size={19} /><span /></summary><div className="rollout-warning-panel"><strong>会话历史已达 {formatRolloutBytes(detail.rolloutBytes!)}</strong><p>超长会话会增加加载和续接成本。建议完成当前任务后归档，并新建任务继续。</p></div></details>}<details className="capacity-menu"><summary className="icon-button" aria-label="会话容量" title="会话容量"><MoreHorizontal size={20} /></summary><div className="capacity-menu-panel"><div className="capacity-menu-row" title="Codex 本地会话记录的磁盘占用"><HardDrive size={16} /><span><small>Rollout 文件</small><strong>{detail.rolloutBytes === null ? "暂无数据" : formatRolloutBytes(detail.rolloutBytes)}</strong></span></div><div className="capacity-menu-row" title="最近一次请求使用的输入上下文 / 当前模型上下文窗口"><Bot size={16} /><span><small>Codex 上下文</small><strong>{detail.contextUsage ? formatContextUsage(detail.contextUsage.inputTokens, detail.contextUsage.modelContextWindow) : "暂无数据"}</strong></span></div><div className="capacity-menu-row" title="当前 Codex 套餐周期的剩余额度"><Gauge size={16} /><span><small>套餐额度</small><strong>{detail.packageQuota ? `${Math.round(detail.packageQuota.remainingPercent)}%` : "暂无数据"}</strong></span></div></div></details></div></div>
     <div ref={messagesRef} className="messages" onScroll={onMessagesScroll} style={{ "--chat-font-size": `${chatFontSize}px` } as CSSProperties}>
       {detail.messagePage.hasMore && <div className="history-loader" aria-live="polite">{loadingOlderMessages ? <><LoaderCircle className="spin" size={14} /><span>正在加载更早消息…</span></> : <span>向上滚动加载更早消息</span>}</div>}
       {detail.messages.map((message) => <article className={`message ${message.role}`} key={message.id}>

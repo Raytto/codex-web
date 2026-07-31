@@ -10,6 +10,18 @@ type AppServerCallbacks = {
   signal: AbortSignal;
   onThreadStarted(threadId: string): void;
   onProgress(payload: unknown): void;
+  onContextUsage?(usage: ContextTokenUsage): void;
+  onQuotaUsage?(usage: CodexQuotaUsage): void;
+};
+
+export type ContextTokenUsage = {
+  threadId: string;
+  inputTokens: number;
+  modelContextWindow: number | null;
+};
+
+export type CodexQuotaUsage = {
+  remainingPercent: number;
 };
 
 export type AppServerTurnOptions = {
@@ -116,6 +128,12 @@ class AppServerTurnClient {
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       this.notify("initialized");
+      void this.request("account/rateLimits/read", {})
+        .then((result) => {
+          const usage = normalizeCodexQuotaUsage(result);
+          if (usage) this.callbacks.onQuotaUsage?.(usage);
+        })
+        .catch(() => undefined);
       const common = {
         model: this.options.model,
         cwd: this.options.cwd,
@@ -199,6 +217,16 @@ class AppServerTurnClient {
       this.callbacks.onProgress({ kind: "status", label: "已开始分析" });
       return;
     }
+    if (message.method === "thread/tokenUsage/updated") {
+      const usage = normalizeContextTokenUsage(params);
+      if (usage) this.callbacks.onContextUsage?.(usage);
+      return;
+    }
+    if (message.method === "account/rateLimits/updated") {
+      const usage = normalizeCodexQuotaUsage(params);
+      if (usage) this.callbacks.onQuotaUsage?.(usage);
+      return;
+    }
     if (message.method === "error") {
       const error = params.error as { message?: string } | undefined;
       const detail = error?.message || "上游处理发生错误";
@@ -243,6 +271,42 @@ class AppServerTurnClient {
     if (this.child.stdin.writable) this.child.stdin.end();
     if (!this.child.killed) this.child.kill("SIGTERM");
   }
+}
+
+export function normalizeContextTokenUsage(params: JsonObject): ContextTokenUsage | null {
+  const threadId = typeof params.threadId === "string" ? params.threadId : "";
+  const tokenUsage = params.tokenUsage && typeof params.tokenUsage === "object"
+    ? params.tokenUsage as JsonObject
+    : null;
+  const last = tokenUsage?.last && typeof tokenUsage.last === "object"
+    ? tokenUsage.last as JsonObject
+    : null;
+  const inputTokens = finiteNonNegativeInteger(last?.inputTokens);
+  if (!threadId || inputTokens === null) return null;
+  const modelContextWindow = finitePositiveInteger(tokenUsage?.modelContextWindow);
+  return { threadId, inputTokens, modelContextWindow };
+}
+
+export function normalizeCodexQuotaUsage(value: unknown): CodexQuotaUsage | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as JsonObject;
+  const rateLimits = source.rateLimits && typeof source.rateLimits === "object"
+    ? source.rateLimits as JsonObject
+    : source;
+  const primary = rateLimits.primary && typeof rateLimits.primary === "object"
+    ? rateLimits.primary as JsonObject
+    : null;
+  const usedPercent = primary?.usedPercent;
+  if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) return null;
+  return { remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent)) };
+}
+
+function finiteNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : null;
+}
+
+function finitePositiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : null;
 }
 
 export function startAppServerTurn(options: AppServerTurnOptions, callbacks: AppServerCallbacks): AppServerTurnExecution {

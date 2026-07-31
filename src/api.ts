@@ -70,6 +70,8 @@ export type ConversationDetail = {
   latestJob: Job | null;
   jobEvents: JobEvent[];
   rolloutBytes: number | null;
+  contextUsage: { inputTokens: number; modelContextWindow: number | null; updatedAt: string | null } | null;
+  packageQuota: { remainingPercent: number; updatedAt: string } | null;
 };
 export type MessagePage = { hasMore: boolean; nextCursor: string | null };
 export type ConversationMessagesPage = { messages: Message[]; messagePage: MessagePage };

@@ -11,6 +11,8 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - A responsive React chat interface for Codex CLI
 - Server-persistent queued prompts with reorder, edit, delete, and steer actions
 - Persistent attachments and generated deliverables
+- Authenticated Markdown reading, sandboxed HTML previews, explicit UTF-8 text responses, and direct original-file downloads
+- Lazy-loaded LaTeX math rendering in Markdown readers, with fenced and inline code left untouched
 - Server-persistent unsent text, quotes, and attachments, restored across conversations, browsers, and devices
 - Codex thread persistence across browser restarts
 - Soft-deleted conversation audit records while workspace files are removed
@@ -24,10 +26,12 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Unread-result markers for completed conversations until their detail is viewed
 - Distinct running and queued indicators, plus a stable overflow menu for task actions
 - A 500 MiB Codex rollout warning that suggests archiving very long conversations
+- Per-conversation context-window usage and current Codex package quota in the capacity menu
 - Light, dark, and system-following appearance modes
 - Select message text and attach it as a removable, server-persisted reference to a new Agent question
 - Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
+- Bounded automatic retries for transient voice-transcription connection and upstream failures
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
 - A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
 - A dedicated Unix identity for the Codex worker inside the container

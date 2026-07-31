@@ -1,5 +1,6 @@
 import type { AgentSelection } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
+import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 
 export type TenantWorkerRunRequest = {
   jobId: string;
@@ -25,6 +26,8 @@ export type TenantWorkerRunRequest = {
 
 export type TenantWorkerEvent =
   | { type: "thread_started"; threadId: string }
+  | { type: "context_usage"; usage: ContextTokenUsage }
+  | { type: "quota_usage"; usage: CodexQuotaUsage }
   | { type: "progress"; payload: unknown }
   | { type: "steer_completed"; requestId: string; turnId: string }
   | { type: "steer_failed"; requestId: string; message: string }

@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { isDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName } from "./paths.js";
+import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -30,6 +31,9 @@ export type ConversationRow = {
   has_unread_result: number;
   has_pending_work: number;
   rollout_bytes: number | null;
+  context_input_tokens: number | null;
+  context_window_tokens: number | null;
+  context_usage_updated_at: string | null;
   archived_at: string | null;
   deleted_at: string | null;
   created_at: string;
@@ -129,6 +133,11 @@ export type StoredAgentSelection = {
   reasoningEffort: string;
 };
 
+export type CodexQuotaSnapshot = {
+  remainingPercent: number;
+  updatedAt: string;
+};
+
 type LegacyUserSeed = { username: string; passwordHash: string; displayName?: string };
 
 const conversationSelect = `
@@ -202,9 +211,17 @@ export class AppDatabase {
         status TEXT NOT NULL DEFAULT 'idle',
         has_unread_result INTEGER NOT NULL DEFAULT 0,
         rollout_bytes INTEGER,
+        context_input_tokens INTEGER,
+        context_window_tokens INTEGER,
+        context_usage_updated_at TEXT,
         archived_at TEXT,
         deleted_at TEXT,
         created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS codex_quota_snapshots (
+        scope_id TEXT PRIMARY KEY,
+        remaining_percent REAL NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS messages (
@@ -294,6 +311,9 @@ export class AppDatabase {
     if (!conversationColumns.has("reasoning_effort")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT");
     if (!conversationColumns.has("has_unread_result")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN has_unread_result INTEGER NOT NULL DEFAULT 0");
     if (!conversationColumns.has("rollout_bytes")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN rollout_bytes INTEGER");
+    if (!conversationColumns.has("context_input_tokens")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN context_input_tokens INTEGER");
+    if (!conversationColumns.has("context_window_tokens")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN context_window_tokens INTEGER");
+    if (!conversationColumns.has("context_usage_updated_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN context_usage_updated_at TEXT");
     if (!conversationColumns.has("archived_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN archived_at TEXT");
     if (!conversationColumns.has("deleted_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN deleted_at TEXT");
     if (!conversationColumns.has("title_source")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'");
@@ -426,7 +446,15 @@ export class AppDatabase {
   updateConversation(id: string, fields: { title?: string; titleSource?: ConversationTitleSource; codexThreadId?: string; agentSelection?: StoredAgentSelection; status?: "idle" | "running" }): void {
     if (fields.title !== undefined) this.sqlite.prepare("UPDATE conversations SET title=?, title_source=COALESCE(?,title_source), updated_at=? WHERE id=?")
       .run(fields.title, fields.titleSource ?? null, new Date().toISOString(), id);
-    if (fields.codexThreadId !== undefined) this.sqlite.prepare("UPDATE conversations SET codex_thread_id=?, updated_at=? WHERE id=?").run(fields.codexThreadId, new Date().toISOString(), id);
+    if (fields.codexThreadId !== undefined) this.sqlite.prepare(`
+      UPDATE conversations SET
+        context_input_tokens=CASE WHEN codex_thread_id=? THEN context_input_tokens ELSE NULL END,
+        context_window_tokens=CASE WHEN codex_thread_id=? THEN context_window_tokens ELSE NULL END,
+        context_usage_updated_at=CASE WHEN codex_thread_id=? THEN context_usage_updated_at ELSE NULL END,
+        codex_thread_id=?,
+        updated_at=?
+      WHERE id=?
+    `).run(fields.codexThreadId, fields.codexThreadId, fields.codexThreadId, fields.codexThreadId, new Date().toISOString(), id);
     if (fields.agentSelection !== undefined) this.sqlite.prepare("UPDATE conversations SET agent_model=?, reasoning_effort=?, updated_at=? WHERE id=?").run(
       fields.agentSelection.model, fields.agentSelection.reasoningEffort, new Date().toISOString(), id,
     );
@@ -461,6 +489,47 @@ export class AppDatabase {
   setConversationRolloutBytes(id: string, bytes: number | null): void {
     const normalized = bytes === null || !Number.isFinite(bytes) ? null : Math.max(0, Math.trunc(bytes));
     this.sqlite.prepare("UPDATE conversations SET rollout_bytes=? WHERE id=? AND deleted_at IS NULL").run(normalized, id);
+  }
+
+  setConversationContextUsage(id: string, usage: ContextTokenUsage): boolean {
+    const inputTokens = Number.isFinite(usage.inputTokens) && usage.inputTokens >= 0
+      ? Math.trunc(usage.inputTokens)
+      : null;
+    const modelContextWindow = typeof usage.modelContextWindow === "number"
+      && Number.isFinite(usage.modelContextWindow)
+      && usage.modelContextWindow > 0
+      ? Math.trunc(usage.modelContextWindow)
+      : null;
+    if (!usage.threadId || inputTokens === null) return false;
+    const result = this.sqlite.prepare(`
+      UPDATE conversations SET context_input_tokens=?,context_window_tokens=?,context_usage_updated_at=?
+      WHERE id=? AND codex_thread_id=? AND deleted_at IS NULL
+    `).run(inputTokens, modelContextWindow, new Date().toISOString(), id, usage.threadId);
+    return result.changes > 0;
+  }
+
+  setConversationCodexQuota(id: string, usage: CodexQuotaUsage): boolean {
+    const remainingPercent = typeof usage.remainingPercent === "number" && Number.isFinite(usage.remainingPercent)
+      ? Math.max(0, Math.min(100, usage.remainingPercent))
+      : null;
+    if (remainingPercent === null) return false;
+    const conversation = this.getConversation(id);
+    if (!conversation) return false;
+    const scopeId = `user:${conversation.user_id}`;
+    this.sqlite.prepare(`
+      INSERT INTO codex_quota_snapshots(scope_id,remaining_percent,updated_at)
+      VALUES(?,?,?)
+      ON CONFLICT(scope_id) DO UPDATE SET remaining_percent=excluded.remaining_percent,updated_at=excluded.updated_at
+    `).run(scopeId, remainingPercent, new Date().toISOString());
+    return true;
+  }
+
+  getConversationCodexQuota(id: string): CodexQuotaSnapshot | null {
+    const conversation = this.getConversation(id);
+    if (!conversation) return null;
+    const row = this.sqlite.prepare("SELECT remaining_percent,updated_at FROM codex_quota_snapshots WHERE scope_id=?")
+      .get(`user:${conversation.user_id}`) as { remaining_percent: number; updated_at: string } | undefined;
+    return row ? { remainingPercent: row.remaining_percent, updatedAt: row.updated_at } : null;
   }
 
   setAiConversationTitleIfDefault(id: string, title: string): boolean {

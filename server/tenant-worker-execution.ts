@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
-import { startAppServerTurn, type AppServerTurnExecution } from "./app-server-turn.js";
+import { startAppServerTurn, type AppServerTurnExecution, type CodexQuotaUsage, type ContextTokenUsage } from "./app-server-turn.js";
 import { buildCodexEnvironment, buildShellEnvironment, resolvePythonRuntime } from "./python-runtime.js";
 import { summarizeEvent } from "./codex-events.js";
 import type { TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
@@ -10,6 +10,8 @@ type ExecutionCallbacks = {
   signal: AbortSignal;
   onThreadStarted(threadId: string): void;
   onProgress(payload: unknown): void;
+  onContextUsage?(usage: ContextTokenUsage): void;
+  onQuotaUsage?(usage: CodexQuotaUsage): void;
 };
 
 export async function executeTenantTurn(request: TenantWorkerRunRequest, callbacks: ExecutionCallbacks): Promise<string> {

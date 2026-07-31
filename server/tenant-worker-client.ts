@@ -1,11 +1,14 @@
 import crypto from "node:crypto";
 import type { SupervisorToWebMessage, TenantWorkerEvent, TenantWorkerRunRequest, WebToSupervisorMessage } from "./tenant-worker-protocol.js";
+import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 
 type PendingJob = {
   resolve(finalResponse: string): void;
   reject(error: Error): void;
   onThreadStarted(threadId: string): void;
   onProgress(payload: unknown): void;
+  onContextUsage(usage: ContextTokenUsage): void;
+  onQuotaUsage(usage: CodexQuotaUsage): void;
 };
 
 export class TenantWorkerClient {
@@ -24,7 +27,7 @@ export class TenantWorkerClient {
 
   run(
     request: TenantWorkerRunRequest,
-    callbacks: Pick<PendingJob, "onThreadStarted" | "onProgress">,
+    callbacks: Pick<PendingJob, "onThreadStarted" | "onProgress" | "onContextUsage" | "onQuotaUsage">,
   ): Promise<string> {
     if (!process.send || !process.connected) return Promise.reject(new Error("Tenant worker isolation is unavailable"));
     if (this.jobs.has(request.jobId)) return Promise.reject(new Error("Tenant worker job already exists"));
@@ -80,6 +83,8 @@ export class TenantWorkerClient {
 
   private handleEvent(jobId: string, pending: PendingJob, event: TenantWorkerEvent): void {
     if (event.type === "thread_started") pending.onThreadStarted(event.threadId);
+    if (event.type === "context_usage") pending.onContextUsage(event.usage);
+    if (event.type === "quota_usage") pending.onQuotaUsage(event.usage);
     if (event.type === "progress") pending.onProgress(event.payload);
     if (event.type === "steer_completed" || event.type === "steer_failed") {
       const steer = this.steers.get(event.requestId);

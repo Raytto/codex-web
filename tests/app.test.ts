@@ -36,7 +36,8 @@ import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-con
 import { buildProcessJournal } from "../src/process-journal.js";
 import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, detectOptionalAgentCapabilities } from "../server/optional-capabilities.js";
 import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../server/cancellation-summary.js";
-import { formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
+import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
+import { normalizeCodexQuotaUsage, normalizeContextTokenUsage } from "../server/app-server-turn.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -151,6 +152,23 @@ test("rollout capacity warning uses a 500 MiB threshold and readable binary unit
   assert.equal(shouldWarnAboutRollout(ROLLOUT_WARNING_BYTES), true);
   assert.equal(formatRolloutBytes(971_549_720), "926.5 MiB");
   assert.equal(formatRolloutBytes(1.25 * 1024 ** 3), "1.3 GiB");
+});
+
+test("conversation capacity tracks context tokens and remaining Codex quota", () => {
+  assert.deepEqual(normalizeContextTokenUsage({
+    threadId: "thread-1",
+    tokenUsage: { last: { inputTokens: 202_345 }, modelContextWindow: 258_400 },
+  }), { threadId: "thread-1", inputTokens: 202_345, modelContextWindow: 258_400 });
+  assert.equal(normalizeContextTokenUsage({ threadId: "thread-1", tokenUsage: { last: {} } }), null);
+  assert.deepEqual(normalizeCodexQuotaUsage({ rateLimits: { primary: { usedPercent: 56 } } }), { remainingPercent: 44 });
+  assert.deepEqual(normalizeCodexQuotaUsage({ rateLimits: { primary: { usedPercent: 105 } } }), { remainingPercent: 0 });
+  assert.equal(formatContextUsage(202_345, 258_400), "202.3K / 258.4K");
+
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /Rollout 文件[\s\S]*Codex 上下文[\s\S]*套餐额度/);
+  assert.match(appSource, /formatContextUsage\(detail\.contextUsage\.inputTokens, detail\.contextUsage\.modelContextWindow\)/);
+  assert.match(styles, /\.capacity-menu-panel \{[^}]*width: 190px;/);
 });
 
 test("completed conversations stay visibly unread until their detail is viewed", () => {
@@ -768,6 +786,12 @@ test("conversation archive API keeps history readable, blocks new turns, and res
   const conversationId = created.body.conversation.id as string;
   const threadId = crypto.randomUUID();
   instance.db.updateConversation(conversationId, { codexThreadId: threadId });
+  assert.equal(instance.db.setConversationContextUsage(conversationId, {
+    threadId,
+    inputTokens: 202_345,
+    modelContextWindow: 258_400,
+  }), true);
+  assert.equal(instance.db.setConversationCodexQuota(conversationId, { remainingPercent: 44 }), true);
   const codexHome = ensureTenant(tenantRoot, LEGACY_USER_ID).codexHome;
   const sessionDirectory = path.join(codexHome, "sessions", "2026", "07", "24");
   fs.mkdirSync(sessionDirectory, { recursive: true });
@@ -782,6 +806,16 @@ test("conversation archive API keeps history readable, blocks new turns, and res
   const detail = await agent.get(`/codex-web/api/conversations/${conversationId}`).expect(200);
   assert.equal(detail.body.conversation.id, conversationId);
   assert.equal(detail.body.rolloutBytes, 7);
+  assert.deepEqual(detail.body.contextUsage, {
+    inputTokens: 202_345,
+    modelContextWindow: 258_400,
+    updatedAt: detail.body.contextUsage.updatedAt,
+  });
+  assert.match(detail.body.contextUsage.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(detail.body.packageQuota, {
+    remainingPercent: 44,
+    updatedAt: detail.body.packageQuota.updatedAt,
+  });
   await agent.post(`/codex-web/api/conversations/${conversationId}/messages`)
     .set("X-CSRF-Token", csrf).field("message", "不应发送").expect(409);
 

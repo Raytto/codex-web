@@ -52,6 +52,8 @@ input.on("line", (line) => {
       activeExecution = startTenantTurn(message.request, {
         signal: controller.signal,
         onThreadStarted: (threadId) => send({ type: "thread_started", threadId }),
+        onContextUsage: (usage) => send({ type: "context_usage", usage }),
+        onQuotaUsage: (usage) => send({ type: "quota_usage", usage }),
         onProgress: (payload) => send({ type: "progress", payload }),
       });
       const finalResponse = await activeExecution.result;
