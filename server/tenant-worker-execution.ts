@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { startAppServerTurn, type AppServerTurnExecution, type CodexQuotaUsage, type ContextTokenUsage } from "./app-server-turn.js";
 import { buildCodexEnvironment, buildShellEnvironment, resolvePythonRuntime } from "./python-runtime.js";
@@ -29,6 +30,13 @@ export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: Exec
   if (process.platform === "win32") {
     codexEnvironment.CODEX_WINDOWS_SANDBOX = request.codexWindowsSandbox;
   }
+  const shellEnvironment = buildShellEnvironment(pythonRuntime, request.runtimeRoot);
+  if (request.automation) Object.assign(shellEnvironment, {
+    CODEX_WEB_AUTOMATION_BASE_URL: request.automation.baseUrl,
+    CODEX_WEB_AUTOMATION_TOKEN: request.automation.token,
+    CODEX_WEB_AUTOMATION_JOB_ID: request.jobId,
+    CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+  });
   return startAppServerTurn({
     executablePath: process.env.CODEX_RUNTIME_PATH || undefined,
     cwd: request.workspace,
@@ -40,7 +48,7 @@ export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: Exec
     model: request.selection.model,
     reasoningEffort: request.selection.reasoningEffort,
     library: request.library,
-    shellEnvironment: buildShellEnvironment(pythonRuntime, request.runtimeRoot),
+    shellEnvironment,
     networkAccessEnabled: request.networkAccessEnabled,
     webSearchMode: request.webSearchMode,
     optionalCapabilities: request.optionalCapabilities,
@@ -78,6 +86,14 @@ export function validateTenantWorkerRequest(request: TenantWorkerRunRequest, exp
     throw new Error("Invalid worker identifiers");
   }
   if (!isOptionalAgentCapabilities(request.optionalCapabilities)) throw new Error("Invalid optional capabilities");
+  if (request.automation) {
+    let baseUrl: URL;
+    try { baseUrl = new URL(request.automation.baseUrl); }
+    catch { throw new Error("Invalid automation endpoint"); }
+    if (!["http:", "https:"].includes(baseUrl.protocol) || baseUrl.username || baseUrl.password || baseUrl.hash
+      || request.automation.baseUrl.length > 2_000 || !/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(request.automation.token)
+      || request.automation.token.length > 4_096) throw new Error("Invalid automation endpoint or token");
+  }
   const tenantRoot = path.resolve(expectedTenantRoot);
   const expectedWorkspace = path.join(tenantRoot, "conversations", request.conversationId);
   const expectedRuntime = path.join(expectedWorkspace, ".runtime", "jobs", request.jobId);

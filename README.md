@@ -1,6 +1,6 @@
 # Codex Web
 
-An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, resumable interruption history, conversation archiving, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
+An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, durable timed or event-driven continuation, resumable interruption history, conversation archiving, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
 
@@ -25,6 +25,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Running work journals expand inline with the page instead of creating a nested vertical scroller
 - Unread-result markers for completed conversations until their detail is viewed
 - Distinct running and queued indicators, plus a stable overflow menu for task actions
+- One-shot timed or external-event continuation plans that survive browser and service restarts
 - A 500 MiB Codex rollout warning that suggests archiving very long conversations
 - Per-conversation context-window usage and current Codex package quota in the capacity menu
 - Light, dark, and system-following appearance modes
@@ -154,6 +155,8 @@ This architecture separates four kinds of durable state:
 - tenant knowledge and files: each user's library, uploads, outputs, and immutable deliverables;
 - Codex state: login credentials and thread history inside the executor's own Codex Home;
 - runtime state: short-lived per-job directories and processes that can be reconstructed after a restart.
+
+Long-running workflows may explicitly register a one-shot continuation plan. The scheduler and external event receipts are durable, but the Agent turn itself is never kept alive with `sleep`; see [Durable continuation](docs/WAKE_AUTOMATION.md).
 
 For the public build, the web process has no Docker socket, host filesystem mount, or root bridge. See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) before adapting the extension pattern to your own environment.
 

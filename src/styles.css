@@ -359,6 +359,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .messages::-webkit-scrollbar-thumb { border-radius: 99px; background: #c4c8d8; }
 .history-loader { height: 28px; display: flex; align-items: center; justify-content: center; gap: 6px; margin: -12px 0 12px; color: var(--muted); font-size: 10px; font-weight: 650; }
 .message { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 12px; margin-bottom: 26px; }
+.wake-plan-card { width: min(720px, calc(100% - 44px)); display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center; gap: 11px; margin: 0 0 26px 44px; padding: 12px 13px; border: 1px solid #d8dced; border-radius: 14px; color: var(--ink); background: rgba(249, 250, 255, .96); box-shadow: 0 7px 22px rgba(15, 17, 32, .05); }
+.wake-plan-icon { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 11px; color: var(--indigo); background: var(--indigo-pale); }
+.wake-plan-copy { min-width: 0; display: grid; gap: 3px; }
+.wake-plan-copy strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.wake-plan-copy span { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.wake-plan-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.wake-plan-actions button { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 8px; border: 1px solid #d8dced; border-radius: 8px; color: #3b456f; background: #fff; cursor: pointer; font-size: 10px; font-weight: 700; }
+.wake-plan-actions button:hover { border-color: #b9c0dc; background: #f4f6ff; }
+.wake-plan-actions button.danger { color: #a13d47; }
+.wake-plan-actions button:disabled { opacity: .55; cursor: wait; }
 .message-avatar { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid rgba(57, 70, 137, .1); border-radius: 10px; color: var(--indigo); background: var(--indigo-pale); box-shadow: 0 5px 14px rgba(15, 17, 32, .07); font-size: 9px; font-weight: 800; }
 .message.assistant .message-avatar { color: var(--navy); border-color: rgba(240, 170, 60, .38); background: linear-gradient(145deg, #f8bb55, var(--amber)); }
 .message-body { min-width: 0; }
@@ -395,6 +405,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .markdown pre { overflow-x: auto; padding: .875em; border: 1px solid #e3e5ed; border-radius: .625em; color: #e9ebf4; background: #171b32; }
 .markdown code { font-family: "Cascadia Code", Consolas, monospace; font-size: .9em; }
 .markdown :not(pre) > code { padding: .125em .3125em; border-radius: .3125em; color: #29356f; background: var(--indigo-pale); }
+.message.assistant .katex-display,
+.process-note-content .katex-display { max-width: 100%; margin: .9em 0; padding: .12em 0; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
 .markdown table { width: 100%; border-collapse: collapse; }
 .markdown th, .markdown td { padding: .5em; border: 1px solid #dfe2ec; text-align: left; }
 .markdown th { color: #29356f; background: var(--indigo-pale); }
@@ -811,6 +823,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
     linear-gradient(180deg, rgba(39, 40, 45, .3), rgba(23, 24, 27, .12));
   scrollbar-color: #4a4c54 transparent;
 }
+:root[data-theme="dark"] .wake-plan-card { border-color: #414553; color: #f0f1f4; background: rgba(37, 39, 46, .96); }
+:root[data-theme="dark"] .wake-plan-actions button { border-color: #4b4f5d; color: #d9ddf0; background: #30323a; }
 :root[data-theme="dark"] .messages::-webkit-scrollbar-thumb { background: #4a4c54; }
 :root[data-theme="dark"] .message-name { color: #c4c5ca; }
 :root[data-theme="dark"] .message-meta time { color: #8f9199; }

@@ -3,11 +3,11 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
+  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
-  RotateCcw, Trash2, TriangleAlert, X, Zap,
+  Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WorkFile } from "./api";
+import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -18,7 +18,7 @@ import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, 
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
-import { prepareMarkdownMath } from "./markdown-math";
+import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { formatContextUsage, formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 
@@ -99,13 +99,8 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [mathPlugins, setMathPlugins] = useState<{
-    remarkMath: typeof import("remark-math")["default"];
-    rehypeKatex: typeof import("rehype-katex")["default"];
-  } | null>(null);
-  const [mathLoadFailed, setMathLoadFailed] = useState(false);
   const readerKind = file ? fileReaderKind(file) : null;
-  const preparedMath = useMemo(() => content === null ? null : prepareMarkdownMath(content), [content]);
+  const math = useAsyncMarkdownMath(content ?? "");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -170,29 +165,13 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
     };
   }, [onSessionExpired]);
 
-  useEffect(() => {
-    if (!preparedMath?.hasMath || mathPlugins || mathLoadFailed) return;
-    let active = true;
-    void Promise.all([
-      import("remark-math"),
-      import("rehype-katex"),
-      import("katex/dist/katex.min.css"),
-    ]).then(([remarkModule, rehypeModule]) => {
-      if (active) setMathPlugins({ remarkMath: remarkModule.default, rehypeKatex: rehypeModule.default });
-    }).catch(() => {
-      if (active) setMathLoadFailed(true);
-    });
-    return () => { active = false; };
-  }, [mathLoadFailed, mathPlugins, preparedMath?.hasMath]);
-
   const download = file ? fileUrl(file, true) : "";
-  const mathLoading = Boolean(preparedMath?.hasMath && !mathPlugins && !mathLoadFailed);
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
       <div className="file-preview-title">
         <FileText size={18} />
-        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? `Markdown 阅读${mathLoading ? " · 正在排版公式" : mathLoadFailed ? " · 公式组件加载失败" : ""}` : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
+        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? `Markdown 阅读${math.loading ? " · 正在排版公式" : math.failed ? " · 公式组件加载失败" : ""}` : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
       </div>
       {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
     </header>
@@ -202,8 +181,8 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
       {!loading && !error && content !== null && readerKind === "markdown" && <div className="file-preview-scroll">
         <article className="file-reader-markdown markdown">
           <ReactMarkdown
-            remarkPlugins={mathPlugins ? [remarkGfm, mathPlugins.remarkMath] : [remarkGfm]}
-            rehypePlugins={mathPlugins ? [[mathPlugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
+            remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
+            rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
             skipHtml
             urlTransform={defaultUrlTransform}
             components={{
@@ -213,7 +192,7 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
               img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
               table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
             }}
-          >{preparedMath?.content ?? content}</ReactMarkdown>
+          >{math.content}</ReactMarkdown>
         </article>
       </div>}
       {!loading && !error && content !== null && readerKind === "html" && <iframe
@@ -904,6 +883,48 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
   }
 
+  async function scheduleWake(conversation: Conversation) {
+    setTaskMenu(null);
+    const rawMinutes = window.prompt("多少分钟后自动继续？", "60");
+    if (rawMinutes === null) return;
+    const minutes = Number(rawMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) { setError("请输入大于 0 的分钟数。"); return; }
+    const prompt = window.prompt("届时交给 Agent 的续跑指令：", "继续检查当前任务并向我报告最新结果。");
+    if (!prompt?.trim()) return;
+    try {
+      await api.createTimeWake(conversation.id, { delaySeconds: Math.max(1, Math.round(minutes * 60)), prompt: prompt.trim() });
+      setNotice("已登记自动续跑计划。");
+      await refreshList();
+      if (selectedIdRef.current === conversation.id) await refreshDetail(conversation.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "自动续跑登记失败"); }
+  }
+
+  async function cancelActiveWake(conversation: Conversation) {
+    setTaskMenu(null);
+    try {
+      const { wakePlan } = await api.activeWake(conversation.id);
+      if (!wakePlan) { setNotice("当前没有等待计划。"); return; }
+      if (!window.confirm("取消这个自动续跑计划？")) return;
+      await api.cancelWake(conversation.id, wakePlan.id);
+      await refreshList();
+      if (selectedIdRef.current === conversation.id) await refreshDetail(conversation.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "取消自动续跑失败"); }
+  }
+
+  async function triggerWake(plan: WakePlan) {
+    try {
+      await api.triggerWake(plan.conversation_id, plan.id);
+      await reconcile(plan.conversation_id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "立即继续失败"); }
+  }
+
+  async function postponeWake(plan: WakePlan) {
+    try {
+      await api.rescheduleWake(plan.conversation_id, plan.id, 30 * 60);
+      await reconcile(plan.conversation_id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "延后计划失败"); }
+  }
+
   async function restoreConversation(conversation: Conversation) {
     try {
       await api.restoreConversation(conversation.id);
@@ -999,6 +1020,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                 ? <LoaderCircle size={14} className="spin" role="img" aria-label="正在执行" />
                 : Boolean(conversation.has_pending_work)
                   ? <CircleDashed size={14} className="conversation-waiting" role="img" aria-label="等待发送" />
+                  : Boolean(conversation.active_wake_count)
+                    ? <Clock3 size={14} className="conversation-waiting" role="img" aria-label="等待自动续跑" />
                   : null}
             </button>
             <div className="row-actions">
@@ -1045,6 +1068,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       aria-label={`任务 ${taskMenuConversation.title} 操作`}
       style={{ top: taskMenu.top, left: taskMenu.left }}
     >
+      {taskMenuConversation.active_wake_count
+        ? <button type="button" role="menuitem" onClick={() => void cancelActiveWake(taskMenuConversation)}><Clock3 size={16} /><span>取消自动续跑</span></button>
+        : <button type="button" role="menuitem" onClick={() => void scheduleWake(taskMenuConversation)}><Clock3 size={16} /><span>定时自动续跑</span></button>}
       <button type="button" role="menuitem" onClick={() => void archiveConversation(taskMenuConversation)}><Archive size={16} /><span>归档</span></button>
       <button type="button" role="menuitem" onClick={() => { setTaskMenu(null); void renameConversation(taskMenuConversation); }}><Pencil size={16} /><span>重命名</span></button>
       <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>
@@ -1068,7 +1094,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
     <main className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
-      {currentDetail ? <Chat detail={currentDetail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} />
+      {currentDetail ? <Chat detail={currentDetail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={(plan) => cancelActiveWake(currentDetail.conversation).then(() => undefined)} onPostponeWake={postponeWake} onTriggerWake={triggerWake} />
         : loadingConversation ? <ConversationLoading />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
@@ -1108,7 +1134,25 @@ function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
 
 type AskAgentSelection = { text: string; left: number; top: number; below: boolean };
 
-function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize }: { detail: ConversationDetail; activities: JobEvent[]; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number }) {
+function AssistantMarkdown({ content, files, citationFiles }: { content: string; files: WorkFile[]; citationFiles: WorkFile[] }) {
+  const sanitized = useMemo(() => sanitizeAgentMarkdown(content, citationFiles), [citationFiles, content]);
+  const math = useAsyncMarkdownMath(sanitized);
+  return <div className="markdown" data-agent-selectable="true" aria-busy={math.loading || undefined}><ReactMarkdown
+    remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
+    rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
+    urlTransform={(url) => isLocalMarkdownUrl(url) ? url : defaultUrlTransform(url)}
+    components={{ a: ({ href, children }) => {
+      const resolved = resolveMessageFileLink(href, files);
+      if (resolved.kind === "preview") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+      if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+      if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
+      if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
+      return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+    } }}
+  >{math.content}</ReactMarkdown></div>;
+}
+
+function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake }: { detail: ConversationDetail; activities: JobEvent[]; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void> }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const chatRef = useRef<HTMLElement>(null);
   const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
@@ -1177,27 +1221,35 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
         <div className="message-avatar">{message.role === "assistant" ? <Zap size={15} /> : userInitials}</div>
         <div className="message-body">
           <div className="message-meta"><span className="message-name">{message.role === "assistant" ? "Codex Web" : "你"}</span><time dateTime={message.created_at} title={formatFullDateTime(message.created_at)}>{formatMessageDateTime(message.created_at)}</time></div>
-          {message.role === "assistant" ? <div className="markdown" data-agent-selectable="true"><ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            urlTransform={(url) => isLocalMarkdownUrl(url) ? url : defaultUrlTransform(url)}
-            components={{ a: ({ href, children }) => {
-              const resolved = resolveMessageFileLink(href, message.files);
-              if (resolved.kind === "preview") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-              if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-              if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
-              if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
-              return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-            } }}
-          >{sanitizeAgentMarkdown(message.content, citationFiles)}</ReactMarkdown></div> : <>
+          {message.role === "assistant" ? <AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} /> : <>
             {message.quote_excerpt && <div className="message-reference" title={message.quote_excerpt}><CornerUpLeft size={14} /><span><strong>引用</strong>{message.quote_excerpt}</span></div>}
             {message.content && <p data-agent-selectable="true">{message.content}</p>}
           </>}
           {message.files.length > 0 && <div className="file-grid">{message.files.map((file) => <FileCard key={file.id} file={file} />)}</div>}
         </div>
       </article>)}
+      {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} />}
       {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={detail.conversation.id} activities={activities} /></div></article>}
       <div />
     </div>{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }}><Zap size={14} /><span>询问 Agent</span></button>}
+  </section>;
+}
+
+function WakePlanCard({ plan, onCancel, onPostpone, onTrigger }: { plan: WakePlan; onCancel: (plan: WakePlan) => Promise<void>; onPostpone: (plan: WakePlan) => Promise<void>; onTrigger: (plan: WakePlan) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const run = async (action: (plan: WakePlan) => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try { await action(plan); } finally { setBusy(false); }
+  };
+  return <section className="wake-plan-card" aria-label="自动续跑计划">
+    <div className="wake-plan-icon"><Clock3 size={18} /></div>
+    <div className="wake-plan-copy"><strong>{plan.label || "自动续跑"}</strong><span>{plan.mode === "event_or_deadline" ? "等待外部事件，最晚" : "将在"} {formatFullDateTime(plan.deadline_at)}继续</span></div>
+    <div className="wake-plan-actions">
+      <button type="button" disabled={busy} onClick={() => void run(onPostponeWake)}><Clock3 size={14} />延后 30 分钟</button>
+      <button type="button" disabled={busy} onClick={() => void run(onTriggerWake)}><Play size={14} />立即继续</button>
+      <button type="button" className="danger" disabled={busy} onClick={() => void run(onCancel)}><X size={14} />取消</button>
+    </div>
   </section>;
 }
 
@@ -1230,9 +1282,13 @@ function ProcessPanel({ activities }: { activities: JobEvent[] }) {
 }
 
 function ProcessJournalNote({ activity }: { activity: JobEvent }) {
+  const math = useAsyncMarkdownMath(activity.detail ?? "");
   return <section className="process-journal-note">
     <header><Bot size={14} /><strong>{activity.kind === "reasoning" ? "重要思路" : "阶段反馈"}</strong>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}</header>
-    <div className="process-note-content"><ReactMarkdown remarkPlugins={[remarkGfm]}>{activity.detail ?? ""}</ReactMarkdown></div>
+    <div className="process-note-content" aria-busy={math.loading || undefined}><ReactMarkdown
+      remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
+      rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
+    >{math.content}</ReactMarkdown></div>
   </section>;
 }
 

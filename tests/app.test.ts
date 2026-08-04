@@ -6,6 +6,11 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import bcrypt from "bcryptjs";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkMath from "remark-math";
 import request from "supertest";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "../server/app.js";
@@ -446,6 +451,9 @@ test("the owner tenant has a dedicated Unix identity and workers reject cross-te
     optionalCapabilities: DEFAULT_OPTIONAL_AGENT_CAPABILITIES,
   };
   assert.doesNotThrow(() => validateTenantWorkerRequest(request, owner.userId, tenantRoot));
+  assert.doesNotThrow(() => validateTenantWorkerRequest({ ...request, automation: { baseUrl: "http://127.0.0.1:37821/codex-web", token: "v1.payload.signature" } }, owner.userId, tenantRoot));
+  assert.throws(() => validateTenantWorkerRequest({ ...request, automation: { baseUrl: "file:///tmp/socket", token: "v1.payload.signature" } }, owner.userId, tenantRoot), /automation/);
+  assert.throws(() => validateTenantWorkerRequest({ ...request, automation: { baseUrl: "https://example.test", token: "not-a-signed-token" } }, owner.userId, tenantRoot), /automation/);
   assert.throws(() => validateTenantWorkerRequest({ ...request, tenantRoot: path.join(os.tmpdir(), "other") }, owner.userId, tenantRoot), /path mismatch/);
   assert.throws(() => validateTenantWorkerRequest({ ...request, imagePaths: [path.join(tenantRoot, "..", "secret.png")] }, owner.userId, tenantRoot), /escapes workspace/);
   const executionSource = fs.readFileSync(path.join(process.cwd(), "server", "tenant-worker-execution.ts"), "utf8");
@@ -709,15 +717,16 @@ test("browser preview is limited to formats browsers can display directly", () =
 
 test("rich document readers keep Markdown inert and HTML isolated from the app origin", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const mathSource = fs.readFileSync(path.join(process.cwd(), "src", "markdown-math.ts"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /reader === "markdown" && <a className="reader-button"/);
   assert.match(appSource, /reader === "markdown" \|\| previewable[\s\S]*href=\{fileUrl\(file\)\}/);
   assert.match(styles, /\.reader-button,[\s\S]*\.download-button\s*\{[^}]*border-left:/);
-  assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*preparedMath\?\.content \?\? content/);
-  assert.match(appSource, /import\("remark-math"\)/);
-  assert.match(appSource, /import\("rehype-katex"\)/);
-  assert.match(appSource, /import\("katex\/dist\/katex\.min\.css"\)/);
-  assert.match(appSource, /rehypePlugins=\{mathPlugins/);
+  assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*>\{math\.content\}<\/ReactMarkdown>/);
+  assert.match(mathSource, /import\("remark-math"\)/);
+  assert.match(mathSource, /import\("rehype-katex"\)/);
+  assert.match(mathSource, /import\("katex\/dist\/katex\.min\.css"\)/);
+  assert.match(appSource, /rehypePlugins=\{math\.plugins/);
   assert.match(appSource, /sandbox="allow-popups allow-popups-to-escape-sandbox"/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-scripts/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-same-origin/);
@@ -725,6 +734,21 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.match(styles, /@media \(max-width: 720px\)[\s\S]*\.file-reader-markdown\s*\{[\s\S]*font-size:\s*15px/);
   assert.match(styles, /\.file-reader-table\s*\{[^}]*overflow-x:\s*auto/);
   assert.match(styles, /\.file-reader-markdown \.katex-display\s*\{[^}]*overflow-x:\s*auto/);
+});
+
+test("assistant cards progressively replace raw LaTeX with asynchronous KaTeX", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const mathSource = fs.readFileSync(path.join(process.cwd(), "src", "markdown-math.ts"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /function AssistantMarkdown/);
+  assert.match(appSource, /const math = useAsyncMarkdownMath\(sanitized\)/);
+  assert.match(appSource, /remarkPlugins=\{math\.plugins \? \[remarkGfm, math\.plugins\.remarkMath\]/);
+  assert.match(appSource, /rehypePlugins=\{math\.plugins \? \[\[math\.plugins\.rehypeKatex/);
+  assert.match(appSource, /aria-busy=\{math\.loading \|\| undefined\}/);
+  assert.match(appSource, />\{math\.content\}<\/ReactMarkdown>/);
+  assert.match(mathSource, /content: plugins && prepared\.hasMath \? prepared\.content : markdown/);
+  assert.match(mathSource, /let markdownMathPluginsPromise:/);
+  assert.match(styles, /\.message\.assistant \.katex-display,[\s\S]*overflow-x:\s*auto/);
 });
 
 test("Markdown math preparation supports LaTeX delimiters without rewriting code", () => {
@@ -748,6 +772,17 @@ test("Markdown math preparation supports LaTeX delimiters without rewriting code
   assert.ok(prepared.content.includes("`\\(literal\\)`"));
   assert.ok(prepared.content.includes("```tex\n\\[not rendered\\]\n```"));
   assert.equal(prepareMarkdownMath("价格是 $5，代码为 `x = $y$`。").hasMath, false);
+});
+
+test("prepared assistant LaTeX produces KaTeX display markup", () => {
+  const prepared = prepareMarkdownMath("\\[\ne^{ix}=\\cos x+i\\sin x\n\\]");
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkMath],
+    rehypePlugins: [[rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]],
+    children: prepared.content,
+  }));
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /annotation encoding="application\/x-tex">e\^\{ix\}=\\cos x\+i\\sin x<\/annotation>/);
 });
 
 test("downloaded text files declare UTF-8 for iOS Safari previews", () => {

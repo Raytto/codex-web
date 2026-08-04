@@ -2,7 +2,7 @@ export const BASE_PATH = "/codex-web";
 
 export type Session = { authenticated: boolean; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; voiceEnabled?: boolean };
 export type Conversation = {
-  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; has_pending_work: number; rollout_bytes: number | null; archived_at: string | null; created_at: string; updated_at: string;
+  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; rollout_bytes: number | null; archived_at: string | null; created_at: string; updated_at: string;
 };
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
@@ -32,6 +32,32 @@ export type ComposerDraft = {
   created_at: string;
   updated_at: string;
 };
+export type WakePlan = {
+  id: string;
+  conversation_id: string;
+  created_by_job_id: string | null;
+  mode: "time" | "event_or_deadline";
+  state: "armed" | "triggered" | "cancelled";
+  revision: number;
+  label: string;
+  run_id: string | null;
+  deadline_at: string;
+  success_prompt: string;
+  failure_prompt: string;
+  timeout_prompt: string;
+  trigger_cause: "success" | "failure" | "deadline" | "manual" | null;
+  triggered_at: string | null;
+  cancelled_at: string | null;
+  pending_prompt_id: string | null;
+  job_id: string | null;
+  last_heartbeat_at: string | null;
+  last_event_at: string | null;
+  last_event_kind: "success" | "failure" | "deadline" | "manual" | "heartbeat" | null;
+  last_event_summary: string | null;
+  created_at: string;
+  updated_at: string;
+};
+export type WakeEvent = { wake_plan_id: string; event_id: string; kind: string; summary: string | null; accepted: number; created_at: string };
 export type Job = { id: string; status: string; conversation_id: string; queuePosition?: number };
 // The online Codex catalog is authoritative. Keep this open so a newer CLI can
 // expose a new reasoning level without requiring a front-end release first.
@@ -66,6 +92,8 @@ export type ConversationDetail = {
   pendingPrompts: PendingPrompt[];
   editingPrompt: PendingPrompt | null;
   composerDraft: ComposerDraft | null;
+  wakePlan: WakePlan | null;
+  wakeEvents: WakeEvent[];
   activeJob: Job | null;
   latestJob: Job | null;
   jobEvents: JobEvent[];
@@ -124,6 +152,22 @@ export const api = {
   archiveConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/archive`, { method: "POST" }),
   restoreConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/restore`, { method: "POST" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
+  createTimeWake: (id: string, input: { delaySeconds: number; label?: string; prompt: string }) => request<{ wakePlan: WakePlan }>(
+    `/conversations/${id}/wake-plans`, { method: "POST", body: JSON.stringify(input) },
+  ),
+  activeWake: (id: string) => request<{ wakePlan: WakePlan | null }>(`/conversations/${id}/wake-plans/active`),
+  cancelWake: (conversationId: string, wakePlanId: string) => request<{ wakePlan: WakePlan }>(
+    `/conversations/${conversationId}/wake-plans/${wakePlanId}/cancel`, { method: "POST" },
+  ),
+  rescheduleWake: (conversationId: string, wakePlanId: string, delaySeconds: number) => request<{ wakePlan: WakePlan }>(
+    `/conversations/${conversationId}/wake-plans/${wakePlanId}/reschedule`, { method: "POST", body: JSON.stringify({ delaySeconds }) },
+  ),
+  updateWakePrompts: (conversationId: string, wakePlanId: string, input: { revision: number; successPrompt: string; failurePrompt?: string; timeoutPrompt?: string }) => request<{ wakePlan: WakePlan }>(
+    `/conversations/${conversationId}/wake-plans/${wakePlanId}/prompts`, { method: "PATCH", body: JSON.stringify(input) },
+  ),
+  triggerWake: (conversationId: string, wakePlanId: string) => request<{ status: string; wakePlan: WakePlan }>(
+    `/conversations/${conversationId}/wake-plans/${wakePlanId}/trigger`, { method: "POST" },
+  ),
   saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft`,
     { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive },

@@ -16,6 +16,7 @@ import { isRetryableUpstreamError, runWithTransientRetries } from "./retry-polic
 import { buildAgentSteerPrompt, buildAgentTurnPrompt, type AgentAttachmentContext } from "./agent-context.js";
 import { detectOptionalAgentCapabilities } from "./optional-capabilities.js";
 import { latestUserCancellationContext } from "./cancellation-summary.js";
+import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wake-automation.js";
 
 type Publish = (jobId: string, eventType: string, payload: unknown) => void;
 
@@ -134,6 +135,10 @@ export class CodexRunner {
     try {
       const conversation = this.db.getConversation(conversationId);
       if (!conversation) throw new Error("会话不存在");
+      const automation = {
+        baseUrl: this.config.publicBaseUrl.replace(/\/$/, "") || `http://127.0.0.1:${this.config.port}${this.config.basePath}`,
+        token: createJobAutomationToken(this.config.sessionSecret, jobId, conversationId),
+      };
       const job = this.db.getJob(jobId);
       const shouldGenerateTitle = conversation.title_source === "default"
         && Boolean(job?.message_id && this.db.isFirstUserMessage(conversationId, job.message_id));
@@ -153,7 +158,7 @@ export class CodexRunner {
       this.db.updateConversation(conversationId, { status: "running" });
       this.publish(jobId, "status", { status: "running", label: taskPolicy.isolated ? "正在隔离模式中处理" : "Codex Web 正在处理" });
 
-      const effectivePrompt = buildAgentTurnPrompt({
+      const effectivePrompt = appendWaitAutomationInstructions(buildAgentTurnPrompt({
         userPrompt: prompt,
         attachments: this.attachmentContext(uploads, workspace),
         interruptedContext,
@@ -161,7 +166,7 @@ export class CodexRunner {
           ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
           : undefined,
         isolationReason: taskPolicy.isolated ? taskPolicy.reason : undefined,
-      });
+      }));
       const request: TenantWorkerRunRequest = {
         jobId,
         userId: conversation.user_id,
@@ -184,6 +189,7 @@ export class CodexRunner {
         webSearchMode: taskPolicy.isolated ? "cached" : "live",
         codexWindowsSandbox: this.config.codexWindowsSandbox,
         optionalCapabilities,
+        automation,
       };
       const callbacks = {
         onThreadStarted: (threadId: string) => {

@@ -30,6 +30,10 @@ export type ConversationRow = {
   status: "idle" | "running";
   has_unread_result: number;
   has_pending_work: number;
+  active_wake_count: number;
+  next_wake_at: string | null;
+  active_wake_mode: WakePlanMode | null;
+  active_wake_label: string | null;
   rollout_bytes: number | null;
   context_input_tokens: number | null;
   context_window_tokens: number | null;
@@ -85,6 +89,55 @@ export type PendingPromptRow = {
 };
 
 export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[] };
+
+export type WakePlanMode = "time" | "event_or_deadline";
+export type WakePlanState = "armed" | "triggered" | "cancelled";
+export type WakeTriggerCause = "success" | "failure" | "deadline" | "manual";
+export type WakeEventKind = WakeTriggerCause | "heartbeat";
+
+export type WakePlanRow = {
+  id: string;
+  conversation_id: string;
+  created_by_job_id: string | null;
+  mode: WakePlanMode;
+  state: WakePlanState;
+  revision: number;
+  label: string;
+  run_id: string | null;
+  deadline_at: string;
+  success_prompt: string;
+  failure_prompt: string;
+  timeout_prompt: string;
+  agent_model: string;
+  reasoning_effort: string;
+  event_token_hash: string | null;
+  trigger_cause: WakeTriggerCause | null;
+  triggered_at: string | null;
+  cancelled_at: string | null;
+  pending_prompt_id: string | null;
+  job_id: string | null;
+  last_heartbeat_at: string | null;
+  last_event_at: string | null;
+  last_event_kind: WakeEventKind | null;
+  last_event_summary: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WakeEventRow = {
+  wake_plan_id: string;
+  event_id: string;
+  kind: WakeEventKind;
+  summary: string | null;
+  accepted: number;
+  created_at: string;
+};
+
+export type WakeTriggerResult = {
+  status: "triggered" | "heartbeat" | "duplicate" | "stale" | "missing";
+  plan?: WakePlanRow;
+  pendingPrompt?: PendingPromptWithFiles;
+};
 
 export type ComposerDraftRow = {
   conversation_id: string;
@@ -145,7 +198,11 @@ const conversationSelect = `
   CASE WHEN
     EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id AND jobs.status='queued')
     OR EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id AND pending_prompts.status='queued')
-  THEN 1 ELSE 0 END AS has_pending_work
+  THEN 1 ELSE 0 END AS has_pending_work,
+  (SELECT count(1) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS active_wake_count,
+  (SELECT min(deadline_at) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS next_wake_at,
+  (SELECT mode FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed' LIMIT 1) AS active_wake_mode,
+  (SELECT label FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed' LIMIT 1) AS active_wake_label
 `;
 
 export class AppDatabase {
@@ -284,6 +341,43 @@ export class AppDatabase {
         created_at TEXT NOT NULL,
         PRIMARY KEY(job_id, seq)
       );
+      CREATE TABLE IF NOT EXISTS wake_plans (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        created_by_job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+        mode TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'armed',
+        revision INTEGER NOT NULL DEFAULT 0,
+        label TEXT NOT NULL,
+        run_id TEXT,
+        deadline_at TEXT NOT NULL,
+        success_prompt TEXT NOT NULL,
+        failure_prompt TEXT NOT NULL,
+        timeout_prompt TEXT NOT NULL,
+        agent_model TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL,
+        event_token_hash TEXT,
+        trigger_cause TEXT,
+        triggered_at TEXT,
+        cancelled_at TEXT,
+        pending_prompt_id TEXT UNIQUE REFERENCES pending_prompts(id) ON DELETE SET NULL,
+        job_id TEXT UNIQUE REFERENCES jobs(id) ON DELETE SET NULL,
+        last_heartbeat_at TEXT,
+        last_event_at TEXT,
+        last_event_kind TEXT,
+        last_event_summary TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS wake_events (
+        wake_plan_id TEXT NOT NULL REFERENCES wake_plans(id) ON DELETE CASCADE,
+        event_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT,
+        accepted INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(wake_plan_id,event_id)
+      );
       CREATE TABLE IF NOT EXISTS sessions (
         token_hash TEXT PRIMARY KEY,
         user_id TEXT REFERENCES users(id),
@@ -368,6 +462,9 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS pending_prompts_queue_idx ON pending_prompts(conversation_id, status, position);
       CREATE INDEX IF NOT EXISTS jobs_conversation_idx ON jobs(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(status, queue_seq);
+      CREATE UNIQUE INDEX IF NOT EXISTS wake_plans_active_conversation_idx ON wake_plans(conversation_id) WHERE state='armed';
+      CREATE INDEX IF NOT EXISTS wake_plans_due_idx ON wake_plans(state,deadline_at);
+      CREATE INDEX IF NOT EXISTS wake_events_plan_created_idx ON wake_events(wake_plan_id,created_at);
       CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
     `);
 
@@ -831,6 +928,172 @@ export class AppDatabase {
     return Number(this.sqlite.prepare("DELETE FROM pending_prompts WHERE conversation_id=?").run(conversationId).changes);
   }
 
+  createWakePlan(input: {
+    id: string;
+    conversationId: string;
+    createdByJobId?: string | null;
+    mode: WakePlanMode;
+    label: string;
+    runId?: string | null;
+    deadlineAt: string;
+    successPrompt: string;
+    failurePrompt: string;
+    timeoutPrompt: string;
+    selection: StoredAgentSelection;
+    eventTokenHash?: string | null;
+  }): WakePlanRow {
+    const conversation = this.getConversation(input.conversationId);
+    if (!conversation || conversation.deleted_at || conversation.archived_at) throw new Error("会话不存在或已归档");
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO wake_plans(
+        id,conversation_id,created_by_job_id,mode,state,label,run_id,deadline_at,
+        success_prompt,failure_prompt,timeout_prompt,agent_model,reasoning_effort,event_token_hash,
+        created_at,updated_at
+      ) VALUES(?,?,?,?,'armed',?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      input.id, input.conversationId, input.createdByJobId ?? null, input.mode, input.label,
+      input.runId ?? null, input.deadlineAt, input.successPrompt, input.failurePrompt, input.timeoutPrompt,
+      input.selection.model, input.selection.reasoningEffort, input.eventTokenHash ?? null, now, now,
+    );
+    this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, input.conversationId);
+    return this.getWakePlan(input.id)!;
+  }
+
+  getWakePlan(id: string): WakePlanRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM wake_plans WHERE id=?").get(id) as WakePlanRow | undefined;
+  }
+
+  getWakePlanForUser(id: string, userId: string): WakePlanRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT wake.* FROM wake_plans wake
+      JOIN conversations conversation ON conversation.id=wake.conversation_id
+      WHERE wake.id=? AND conversation.user_id=? AND conversation.deleted_at IS NULL
+    `).get(id, userId) as WakePlanRow | undefined;
+  }
+
+  getActiveWakePlan(conversationId: string): WakePlanRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM wake_plans WHERE conversation_id=? AND state='armed' ORDER BY created_at DESC,id DESC LIMIT 1")
+      .get(conversationId) as WakePlanRow | undefined;
+  }
+
+  listDueWakePlans(now: string, limit = 100): WakePlanRow[] {
+    return this.sqlite.prepare(`
+      SELECT wake.* FROM wake_plans wake
+      JOIN conversations conversation ON conversation.id=wake.conversation_id
+      WHERE wake.state='armed' AND wake.deadline_at<=? AND conversation.deleted_at IS NULL AND conversation.archived_at IS NULL
+      ORDER BY wake.deadline_at,wake.id LIMIT ?
+    `).all(now, Math.max(1, Math.min(500, Math.trunc(limit)))) as WakePlanRow[];
+  }
+
+  listWakeEvents(wakePlanId: string, limit = 100): WakeEventRow[] {
+    return this.sqlite.prepare("SELECT * FROM wake_events WHERE wake_plan_id=? ORDER BY created_at,event_id LIMIT ?")
+      .all(wakePlanId, Math.max(1, Math.min(500, Math.trunc(limit)))) as WakeEventRow[];
+  }
+
+  cancelWakePlan(id: string): WakePlanRow | undefined {
+    const plan = this.getWakePlan(id);
+    if (!plan || plan.state !== "armed") return undefined;
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare("UPDATE wake_plans SET state='cancelled',cancelled_at=?,updated_at=? WHERE id=? AND state='armed'")
+      .run(now, now, id);
+    if (!result.changes) return undefined;
+    this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, plan.conversation_id);
+    return this.getWakePlan(id);
+  }
+
+  cancelArmedWakePlansForConversation(conversationId: string): number {
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare(`
+      UPDATE wake_plans SET state='cancelled',cancelled_at=?,updated_at=?
+      WHERE conversation_id=? AND state='armed'
+    `).run(now, now, conversationId);
+    if (result.changes) this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, conversationId);
+    return Number(result.changes);
+  }
+
+  rescheduleWakePlan(id: string, deadlineAt: string): WakePlanRow | undefined {
+    const plan = this.getWakePlan(id);
+    if (!plan || plan.state !== "armed") return undefined;
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare("UPDATE wake_plans SET deadline_at=?,updated_at=? WHERE id=? AND state='armed'")
+      .run(deadlineAt, now, id);
+    if (!result.changes) return undefined;
+    this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, plan.conversation_id);
+    return this.getWakePlan(id);
+  }
+
+  updateWakePlanPrompts(input: {
+    id: string;
+    expectedRevision: number;
+    successPrompt: string;
+    failurePrompt: string;
+    timeoutPrompt: string;
+  }): WakePlanRow | undefined {
+    const plan = this.getWakePlan(input.id);
+    if (!plan || plan.state !== "armed") return undefined;
+    const now = new Date().toISOString();
+    const result = this.sqlite.prepare(`
+      UPDATE wake_plans
+      SET success_prompt=?,failure_prompt=?,timeout_prompt=?,revision=revision+1,updated_at=?
+      WHERE id=? AND state='armed' AND revision=?
+    `).run(input.successPrompt, input.failurePrompt, input.timeoutPrompt, now, input.id, input.expectedRevision);
+    if (!result.changes) return undefined;
+    this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, plan.conversation_id);
+    return this.getWakePlan(input.id);
+  }
+
+  recordWakeEvent(
+    wakePlanId: string,
+    eventId: string,
+    kind: WakeEventKind,
+    summary: string | null,
+    pendingPromptId: string,
+  ): WakeTriggerResult {
+    const now = new Date().toISOString();
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const plan = this.getWakePlan(wakePlanId);
+      if (!plan) { this.sqlite.exec("COMMIT"); return { status: "missing" }; }
+      const duplicate = this.sqlite.prepare("SELECT 1 AS found FROM wake_events WHERE wake_plan_id=? AND event_id=?")
+        .get(wakePlanId, eventId) as { found: number } | undefined;
+      if (duplicate) { this.sqlite.exec("COMMIT"); return { status: "duplicate", plan }; }
+      if (plan.state !== "armed") { this.sqlite.exec("COMMIT"); return { status: "stale", plan }; }
+      this.sqlite.prepare("INSERT INTO wake_events(wake_plan_id,event_id,kind,summary,accepted,created_at) VALUES(?,?,?,?,0,?)")
+        .run(wakePlanId, eventId, kind, summary, now);
+      if (kind === "heartbeat") {
+        this.sqlite.prepare(`
+          UPDATE wake_plans SET last_heartbeat_at=?,last_event_at=?,last_event_kind=?,last_event_summary=?,updated_at=? WHERE id=?
+        `).run(now, now, kind, summary, now, wakePlanId);
+        this.sqlite.prepare("UPDATE wake_events SET accepted=1 WHERE wake_plan_id=? AND event_id=?").run(wakePlanId, eventId);
+        this.sqlite.exec("COMMIT");
+        return { status: "heartbeat", plan: this.getWakePlan(wakePlanId) };
+      }
+      const cause = kind as WakeTriggerCause;
+      const prompt = cause === "success" ? plan.success_prompt
+        : cause === "failure" ? plan.failure_prompt
+        : plan.mode === "time" ? plan.success_prompt : plan.timeout_prompt;
+      const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND status='queued'")
+        .get(plan.conversation_id) as { value: number };
+      this.sqlite.prepare(`
+        INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
+        VALUES(?,?,?,NULL,?,?,?,'queued',?,?)
+      `).run(pendingPromptId, plan.conversation_id, prompt, plan.agent_model, plan.reasoning_effort, next.value, now, now);
+      this.sqlite.prepare(`
+        UPDATE wake_plans SET state='triggered',trigger_cause=?,triggered_at=?,pending_prompt_id=?,
+          last_event_at=?,last_event_kind=?,last_event_summary=?,updated_at=?
+        WHERE id=? AND state='armed'
+      `).run(cause, now, pendingPromptId, now, kind, summary, now, wakePlanId);
+      this.sqlite.prepare("UPDATE wake_events SET accepted=1 WHERE wake_plan_id=? AND event_id=?").run(wakePlanId, eventId);
+      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, plan.conversation_id);
+      this.sqlite.exec("COMMIT");
+      return { status: "triggered", plan: this.getWakePlan(wakePlanId), pendingPrompt: this.getPendingPrompt(pendingPromptId) };
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getNextDispatchablePendingPrompt(): PendingPromptWithFiles | undefined {
     const prompt = this.sqlite.prepare(`
       SELECT pending.* FROM pending_prompts pending
@@ -858,12 +1121,14 @@ export class AppDatabase {
       this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'user',?,?,?)")
         .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, now);
       this.sqlite.prepare("UPDATE files SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
-      this.sqlite.prepare("DELETE FROM pending_prompts WHERE id=?").run(pendingId);
       const next = this.sqlite.prepare("SELECT COALESCE(MAX(queue_seq),0)+1 AS value FROM jobs").get() as { value: number };
       this.sqlite.prepare(`
         INSERT INTO jobs(id,conversation_id,message_id,agent_model,reasoning_effort,queue_seq,status,created_at,updated_at)
         VALUES(?,?,?,?,?,?,'queued',?,?)
       `).run(jobId, prompt.conversation_id, messageId, prompt.agent_model, prompt.reasoning_effort, next.value, now, now);
+      this.sqlite.prepare("UPDATE wake_plans SET job_id=?,pending_prompt_id=NULL,updated_at=? WHERE pending_prompt_id=?")
+        .run(jobId, now, pendingId);
+      this.sqlite.prepare("DELETE FROM pending_prompts WHERE id=?").run(pendingId);
       this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, prompt.conversation_id);
       this.sqlite.exec("COMMIT");
     } catch (error) {

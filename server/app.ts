@@ -12,11 +12,12 @@ import { CodexRunner, extractLeakedAutoTitleAnswer } from "./codex-runner.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
-import { AppDatabase, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow } from "./db.js";
+import { AppDatabase, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type SessionRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { buildUserCancellationSummary } from "./cancellation-summary.js";
+import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from "./wake-automation.js";
 
 const COOKIE_NAME = "cww_session";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
@@ -100,6 +101,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const deletingConversations = new Set<string>();
   let queuePumpBusy = false;
   let shuttingDown = false;
+  let wakeSchedulerBusy = false;
+  let wakeSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
     const workspace = ensureTenantWorkspace(config.tenantRoot, userId, prompt.conversation_id);
@@ -173,6 +176,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   async function stopConversationJobs(conversationId: string, recordCancellation = true): Promise<void> {
+    db.cancelArmedWakePlansForConversation(conversationId);
     const activeJobs = db.listActiveJobsForConversation(conversationId);
     const runningJobs = activeJobs.filter((job) => job.status === "running");
     for (const job of activeJobs) {
@@ -256,6 +260,40 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   }
 
+  function publicWakePlan(plan: WakePlanRow | undefined | null) {
+    if (!plan) return null;
+    const { event_token_hash: _secret, ...visible } = plan;
+    return visible;
+  }
+
+  function wakeEventTokenMatches(plan: WakePlanRow, token: string): boolean {
+    if (!plan.event_token_hash || !token) return false;
+    const received = Buffer.from(hashWakeEventToken(config.sessionSecret, token));
+    const expected = Buffer.from(plan.event_token_hash);
+    return received.length === expected.length && crypto.timingSafeEqual(received, expected);
+  }
+
+  function recordWakeEvent(planId: string, eventId: string, kind: WakeEventKind, summary: string | null) {
+    const result = db.recordWakeEvent(planId, eventId, kind, summary, newId());
+    if (result.status === "triggered" && config.queueAutoStart) setImmediate(() => void pumpQueue());
+    return result;
+  }
+
+  async function processDueWakePlans(): Promise<void> {
+    if (wakeSchedulerBusy || shuttingDown) return;
+    wakeSchedulerBusy = true;
+    try {
+      for (const plan of db.listDueWakePlans(new Date().toISOString())) {
+        recordWakeEvent(plan.id, `deadline:${plan.deadline_at}`, "deadline", null);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/database is not open/i.test(message)) console.error("Wake scheduler failed", message);
+    } finally {
+      wakeSchedulerBusy = false;
+    }
+  }
+
   const app = express();
   app.set("trust proxy", "loopback");
   app.enable("strict routing");
@@ -281,6 +319,97 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   // session. Keep it before the authentication middleware and expose no other
   // temporary files through this route.
   api.get("/transcription-audio/:fileName", (req, res) => transcription.serveSignedAudio(req, res));
+
+  const automationLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 120,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Automatic continuation requests are too frequent." },
+  });
+
+  function authenticatedAutomationJob(req: Request) {
+    const jobId = String(req.params.jobId);
+    const claims = verifyJobAutomationToken(config.sessionSecret, readBearerToken(req.get("authorization")));
+    if (!claims || claims.jobId !== jobId) return null;
+    const job = db.getJob(jobId);
+    if (!job || job.status !== "running" || job.conversation_id !== claims.conversationId) return null;
+    return job;
+  }
+
+  function wakeDeadline(value: unknown): string | null {
+    const seconds = Number(value);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 365 * 24 * 60 * 60) return null;
+    return new Date(Date.now() + seconds * 1000).toISOString();
+  }
+
+  function wakeText(value: unknown, max = 20_000): string {
+    return typeof value === "string" ? value.trim().slice(0, max) : "";
+  }
+
+  function editableWakePrompt(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const prompt = value.trim();
+    return prompt && prompt.length <= 20_000 ? prompt : null;
+  }
+
+  api.post("/automation/jobs/:jobId/wake-plans", automationLimiter, (req, res) => {
+    const job = authenticatedAutomationJob(req);
+    if (!job) return res.status(401).json({ error: "Automation credentials are invalid, expired, or the job has ended." });
+    const mode = req.body?.mode as WakePlanMode;
+    const deadlineAt = wakeDeadline(req.body?.delaySeconds);
+    const successPrompt = wakeText(req.body?.successPrompt);
+    const failurePrompt = mode === "event_or_deadline" ? wakeText(req.body?.failurePrompt) : successPrompt;
+    const timeoutPrompt = mode === "event_or_deadline" ? wakeText(req.body?.timeoutPrompt) : successPrompt;
+    if (!deadlineAt || !["time", "event_or_deadline"].includes(mode) || !successPrompt || !failurePrompt || !timeoutPrompt) {
+      return res.status(400).json({ error: "Invalid wait mode, deadline, or continuation prompt." });
+    }
+    const eventToken = mode === "event_or_deadline" ? crypto.randomBytes(32).toString("base64url") : null;
+    try {
+      const conversation = db.getConversation(job.conversation_id)!;
+      const plan = db.createWakePlan({
+        id: newId(), conversationId: job.conversation_id, createdByJobId: job.id, mode,
+        label: wakeText(req.body?.label, 120) || (mode === "time" ? "Scheduled continuation" : "Waiting for external event"),
+        runId: wakeText(req.body?.runId, 200) || null, deadlineAt, successPrompt, failurePrompt, timeoutPrompt,
+        selection: job.agent_model && job.reasoning_effort
+          ? { model: job.agent_model, reasoningEffort: job.reasoning_effort }
+          : conversationAgentSelection(conversation),
+        eventTokenHash: eventToken ? hashWakeEventToken(config.sessionSecret, eventToken) : null,
+      });
+      const baseUrl = config.publicBaseUrl.replace(/\/$/, "") || `http://127.0.0.1:${config.port}${config.basePath}`;
+      return res.status(201).json({
+        wakePlan: publicWakePlan(plan),
+        signal: eventToken ? { url: `${baseUrl}/api/automation/wake-plans/${encodeURIComponent(plan.id)}/events`, token: eventToken } : undefined,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to create wait plan.";
+      return res.status(/UNIQUE constraint/i.test(message) ? 409 : 400).json({
+        error: /UNIQUE constraint/i.test(message) ? "This conversation already has an active wait plan." : message,
+      });
+    }
+  });
+
+  api.post("/automation/jobs/:jobId/wake-plans/:planId/cancel", automationLimiter, (req, res) => {
+    const job = authenticatedAutomationJob(req);
+    const plan = job ? db.getWakePlan(String(req.params.planId)) : undefined;
+    if (!job || !plan || plan.conversation_id !== job.conversation_id) return res.status(401).json({ error: "Invalid automation credentials." });
+    const cancelled = db.cancelWakePlan(plan.id);
+    return cancelled ? res.json({ wakePlan: publicWakePlan(cancelled) }) : res.status(409).json({ error: "Wait plan already triggered or cancelled." });
+  });
+
+  api.post("/automation/wake-plans/:planId/events", automationLimiter, (req, res) => {
+    const plan = db.getWakePlan(String(req.params.planId));
+    if (!plan || !wakeEventTokenMatches(plan, readBearerToken(req.get("authorization")))) return res.status(401).json({ error: "Invalid event receipt credentials." });
+    const eventId = wakeText(req.body?.eventId, 200);
+    const kind = req.body?.kind as WakeEventKind;
+    const summary = wakeText(req.body?.summary, 2_000) || null;
+    if (!eventId || !["success", "failure", "heartbeat"].includes(kind)) return res.status(400).json({ error: "Invalid event id or status." });
+    const result = recordWakeEvent(plan.id, eventId, kind, summary);
+    return res.json({
+      status: result.status,
+      wakePlan: result.plan ? { id: result.plan.id, state: result.plan.state, deadlineAt: result.plan.deadline_at, triggerCause: result.plan.trigger_cause } : undefined,
+    });
+  });
 
   const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -396,6 +525,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
     if (conversation.archived_at) return res.json({ conversation });
     const hasWork = conversation.status === "running"
+      || conversation.active_wake_count > 0
       || db.listActiveJobsForConversation(conversation.id).length > 0
       || db.listPendingPrompts(conversation.id).length > 0
       || db.listPendingPrompts(conversation.id, "editing").length > 0;
@@ -435,6 +565,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const pendingPrompts = db.listPendingPrompts(conversation.id);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0] ?? null;
     const composerDraft = db.getComposerDraft(conversation.id) ?? null;
+    const wakePlan = db.getActiveWakePlan(conversation.id) ?? null;
     return res.json({
       conversation,
       agentSelection,
@@ -443,6 +574,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       pendingPrompts,
       editingPrompt,
       composerDraft,
+      wakePlan: publicWakePlan(wakePlan),
+      wakeEvents: wakePlan ? db.listWakeEvents(wakePlan.id) : [],
       activeJob,
       latestJob,
       jobEvents,
@@ -456,6 +589,89 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           },
       packageQuota: db.getConversationCodexQuota(conversation.id),
     });
+  });
+
+  api.get("/conversations/:id/wake-plans/active", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    return res.json({ wakePlan: publicWakePlan(db.getActiveWakePlan(conversation.id)) });
+  });
+
+  api.post("/conversations/:id/wake-plans", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (conversation.archived_at) return res.status(409).json({ error: "会话已归档。" });
+    const deadlineAt = wakeDeadline(req.body?.delaySeconds);
+    const prompt = wakeText(req.body?.prompt);
+    if (!deadlineAt || !prompt) return res.status(400).json({ error: "等待时间或续跑指令无效。" });
+    try {
+      const plan = db.createWakePlan({
+        id: newId(), conversationId: conversation.id, mode: "time",
+        label: wakeText(req.body?.label, 120) || "定时自动继续", deadlineAt,
+        successPrompt: prompt, failurePrompt: prompt, timeoutPrompt: prompt,
+        selection: conversationAgentSelection(conversation),
+      });
+      return res.status(201).json({ wakePlan: publicWakePlan(plan) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "等待计划创建失败。";
+      return res.status(/UNIQUE constraint/i.test(message) ? 409 : 400).json({ error: /UNIQUE constraint/i.test(message) ? "这个会话已经有一个等待计划。" : message });
+    }
+  });
+
+  api.post("/conversations/:id/wake-plans/:planId/cancel", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
+    if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ error: "等待计划不存在。" });
+    const cancelled = db.cancelWakePlan(plan.id);
+    return cancelled ? res.json({ wakePlan: publicWakePlan(cancelled) }) : res.status(409).json({ error: "等待计划已经触发或取消。" });
+  });
+
+  api.post("/conversations/:id/wake-plans/:planId/reschedule", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
+    const deadlineAt = wakeDeadline(req.body?.delaySeconds);
+    if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ error: "等待计划不存在。" });
+    if (!deadlineAt) return res.status(400).json({ error: "等待时间无效。" });
+    const updated = db.rescheduleWakePlan(plan.id, deadlineAt);
+    return updated ? res.json({ wakePlan: publicWakePlan(updated) }) : res.status(409).json({ error: "等待计划已经触发或取消。" });
+  });
+
+  api.patch("/conversations/:id/wake-plans/:planId/prompts", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
+    if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ code: "WAKE_PLAN_NOT_FOUND", error: "等待计划不存在。" });
+    const body = req.body;
+    const allowedFields = plan.mode === "time" ? new Set(["revision", "successPrompt"]) : new Set(["revision", "successPrompt", "failurePrompt", "timeoutPrompt"]);
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !allowedFields.has(key))) {
+      return res.status(400).json({ code: "WAKE_PROMPTS_INVALID", error: "续跑提示词请求包含不允许的字段。" });
+    }
+    const expectedRevision = Number(body.revision);
+    const successPrompt = editableWakePrompt(body.successPrompt);
+    const failurePrompt = plan.mode === "time" ? successPrompt : editableWakePrompt(body.failurePrompt);
+    const timeoutPrompt = plan.mode === "time" ? successPrompt : editableWakePrompt(body.timeoutPrompt);
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 0 || !successPrompt || !failurePrompt || !timeoutPrompt) {
+      return res.status(400).json({ code: "WAKE_PROMPTS_INVALID", error: "续跑提示词不能为空，且每段不能超过 20,000 个字符。" });
+    }
+    const updated = db.updateWakePlanPrompts({ id: plan.id, expectedRevision, successPrompt, failurePrompt, timeoutPrompt });
+    return updated
+      ? res.json({ wakePlan: publicWakePlan(updated) })
+      : res.status(409).json({ code: "WAKE_PLAN_CONFLICT", error: "等待计划已被修改、触发或取消，请刷新后重试。" });
+  });
+
+  api.post("/conversations/:id/wake-plans/:planId/trigger", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
+    if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ error: "等待计划不存在。" });
+    const result = recordWakeEvent(plan.id, `manual:${crypto.randomUUID()}`, "manual", "用户手动立即继续");
+    return result.status === "triggered"
+      ? res.json({ status: result.status, wakePlan: publicWakePlan(result.plan) })
+      : res.status(409).json({ error: "等待计划已经触发或取消。" });
   });
 
   api.get("/conversations/:id/messages", (req, res) => {
@@ -1001,10 +1217,19 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.status(500).json({ error: message });
   });
 
-  if (config.queueAutoStart) setImmediate(() => void pumpQueue());
+  wakeSchedulerTimer = config.queueAutoStart ? setInterval(() => void processDueWakePlans(), 1_000) : undefined;
+  wakeSchedulerTimer?.unref();
+  if (config.queueAutoStart) {
+    setImmediate(() => void processDueWakePlans());
+    setImmediate(() => void pumpQueue());
+  }
   return {
     app, db, runner, config, pumpQueue,
-    beginShutdown: () => { shuttingDown = true; },
+    beginShutdown: () => {
+      shuttingDown = true;
+      if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
+      wakeSchedulerTimer = undefined;
+    },
   };
 }
 
