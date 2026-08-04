@@ -193,7 +193,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .conversation-select { min-width: 0; flex: 1; display: flex; align-items: center; gap: 9px; padding: 10px 10px 10px 11px; border: 0; color: #e4e6ef; background: transparent; cursor: pointer; text-align: left; }
 .conversation-select > svg { flex: 0 0 auto; color: #b9bdcc; }
 .conversation-select > svg.conversation-waiting { color: #9399ad; }
+.conversation-wake-trigger { width: 28px; height: 28px; display: grid; flex: 0 0 28px; place-items: center; padding: 0; border: 0; border-radius: 7px; color: #9399ad; background: transparent; cursor: pointer; }
+.conversation-wake-trigger:hover, .conversation-wake-trigger:focus-visible { color: #fff; background: rgba(255, 255, 255, .065); }
 .conversation-row.active .conversation-select > svg { color: var(--amber); }
+.conversation-row.active .conversation-wake-trigger { color: var(--amber); }
+.conversation-row.active .conversation-wake-trigger:hover, .conversation-row.active .conversation-wake-trigger:focus-visible { color: #ffd27c; background: rgba(240, 170, 60, .13); }
 .conversation-select span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .conversation-row.unread .conversation-select::after { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #38c976; box-shadow: 0 0 0 2px rgba(56, 201, 118, .14); content: ""; }
 .row-actions { width: 30px; display: flex; flex: 0 0 30px; align-items: center; padding-right: 3px; opacity: 0; pointer-events: none; transition: opacity .14s ease; }

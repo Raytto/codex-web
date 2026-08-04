@@ -1514,6 +1514,12 @@ test("nightly Codex maintenance gate prevents a new job from racing runtime prom
   assert.equal(instance.db.listQueuedJobs().length, 1);
 });
 
+test("wake controls use muted color until their conversation is selected", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(styles, /\.conversation-wake-trigger \{[^}]*color: #9399ad;/);
+  assert.match(styles, /\.conversation-row\.active \.conversation-wake-trigger \{ color: var\(--amber\); \}/);
+});
+
 test("account identity uses the signed-in display name for the label and avatar", () => {
   assert.deepEqual(resolveAccountIdentity({ username: "wh", displayName: "WH" }), { displayName: "WH", initials: "WH" });
   assert.deepEqual(resolveAccountIdentity({ username: "wenhao", displayName: "Wen Hao" }), { displayName: "Wen Hao", initials: "WH" });
