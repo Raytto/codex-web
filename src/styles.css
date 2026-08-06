@@ -615,7 +615,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .setting-menu.model { width: 166px; }
 .setting-menu.effort { width: 92px; }
 .setting-select { width: 100%; }
-.setting-menu-panel { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 30; min-width: 100%; max-width: min(290px, calc(100vw - 28px)); padding: 6px; border: 1px solid rgba(57, 70, 137, .14); border-radius: 12px; background: rgba(255, 255, 255, .98); box-shadow: 0 16px 38px rgba(15, 17, 32, .16), 0 3px 10px rgba(15, 17, 32, .06); backdrop-filter: blur(12px); }
+.setting-menu-panel { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 30; min-width: 100%; max-width: min(290px, calc(100vw - 28px)); max-height: min(420px, calc(60dvh - env(safe-area-inset-top))); overflow-y: auto; overscroll-behavior-y: contain; padding: 6px; border: 1px solid rgba(57, 70, 137, .14); border-radius: 12px; background: rgba(255, 255, 255, .98); box-shadow: 0 16px 38px rgba(15, 17, 32, .16), 0 3px 10px rgba(15, 17, 32, .06); backdrop-filter: blur(12px); -webkit-overflow-scrolling: touch; }
 .setting-menu.model .setting-menu-panel { width: 236px; }
 .setting-menu-panel button { width: 100%; min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 8px; border: 0; border-radius: 8px; color: #34384b; background: transparent; cursor: pointer; text-align: left; }
 .setting-menu-panel button.active, .setting-menu-panel button:hover { background: #f1f3fa; }
@@ -711,7 +711,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .setting-select > span { display: none; }
   .setting-menu.model { width: 132px; }
   .setting-menu.effort { width: 76px; }
-  .setting-menu.model .setting-menu-panel { width: min(236px, calc(100vw - 28px)); }
+  .setting-menu.model .setting-menu-panel { right: auto; left: 0; width: min(236px, calc(100vw - 76px)); }
   .composer-note { display: none; }
   .welcome { padding: 30px 18px 180px; }
   .welcome > p { text-align: center; }

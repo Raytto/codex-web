@@ -187,6 +187,13 @@ test("completed conversations stay visibly unread until their detail is viewed",
   assert.match(styles, /\.conversation-row\.unread \.conversation-select::after \{[^}]*background: #38c976;[^}]*content: "";/);
 });
 
+test("mobile model menus stay inside the viewport and scroll internally", () => {
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  const mobileBlock = styles.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(styles, /\.setting-menu-panel \{[^}]*max-height: min\(420px, calc\(60dvh - env\(safe-area-inset-top\)\)\);[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
+  assert.match(mobileBlock, /\.setting-menu\.model \.setting-menu-panel \{[^}]*right: auto;[^}]*left: 0;[^}]*width: min\(236px, calc\(100vw - 76px\)\);/);
+});
+
 test("selected message text can be quoted into a focused Agent question", () => {
   assert.equal(normalizeAskAgentSelection("  第一行  \r\n\r\n\r\n第二行  \n"), "第一行\n\n第二行");
   assert.equal(buildAskAgentDraft("", "第一行\n第二行"), "请结合以下引用回答我的问题：\n\n> 第一行\n> 第二行\n\n请解释这段引用。");
