@@ -2,7 +2,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Upload as TusUpload } from "tus-js-client";
 import {
   Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
   CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Square, Sun,
@@ -32,6 +31,7 @@ const RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 type DraftSaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
 type DraftUpload = { id: string; name: string; resumable: boolean; progress: number; status: "uploading" | "retrying" | "paused" | "error" };
+type TusUploadClient = import("tus-js-client").Upload;
 type CachedComposerDraft = { content: string; quoteExcerpt: string; composerDraft: ComposerDraft | null };
 
 function composerDraftSignature(content: string, quoteExcerpt: string): string {
@@ -265,7 +265,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const composerDraftRef = useRef<ComposerDraft | null>(composerDraft);
   const draftUploadsRef = useRef<DraftUpload[]>(draftUploads);
   const draftUploadControllersRef = useRef(new Map<string, AbortController>());
-  const draftTusUploadsRef = useRef(new Map<string, TusUpload>());
+  const draftTusUploadsRef = useRef(new Map<string, TusUploadClient>());
   const cancelledDraftUploadIdsRef = useRef(new Set<string>());
   const draftLoadedConversationRef = useRef<string | null>(null);
   const draftCacheRef = useRef(new Map<string, CachedComposerDraft>());
@@ -669,6 +669,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function startResumableComposerUpload(conversationId: string, file: File, upload: DraftUpload) {
+    let TusUpload: typeof import("tus-js-client").Upload;
+    try {
+      ({ Upload: TusUpload } = await import("tus-js-client"));
+    } catch (reason) {
+      setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
+      setError(reason instanceof Error ? reason.message : "无法加载断点续传组件，请检查网络后重试");
+      return;
+    }
     const client = new TusUpload(file, {
       endpoint: resumableUploadEndpoint(),
       chunkSize: RESUMABLE_UPLOAD_CHUNK_BYTES,

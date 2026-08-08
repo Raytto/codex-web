@@ -114,6 +114,28 @@ test("uploading composer attachments expose per-file cancellation backed by Abor
   assert.match(apiSource, /draft\/files`, \{ method: "POST", body, signal \}/);
 });
 
+test("the tus browser client is loaded only when a resumable upload starts", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.doesNotMatch(appSource, /^import .* from ["']tus-js-client["'];$/m);
+  assert.match(appSource, /startResumableComposerUpload[\s\S]*await import\("tus-js-client"\)/);
+  assert.match(appSource, /file\.size >= RESUMABLE_UPLOAD_THRESHOLD_BYTES[\s\S]*if \(upload\.resumable\)[\s\S]*startResumableComposerUpload/);
+
+  const distRoot = path.join(process.cwd(), "dist");
+  const builtIndex = fs.readFileSync(path.join(distRoot, "index.html"), "utf8");
+  const entryPath = builtIndex.match(/<script[^>]+src="([^"]+\.js)"/)?.[1].replace(/^\/+/, "");
+  assert.ok(entryPath, "the production build should expose its JavaScript entry");
+  const assetsRoot = path.join(distRoot, "assets");
+  const tusChunks = fs.readdirSync(assetsRoot).filter((name) => {
+    if (!name.endsWith(".js")) return false;
+    const source = fs.readFileSync(path.join(assetsRoot, name), "utf8");
+    return source.includes("tus-js-client") && source.includes("Tus-Resumable") && source.includes("Upload-Offset");
+  });
+  assert.equal(tusChunks.length, 1, "the production build should emit one isolated tus client chunk");
+  const entrySource = fs.readFileSync(path.join(distRoot, entryPath), "utf8");
+  assert.doesNotMatch(entrySource, /tus-js-client|Tus-Resumable|Upload-Offset/);
+  assert.ok(entrySource.includes(tusChunks[0]), "the entry should reference the isolated tus chunk dynamically");
+});
+
 test("chat font sizing keeps readable bounds and scales from the default", () => {
   assert.equal(normalizeChatFontSize(undefined), CHAT_FONT_SIZE_DEFAULT);
   assert.equal(normalizeChatFontSize("18"), 18);
