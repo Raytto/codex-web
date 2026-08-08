@@ -24,7 +24,7 @@
 
 * { box-sizing: border-box; }
 html, body, #root { min-width: 320px; min-height: 100%; height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
-body { position: fixed; inset: 0; width: 100%; height: 100%; height: 100dvh; background: var(--canvas); }
+body { width: 100%; height: 100%; height: 100dvh; background: var(--canvas); }
 #root { width: 100%; }
 button, input, textarea { font: inherit; }
 button { color: inherit; }

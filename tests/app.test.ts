@@ -151,11 +151,14 @@ test("sidebar task actions collapse into a stable overflow menu", () => {
   assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
 });
 
-test("mobile Safari keeps the app shell fixed while only inner regions scroll", () => {
+test("mobile Safari keeps login and workspace controls out of a fixed interactive root", () => {
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(styles, /html, body, #root \{[^}]*overflow: hidden;[^}]*overscroll-behavior: none;/);
-  assert.match(styles, /body \{[^}]*position: fixed;[^}]*inset: 0;[^}]*height: 100dvh;/);
+  assert.match(styles, /body \{[^}]*height: 100%;[^}]*height: 100dvh;/);
+  assert.doesNotMatch(styles, /body \{[^}]*position: fixed;/);
   assert.match(styles, /#root \{[^}]*width: 100%;/);
+  assert.match(styles, /\.login-page \{[^}]*position: relative;[^}]*height: 100%;[^}]*overflow: hidden;/);
+  assert.match(styles, /\.shell \{[^}]*height: 100%;[^}]*overflow: hidden;/);
   assert.match(styles, /\.messages \{[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
 });
 
