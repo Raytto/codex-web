@@ -18,6 +18,7 @@ import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId,
 import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { buildUserCancellationSummary } from "./cancellation-summary.js";
 import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from "./wake-automation.js";
+import { ResumableUploadService } from "./resumable-upload.js";
 
 const COOKIE_NAME = "cww_session";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
@@ -109,6 +110,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     for (const file of prompt.files) {
       try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); }
       catch { /* Missing or already-cleaned drafts must not block queue cleanup. */ }
+      db.deleteCompletedResumableUploadForFile(file.id);
     }
   }
 
@@ -117,6 +119,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     for (const file of draft.files) {
       try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); }
       catch { /* Missing draft files must not block explicit draft cleanup. */ }
+      db.deleteCompletedResumableUploadForFile(file.id);
     }
   }
 
@@ -202,6 +205,28 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (recordCancellation) for (const job of runningJobs) recordUserCancelledJob(job);
   }
 
+  let diskSpaceSample: { sampledAt: number; bytes: number } | null = null;
+  function availableDiskBytes(forceRefresh = false): number {
+    if (!forceRefresh && diskSpaceSample && Date.now() - diskSpaceSample.sampledAt < 2_000) return diskSpaceSample.bytes;
+    try {
+      const roots = [...new Set([config.dataRoot, config.tenantRoot])];
+      const bytes = Math.min(...roots.map((root) => {
+        const stat = fs.statfsSync(root);
+        return Number(stat.bavail) * Number(stat.bsize);
+      }));
+      diskSpaceSample = { sampledAt: Date.now(), bytes };
+      return bytes;
+    } catch {
+      diskSpaceSample = { sampledAt: Date.now(), bytes: 0 };
+      return diskSpaceSample.bytes;
+    }
+  }
+
+  function maximumStoredBytesForUser(_userId: string): number {
+    return config.maxStoredBytesPerUser;
+  }
+
+  const resumableUploads = new ResumableUploadService({ db, config, availableDiskBytes, maximumStoredBytesForUser });
   function publishQueuePositions(): void {
     for (const queued of db.listQueuedJobs()) {
       const queuePosition = db.getQueuePosition(queued.id) ?? 1;
@@ -485,6 +510,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
+  api.options(["/uploads", "/uploads/:id"], (req, res) => resumableUploads.options(req, res));
+  api.post("/uploads", (req, res) => resumableUploads.create(req, res, res.locals.session as SessionRow));
+  api.head("/uploads/:id", (req, res) => resumableUploads.head(req, res, res.locals.session as SessionRow));
+  api.patch("/uploads/:id", (req, res) => resumableUploads.patch(req, res, res.locals.session as SessionRow));
+  api.delete("/uploads/:id", (req, res) => resumableUploads.terminate(req, res, res.locals.session as SessionRow));
+  api.get("/uploads/:id/result", (req, res) => resumableUploads.result(req, res, res.locals.session as SessionRow));
+
   api.post("/auth/logout", (req, res) => {
     const token = req.cookies?.[COOKIE_NAME];
     if (token) db.deleteSession(hashToken(token, config.sessionSecret));
@@ -754,6 +786,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       // queue pump during cancellation, so leaving drafts here could promote one
       // into a real message/job while the conversation is being deleted.
       await stopConversationJobs(conversation.id, false);
+      await resumableUploads.cancelConversationUploads(conversation.id);
       for (const file of db.listFiles(conversation.id)) removePersistedDeliverable(config.dataRoot, file.relative_path);
       const tenant = ensureTenant(config.tenantRoot, session.user_id);
       if (conversation.codex_thread_id && !db.isCodexThreadUsedByAnotherActiveConversation(conversation.codex_thread_id, conversation.id)) {
@@ -782,7 +815,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       },
       filename(_req, file, callback) { callback(null, safeUploadName(file.originalname).diskName); },
     }),
-    limits: { files: 12, fields: 4 },
+    limits: { files: 12, fields: 4, fileSize: config.maxUploadFileBytes },
   });
 
   api.put("/conversations/:id/draft", (req, res) => {
@@ -806,7 +839,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     if (uploaded.length === 0) return res.status(400).json({ error: "没有收到附件。" });
     const existing = db.getComposerDraft(conversation.id);
-    if ((existing?.files.length ?? 0) + uploaded.length > 12) {
+    if ((existing?.files.length ?? 0) + db.listActiveResumableUploads(conversation.id).length + uploaded.length > 12) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "单个会话草稿最多包含 12 个附件。" });
     }
@@ -825,15 +858,17 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, conversation.id);
     try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); } catch {}
     db.removeFile(file.id);
+    db.deleteCompletedResumableUploadForFile(file.id);
     db.pruneEmptyComposerDraft(conversation.id);
     if (db.getComposerDraft(conversation.id)) db.touchComposerDraft(conversation.id);
     return res.json({ composerDraft: db.getComposerDraft(conversation.id) ?? null });
   });
 
-  api.delete("/conversations/:id/draft", (req, res) => {
+  api.delete("/conversations/:id/draft", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    await resumableUploads.cancelConversationUploads(conversation.id);
     const draft = db.getComposerDraft(conversation.id);
     if (draft) {
       removeComposerDraftFiles(draft, session.user_id);
@@ -1237,10 +1272,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     setImmediate(() => void processDueWakePlans());
     setImmediate(() => void pumpQueue());
   }
+  if (config.queueAutoStart) resumableUploads.start();
   return {
-    app, db, runner, config, pumpQueue,
+    app, db, runner, config, pumpQueue, resumableUploads,
     beginShutdown: () => {
       shuttingDown = true;
+      resumableUploads.stop();
       if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
       wakeSchedulerTimer = undefined;
     },

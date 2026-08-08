@@ -24,6 +24,11 @@ export type AppConfig = {
   codexHome: string;
   codexModel?: string;
   queueAutoStart: boolean;
+  maxUploadFileBytes: number;
+  maxStoredBytesPerUser: number;
+  minimumFreeDiskBytes: number;
+  resumableUploadChunkBytes: number;
+  resumableUploadExpiryHours: number;
   tenantWorkerIsolation: boolean;
   publicBaseUrl: string;
   dashscopeApiKey: string;
@@ -68,6 +73,11 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     codexHome: overrides.codexHome ?? (process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
     codexModel: overrides.codexModel ?? (process.env.CODEX_MODEL || undefined),
     queueAutoStart: overrides.queueAutoStart ?? process.env.QUEUE_AUTO_START !== "false",
+    maxUploadFileBytes: boundedInteger(overrides.maxUploadFileBytes ?? process.env.MAX_UPLOAD_FILE_BYTES, 2 * 1024 * 1024 * 1024, 1 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+    maxStoredBytesPerUser: boundedInteger(overrides.maxStoredBytesPerUser ?? process.env.MAX_STORED_BYTES_PER_USER, 20 * 1024 * 1024 * 1024, 1, 1024 * 1024 * 1024 * 1024),
+    minimumFreeDiskBytes: boundedInteger(overrides.minimumFreeDiskBytes ?? process.env.MINIMUM_FREE_DISK_BYTES, 2 * 1024 * 1024 * 1024, 1, Number.MAX_SAFE_INTEGER),
+    resumableUploadChunkBytes: boundedInteger(overrides.resumableUploadChunkBytes ?? process.env.RESUMABLE_UPLOAD_CHUNK_BYTES, 8 * 1024 * 1024, 1 * 1024 * 1024, 32 * 1024 * 1024),
+    resumableUploadExpiryHours: boundedInteger(overrides.resumableUploadExpiryHours ?? process.env.RESUMABLE_UPLOAD_EXPIRY_HOURS, 72, 1, 24 * 30),
     tenantWorkerIsolation: overrides.tenantWorkerIsolation ?? process.env.TENANT_WORKER_ISOLATION === "true",
     publicBaseUrl: overrides.publicBaseUrl ?? (process.env.PUBLIC_BASE_URL || ""),
     dashscopeApiKey: overrides.dashscopeApiKey ?? (process.env.DASHSCOPE_API_KEY || ""),

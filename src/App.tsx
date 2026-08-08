@@ -2,12 +2,13 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Upload as TusUpload } from "tus-js-client";
 import {
   Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
-  CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pencil, Plus, Search, Settings2, Square, Sun,
+  CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Square, Sun,
   Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileUrl, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
+import { api, BASE_PATH, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -26,9 +27,11 @@ import { recoverBrowserSession } from "./session-recovery";
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
 const FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
+const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 type DraftSaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
-type DraftUpload = { id: string; name: string };
+type DraftUpload = { id: string; name: string; resumable: boolean; progress: number; status: "uploading" | "retrying" | "paused" | "error" };
 type CachedComposerDraft = { content: string; quoteExcerpt: string; composerDraft: ComposerDraft | null };
 
 function composerDraftSignature(content: string, quoteExcerpt: string): string {
@@ -262,6 +265,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const composerDraftRef = useRef<ComposerDraft | null>(composerDraft);
   const draftUploadsRef = useRef<DraftUpload[]>(draftUploads);
   const draftUploadControllersRef = useRef(new Map<string, AbortController>());
+  const draftTusUploadsRef = useRef(new Map<string, TusUpload>());
   const cancelledDraftUploadIdsRef = useRef(new Set<string>());
   const draftLoadedConversationRef = useRef<string | null>(null);
   const draftCacheRef = useRef(new Map<string, CachedComposerDraft>());
@@ -634,6 +638,89 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     await refreshList(); setSelectedId(result.conversation.id);
   }
 
+  async function mergeCompletedDraftUpload(conversationId: string, upload: DraftUpload, result: { composerDraft: ComposerDraft; uploadedFiles: WorkFile[] }) {
+    if (cancelledDraftUploadIdsRef.current.has(upload.id)) {
+      await Promise.all(result.uploadedFiles.map((uploadedFile) => api.deleteConversationDraftFile(conversationId, uploadedFile.id)));
+      return;
+    }
+    draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+    const mergeUpload = (current: ComposerDraft | null): ComposerDraft => current ? {
+      ...current,
+      files: [...current.files, ...result.uploadedFiles.filter((uploadedFile) => !current.files.some((file) => file.id === uploadedFile.id))],
+      updated_at: result.composerDraft.updated_at,
+    } : result.composerDraft;
+    if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
+      const merged = mergeUpload(composerDraftRef.current);
+      composerDraftRef.current = merged;
+      setComposerDraft(merged);
+    }
+    const cached = draftCacheRef.current.get(conversationId);
+    const cachedDraft = mergeUpload(cached?.composerDraft ?? null);
+    if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: cachedDraft });
+    else draftCacheRef.current.set(conversationId, {
+      content: conversationId === selectedIdRef.current ? inputRef.current : result.composerDraft.content,
+      quoteExcerpt: conversationId === selectedIdRef.current ? askAgentQuoteRef.current : result.composerDraft.quote_excerpt ?? "",
+      composerDraft: cachedDraft,
+    });
+    if (selectedIdRef.current === conversationId) {
+      const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
+      setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId) ? "saved" : "unsaved");
+    }
+  }
+
+  async function startResumableComposerUpload(conversationId: string, file: File, upload: DraftUpload) {
+    const client = new TusUpload(file, {
+      endpoint: resumableUploadEndpoint(),
+      chunkSize: RESUMABLE_UPLOAD_CHUNK_BYTES,
+      retryDelays: [0, 1_000, 3_000, 5_000, 10_000, 20_000],
+      removeFingerprintOnSuccess: true,
+      storeFingerprintForResuming: true,
+      headers: resumableUploadHeaders(),
+      metadata: { filename: file.name, filetype: file.type || "application/octet-stream", conversationId },
+      fingerprint: () => Promise.resolve(["codex-web", conversationId, file.name, file.type, file.size, file.lastModified].join("-")),
+      onProgress(bytesUploaded, bytesTotal) {
+        const progress = bytesTotal > 0 ? bytesUploaded / bytesTotal : 0;
+        setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, progress, status: "uploading" } : item));
+      },
+      onShouldRetry(reason, retryAttempt) {
+        if (cancelledDraftUploadIdsRef.current.has(upload.id)) return false;
+        const status = (reason as { originalResponse?: { getStatus?: () => number } }).originalResponse?.getStatus?.();
+        if (status && status < 500 && status !== 409 && status !== 423 && status !== 429) return false;
+        setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "retrying" } : item));
+        return retryAttempt < 6;
+      },
+      onError(reason) {
+        if (cancelledDraftUploadIdsRef.current.has(upload.id)) return;
+        setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
+        setError(reason instanceof Error ? reason.message : "草稿附件断点续传失败，可点击继续重试");
+      },
+      onSuccess() {
+        void (async () => {
+          try {
+            if (!client.url) throw new Error("服务器没有返回上传资源地址");
+            const result = await api.resumableUploadResult(client.url);
+            await mergeCompletedDraftUpload(conversationId, upload, result);
+            draftTusUploadsRef.current.delete(upload.id);
+            cancelledDraftUploadIdsRef.current.delete(upload.id);
+            setDraftUploads((current) => current.filter((item) => item.id !== upload.id));
+          } catch (reason) {
+            setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
+            setError(reason instanceof Error ? reason.message : "上传完成登记失败，可点击继续恢复");
+          }
+        })();
+      },
+    });
+    draftTusUploadsRef.current.set(upload.id, client);
+    try {
+      const previous = await client.findPreviousUploads();
+      if (previous.length > 0) client.resumeFromPreviousUpload(previous[0]);
+      client.start();
+    } catch (reason) {
+      setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
+      setError(reason instanceof Error ? reason.message : "无法启动断点续传");
+    }
+  }
+
   async function addComposerFiles(incoming: File[]) {
     if (incoming.length === 0) return;
     const conversationId = selectedIdRef.current;
@@ -644,42 +731,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const available = Math.max(0, 12 - (composerDraftRef.current?.files.length ?? 0) - draftUploadsRef.current.length);
     const accepted = incoming.slice(0, available);
     if (accepted.length === 0) { setNotice("单个会话草稿最多包含 12 个附件。"); return; }
-    const uploads = accepted.map((file) => ({ id: crypto.randomUUID(), name: file.name }));
+    const uploads = accepted.map((file): DraftUpload => ({
+      id: crypto.randomUUID(), name: file.name, resumable: file.size >= RESUMABLE_UPLOAD_THRESHOLD_BYTES, progress: 0, status: "uploading",
+    }));
     setDraftUploads((current) => [...current, ...uploads]);
     setError("");
     await Promise.all(accepted.map(async (file, index) => {
       const upload = uploads[index];
+      if (upload.resumable) {
+        await startResumableComposerUpload(conversationId, file, upload);
+        return;
+      }
       const controller = new AbortController();
       draftUploadControllersRef.current.set(upload.id, controller);
       try {
         const result = await api.uploadConversationDraftFiles(conversationId, [file], controller.signal);
-        if (cancelledDraftUploadIdsRef.current.has(upload.id)) {
-          await Promise.all(result.uploadedFiles.map((uploadedFile) => api.deleteConversationDraftFile(conversationId, uploadedFile.id)));
-          return;
-        }
-        draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
-        const mergeUpload = (current: ComposerDraft | null): ComposerDraft => current ? {
-          ...current,
-          files: [...current.files, ...result.uploadedFiles.filter((uploadedFile) => !current.files.some((file) => file.id === uploadedFile.id))],
-          updated_at: result.composerDraft.updated_at,
-        } : result.composerDraft;
-        if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
-          const merged = mergeUpload(composerDraftRef.current);
-          composerDraftRef.current = merged;
-          setComposerDraft(merged);
-        }
-        const cached = draftCacheRef.current.get(conversationId);
-        const cachedDraft = mergeUpload(cached?.composerDraft ?? null);
-        if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: cachedDraft });
-        else draftCacheRef.current.set(conversationId, {
-          content: conversationId === selectedIdRef.current ? inputRef.current : result.composerDraft.content,
-          quoteExcerpt: conversationId === selectedIdRef.current ? askAgentQuoteRef.current : result.composerDraft.quote_excerpt ?? "",
-          composerDraft: cachedDraft,
-        });
-        if (selectedIdRef.current === conversationId) {
-          const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
-          setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId) ? "saved" : "unsaved");
-        }
+        await mergeCompletedDraftUpload(conversationId, upload, result);
       } catch (reason) {
         if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "草稿附件上传失败");
       } finally {
@@ -693,7 +760,27 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function cancelComposerDraftUpload(uploadId: string) {
     cancelledDraftUploadIdsRef.current.add(uploadId);
     draftUploadControllersRef.current.get(uploadId)?.abort();
+    const resumable = draftTusUploadsRef.current.get(uploadId);
+    if (resumable) {
+      draftTusUploadsRef.current.delete(uploadId);
+      void resumable.abort(true).catch((reason) => setError(reason instanceof Error ? reason.message : "取消上传失败，服务器会在到期后自动清理"));
+    }
     setDraftUploads((current) => current.filter((upload) => upload.id !== uploadId));
+  }
+
+  function pauseComposerDraftUpload(uploadId: string) {
+    const upload = draftTusUploadsRef.current.get(uploadId);
+    if (!upload) return;
+    void upload.abort(false).then(() => {
+      setDraftUploads((current) => current.map((item) => item.id === uploadId ? { ...item, status: "paused" } : item));
+    }).catch((reason) => setError(reason instanceof Error ? reason.message : "暂停上传失败"));
+  }
+
+  function resumeComposerDraftUpload(uploadId: string) {
+    const upload = draftTusUploadsRef.current.get(uploadId);
+    if (!upload) return;
+    setDraftUploads((current) => current.map((item) => item.id === uploadId ? { ...item, status: "uploading" } : item));
+    upload.start();
   }
 
   async function removeComposerDraftFile(file: WorkFile) {
@@ -1143,7 +1230,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
         canSteer={job?.status === "running"} onCancelPendingEdit={() => void cancelPendingEdit()}
-        onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
+        onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onPauseDraftUpload={pauseComposerDraftUpload} onResumeDraftUpload={resumeComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
         onSend={(message) => void send(message)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
@@ -1409,7 +1496,7 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
   </section>;
 }
 
-function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
+function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
   conversationId: string | null;
   input: string;
   setInput: (value: string) => void;
@@ -1441,6 +1528,8 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   onCancelPendingEdit: () => void;
   onAddFiles: (files: File[]) => void;
   onCancelDraftUpload: (uploadId: string) => void;
+  onPauseDraftUpload: (uploadId: string) => void;
+  onResumeDraftUpload: (uploadId: string) => void;
   onRemoveDraftFile: (file: WorkFile) => void;
   onClearDraft: () => void;
   onRemoveEditingFile: (fileId: string) => void;
@@ -1675,9 +1764,16 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       const removed = removedEditingFileIds.includes(file.id);
       return <span key={file.id} className={removed ? "removed" : ""}><FileIcon size={14} />{file.original_name}<button type="button" onClick={() => removed ? onRestoreEditingFile(file.id) : onRemoveEditingFile(file.id)} title={removed ? "恢复附件" : "移除附件"}>{removed ? <Plus size={13} /> : <X size={13} />}</button></span>;
     })}</div>}
-    {!editingPending && draftFiles.length > 0 && <div className="pending-files">{draftFiles.map((file) => <span key={file.id}><FileIcon size={14} />{file.original_name}<button type="button" aria-label={`移除附件 ${file.original_name}`} title="移除附件" onClick={() => onRemoveDraftFile(file)}><X size={13} /></button></span>)}</div>}
-    {!editingPending && draftUploads.length > 0 && <div className="pending-files">{draftUploads.map((file) => <span key={file.id} className="uploading"><LoaderCircle className="spin" size={14} />{file.name}<button type="button" aria-label={`取消上传 ${file.name}`} title="取消上传" onClick={() => onCancelDraftUpload(file.id)}><X size={13} /></button></span>)}</div>}
-    {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} />{file.name}<button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
+    {!editingPending && draftFiles.length > 0 && <div className="pending-files">{draftFiles.map((file) => <span key={file.id}><FileIcon size={14} /><span className="attachment-chip-name">{file.original_name}</span><button type="button" aria-label={`移除附件 ${file.original_name}`} title="移除附件" onClick={() => onRemoveDraftFile(file)}><X size={13} /></button></span>)}</div>}
+    {!editingPending && draftUploads.length > 0 && <div className="pending-files">{draftUploads.map((file) => <span key={file.id} className={`uploading ${file.status}`}>
+      {file.status === "paused" || file.status === "error" ? <Pause size={14} /> : <LoaderCircle className="spin" size={14} />}
+      <span className="attachment-upload-copy"><span className="attachment-chip-name">{file.name}</span><small>{file.resumable ? `${file.status === "retrying" ? "正在重试 · " : file.status === "paused" ? "已暂停 · " : file.status === "error" ? "等待继续 · " : ""}${Math.round(file.progress * 100)}%` : "正在上传"}</small>{file.resumable && <i style={{ width: `${Math.max(2, file.progress * 100)}%` }} />}</span>
+      {file.resumable && (file.status === "paused" || file.status === "error")
+        ? <button type="button" aria-label={`继续上传 ${file.name}`} title="继续上传" onClick={() => onResumeDraftUpload(file.id)}><Play size={12} /></button>
+        : file.resumable ? <button type="button" aria-label={`暂停上传 ${file.name}`} title="暂停上传" onClick={() => onPauseDraftUpload(file.id)}><Pause size={12} /></button> : null}
+      <button type="button" aria-label={`取消上传 ${file.name}`} title="取消并删除上传" onClick={() => onCancelDraftUpload(file.id)}><X size={13} /></button>
+    </span>)}</div>}
+    {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
     <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />

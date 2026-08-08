@@ -8,6 +8,15 @@ import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 
+export class StorageQuotaExceededError extends Error {
+  readonly code = "USER_STORAGE_LIMIT";
+
+  constructor() {
+    super("User storage limit exceeded");
+    this.name = "StorageQuotaExceededError";
+  }
+}
+
 export type UserRow = {
   id: string;
   username: string;
@@ -65,8 +74,28 @@ export type FileRow = {
   relative_path: string;
   mime_type: string;
   size: number;
+  sha256?: string | null;
   kind: "upload" | "output";
   created_at: string;
+};
+
+export type ResumableUploadState = "uploading" | "finalizing" | "completed" | "cancelled" | "expired";
+export type ResumableUploadRow = {
+  id: string;
+  user_id: string;
+  conversation_id: string;
+  file_id: string;
+  original_name: string;
+  mime_type: string;
+  size: number;
+  offset: number;
+  storage_name: string;
+  final_name: string;
+  state: ResumableUploadState;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  completed_at: string | null;
 };
 
 export type MessagePage = {
@@ -318,6 +347,7 @@ export class AppDatabase {
         relative_path TEXT NOT NULL,
         mime_type TEXT NOT NULL,
         size INTEGER NOT NULL,
+        sha256 TEXT,
         kind TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
@@ -397,6 +427,26 @@ export class AppDatabase {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(user_id, key)
       );
+      CREATE TABLE IF NOT EXISTS resumable_uploads (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        file_id TEXT NOT NULL UNIQUE,
+        original_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK(size >= 0),
+        offset INTEGER NOT NULL DEFAULT 0 CHECK(offset >= 0 AND offset <= size),
+        storage_name TEXT NOT NULL UNIQUE,
+        final_name TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('uploading','finalizing','completed','cancelled','expired')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS resumable_uploads_owner_state_idx ON resumable_uploads(user_id,state,expires_at);
+      CREATE INDEX IF NOT EXISTS resumable_uploads_conversation_state_idx ON resumable_uploads(conversation_id,state);
+      CREATE INDEX IF NOT EXISTS resumable_uploads_expiry_idx ON resumable_uploads(state,expires_at);
     `);
 
     const conversationColumns = this.columnNames("conversations");
@@ -425,6 +475,7 @@ export class AppDatabase {
     const fileColumns = this.columnNames("files");
     if (!fileColumns.has("pending_prompt_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN pending_prompt_id TEXT REFERENCES pending_prompts(id) ON DELETE CASCADE");
     if (!fileColumns.has("composer_draft_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN composer_draft_id TEXT REFERENCES composer_drafts(conversation_id) ON DELETE CASCADE");
+    if (!fileColumns.has("sha256")) this.sqlite.exec("ALTER TABLE files ADD COLUMN sha256 TEXT");
     this.sqlite.prepare("UPDATE jobs SET queue_seq=rowid WHERE queue_seq IS NULL").run();
 
     const now = new Date().toISOString();
@@ -708,9 +759,124 @@ export class AppDatabase {
   }
 
   addFile(file: FileRow): void {
-    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,relative_path,mime_type,size,kind,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(
-      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.mime_type, file.size, file.kind, file.created_at,
+    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,relative_path,mime_type,size,sha256,kind,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.mime_type, file.size, file.sha256 ?? null, file.kind, file.created_at,
     );
+  }
+
+  createResumableUpload(input: Omit<ResumableUploadRow, "offset" | "state" | "completed_at">, maximumStoredBytes: number): ResumableUploadRow {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const conversation = this.sqlite.prepare("SELECT user_id,archived_at,deleted_at FROM conversations WHERE id=?").get(input.conversation_id) as { user_id: string; archived_at: string | null; deleted_at: string | null } | undefined;
+      if (!conversation || conversation.user_id !== input.user_id || conversation.archived_at || conversation.deleted_at) throw new Error("Upload conversation ownership mismatch");
+      if (!Number.isSafeInteger(input.size) || input.size < 0) throw new Error("Upload size is invalid");
+      const activeSlots = this.sqlite.prepare("SELECT count(*) AS value FROM resumable_uploads WHERE conversation_id=? AND state IN ('uploading','finalizing')").get(input.conversation_id) as { value: number };
+      const draftSlots = this.sqlite.prepare("SELECT count(*) AS value FROM files WHERE composer_draft_id=?").get(input.conversation_id) as { value: number };
+      if (Number(activeSlots.value) + Number(draftSlots.value) >= 12) throw new Error("DRAFT_FILE_LIMIT");
+      const maximum = Number.isSafeInteger(maximumStoredBytes) && maximumStoredBytes >= 0 ? maximumStoredBytes : 0;
+      if (this.sumStoredFileBytesForUser(input.user_id) + this.sumActiveResumableBytesForUser(input.user_id) + input.size > maximum) throw new StorageQuotaExceededError();
+      this.sqlite.prepare(`
+        INSERT INTO resumable_uploads(
+          id,user_id,conversation_id,file_id,original_name,mime_type,size,offset,storage_name,final_name,state,created_at,updated_at,expires_at,completed_at
+        ) VALUES(?,?,?,?,?,?,?,0,?,?,'uploading',?,?,?,NULL)
+      `).run(
+        input.id, input.user_id, input.conversation_id, input.file_id, input.original_name, input.mime_type,
+        input.size, input.storage_name, input.final_name, input.created_at, input.updated_at, input.expires_at,
+      );
+      this.sqlite.exec("COMMIT");
+      return this.getResumableUpload(input.id)!;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getResumableUpload(id: string): ResumableUploadRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM resumable_uploads WHERE id=?").get(id) as ResumableUploadRow | undefined;
+  }
+
+  getResumableUploadForUser(id: string, userId: string): ResumableUploadRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM resumable_uploads WHERE id=? AND user_id=?").get(id, userId) as ResumableUploadRow | undefined;
+  }
+
+  listActiveResumableUploads(conversationId?: string): ResumableUploadRow[] {
+    return (conversationId
+      ? this.sqlite.prepare("SELECT * FROM resumable_uploads WHERE conversation_id=? AND state IN ('uploading','finalizing') ORDER BY created_at,id").all(conversationId)
+      : this.sqlite.prepare("SELECT * FROM resumable_uploads WHERE state IN ('uploading','finalizing') ORDER BY created_at,id").all()) as ResumableUploadRow[];
+  }
+
+  listExpiredResumableUploads(now: string): ResumableUploadRow[] {
+    return this.sqlite.prepare("SELECT * FROM resumable_uploads WHERE state IN ('uploading','finalizing') AND expires_at<=? ORDER BY expires_at,id").all(now) as ResumableUploadRow[];
+  }
+
+  sumActiveResumableBytesForUser(userId: string): number {
+    const row = this.sqlite.prepare("SELECT COALESCE(sum(size),0) AS value FROM resumable_uploads WHERE user_id=? AND state IN ('uploading','finalizing')").get(userId) as { value: number };
+    return Number(row.value);
+  }
+
+  updateResumableUploadOffset(id: string, offset: number, expiresAt: string): ResumableUploadRow | undefined {
+    this.sqlite.prepare(`
+      UPDATE resumable_uploads SET offset=?,updated_at=?,expires_at=?
+      WHERE id=? AND state='uploading' AND ? BETWEEN offset AND size
+    `).run(offset, new Date().toISOString(), expiresAt, id, offset);
+    return this.getResumableUpload(id);
+  }
+
+  reconcileResumableUploadOffset(id: string, offset: number, expiresAt: string): ResumableUploadRow | undefined {
+    this.sqlite.prepare(`
+      UPDATE resumable_uploads SET offset=?,updated_at=?,expires_at=?
+      WHERE id=? AND state='uploading' AND ? BETWEEN 0 AND size
+    `).run(offset, new Date().toISOString(), expiresAt, id, offset);
+    return this.getResumableUpload(id);
+  }
+
+  markResumableUploadFinalizing(id: string, offset: number): ResumableUploadRow | undefined {
+    this.sqlite.prepare(`
+      UPDATE resumable_uploads SET state='finalizing',offset=?,updated_at=?
+      WHERE id=? AND state IN ('uploading','finalizing') AND size=?
+    `).run(offset, new Date().toISOString(), id, offset);
+    return this.getResumableUpload(id);
+  }
+
+  completeResumableUpload(id: string, file: FileRow, maximumStoredBytes: number): ResumableUploadRow {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const upload = this.getResumableUpload(id);
+      if (!upload) throw new Error("Resumable upload does not exist");
+      if (upload.state === "completed") {
+        this.sqlite.exec("COMMIT");
+        return upload;
+      }
+      if (upload.state !== "finalizing" || upload.offset !== upload.size || upload.file_id !== file.id || upload.conversation_id !== file.conversation_id) {
+        throw new Error("Resumable upload finalization state mismatch");
+      }
+      const maximum = Number.isSafeInteger(maximumStoredBytes) && maximumStoredBytes >= 0 ? maximumStoredBytes : 0;
+      if (this.sumStoredFileBytesForUser(upload.user_id) + this.sumActiveResumableBytesForUser(upload.user_id) > maximum) throw new StorageQuotaExceededError();
+      this.ensureComposerDraft(upload.conversation_id);
+      if (!this.getFile(file.id)) this.addFile(file);
+      const now = new Date().toISOString();
+      this.sqlite.prepare("UPDATE resumable_uploads SET state='completed',offset=size,updated_at=?,completed_at=? WHERE id=?").run(now, now, id);
+      this.touchComposerDraft(upload.conversation_id);
+      this.sqlite.exec("COMMIT");
+      return this.getResumableUpload(id)!;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markResumableUploadTerminated(id: string, state: "cancelled" | "expired"): boolean {
+    return this.sqlite.prepare(`
+      UPDATE resumable_uploads SET state=?,updated_at=? WHERE id=? AND state IN ('uploading','finalizing')
+    `).run(state, new Date().toISOString(), id).changes > 0;
+  }
+
+  deleteResumableUploadRecord(id: string): boolean {
+    return this.sqlite.prepare("DELETE FROM resumable_uploads WHERE id=? AND state NOT IN ('uploading','finalizing')").run(id).changes > 0;
+  }
+
+  deleteCompletedResumableUploadForFile(fileId: string): boolean {
+    return this.sqlite.prepare("DELETE FROM resumable_uploads WHERE file_id=? AND state='completed'").run(fileId).changes > 0;
   }
 
   getFile(id: string): FileRow | undefined {
@@ -1239,6 +1405,15 @@ export class AppDatabase {
 
   getActiveJob(): JobRow | undefined {
     return this.sqlite.prepare("SELECT j.* FROM jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.status IN ('running','queued') AND c.deleted_at IS NULL ORDER BY CASE j.status WHEN 'running' THEN 0 ELSE 1 END,j.queue_seq LIMIT 1").get() as JobRow | undefined;
+  }
+
+  sumStoredFileBytesForUser(userId: string): number {
+    const row = this.sqlite.prepare(`
+      SELECT COALESCE(sum(file.size),0) AS value FROM files file
+      JOIN conversations conversation ON conversation.id=file.conversation_id
+      WHERE conversation.user_id=?
+    `).get(userId) as { value: number };
+    return Number(row.value);
   }
 
   getActiveJobForConversation(conversationId: string): JobRow | undefined {

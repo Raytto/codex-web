@@ -641,7 +641,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .editing-pending-files { display: flex; gap: 7px; overflow-x: auto; padding: 2px 4px 8px; }
 .pending-files > span, .editing-pending-files > span { max-width: 240px; flex: 0 0 auto; display: flex; align-items: center; gap: 6px; overflow: hidden; padding: 7px 8px; border: 1px solid #d9dce8; border-radius: 9px; color: #374071; background: #f7f8fc; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .pending-files > span.uploading { opacity: .72; }
-.pending-files button, .editing-pending-files button { display: grid; place-items: center; padding: 0; border: 0; color: #777b8c; background: transparent; cursor: pointer; }
+.pending-files > span.uploading.paused, .pending-files > span.uploading.error { opacity: 1; }
+.attachment-upload-copy { position: relative; min-width: 110px; max-width: 190px; display: grid; gap: 1px; padding-bottom: 3px; overflow: hidden; }
+.attachment-upload-copy small { color: #777e96; font-size: 9px; line-height: 1.1; }
+.attachment-upload-copy i { position: absolute; left: 0; bottom: 0; height: 2px; max-width: 100%; border-radius: 2px; background: #5968c5; transition: width .18s ease; }
+.attachment-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pending-files button, .editing-pending-files button { width: 23px; height: 23px; display: grid; flex: 0 0 23px; place-items: center; padding: 0; border: 0; border-radius: 50%; color: #656b80; background: #e7e9f1; cursor: pointer; }
+.pending-files button:hover, .editing-pending-files button:hover { color: #fff; background: #566195; }
 .editing-pending-files > span.removed { opacity: .55; text-decoration: line-through; }
 .paste-notice { width: fit-content; display: flex; align-items: center; gap: 6px; margin: 0 5px 4px; padding: 5px 8px; border-radius: 8px; color: var(--indigo); background: var(--indigo-pale); font-size: 11px; }
 .paste-notice svg { flex: 0 0 auto; }

@@ -115,6 +115,8 @@ export type PendingMutationResponse = {
 
 let csrfToken = "";
 export function setCsrf(value?: string) { csrfToken = value ?? ""; }
+export function resumableUploadEndpoint(): string { return `${BASE_PATH}/api/uploads`; }
+export function resumableUploadHeaders(): Record<string, string> { return csrfToken ? { "X-CSRF-Token": csrfToken } : {}; }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -178,6 +180,10 @@ export const api = {
     return request<{ composerDraft: ComposerDraft; uploadedFiles: WorkFile[] }>(
       `/conversations/${id}/draft/files`, { method: "POST", body, signal },
     );
+  },
+  resumableUploadResult: (uploadUrl: string) => {
+    const id = new URL(uploadUrl, window.location.href).pathname.split("/").filter(Boolean).at(-1) ?? "";
+    return request<{ composerDraft: ComposerDraft; uploadedFiles: WorkFile[] }>(`/uploads/${encodeURIComponent(id)}/result`);
   },
   deleteConversationDraftFile: (id: string, fileId: string) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft/files/${fileId}`, { method: "DELETE" },

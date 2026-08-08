@@ -4,10 +4,15 @@ import pino from "pino";
 import { createApp } from "./app.js";
 import { assertProductionConfig } from "./config.js";
 
-const { app, db, config, runner, beginShutdown } = createApp();
+const { app, db, config, runner, resumableUploads, beginShutdown } = createApp();
 assertProductionConfig(config);
 fs.mkdirSync(path.join(config.dataRoot, "logs"), { recursive: true });
 const logger = pino(pino.destination({ dest: path.join(config.dataRoot, "logs", "app.log"), sync: false }));
+
+const uploadRecovery = await resumableUploads.recover();
+if (uploadRecovery.finalized || uploadRecovery.reconciled || uploadRecovery.cancelled) {
+  logger.info(uploadRecovery, "Resumable upload startup recovery finished");
+}
 
 const server = app.listen(config.port, config.host, () => {
   logger.info({ host: config.host, port: config.port, basePath: config.basePath }, "Codex Web started");
