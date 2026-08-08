@@ -70,6 +70,14 @@ test("composer replaces stop with send as soon as there is sendable input", () =
   assert.equal(chooseComposerPrimaryAction({ running: false, hasText: false, hasAttachments: false, voiceActive: false }), "send");
 });
 
+test("uploading composer attachments expose per-file cancellation backed by AbortController", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
+  assert.match(appSource, /draftUploadControllersRef\.current\.get\(uploadId\)\?\.abort\(\)/);
+  assert.match(appSource, /aria-label=\{`取消上传 \$\{file\.name\}`\}/);
+  assert.match(apiSource, /draft\/files`, \{ method: "POST", body, signal \}/);
+});
+
 test("chat font sizing keeps readable bounds and scales from the default", () => {
   assert.equal(normalizeChatFontSize(undefined), CHAT_FONT_SIZE_DEFAULT);
   assert.equal(normalizeChatFontSize("18"), 18);
@@ -1223,6 +1231,7 @@ test("composer drafts and attachments survive browser sessions and are consumed 
     .attach("files", Buffer.from("draft attachment"), { filename: "draft.txt", contentType: "text/plain" })
     .expect(201);
   const draftFile = uploaded.body.composerDraft.files[0] as { id: string; relative_path: string };
+  assert.deepEqual(uploaded.body.uploadedFiles.map((file: { id: string }) => file.id), [draftFile.id]);
   const uploadedPath = path.join(ensureTenantWorkspace(tenantRoot, LEGACY_USER_ID, conversationId), draftFile.relative_path);
   assert.equal(fs.existsSync(uploadedPath), true);
 

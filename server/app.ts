@@ -796,8 +796,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "单个会话草稿最多包含 12 个附件。" });
     }
-    registerComposerUploads(conversation.id, uploaded);
-    return res.status(201).json({ composerDraft: db.getComposerDraft(conversation.id)! });
+    const uploadedFiles = registerComposerUploads(conversation.id, uploaded);
+    return res.status(201).json({ composerDraft: db.getComposerDraft(conversation.id)!, uploadedFiles });
   });
 
   api.delete("/conversations/:id/draft/files/:fileId", (req, res) => {

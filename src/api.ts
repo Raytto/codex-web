@@ -172,10 +172,12 @@ export const api = {
     `/conversations/${id}/draft`,
     { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive },
   ),
-  uploadConversationDraftFiles: (id: string, files: File[]) => {
+  uploadConversationDraftFiles: (id: string, files: File[], signal?: AbortSignal) => {
     const body = new FormData();
     files.forEach((file) => body.append("files", file));
-    return request<{ composerDraft: ComposerDraft }>(`/conversations/${id}/draft/files`, { method: "POST", body });
+    return request<{ composerDraft: ComposerDraft; uploadedFiles: WorkFile[] }>(
+      `/conversations/${id}/draft/files`, { method: "POST", body, signal },
+    );
   },
   deleteConversationDraftFile: (id: string, fileId: string) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft/files/${fileId}`, { method: "DELETE" },

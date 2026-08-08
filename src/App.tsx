@@ -253,6 +253,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const askAgentQuoteRef = useRef(askAgentQuote);
   const composerDraftRef = useRef<ComposerDraft | null>(composerDraft);
   const draftUploadsRef = useRef<DraftUpload[]>(draftUploads);
+  const draftUploadControllersRef = useRef(new Map<string, AbortController>());
+  const cancelledDraftUploadIdsRef = useRef(new Set<string>());
   const draftLoadedConversationRef = useRef<string | null>(null);
   const draftCacheRef = useRef(new Map<string, CachedComposerDraft>());
   const draftSyncedSignaturesRef = useRef(new Map<string, string>());
@@ -637,28 +639,53 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const uploads = accepted.map((file) => ({ id: crypto.randomUUID(), name: file.name }));
     setDraftUploads((current) => [...current, ...uploads]);
     setError("");
-    try {
-      const result = await api.uploadConversationDraftFiles(conversationId, accepted);
-      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
-      if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
-        composerDraftRef.current = result.composerDraft;
-        setComposerDraft(result.composerDraft);
+    await Promise.all(accepted.map(async (file, index) => {
+      const upload = uploads[index];
+      const controller = new AbortController();
+      draftUploadControllersRef.current.set(upload.id, controller);
+      try {
+        const result = await api.uploadConversationDraftFiles(conversationId, [file], controller.signal);
+        if (cancelledDraftUploadIdsRef.current.has(upload.id)) {
+          await Promise.all(result.uploadedFiles.map((uploadedFile) => api.deleteConversationDraftFile(conversationId, uploadedFile.id)));
+          return;
+        }
+        draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+        const mergeUpload = (current: ComposerDraft | null): ComposerDraft => current ? {
+          ...current,
+          files: [...current.files, ...result.uploadedFiles.filter((uploadedFile) => !current.files.some((file) => file.id === uploadedFile.id))],
+          updated_at: result.composerDraft.updated_at,
+        } : result.composerDraft;
+        if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
+          const merged = mergeUpload(composerDraftRef.current);
+          composerDraftRef.current = merged;
+          setComposerDraft(merged);
+        }
+        const cached = draftCacheRef.current.get(conversationId);
+        const cachedDraft = mergeUpload(cached?.composerDraft ?? null);
+        if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: cachedDraft });
+        else draftCacheRef.current.set(conversationId, {
+          content: conversationId === selectedIdRef.current ? inputRef.current : result.composerDraft.content,
+          quoteExcerpt: conversationId === selectedIdRef.current ? askAgentQuoteRef.current : result.composerDraft.quote_excerpt ?? "",
+          composerDraft: cachedDraft,
+        });
+        if (selectedIdRef.current === conversationId) {
+          const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
+          setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId) ? "saved" : "unsaved");
+        }
+      } catch (reason) {
+        if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "草稿附件上传失败");
+      } finally {
+        draftUploadControllersRef.current.delete(upload.id);
+        cancelledDraftUploadIdsRef.current.delete(upload.id);
+        setDraftUploads((current) => current.filter((currentUpload) => currentUpload.id !== upload.id));
       }
-      const cached = draftCacheRef.current.get(conversationId);
-      if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: result.composerDraft });
-      else draftCacheRef.current.set(conversationId, {
-        content: conversationId === selectedIdRef.current ? inputRef.current : result.composerDraft.content,
-        quoteExcerpt: conversationId === selectedIdRef.current ? askAgentQuoteRef.current : result.composerDraft.quote_excerpt ?? "",
-        composerDraft: result.composerDraft,
-      });
-      const currentSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
-      setDraftSaveState(currentSignature === draftSyncedSignaturesRef.current.get(conversationId) ? "saved" : "unsaved");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "草稿附件上传失败");
-    } finally {
-      const ids = new Set(uploads.map((upload) => upload.id));
-      setDraftUploads((current) => current.filter((upload) => !ids.has(upload.id)));
-    }
+    }));
+  }
+
+  function cancelComposerDraftUpload(uploadId: string) {
+    cancelledDraftUploadIdsRef.current.add(uploadId);
+    draftUploadControllersRef.current.get(uploadId)?.abort();
+    setDraftUploads((current) => current.filter((upload) => upload.id !== uploadId));
   }
 
   async function removeComposerDraftFile(file: WorkFile) {
@@ -1108,7 +1135,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
         canSteer={job?.status === "running"} onCancelPendingEdit={() => void cancelPendingEdit()}
-        onAddFiles={(incoming) => void addComposerFiles(incoming)} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
+        onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
         onSend={(message) => void send(message)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
@@ -1374,7 +1401,7 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
   </section>;
 }
 
-function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
+function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
   conversationId: string | null;
   input: string;
   setInput: (value: string) => void;
@@ -1405,6 +1432,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   canSteer: boolean;
   onCancelPendingEdit: () => void;
   onAddFiles: (files: File[]) => void;
+  onCancelDraftUpload: (uploadId: string) => void;
   onRemoveDraftFile: (file: WorkFile) => void;
   onClearDraft: () => void;
   onRemoveEditingFile: (fileId: string) => void;
@@ -1640,8 +1668,8 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       return <span key={file.id} className={removed ? "removed" : ""}><FileIcon size={14} />{file.original_name}<button type="button" onClick={() => removed ? onRestoreEditingFile(file.id) : onRemoveEditingFile(file.id)} title={removed ? "恢复附件" : "移除附件"}>{removed ? <Plus size={13} /> : <X size={13} />}</button></span>;
     })}</div>}
     {!editingPending && draftFiles.length > 0 && <div className="pending-files">{draftFiles.map((file) => <span key={file.id}><FileIcon size={14} />{file.original_name}<button type="button" aria-label={`移除附件 ${file.original_name}`} title="移除附件" onClick={() => onRemoveDraftFile(file)}><X size={13} /></button></span>)}</div>}
-    {!editingPending && draftUploads.length > 0 && <div className="pending-files">{draftUploads.map((file) => <span key={file.id} className="uploading"><LoaderCircle className="spin" size={14} />{file.name}</span>)}</div>}
-    {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} />{file.name}<button onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
+    {!editingPending && draftUploads.length > 0 && <div className="pending-files">{draftUploads.map((file) => <span key={file.id} className="uploading"><LoaderCircle className="spin" size={14} />{file.name}<button type="button" aria-label={`取消上传 ${file.name}`} title="取消上传" onClick={() => onCancelDraftUpload(file.id)}><X size={13} /></button></span>)}</div>}
+    {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} />{file.name}<button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
     <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
