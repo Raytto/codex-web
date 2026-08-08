@@ -43,6 +43,7 @@ test("tus upload persists confirmed offsets, enforces ownership and registers an
   const conversation = await owner.post("/api/conversations").set("X-CSRF-Token", ownerLogin.body.csrfToken).expect(201);
   const conversationId = conversation.body.conversation.id as string;
   const payload = Buffer.from("hello-world!");
+  assert.equal(instance.resumableUploads.root, path.join(root, "tenants", ".resumable-uploads"));
 
   await owner.post("/api/uploads").set(TUS_HEADERS)
     .set("Upload-Length", String(payload.length))
@@ -96,14 +97,20 @@ test("tus upload persists confirmed offsets, enforces ownership and registers an
 
 test("startup recovery finalizes a fully written partial and expiry cleanup releases reservations", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-tus-recovery-"));
+  const legacyDataRoot = fs.mkdtempSync(path.join(fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir(), "codex-web-tus-legacy-"));
   const instance = createApp({
-    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
+    projectRoot: process.cwd(), dataRoot: legacyDataRoot, tenantRoot: path.join(root, "tenants"),
     basePath: "",
     username: "recover", passwordHash: bcrypt.hashSync(PASSWORD, 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
     minimumFreeDiskBytes: 1, maxStoredBytesPerUser: 1_000,
   });
-  context.after(() => { instance.beginShutdown(); instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  context.after(() => {
+    instance.beginShutdown();
+    instance.db.close();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(legacyDataRoot, { recursive: true, force: true });
+  });
   const browser = request.agent(instance.app);
   const login = await browser.post("/api/auth/login").send({ username: "recover", password: PASSWORD }).expect(200);
   const conversation = await browser.post("/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
@@ -114,12 +121,23 @@ test("startup recovery finalizes a fully written partial and expiry cleanup rele
     .expect(201);
   const id = uploadId(created.headers.location);
   const row = instance.db.getResumableUpload(id)!;
-  fs.writeFileSync(path.join(instance.resumableUploads.root, row.storage_name), payload, { mode: 0o600 });
+  // Simulate a fully received upload created by the first production release,
+  // when partials still lived below dataRoot. Recovery must find and finalize
+  // it after the staging root moved onto the tenant filesystem.
+  const legacyRoot = path.join(legacyDataRoot, "resumable-uploads");
+  fs.mkdirSync(legacyRoot, { recursive: true, mode: 0o700 });
+  if (legacyDataRoot.startsWith("/dev/shm/")) {
+    assert.notEqual(fs.statSync(legacyRoot).dev, fs.statSync(instance.resumableUploads.root).dev);
+  }
+  fs.rmSync(path.join(instance.resumableUploads.root, row.storage_name), { force: true });
+  const legacyPartial = path.join(legacyRoot, row.storage_name);
+  fs.writeFileSync(legacyPartial, payload, { mode: 0o600 });
   const recovery = await instance.resumableUploads.recover();
   assert.equal(recovery.reconciled, 1);
   assert.equal(recovery.finalized, 1);
   assert.equal(instance.db.getResumableUpload(id)?.state, "completed");
   assert.equal(instance.db.getFile(row.file_id)?.sha256, crypto.createHash("sha256").update(payload).digest("hex"));
+  assert.equal(fs.existsSync(legacyPartial), false);
 
   const expiring = await browser.post("/api/uploads").set(TUS_HEADERS).set("X-CSRF-Token", login.body.csrfToken)
     .set("Upload-Length", "25")

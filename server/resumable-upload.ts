@@ -62,6 +62,7 @@ async function sha256File(filePath: string): Promise<string> {
 
 export class ResumableUploadService {
   readonly root: string;
+  private readonly legacyRoot: string;
   private readonly db: AppDatabase;
   private readonly config: AppConfig;
   private readonly availableDiskBytes: ServiceOptions["availableDiskBytes"];
@@ -74,7 +75,12 @@ export class ResumableUploadService {
     this.config = options.config;
     this.availableDiskBytes = options.availableDiskBytes;
     this.maximumStoredBytesForUser = options.maximumStoredBytesForUser;
-    this.root = path.join(this.config.dataRoot, "resumable-uploads");
+    // Partials must live on the same mounted filesystem as tenant workspaces so
+    // completion can be an atomic rename without temporarily duplicating a
+    // multi-gigabyte upload. The former dataRoot location remains readable for
+    // in-flight uploads created by releases before 2026-08-08.
+    this.root = path.join(this.config.tenantRoot, ".resumable-uploads");
+    this.legacyRoot = path.join(this.config.dataRoot, "resumable-uploads");
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(this.root, 0o700); } catch { /* A restrictive umask already protects the directory. */ }
   }
@@ -92,7 +98,18 @@ export class ResumableUploadService {
   }
 
   private partialPath(upload: Pick<ResumableUploadRow, "storage_name">): string {
-    return path.join(this.root, upload.storage_name);
+    const current = path.join(this.root, upload.storage_name);
+    const legacy = path.join(this.legacyRoot, upload.storage_name);
+    if (fs.existsSync(current) || !fs.existsSync(legacy)) return current;
+    return legacy;
+  }
+
+  private partialPaths(upload: Pick<ResumableUploadRow, "storage_name">): string[] {
+    return [...new Set([path.join(this.root, upload.storage_name), path.join(this.legacyRoot, upload.storage_name)])];
+  }
+
+  private async removePartials(upload: Pick<ResumableUploadRow, "storage_name">): Promise<void> {
+    await Promise.all(this.partialPaths(upload).map((candidate) => fs.promises.rm(candidate, { force: true })));
   }
 
   private finalPath(upload: Pick<ResumableUploadRow, "user_id" | "conversation_id" | "final_name">): string {
@@ -258,7 +275,10 @@ export class ResumableUploadService {
       const currentSize = (await fs.promises.stat(this.partialPath(upload)).catch(() => null))?.size ?? cursor;
       if (currentSize >= upload.offset && currentSize <= upload.size) this.db.reconcileResumableUploadOffset(id, currentSize, this.expiresAt());
       if (!req.aborted) console.warn(JSON.stringify({ event: "resumable_upload_patch_failed", uploadId: id, offset: currentSize, error: error instanceof Error ? error.message : String(error) }));
-      if (!res.headersSent && !req.aborted) return res.status(error instanceof Error && error.message === "UPLOAD_BODY_TOO_LARGE" ? 413 : 400).json({ error: "上传分块未完整接收，可从服务器确认的偏移继续。" });
+      if (!res.headersSent && !req.aborted) {
+        if (currentSize === upload.size) return res.status(500).json({ code: "UPLOAD_FINALIZATION_FAILED", error: "文件已完整接收，服务器将在重试时继续完成登记。" });
+        return res.status(error instanceof Error && error.message === "UPLOAD_BODY_TOO_LARGE" ? 413 : 400).json({ error: "上传分块未完整接收，可从服务器确认的偏移继续。" });
+      }
       return res;
     } finally {
       this.locks.delete(id);
@@ -273,7 +293,7 @@ export class ResumableUploadService {
     if (this.isLocked(upload.id)) return res.status(409).json({ code: "UPLOAD_BUSY", error: "上传分块仍在写入，请稍后重试取消。" });
     this.db.markResumableUploadTerminated(upload.id, "cancelled");
     await Promise.all([
-      fs.promises.rm(this.partialPath(upload), { force: true }),
+      this.removePartials(upload),
       fs.promises.rm(this.finalPath(upload), { force: true }),
     ]).catch(() => undefined);
     this.applyTusHeaders(res);
@@ -303,12 +323,29 @@ export class ResumableUploadService {
         const partialStat = await fs.promises.stat(partialPath);
         if (partialStat.size !== upload.size) throw new Error("Upload is not complete");
         upload = this.db.markResumableUploadFinalizing(upload.id, partialStat.size) ?? upload;
-        await fs.promises.rename(partialPath, finalPath);
+        try {
+          await fs.promises.rename(partialPath, finalPath);
+        } catch (error) {
+          if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+          // Transitional recovery for sessions created in the old dataRoot.
+          // New uploads never take this path. Keep the destination invisible
+          // until a fully copied and fsynced temporary file is atomically moved.
+          if (this.availableDiskBytes(true) - upload.size < this.config.minimumFreeDiskBytes) throw new Error("DISK_WATERMARK_FINALIZE");
+          const temporaryPath = `${finalPath}.${upload.id}.tus-finalizing`;
+          await fs.promises.rm(temporaryPath, { force: true });
+          await fs.promises.copyFile(partialPath, temporaryPath);
+          await fs.promises.chmod(temporaryPath, 0o600);
+          const temporary = await fs.promises.open(temporaryPath, "r");
+          try { await temporary.sync(); } finally { await temporary.close(); }
+          await fs.promises.rename(temporaryPath, finalPath);
+          await fs.promises.rm(partialPath, { force: true });
+        }
       } else if (finalStat.size !== upload.size) {
         throw new Error("Final upload size mismatch");
       } else {
         upload = this.db.markResumableUploadFinalizing(upload.id, upload.size) ?? upload;
       }
+      await this.removePartials(upload);
       const sha256 = await sha256File(finalPath);
       const file: FileRow = {
         id: upload.file_id, conversation_id: upload.conversation_id, message_id: null, pending_prompt_id: null,
@@ -329,7 +366,7 @@ export class ResumableUploadService {
       if (this.isLocked(upload.id)) throw new Error("会话仍有附件分块正在写入");
       this.db.markResumableUploadTerminated(upload.id, "cancelled");
       await Promise.all([
-        fs.promises.rm(this.partialPath(upload), { force: true }),
+        this.removePartials(upload),
         fs.promises.rm(this.finalPath(upload), { force: true }),
       ]);
     }
@@ -341,21 +378,23 @@ export class ResumableUploadService {
       if (this.isLocked(upload.id)) continue;
       if (this.db.markResumableUploadTerminated(upload.id, "expired")) expired += 1;
       await Promise.all([
-        fs.promises.rm(this.partialPath(upload), { force: true }),
+        this.removePartials(upload),
         fs.promises.rm(this.finalPath(upload), { force: true }),
       ]).catch(() => undefined);
     }
     const known = new Set(this.db.listActiveResumableUploads().map((upload) => upload.storage_name));
     let orphans = 0;
-    const entries = await fs.promises.readdir(this.root, { withFileTypes: true });
     const cutoff = Date.now() - this.config.resumableUploadExpiryHours * 3_600_000;
-    for (const entry of entries) {
-      if (!entry.isFile() || !/^[0-9a-f-]{36}\.part$/i.test(entry.name) || known.has(entry.name)) continue;
-      const candidate = path.join(this.root, entry.name);
-      const stat = await fs.promises.stat(candidate).catch(() => null);
-      if (stat && stat.mtimeMs <= cutoff) {
-        await fs.promises.rm(candidate, { force: true });
-        orphans += 1;
+    for (const uploadRoot of [...new Set([this.root, this.legacyRoot])]) {
+      const entries = await fs.promises.readdir(uploadRoot, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile() || !/^[0-9a-f-]{36}\.part$/i.test(entry.name) || known.has(entry.name)) continue;
+        const candidate = path.join(uploadRoot, entry.name);
+        const stat = await fs.promises.stat(candidate).catch(() => null);
+        if (stat && stat.mtimeMs <= cutoff) {
+          await fs.promises.rm(candidate, { force: true });
+          orphans += 1;
+        }
       }
     }
     if (expired || orphans) console.info(JSON.stringify({ event: "resumable_upload_cleanup", expired, orphans }));
@@ -379,7 +418,7 @@ export class ResumableUploadService {
       const partialStat = await fs.promises.stat(this.partialPath(upload)).catch(() => null);
       if (!partialStat || partialStat.size > upload.size) {
         this.db.markResumableUploadTerminated(upload.id, "cancelled");
-        await fs.promises.rm(this.partialPath(upload), { force: true }).catch(() => undefined);
+        await this.removePartials(upload).catch(() => undefined);
         cancelled += 1;
         continue;
       }
