@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import type { AppConfig } from "./config.js";
 import { AppDatabase, type FileRow } from "./db.js";
-import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, newId, normalizeStoredRelativePath, persistDeliverable, resolveInside, snapshotDeliverables } from "./paths.js";
+import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, newId, normalizeStoredRelativePath, persistDeliverable, resolveGeneratedImage, resolveInside, snapshotDeliverables, snapshotGeneratedImages } from "./paths.js";
 import { cleanupJobRuntime, prepareJobRuntime, resolvePythonRuntime } from "./python-runtime.js";
 import { assessTaskPolicy } from "./task-policy.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
@@ -144,6 +144,10 @@ export class CodexRunner {
         && Boolean(job?.message_id && this.db.isFirstUserMessage(conversationId, job.message_id));
       const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
       const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversationId);
+      const generatedImagesBeforeThreadId = conversation.codex_thread_id;
+      const generatedImagesBefore = generatedImagesBeforeThreadId
+        ? await snapshotGeneratedImages(tenant.codexHome, generatedImagesBeforeThreadId)
+        : new Map<string, string>();
       const before = await snapshotDeliverables(workspace);
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
@@ -244,19 +248,48 @@ export class CodexRunner {
         created_at: createdAt,
       });
       const after = await snapshotDeliverables(workspace);
+      let hasExplicitImageOutput = false;
       for (const [relativePath, fingerprint] of after) {
         if (before.get(relativePath) === fingerprint) continue;
         const portablePath = normalizeStoredRelativePath(relativePath);
         const absolute = resolveInside(workspace, portablePath);
         const stat = await fs.promises.stat(absolute);
+        const mimeType = guessMime(relativePath);
+        if (mimeType.startsWith("image/")) hasExplicitImageOutput = true;
         const fileId = newId();
         const storedPath = await persistDeliverable(this.config.dataRoot, workspace, portablePath, fileId);
         const file: FileRow = {
           id: fileId, conversation_id: conversationId, message_id: messageId,
           original_name: path.basename(portablePath), relative_path: storedPath,
-          mime_type: guessMime(relativePath), size: stat.size, kind: "output", created_at: createdAt,
+          mime_type: mimeType, size: stat.size, kind: "output", created_at: createdAt,
         };
         this.db.addFile(file);
+      }
+      const generatedImageThreadId = request.codexThreadId;
+      if (!hasExplicitImageOutput && generatedImageThreadId) {
+        const baseline = generatedImagesBeforeThreadId === generatedImageThreadId
+          ? generatedImagesBefore
+          : new Map<string, string>();
+        const generatedImagesAfter = await snapshotGeneratedImages(tenant.codexHome, generatedImageThreadId);
+        const newGeneratedImages = [...generatedImagesAfter]
+          .filter(([fileName, fingerprint]) => baseline.get(fileName) !== fingerprint);
+        for (const [index, [fileName]] of newGeneratedImages.entries()) {
+          const source = resolveGeneratedImage(tenant.codexHome, generatedImageThreadId, fileName);
+          const stat = await fs.promises.lstat(source);
+          if (!stat.isFile() || stat.isSymbolicLink()) continue;
+          const extension = path.extname(fileName).toLowerCase();
+          const originalName = newGeneratedImages.length === 1 ? `AI生成图片${extension}` : `AI生成图片-${index + 1}${extension}`;
+          const fileId = newId();
+          const storedPath = path.posix.join("deliverables", fileId, originalName);
+          const destination = resolveInside(this.config.dataRoot, storedPath);
+          await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+          await fs.promises.copyFile(source, destination);
+          this.db.addFile({
+            id: fileId, conversation_id: conversationId, message_id: messageId,
+            original_name: originalName, relative_path: storedPath,
+            mime_type: guessMime(fileName), size: stat.size, kind: "output", created_at: createdAt,
+          });
+        }
       }
       if (titledResponse) this.db.setAiConversationTitleIfDefault(conversationId, titledResponse.title);
       this.db.finishJob(jobId, conversationId, "completed");

@@ -39,6 +39,7 @@ const LIBRARY_AGENTS = `# Long-term knowledge library
 `;
 
 const TRANSIENT_OUTPUT_SUFFIXES = new Set([".bak", ".lock", ".part", ".swp", ".temp", ".tmp"]);
+const GENERATED_IMAGE_SUFFIXES = new Set([".gif", ".jpeg", ".jpg", ".png", ".webp"]);
 
 export function newId(): string {
   return crypto.randomUUID();
@@ -304,4 +305,42 @@ export async function snapshotDeliverables(root: string): Promise<Map<string, st
   }
   await walk(outputRoot);
   return snapshot;
+}
+
+/** Snapshot only images owned by one Codex thread, never the shared generated-images root. */
+export async function snapshotGeneratedImages(codexHome: string, threadId: string): Promise<Map<string, string>> {
+  if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Invalid Codex thread id");
+  const generatedRoot = path.resolve(codexHome, "generated_images");
+  const threadRoot = path.resolve(generatedRoot, threadId);
+  if (path.dirname(threadRoot) !== generatedRoot) throw new Error("Generated image path escapes its root");
+  const snapshot = new Map<string, string>();
+  let entries: fs.Dirent[];
+  try { entries = await fs.promises.readdir(threadRoot, { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return snapshot;
+    throw error;
+  }
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (!entry.isFile() || entry.isSymbolicLink() || !GENERATED_IMAGE_SUFFIXES.has(path.extname(entry.name).toLowerCase())) continue;
+    const absolute = path.resolve(threadRoot, entry.name);
+    if (path.dirname(absolute) !== threadRoot) continue;
+    const stat = await fs.promises.lstat(absolute);
+    if (!stat.isFile() || stat.isSymbolicLink()) continue;
+    snapshot.set(entry.name, `${stat.size}:${stat.mtimeMs}`);
+  }
+  return snapshot;
+}
+
+export function resolveGeneratedImage(codexHome: string, threadId: string, fileName: string): string {
+  if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error("Invalid Codex thread id");
+  if (path.basename(fileName) !== fileName || !GENERATED_IMAGE_SUFFIXES.has(path.extname(fileName).toLowerCase())) {
+    throw new Error("Invalid generated image name");
+  }
+  const generatedRoot = path.resolve(codexHome, "generated_images");
+  const threadRoot = path.resolve(generatedRoot, threadId);
+  const absolute = path.resolve(threadRoot, fileName);
+  if (path.dirname(threadRoot) !== generatedRoot || path.dirname(absolute) !== threadRoot) {
+    throw new Error("Generated image path escapes its root");
+  }
+  return absolute;
 }

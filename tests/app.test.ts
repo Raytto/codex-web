@@ -18,7 +18,7 @@ import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
 import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
-import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveInside, safeUploadName } from "../server/paths.js";
+import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveGeneratedImage, resolveInside, safeUploadName, snapshotGeneratedImages } from "../server/paths.js";
 import { buildShellEnvironment, cleanupJobRuntime, prepareJobRuntime } from "../server/python-runtime.js";
 import { assessTaskPolicy } from "../server/task-policy.js";
 import { listTenantIdentities, tenantIdentityForUser } from "../server/tenant-identities.js";
@@ -758,6 +758,31 @@ test("only finished files under outputs are deliverables", () => {
   assert.equal(isDeliverablePath("outputs/~$draft.xlsx"), false);
   assert.equal(isDeliverablePath("outputs/../secret.txt"), false);
   assert.equal(isDeliverablePath("deliverables/550e8400-e29b-41d4-a716-446655440000/final.xlsx"), true);
+});
+
+test("generated image snapshots stay scoped to one Codex thread", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-generated-image-test-"));
+  const codexHome = path.join(root, "codex-home");
+  const threadId = crypto.randomUUID();
+  const otherThreadId = crypto.randomUUID();
+  const threadRoot = path.join(codexHome, "generated_images", threadId);
+  const otherThreadRoot = path.join(codexHome, "generated_images", otherThreadId);
+  fs.mkdirSync(threadRoot, { recursive: true });
+  fs.mkdirSync(otherThreadRoot, { recursive: true });
+  fs.writeFileSync(path.join(threadRoot, "first.png"), "first");
+  fs.writeFileSync(path.join(threadRoot, "ignore.txt"), "ignore");
+  fs.writeFileSync(path.join(otherThreadRoot, "other.png"), "other");
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const before = await snapshotGeneratedImages(codexHome, threadId);
+  assert.deepEqual([...before.keys()], ["first.png"]);
+  fs.writeFileSync(path.join(threadRoot, "second.webp"), "second");
+  const after = await snapshotGeneratedImages(codexHome, threadId);
+  assert.deepEqual([...after.keys()], ["first.png", "second.webp"]);
+  assert.deepEqual([...after].filter(([name, fingerprint]) => before.get(name) !== fingerprint).map(([name]) => name), ["second.webp"]);
+  assert.equal(resolveGeneratedImage(codexHome, threadId, "second.webp"), path.join(threadRoot, "second.webp"));
+  assert.throws(() => resolveGeneratedImage(codexHome, threadId, "../other.png"), /Invalid generated image name/);
+  await assert.rejects(() => snapshotGeneratedImages(codexHome, "not-a-thread"), /Invalid Codex thread id/);
 });
 
 test("finished outputs are copied to immutable app storage and legacy rows migrate", async (context) => {

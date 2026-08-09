@@ -1445,11 +1445,12 @@ function formatActivityTime(value: string): string {
 }
 
 function FileCard({ file }: { file: WorkFile }) {
-  const icon = file.mime_type.startsWith("image/") ? <FileImage size={20} /> : <FileIcon size={20} />;
+  const image = file.mime_type.startsWith("image/");
+  const icon = image ? <FileImage size={20} /> : <FileIcon size={20} />;
   const reader = fileReaderKind(file);
   const previewable = isBrowserPreviewable(file);
-  const body = <>{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
-  return <div className="file-card">
+  const body = <>{image && <img className="file-card-image" src={fileUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
+  return <div className={`file-card ${image ? "image-file-card" : ""}`}>
     {reader === "html"
       ? <a href={filePreviewUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : reader === "markdown" || previewable
