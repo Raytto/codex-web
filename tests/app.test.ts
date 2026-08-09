@@ -35,7 +35,7 @@ import { mergeMessagePages, preservePrependedScrollTop } from "../src/message-hi
 import { resolveScrollFollow } from "../src/scroll-follow.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../src/recovery.js";
-import { normalizeThemePreference, resolveTheme, THEME_PREFERENCE_KEY } from "../src/theme.js";
+import { normalizeThemePreference, resolveTheme, themeCanvasColor, THEME_PREFERENCE_KEY } from "../src/theme.js";
 import type { Conversation, WorkFile } from "../src/api.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-context.js";
 import { buildProcessJournal } from "../src/process-journal.js";
@@ -94,11 +94,17 @@ test("appearance setting supports light, dark, and live system preference", () =
   assert.equal(resolveTheme("system", true), "dark");
   assert.equal(resolveTheme("system", false), "light");
   assert.equal(resolveTheme("dark", false), "dark");
+  assert.equal(themeCanvasColor("light"), "#fafbff");
+  assert.equal(themeCanvasColor("dark"), "#17181b");
 
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const indexSource = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
+  const themeSource = fs.readFileSync(path.join(process.cwd(), "src", "theme.ts"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /使用浅色模式[\s\S]*使用深色模式[\s\S]*外观跟随系统/);
   assert.match(appSource, /matchMedia\?\.\("\(prefers-color-scheme: dark\)"\)/);
+  assert.match(indexSource, /<meta name="theme-color" content="#fafbff" \/>/);
+  assert.match(themeSource, /meta\[name="theme-color"\][\s\S]*setAttribute\("content", themeCanvasColor\(resolved\)\)/);
   assert.match(styles, /:root\[data-theme="dark"\]/);
   assert.match(styles, /\.theme-options button\[aria-pressed="true"\]/);
 
@@ -151,15 +157,22 @@ test("sidebar task actions collapse into a stable overflow menu", () => {
   assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
 });
 
-test("mobile Safari keeps login and workspace controls out of a fixed interactive root", () => {
+test("mobile Safari restores the non-fixed app viewport after the software keyboard closes", () => {
+  const mainSource = fs.readFileSync(path.join(process.cwd(), "src", "main.tsx"), "utf8");
+  const viewportSource = fs.readFileSync(path.join(process.cwd(), "src", "mobile-viewport.ts"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(styles, /html, body, #root \{[^}]*overflow: hidden;[^}]*overscroll-behavior: none;/);
-  assert.match(styles, /body \{[^}]*height: 100%;[^}]*height: 100dvh;/);
+  assert.match(styles, /html, body, #root \{[^}]*min-height: var\(--app-viewport-height, 100%\);[^}]*height: var\(--app-viewport-height, 100%\);[^}]*overflow: hidden;[^}]*overscroll-behavior: none;[^}]*background: var\(--canvas\);/);
+  assert.doesNotMatch(styles, /body \{[^}]*100dvh/);
   assert.doesNotMatch(styles, /body \{[^}]*position: fixed;/);
   assert.match(styles, /#root \{[^}]*width: 100%;/);
   assert.match(styles, /\.login-page \{[^}]*position: relative;[^}]*height: 100%;[^}]*overflow: hidden;/);
   assert.match(styles, /\.shell \{[^}]*height: 100%;[^}]*overflow: hidden;/);
   assert.match(styles, /\.messages \{[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
+  assert.match(mainSource, /installMobileViewportRecovery\(\);/);
+  assert.match(viewportSource, /visualViewport/);
+  assert.match(viewportSource, /requestAnimationFrame\(apply\)/);
+  assert.match(viewportSource, /addEventListener\("focusout", scheduleSettled\)/);
+  assert.match(viewportSource, /documentElement\.scrollTop = 0/);
 });
 
 test("rollout capacity warning uses a 500 MiB threshold and readable binary units", () => {

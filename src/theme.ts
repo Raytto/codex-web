@@ -4,6 +4,10 @@ export type ThemePreference = "light" | "dark" | "system";
 export type ResolvedTheme = "light" | "dark";
 
 const THEME_PREFERENCES: ThemePreference[] = ["light", "dark", "system"];
+const THEME_CANVAS_COLORS: Record<ResolvedTheme, string> = {
+  light: "#fafbff",
+  dark: "#17181b",
+};
 
 export function normalizeThemePreference(value: unknown, fallback: ThemePreference = "light"): ThemePreference {
   return typeof value === "string" && THEME_PREFERENCES.includes(value as ThemePreference)
@@ -13,6 +17,10 @@ export function normalizeThemePreference(value: unknown, fallback: ThemePreferen
 
 export function resolveTheme(preference: ThemePreference, systemPrefersDark: boolean): ResolvedTheme {
   return preference === "system" ? (systemPrefersDark ? "dark" : "light") : preference;
+}
+
+export function themeCanvasColor(theme: ResolvedTheme): string {
+  return THEME_CANVAS_COLORS[theme];
 }
 
 export function readStoredThemePreference(storage: Pick<Storage, "getItem"> = window.localStorage): ThemePreference {
@@ -32,5 +40,7 @@ export function applyThemePreference(
   root.dataset.theme = resolved;
   root.dataset.themePreference = preference;
   root.style.colorScheme = resolved;
+  root.ownerDocument?.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+    ?.setAttribute("content", themeCanvasColor(resolved));
   return resolved;
 }
