@@ -10,14 +10,18 @@ export function isTextEntryElement(element: Element | null): boolean {
   ));
 }
 
-export function mobileViewportUpdate(editing: boolean, height: number, previousHeight: number) {
+export function mobileViewportUpdate(editing: boolean, height: number, offsetTop: number, previousHeight: number) {
   const validHeight = Number.isFinite(height) && height > 0;
+  const validOffsetTop = Number.isFinite(offsetTop) && offsetTop > 0 ? offsetTop : 0;
   const keyboardClosed = validHeight
     && Number.isFinite(previousHeight)
     && height - previousHeight >= KEYBOARD_HEIGHT_DELTA;
 
   return {
-    rootHeight: editing && validHeight ? `${Math.round(height)}px` : null,
+    // Safari may pan the visual viewport while focusing a field. Its bottom
+    // edge is offsetTop + height in layout coordinates; height alone would
+    // compensate twice and lift the composer far above the keyboard.
+    rootHeight: editing && validHeight ? `${Math.round(height + validOffsetTop)}px` : null,
     resetRootScroll: !editing || keyboardClosed,
   };
 }
@@ -41,6 +45,7 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
     const next = mobileViewportUpdate(
       isTextEntryElement(doc.activeElement),
       viewport.height,
+      viewport.offsetTop,
       previousHeight,
     );
     previousHeight = viewport.height;

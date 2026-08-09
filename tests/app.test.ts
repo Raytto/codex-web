@@ -170,6 +170,8 @@ test("mobile Safari restores the non-fixed app viewport after the software keybo
   assert.match(styles, /\.messages \{[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
   assert.match(mainSource, /installMobileViewportRecovery\(\);/);
   assert.match(viewportSource, /visualViewport/);
+  assert.match(viewportSource, /viewport\.offsetTop/);
+  assert.match(viewportSource, /height \+ validOffsetTop/);
   assert.match(viewportSource, /requestAnimationFrame\(apply\)/);
   assert.match(viewportSource, /addEventListener\("focusout", scheduleSettled\)/);
   assert.match(viewportSource, /documentElement\.scrollTop = 0/);
