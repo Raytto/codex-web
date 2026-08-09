@@ -831,6 +831,14 @@ test("browser preview is limited to formats browsers can display directly", () =
   assert.equal(filePreviewIdFromPath("/not-a-preview"), null);
 });
 
+test("image file cards use a compact preview without a duplicate file icon", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /const icon = image \? null : <FileIcon size=\{20\} \/>/);
+  assert.match(appSource, /image && <img className="file-card-image"/);
+  assert.match(styles, /\.file-card-image \{ width: 56px; height: 31\.5px;/);
+});
+
 test("rich document readers keep Markdown inert and HTML isolated from the app origin", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const mathSource = fs.readFileSync(path.join(process.cwd(), "src", "markdown-math.ts"), "utf8");

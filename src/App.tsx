@@ -1446,7 +1446,7 @@ function formatActivityTime(value: string): string {
 
 function FileCard({ file }: { file: WorkFile }) {
   const image = file.mime_type.startsWith("image/");
-  const icon = image ? <FileImage size={20} /> : <FileIcon size={20} />;
+  const icon = image ? null : <FileIcon size={20} />;
   const reader = fileReaderKind(file);
   const previewable = isBrowserPreviewable(file);
   const body = <>{image && <img className="file-card-image" src={fileUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
