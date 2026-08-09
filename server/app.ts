@@ -19,6 +19,7 @@ import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from 
 import { buildUserCancellationSummary } from "./cancellation-summary.js";
 import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from "./wake-automation.js";
 import { ResumableUploadService } from "./resumable-upload.js";
+import { ImageThumbnailService } from "./image-thumbnail.js";
 
 const COOKIE_NAME = "cww_session";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
@@ -100,10 +101,17 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const transcription = new TranscriptionService(config);
   const voiceEnabled = Boolean(config.dashscopeApiKey && config.publicBaseUrl.startsWith("https://"));
   const deletingConversations = new Set<string>();
+  const imageThumbnails = new ImageThumbnailService();
   let queuePumpBusy = false;
   let shuttingDown = false;
   let wakeSchedulerBusy = false;
   let wakeSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+
+  function resolveFilePath(file: FileRow, userId: string): string {
+    const workspace = ensureTenantWorkspace(config.tenantRoot, userId, file.conversation_id);
+    const storageRoot = file.kind === "output" && isPersistedDeliverablePath(file.relative_path) ? config.dataRoot : workspace;
+    return resolveInside(storageRoot, file.relative_path);
+  }
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
     const workspace = ensureTenantWorkspace(config.tenantRoot, userId, prompt.conversation_id);
@@ -1233,14 +1241,34 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       },
     });
   });
+  api.get("/files/:id/thumbnail", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    if (!/^image\//.test(file.mime_type)) return res.status(415).json({ error: "该文件不是图片。" });
+    let absolute: string;
+    try { absolute = resolveFilePath(file, session.user_id); }
+    catch { return res.status(400).json({ error: "文件路径无效。" }); }
+    let stat: fs.Stats;
+    try { stat = fs.statSync(absolute); }
+    catch { return res.status(404).json({ error: "文件已不存在。" }); }
+    try {
+      const thumbnail = await imageThumbnails.render(file.id, absolute, `${stat.size}:${stat.mtimeMs}`);
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Content-Type", "image/webp");
+      res.setHeader("Content-Length", String(thumbnail.length));
+      return res.send(thumbnail);
+    } catch {
+      return res.status(415).json({ error: "图片缩略图生成失败。" });
+    }
+  });
   api.get("/files/:id", (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
-    const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, file.conversation_id);
-    const storageRoot = file.kind === "output" && isPersistedDeliverablePath(file.relative_path) ? config.dataRoot : workspace;
     let absolute: string;
-    try { absolute = resolveInside(storageRoot, file.relative_path); }
+    try { absolute = resolveFilePath(file, session.user_id); }
     catch { return res.status(400).json({ error: "文件路径无效。" }); }
     if (!fs.existsSync(absolute)) return res.status(404).json({ error: "文件已不存在。" });
     const inline = req.query.download !== "1" && (/^image\//.test(file.mime_type) || file.mime_type === "application/pdf" || /^text\/(plain|markdown|csv)/.test(file.mime_type));

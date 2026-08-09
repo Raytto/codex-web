@@ -12,10 +12,12 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 import request from "supertest";
+import sharp from "sharp";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "../server/app.js";
 import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
+import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
 import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
 import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveGeneratedImage, resolveInside, safeUploadName, snapshotGeneratedImages } from "../server/paths.js";
@@ -36,7 +38,7 @@ import { resolveScrollFollow } from "../src/scroll-follow.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../src/recovery.js";
 import { normalizeThemePreference, resolveTheme, themeCanvasColor, THEME_PREFERENCE_KEY } from "../src/theme.js";
-import type { Conversation, WorkFile } from "../src/api.js";
+import { fileThumbnailUrl, type Conversation, type WorkFile } from "../src/api.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt } from "../server/agent-context.js";
 import { buildProcessJournal } from "../src/process-journal.js";
 import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, detectOptionalAgentCapabilities } from "../server/optional-capabilities.js";
@@ -811,6 +813,58 @@ test("finished outputs are copied to immutable app storage and legacy rows migra
   assert.equal(fs.readFileSync(resolveInside(dataRoot, copiedPath), "utf8"), "result");
 });
 
+test("authenticated image thumbnails transfer a real 56 by 32 WebP instead of the original", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-image-thumbnail-test-"));
+  const dataRoot = path.join(root, "data");
+  const tenantRoot = path.join(root, "tenants");
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot, tenantRoot,
+    username: "pp", passwordHash: bcrypt.hashSync("Thumbnail-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const conversationId = crypto.randomUUID();
+  const fileId = crypto.randomUUID();
+  instance.db.createConversation(conversationId, "thumbnail transfer");
+  const workspace = ensureTenantWorkspace(tenantRoot, LEGACY_USER_ID, conversationId);
+  const relativePath = "outputs/original.png";
+  const absolutePath = resolveInside(workspace, relativePath);
+  await sharp({
+    create: { width: 640, height: 360, channels: 3, background: { r: 29, g: 74, b: 141 } },
+  }).png().toFile(absolutePath);
+  const originalSize = fs.statSync(absolutePath).size;
+  instance.db.addFile({
+    id: fileId, conversation_id: conversationId, message_id: null,
+    original_name: "original.png", relative_path: relativePath, mime_type: "image/png",
+    size: originalSize, kind: "output", created_at: new Date().toISOString(),
+  });
+
+  await request(instance.app).get(`/api/files/${fileId}/thumbnail`).expect(401);
+  const agent = request.agent(instance.app);
+  await agent.post("/api/auth/login").send({ username: "pp", password: "Thumbnail-Password-2026!" }).expect(200);
+  const thumbnail = await agent.get(`/api/files/${fileId}/thumbnail`).expect(200);
+  assert.match(thumbnail.headers["content-type"], /^image\/webp/);
+  assert.equal(thumbnail.headers["cache-control"], "private, no-store");
+  assert.equal(thumbnail.headers["x-content-type-options"], "nosniff");
+  assert.ok(Buffer.isBuffer(thumbnail.body));
+  assert.equal(Number(thumbnail.headers["content-length"]), thumbnail.body.length);
+  assert.ok(thumbnail.body.length < originalSize);
+  const metadata = await sharp(thumbnail.body).metadata();
+  assert.equal(metadata.width, IMAGE_THUMBNAIL_WIDTH);
+  assert.equal(metadata.height, IMAGE_THUMBNAIL_HEIGHT);
+  assert.deepEqual((await agent.get(`/api/files/${fileId}/thumbnail`).expect(200)).body, thumbnail.body);
+  assert.equal((await agent.get(`/api/files/${fileId}`).expect(200)).body.length, originalSize);
+
+  const textId = crypto.randomUUID();
+  fs.writeFileSync(resolveInside(workspace, "outputs/not-image.txt"), "text", "utf8");
+  instance.db.addFile({
+    id: textId, conversation_id: conversationId, message_id: null,
+    original_name: "not-image.txt", relative_path: "outputs/not-image.txt", mime_type: "text/plain",
+    size: 4, kind: "output", created_at: new Date().toISOString(),
+  });
+  await agent.get(`/api/files/${textId}/thumbnail`).expect(415, { error: "该文件不是图片。" });
+});
+
 test("browser preview is limited to formats browsers can display directly", () => {
   const file = (mime_type: string, original_name = "file.bin") => ({ mime_type, original_name } as WorkFile);
   assert.equal(isBrowserPreviewable(file("image/png")), true);
@@ -835,8 +889,9 @@ test("image file cards use a compact preview without a duplicate file icon", () 
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /const icon = image \? null : <FileIcon size=\{20\} \/>/);
-  assert.match(appSource, /image && <img className="file-card-image"/);
-  assert.match(styles, /\.file-card-image \{ width: 56px; height: 31\.5px;/);
+  assert.match(appSource, /image && <img className="file-card-image" src=\{fileThumbnailUrl\(file\)\}/);
+  assert.equal(fileThumbnailUrl({ id: "image-id" } as WorkFile), "/api/files/image-id/thumbnail");
+  assert.match(styles, /\.file-card-image \{ width: 56px; height: 32px;/);
 });
 
 test("rich document readers keep Markdown inert and HTML isolated from the app origin", () => {

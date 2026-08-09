@@ -253,3 +253,7 @@ export const api = {
 export function fileUrl(file: WorkFile, download = false): string {
   return `${BASE_PATH}/api/files/${file.id}${download ? "?download=1" : ""}`;
 }
+
+export function fileThumbnailUrl(file: WorkFile): string {
+  return `${BASE_PATH}/api/files/${file.id}/thumbnail`;
+}

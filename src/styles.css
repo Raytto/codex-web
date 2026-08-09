@@ -424,8 +424,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-card { min-width: 0; display: flex; align-items: center; border: 1px solid #d5d9e8; border-radius: 12px; background: #f7f8fc; transition: border-color .16s ease, background .16s ease, transform .14s ease; }
 .file-card:hover { transform: translateY(-1px); border-color: #aeb6d7; background: #eef1fa; }
 .file-card > a:first-child { min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; padding: 10px 12px; color: inherit; text-decoration: none; }
-.file-card > a:first-child > svg { color: var(--indigo); }
-.file-card-image { width: 56px; height: 31.5px; flex: 0 0 auto; border: 1px solid #dfe2ec; border-radius: 5px; background: #fff; object-fit: cover; }
+.file-card > a:first-child > svg { flex: 0 0 auto; color: var(--indigo); }
+.file-card-image { width: 56px; height: 32px; flex: 0 0 auto; border: 1px solid #dfe2ec; border-radius: 5px; background: #fff; object-fit: cover; }
 .file-card span { min-width: 0; display: grid; gap: 3px; }
 .file-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .file-card small { color: var(--muted); font-size: 10px; }
