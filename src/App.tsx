@@ -4,11 +4,11 @@ import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
-  CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Square, Sun,
+  Copy, CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Share2, Square, Sun,
   Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
-import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "./file-links";
+import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type FileShareState, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
+import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
 import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
@@ -43,12 +43,14 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readStoredThemePreference());
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
-  const previewFileId = filePreviewIdFromPath(window.location.pathname);
+  const publicPreviewFileId = publicFilePreviewIdFromPath(window.location.pathname);
+  const previewFileId = publicPreviewFileId ? null : filePreviewIdFromPath(window.location.pathname);
   const expireSession = useCallback(() => {
     setCsrf();
     setSession({ authenticated: false });
   }, []);
   useEffect(() => {
+    if (publicPreviewFileId) return;
     const controller = new AbortController();
     recoverBrowserSession(api.session, { signal: controller.signal }).then((value) => {
       setCsrf(value.csrfToken);
@@ -58,7 +60,7 @@ export default function App() {
       if (!(error instanceof DOMException && error.name === "AbortError")) console.error("Session recovery failed", error);
     });
     return () => controller.abort();
-  }, []);
+  }, [publicPreviewFileId]);
   useEffect(() => {
     const query = window.matchMedia?.("(prefers-color-scheme: dark)");
     if (!query) return;
@@ -71,6 +73,7 @@ export default function App() {
     try { window.localStorage.setItem(THEME_PREFERENCE_KEY, themePreference); } catch { /* Storage can be unavailable in private browsing. */ }
   }, [systemPrefersDark, themePreference]);
 
+  if (publicPreviewFileId) return <PublicFilePreviewPage fileId={publicPreviewFileId} />;
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
   if (previewFileId) return <FilePreviewPage fileId={previewFileId} onSessionExpired={expireSession} />;
@@ -105,31 +108,128 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   </main>;
 }
 
+function FileReaderContent({ file, content }: {
+  file: Pick<WorkFile, "original_name" | "mime_type">;
+  content: string;
+}) {
+  const readerKind = fileReaderKind(file);
+  const math = useAsyncMarkdownMath(content);
+  if (readerKind === "markdown") return <div className="file-preview-scroll">
+    <article className="file-reader-markdown markdown">
+      <ReactMarkdown
+        remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
+        rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
+        skipHtml
+        urlTransform={defaultUrlTransform}
+        components={{
+          a: ({ href, children }) => href?.startsWith("#")
+            ? <a href={href}>{children}</a>
+            : <a href={href} target="_blank" rel="noreferrer">{children}</a>,
+          img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
+          table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
+        }}
+      >{math.content}</ReactMarkdown>
+    </article>
+  </div>;
+  if (readerKind === "html") return <iframe
+    className="file-reader-html"
+    title={file.original_name || "HTML 文件预览"}
+    sandbox="allow-popups allow-popups-to-escape-sandbox"
+    referrerPolicy="no-referrer"
+    srcDoc={content}
+  />;
+  return null;
+}
+
+function FileShareMenu({ file, share, onChange }: { file: WorkFile; share: FileShareState; onChange: (share: FileShareState) => void }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOutside);
+    document.addEventListener("keydown", closeEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOutside);
+      document.removeEventListener("keydown", closeEscape);
+    };
+  }, [open]);
+
+  async function enable() {
+    setBusy(true); setError("");
+    try { onChange((await api.enableFileShare(file.id)).share); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "开启公开分享失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function disable() {
+    if (!window.confirm("关闭后，这个固定链接及其中的图片将立即无法访问。确定关闭吗？")) return;
+    setBusy(true); setError("");
+    try { onChange((await api.disableFileShare(file.id)).share); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "关闭公开分享失败"); }
+    finally { setBusy(false); }
+  }
+
+  async function copyLink() {
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(share.publicUrl);
+      else {
+        const input = document.createElement("textarea");
+        input.value = share.publicUrl;
+        input.style.position = "fixed"; input.style.opacity = "0";
+        document.body.appendChild(input); input.select(); document.execCommand("copy"); input.remove();
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch { setError("复制失败，请手动复制链接。"); }
+  }
+
+  return <div className="file-preview-share-wrap" ref={root}>
+    <button className={`file-preview-share${share.enabled ? " active" : ""}`} type="button" title="公开分享" aria-label="公开分享" aria-expanded={open} onClick={() => { setOpen((value) => !value); setError(""); }}>
+      <Share2 size={18} /><span>分享</span>
+    </button>
+    {open && <section className="file-share-panel" aria-label="公开分享设置">
+      <div className="file-share-heading"><strong>公开分享</strong>{share.enabled && <span>● 已开启</span>}</div>
+      <p>{share.enabled ? "任何获得链接的人都能查看此文件及其中引用的图片，无需登录。" : "默认保持私有。开启后，任何获得固定链接的人都能查看。"}</p>
+      {share.enabled && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
+      {error && <div className="file-share-error">{error}</div>}
+      <div className="file-share-actions">
+        {share.enabled
+          ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>{busy ? "正在关闭…" : "关闭分享"}</button></>
+          : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : "开启公开分享"}</button>}
+      </div>
+    </section>}
+  </div>;
+}
+
 function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessionExpired: () => void }) {
   const [file, setFile] = useState<WorkFile | null>(null);
+  const [share, setShare] = useState<FileShareState | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const readerKind = file ? fileReaderKind(file) : null;
-  const math = useAsyncMarkdownMath(content ?? "");
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
-    setError("");
-    setContent(null);
+    setLoading(true); setError(""); setContent(null);
     void (async () => {
       try {
         const metadata = await api.filePreview(fileId, controller.signal);
         if (controller.signal.aborted) return;
-        setFile(metadata.file);
-        if (!fileReaderKind(metadata.file)) {
-          setError("这个文件不支持站内阅读，请下载后打开。");
-          return;
-        }
+        setFile(metadata.file); setShare(metadata.share);
+        if (!fileReaderKind(metadata.file)) { setError("这个文件不支持站内阅读，请下载后打开。"); return; }
         if (metadata.file.size > FILE_READER_MAX_BYTES) {
-          setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 5 MB 的移动端在线阅读上限，请直接下载。`);
-          return;
+          setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 5 MB 的移动端在线阅读上限，请直接下载。`); return;
         }
         const text = await api.fileText(metadata.file, controller.signal);
         if (!controller.signal.aborted) setContent(text);
@@ -138,9 +238,7 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
         const message = reason instanceof Error ? reason.message : "文件读取失败";
         setError(message);
         if (message === "请先登录。") onSessionExpired();
-      } finally {
-        if (!controller.signal.aborted) setLoading(false);
-      }
+      } finally { if (!controller.signal.aborted) setLoading(false); }
     })();
     return () => controller.abort();
   }, [fileId, onSessionExpired]);
@@ -152,20 +250,11 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
       checking = true;
       try {
         const current = await api.session();
-        if (!current.authenticated) {
-          setContent(null);
-          setFile(null);
-          onSessionExpired();
-        }
-      } catch {
-        // A transient network failure must not clear an otherwise valid reader.
-      } finally {
-        checking = false;
-      }
+        if (!current.authenticated) { setContent(null); setFile(null); onSessionExpired(); }
+      } catch { /* A transient network failure must not clear an otherwise valid reader. */ }
+      finally { checking = false; }
     }
-    const verifyVisibleSession = () => {
-      if (!document.hidden) void verifySession();
-    };
+    const verifyVisibleSession = () => { if (!document.hidden) void verifySession(); };
     const interval = window.setInterval(() => void verifySession(), 60_000);
     window.addEventListener("focus", verifyVisibleSession);
     document.addEventListener("visibilitychange", verifyVisibleSession);
@@ -180,39 +269,65 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
-      <div className="file-preview-title">
-        <FileText size={18} />
-        <span><strong>{file?.original_name || "正在读取文件…"}</strong><small>{readerKind === "markdown" ? `Markdown 阅读${math.loading ? " · 正在排版公式" : math.failed ? " · 公式组件加载失败" : ""}` : readerKind === "html" ? "HTML 隔离预览" : "在线文件"}</small></span>
+      <div className="file-preview-title"><FileText size={18} /><strong>{file?.original_name || "正在读取文件…"}</strong></div>
+      <div className="file-preview-actions">
+        {file && share && <FileShareMenu file={file} share={share} onChange={setShare} />}
+        {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
       </div>
-      {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
     </header>
     <section className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
-      {!loading && !error && content !== null && readerKind === "markdown" && <div className="file-preview-scroll">
-        <article className="file-reader-markdown markdown">
-          <ReactMarkdown
-            remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
-            rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
-            skipHtml
-            urlTransform={defaultUrlTransform}
-            components={{
-              a: ({ href, children }) => href?.startsWith("#")
-                ? <a href={href}>{children}</a>
-                : <a href={href} target="_blank" rel="noreferrer">{children}</a>,
-              img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
-              table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
-            }}
-          >{math.content}</ReactMarkdown>
-        </article>
-      </div>}
-      {!loading && !error && content !== null && readerKind === "html" && <iframe
-        className="file-reader-html"
-        title={file?.original_name || "HTML 文件预览"}
-        sandbox="allow-popups allow-popups-to-escape-sandbox"
-        referrerPolicy="no-referrer"
-        srcDoc={content}
-      />}
+      {!loading && !error && content !== null && file && <FileReaderContent file={file} content={content} />}
+    </section>
+  </main>;
+}
+
+function PublicFilePreviewPage({ fileId }: { fileId: string }) {
+  const viewId = useRef(globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const [file, setFile] = useState<Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind"> | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const readerKind = file ? fileReaderKind(file) : null;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void api.publicFilePreview(fileId, viewId.current, controller.signal)
+      .then((preview) => { setFile(preview.file); setContent(preview.content); })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "公开文件读取失败"))
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [fileId]);
+
+  useEffect(() => {
+    let checking = false;
+    async function verify() {
+      if (checking || !content) return;
+      checking = true;
+      try { await api.verifyPublicFileShare(fileId); }
+      catch (reason) { setContent(null); setError(reason instanceof Error ? reason.message : "公开分享已关闭。"); }
+      finally { checking = false; }
+    }
+    const verifyVisible = () => { if (!document.hidden) void verify(); };
+    const interval = window.setInterval(() => void verify(), 60_000);
+    window.addEventListener("focus", verifyVisible);
+    document.addEventListener("visibilitychange", verifyVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", verifyVisible);
+      document.removeEventListener("visibilitychange", verifyVisible);
+    };
+  }, [content, fileId]);
+
+  return <main className={`file-preview-page public ${readerKind ?? ""}`}>
+    <header className="file-preview-header public">
+      <div className="file-preview-title"><FileText size={18} /><strong>{file?.original_name || "公开文件"}</strong></div>
+    </header>
+    <section className="file-preview-body">
+      {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在读取公开文件…</p></div>}
+      {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p></div>}
+      {!loading && !error && content !== null && file && <FileReaderContent file={file} content={content} />}
     </section>
   </main>;
 }

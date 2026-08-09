@@ -20,10 +20,12 @@ import { buildUserCancellationSummary } from "./cancellation-summary.js";
 import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from "./wake-automation.js";
 import { ResumableUploadService } from "./resumable-upload.js";
 import { ImageThumbnailService } from "./image-thumbnail.js";
+import { PublicShareAssetError, isPublicShareImage, publicShareDocumentKind, resolvePublicShareAssets, rewritePublicShareDocument } from "./public-file-share.js";
 
 const COOKIE_NAME = "cww_session";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
 const FILE_INSTRUCTION_GUIDANCE = "文件已上传，请输入具体操作，例如“把图片背景改为白色”或“汇总这些表格”。收到明确指令后才会开始处理。";
+const PUBLIC_FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
 type AuthenticatedRequest = Request & { appSession?: SessionRow };
 
 export function createApp(overrides: Partial<AppConfig> = {}) {
@@ -33,6 +35,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: config.displayName });
   for (const user of db.listUsers()) ensureTenant(config.tenantRoot, user.id);
   migrateExistingOutputFiles(config, db);
+  db.prunePublicShareAccessEvents(new Date(Date.now() - 180 * 24 * 60 * 60 * 1_000).toISOString());
   const subscribers = new Map<string, Set<Response>>();
 
   function optionsForUser(userId: string): AgentOptions {
@@ -111,6 +114,48 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const workspace = ensureTenantWorkspace(config.tenantRoot, userId, file.conversation_id);
     const storageRoot = file.kind === "output" && isPersistedDeliverablePath(file.relative_path) ? config.dataRoot : workspace;
     return resolveInside(storageRoot, file.relative_path);
+  }
+
+  function publicApplicationBase(req: Request): string {
+    const configured = config.publicBaseUrl.replace(/\/$/, "");
+    if (configured) return configured;
+    const forwardedProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0].trim();
+    return `${forwardedProto || req.protocol}://${req.get("host")}${config.basePath}`;
+  }
+
+  function publicPreviewUrl(req: Request, fileId: string): string {
+    return `${publicApplicationBase(req)}/files/${encodeURIComponent(fileId)}/preview/public`;
+  }
+
+  function publicShareState(req: Request, fileId: string) {
+    return { enabled: Boolean(db.getPublicFileShare(fileId)?.enabled), publicUrl: publicPreviewUrl(req, fileId) };
+  }
+
+  function publicResponseHeaders(res: Response): void {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  }
+
+  function activePublicDocument(fileId: string) {
+    const active = db.getActivePublicFile(fileId);
+    if (!active || !isPersistedDeliverablePath(active.file.relative_path)) return undefined;
+    const kind = publicShareDocumentKind(active.file);
+    if (!kind || active.file.size > PUBLIC_FILE_READER_MAX_BYTES) return undefined;
+    let absolute: string;
+    try { absolute = resolveFilePath(active.file, active.share.user_id); }
+    catch { return undefined; }
+    try {
+      const stat = fs.statSync(absolute);
+      if (!stat.isFile() || stat.size !== active.file.size || stat.size > PUBLIC_FILE_READER_MAX_BYTES) return undefined;
+    } catch { return undefined; }
+    return { ...active, kind, absolute };
+  }
+
+  function normalizedPublicIp(req: Request): string {
+    const value = String(req.ip || req.socket.remoteAddress || "unknown").trim();
+    return value.startsWith("::ffff:") ? value.slice(7) : value.slice(0, 64) || "unknown";
   }
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
@@ -352,6 +397,79 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   // session. Keep it before the authentication middleware and expose no other
   // temporary files through this route.
   api.get("/transcription-audio/:fileName", (req, res) => transcription.serveSignedAudio(req, res));
+
+  const publicShareLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 120,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "公开文件访问过于频繁，请稍后再试。" },
+  });
+
+  api.head("/files/:id/preview/public", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    if (!activePublicDocument(String(req.params.id))) return res.status(404).end();
+    return res.status(204).end();
+  });
+
+  api.get("/files/:id/preview/public", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    const fileId = String(req.params.id);
+    const active = activePublicDocument(fileId);
+    if (!active) return res.status(404).json({ error: "公开文件不存在或分享已关闭。" });
+    let content: string;
+    try { content = fs.readFileSync(active.absolute, "utf8").replace(/^\uFEFF/, ""); }
+    catch { return res.status(404).json({ error: "公开文件不存在或分享已关闭。" }); }
+    const assets = db.listPublicFileShareAssets(active.share.id).map((asset) => ({
+      sourceRef: asset.source_ref,
+      assetFileId: asset.asset_file_id,
+    }));
+    try {
+      content = rewritePublicShareDocument(active.kind, content, assets, (assetFileId) => (
+        `${publicApplicationBase(req)}/api/files/${encodeURIComponent(fileId)}/preview/public/assets/${encodeURIComponent(assetFileId)}`
+      ));
+    } catch {
+      return res.status(404).json({ error: "公开文件资源不完整。" });
+    }
+    const suppliedViewId = String(req.get("x-codex-web-view-id") ?? "");
+    const viewId = /^[A-Za-z0-9_-]{8,100}$/.test(suppliedViewId) ? suppliedViewId : crypto.randomUUID();
+    const userAgent = String(req.get("user-agent") ?? "").trim().slice(0, 256) || null;
+    db.recordPublicShareAccess(active.share.id, normalizedPublicIp(req), viewId, userAgent);
+    return res.json({
+      file: {
+        id: active.file.id,
+        original_name: active.file.original_name,
+        mime_type: active.file.mime_type,
+        size: active.file.size,
+        kind: active.file.kind,
+      },
+      content,
+    });
+  });
+
+  api.get("/files/:id/preview/public/assets/:assetId", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    const active = activePublicDocument(String(req.params.id));
+    if (!active) return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+    const assetId = String(req.params.assetId);
+    const mapping = db.listPublicFileShareAssets(active.share.id).find((asset) => asset.asset_file_id === assetId);
+    const asset = mapping ? db.getFile(assetId) : undefined;
+    const conversation = asset ? db.getConversation(asset.conversation_id) : undefined;
+    if (!asset || !conversation || conversation.user_id !== active.share.user_id || conversation.deleted_at
+      || asset.kind !== "output" || !isPublicShareImage(asset) || !isPersistedDeliverablePath(asset.relative_path)) {
+      return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+    }
+    let absolute: string;
+    try { absolute = resolveFilePath(asset, active.share.user_id); }
+    catch { return res.status(404).json({ error: "公开图片不存在或分享已关闭。" }); }
+    let stat: fs.Stats;
+    try { stat = fs.statSync(absolute); }
+    catch { return res.status(404).json({ error: "公开图片不存在或分享已关闭。" }); }
+    if (!stat.isFile() || stat.size !== asset.size) return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+    res.setHeader("Content-Type", fileResponseContentType(asset.mime_type));
+    res.setHeader("Content-Length", String(stat.size));
+    return res.sendFile(path.basename(absolute), { root: path.dirname(absolute) });
+  });
 
   const automationLimiter = rateLimit({
     windowMs: 60_000,
@@ -1239,8 +1357,57 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         size: file.size,
         kind: file.kind,
       },
+      share: publicShareState(req, file.id),
     });
   });
+
+  api.post("/files/:id/share", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    const kind = publicShareDocumentKind(file);
+    if (file.kind !== "output" || !kind || !isPersistedDeliverablePath(file.relative_path)) {
+      return res.status(400).json({ error: "只有已完成的 Markdown 或 HTML 成品可以公开分享。" });
+    }
+    if (file.size > PUBLIC_FILE_READER_MAX_BYTES) return res.status(413).json({ error: "超过 5 MiB 的文件不能在线公开分享。" });
+    let absolute: string;
+    try { absolute = resolveFilePath(file, session.user_id); }
+    catch { return res.status(404).json({ error: "文件不存在。" }); }
+    let content: string;
+    try {
+      const stat = fs.statSync(absolute);
+      if (!stat.isFile() || stat.size !== file.size) return res.status(404).json({ error: "文件不存在。" });
+      content = fs.readFileSync(absolute, "utf8").replace(/^\uFEFF/, "");
+    } catch { return res.status(404).json({ error: "文件不存在。" }); }
+    try {
+      const siblings = file.message_id ? db.listFilesForMessage(file.message_id) : [];
+      const assets = resolvePublicShareAssets(kind, content, siblings);
+      for (const reference of assets) {
+        const asset = db.getFileForUser(reference.assetFileId, session.user_id);
+        if (!asset || asset.message_id !== file.message_id || asset.kind !== "output" || !isPublicShareImage(asset)
+          || !isPersistedDeliverablePath(asset.relative_path)) {
+          throw new PublicShareAssetError(`图片“${reference.sourceRef}”不是同次交付的安全成品图片。`);
+        }
+        const assetPath = resolveFilePath(asset, session.user_id);
+        const stat = fs.statSync(assetPath);
+        if (!stat.isFile() || stat.size !== asset.size) throw new PublicShareAssetError(`图片“${reference.sourceRef}”已经不存在。`);
+      }
+      db.enablePublicFileShare({ id: newId(), file, userId: session.user_id, assets });
+      return res.json({ share: publicShareState(req, file.id) });
+    } catch (error) {
+      if (error instanceof PublicShareAssetError) return res.status(422).json({ error: error.message });
+      return res.status(500).json({ error: "公开分享创建失败。" });
+    }
+  });
+
+  api.delete("/files/:id/share", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    db.disablePublicFileShare(file.id, session.user_id);
+    return res.json({ share: publicShareState(req, file.id) });
+  });
+
   api.get("/files/:id/thumbnail", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);

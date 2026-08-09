@@ -7,7 +7,12 @@ export type Conversation = {
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
 };
-export type FilePreviewMetadata = { file: WorkFile };
+export type FileShareState = { enabled: boolean; publicUrl: string };
+export type FilePreviewMetadata = { file: WorkFile; share: FileShareState };
+export type PublicFilePreview = {
+  file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind">;
+  content: string;
+};
 export type Message = {
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; created_at: string; files: WorkFile[];
 };
@@ -235,6 +240,21 @@ export const api = {
   filePreview: (id: string, signal?: AbortSignal) => request<FilePreviewMetadata>(
     `/files/${encodeURIComponent(id)}/preview`, { signal },
   ),
+  enableFileShare: (id: string) => request<{ share: FileShareState }>(
+    `/files/${encodeURIComponent(id)}/share`, { method: "POST" },
+  ),
+  disableFileShare: (id: string) => request<{ share: FileShareState }>(
+    `/files/${encodeURIComponent(id)}/share`, { method: "DELETE" },
+  ),
+  publicFilePreview: (id: string, viewId: string, signal?: AbortSignal) => request<PublicFilePreview>(
+    `/files/${encodeURIComponent(id)}/preview/public`, { signal, headers: { "X-Codex-Web-View-ID": viewId } },
+  ),
+  verifyPublicFileShare: async (id: string, signal?: AbortSignal) => {
+    const response = await fetch(`${BASE_PATH}/api/files/${encodeURIComponent(id)}/preview/public`, {
+      method: "HEAD", credentials: "same-origin", cache: "no-store", signal,
+    });
+    if (!response.ok) throw new Error("公开分享已关闭或文件不存在。");
+  },
   fileText: async (file: WorkFile, signal?: AbortSignal) => {
     const response = await fetch(fileUrl(file), { credentials: "same-origin", signal });
     const body = await response.text();

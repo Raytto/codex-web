@@ -18,7 +18,7 @@ import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "
 import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
 import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
-import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
+import { AppDatabase, LEGACY_USER_ID, type FileRow } from "../server/db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
 import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveGeneratedImage, resolveInside, safeUploadName, snapshotGeneratedImages } from "../server/paths.js";
 import { buildShellEnvironment, cleanupJobRuntime, prepareJobRuntime } from "../server/python-runtime.js";
@@ -27,7 +27,7 @@ import { listTenantIdentities, tenantIdentityForUser } from "../server/tenant-id
 import { consumeTenantTurnEvents, validateTenantWorkerRequest } from "../server/tenant-worker-execution.js";
 import type { TenantWorkerRunRequest } from "../server/tenant-worker-protocol.js";
 import { isRetryableUpstreamError, runWithTransientRetries } from "../server/retry-policy.js";
-import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, resolveMessageFileLink } from "../src/file-links.js";
+import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, publicFilePreviewUrl, resolveMessageFileLink } from "../src/file-links.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
@@ -46,6 +46,7 @@ import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../se
 import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
 import { normalizeCodexQuotaUsage, normalizeContextTokenUsage } from "../server/app-server-turn.js";
 import { recoverBrowserSession } from "../src/session-recovery.js";
+import { PublicShareAssetError, resolvePublicShareAssets, rewritePublicShareDocument } from "../server/public-file-share.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -818,7 +819,7 @@ test("authenticated image thumbnails transfer a real 56 by 32 WebP instead of th
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
   const instance = createApp({
-    projectRoot: process.cwd(), dataRoot, tenantRoot,
+    projectRoot: process.cwd(), dataRoot, tenantRoot, basePath: "",
     username: "pp", passwordHash: bcrypt.hashSync("Thumbnail-Password-2026!", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
   });
@@ -879,10 +880,91 @@ test("browser preview is limited to formats browsers can display directly", () =
   assert.equal(fileReaderKind(file("application/octet-stream", "report.htm")), "html");
   assert.equal(fileReaderKind(file("text/plain", "report.txt")), null);
   assert.equal(filePreviewUrl({ id: "file id" }), "/codex-web/files/file%20id/preview");
+  assert.equal(publicFilePreviewUrl({ id: "file id" }), "/codex-web/files/file%20id/preview/public");
   assert.equal(filePreviewIdFromPath("/codex-web/files/file%20id/preview"), "file id");
   assert.equal(filePreviewIdFromPath("/codex-web/files/file%20id/preview/"), "file id");
+  assert.equal(filePreviewIdFromPath("/codex-web/files/file%20id/preview/public"), null);
+  assert.equal(publicFilePreviewIdFromPath("/codex-web/files/file%20id/preview/public"), "file id");
+  assert.equal(publicFilePreviewIdFromPath("/codex-web/files/file%20id/preview/public/"), "file id");
   assert.equal(filePreviewIdFromPath("/codex-web/files/file%2/preview"), null);
   assert.equal(filePreviewIdFromPath("/not-a-preview"), null);
+});
+
+test("public share image manifests accept only safe same-delivery images and rewrite document URLs", () => {
+  const parent = { id: "report", original_name: "report.html", mime_type: "text/html", kind: "output", message_id: "message" } as FileRow;
+  const chart = { id: "chart", original_name: "chart.png", mime_type: "image/png", kind: "output", message_id: "message" } as FileRow;
+  const assets = resolvePublicShareAssets("html", '<img src="./chart.png"><source srcset="chart.png 1x, chart.png 2x"><img src="data:image/png;base64,AA==">', [parent, chart]);
+  assert.deepEqual(assets, [{ sourceRef: "chart.png", assetFileId: "chart" }]);
+  const rewritten = rewritePublicShareDocument("html", '<img src="./chart.png"><source srcset="chart.png 1x, chart.png 2x">', assets, (id) => `/public-assets/${id}`);
+  assert.match(rewritten, /src="\/public-assets\/chart"/);
+  assert.match(rewritten, /srcset="\/public-assets\/chart 1x, \/public-assets\/chart 2x"/);
+  assert.equal(rewritePublicShareDocument("markdown", "![趋势](chart.png)", assets, (id) => `/public-assets/${id}`), "![趋势](/public-assets/chart)");
+  assert.throws(() => resolvePublicShareAssets("html", '<img src="https://tracker.example/pixel.png">', [parent, chart]), PublicShareAssetError);
+  assert.throws(() => resolvePublicShareAssets("html", '<img src="../secret.png">', [parent, chart]), PublicShareAssetError);
+});
+
+test("fixed public file sharing is private by default, owner-controlled, image-aware, and audited in SQLite", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-public-file-share-"));
+  const dataRoot = path.join(root, "data");
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), basePath: "",
+    username: "pp", passwordHash: bcrypt.hashSync("Owner-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+    publicBaseUrl: "https://agent.example.test", queueAutoStart: false,
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const conversation = instance.db.createConversation(crypto.randomUUID(), "public report");
+  const messageId = crypto.randomUUID();
+  instance.db.addMessage({ id: messageId, conversation_id: conversation.id, role: "assistant", content: "done", created_at: new Date().toISOString() });
+  const parentId = crypto.randomUUID();
+  const imageId = crypto.randomUUID();
+  const html = '<!doctype html><meta charset="utf-8"><h1>公开报告</h1><img src="chart.png">';
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const writeDeliverable = (id: string, name: string, body: string | Buffer) => {
+    const relative = path.posix.join("deliverables", id, name);
+    const absolute = path.join(dataRoot, relative);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, body);
+    return relative;
+  };
+  instance.db.addFile({
+    id: parentId, conversation_id: conversation.id, message_id: messageId, original_name: "report.html",
+    relative_path: writeDeliverable(parentId, "report.html", html), mime_type: "text/html", size: Buffer.byteLength(html), kind: "output", created_at: new Date().toISOString(),
+  });
+  instance.db.addFile({
+    id: imageId, conversation_id: conversation.id, message_id: messageId, original_name: "chart.png",
+    relative_path: writeDeliverable(imageId, "chart.png", png), mime_type: "image/png", size: png.length, kind: "output", created_at: new Date().toISOString(),
+  });
+
+  await request(instance.app).get(`/api/files/${parentId}/preview/public`).expect(404);
+  const owner = request.agent(instance.app);
+  const login = await owner.post("/api/auth/login").send({ username: "pp", password: "Owner-Password-2026!" }).expect(200);
+  const privatePreview = await owner.get(`/api/files/${parentId}/preview`).expect(200);
+  assert.deepEqual(privatePreview.body.share, { enabled: false, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
+  await owner.post(`/api/files/${parentId}/share`).expect(403);
+  const enabled = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.equal(enabled.body.share.enabled, true);
+  assert.equal(instance.db.listPublicFileShareAssets(instance.db.getPublicFileShare(parentId)!.id)[0]?.asset_file_id, imageId);
+
+  const first = await request(instance.app).get(`/api/files/${parentId}/preview/public`)
+    .set("X-Codex-Web-View-ID", "view-public-0001").set("X-Forwarded-For", "203.0.113.8").expect(200);
+  assert.equal(first.headers["cache-control"], "no-store");
+  assert.equal(first.headers["x-robots-tag"], "noindex, nofollow, noarchive");
+  assert.equal(first.body.file.conversation_id, undefined);
+  assert.match(first.body.content, new RegExp(`/api/files/${parentId}/preview/public/assets/${imageId}`));
+  await request(instance.app).get(`/api/files/${parentId}/preview/public/assets/${imageId}`).expect(200).expect("Content-Type", /image\/png/);
+  await request(instance.app).get(`/api/files/${parentId}/preview/public`).set("X-Codex-Web-View-ID", "view-public-0001").set("X-Forwarded-For", "203.0.113.8").expect(200);
+  await request(instance.app).get(`/api/files/${parentId}/preview/public`).set("X-Codex-Web-View-ID", "view-public-0002").set("X-Forwarded-For", "203.0.113.8").expect(200);
+  const access = instance.db.sqlite.prepare("SELECT ip_address,access_count FROM public_share_access_rollups").get() as { ip_address: string; access_count: number };
+  assert.equal(access.ip_address, "203.0.113.8");
+  assert.equal(access.access_count, 2);
+
+  const disabled = await owner.delete(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.equal(disabled.body.share.enabled, false);
+  assert.equal(disabled.body.share.publicUrl, enabled.body.share.publicUrl);
+  await request(instance.app).get(`/api/files/${parentId}/preview/public`).expect(404);
+  const reopened = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.equal(reopened.body.share.publicUrl, enabled.body.share.publicUrl);
 });
 
 test("image file cards use a compact preview without a duplicate file icon", () => {
@@ -890,7 +972,7 @@ test("image file cards use a compact preview without a duplicate file icon", () 
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /const icon = image \? null : <FileIcon size=\{20\} \/>/);
   assert.match(appSource, /image && <img className="file-card-image" src=\{fileThumbnailUrl\(file\)\}/);
-  assert.equal(fileThumbnailUrl({ id: "image-id" } as WorkFile), "/api/files/image-id/thumbnail");
+  assert.equal(fileThumbnailUrl({ id: "image-id" } as WorkFile), "/codex-web/api/files/image-id/thumbnail");
   assert.match(styles, /\.file-card-image \{ width: 56px; height: 32px;/);
 });
 

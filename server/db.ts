@@ -79,6 +79,24 @@ export type FileRow = {
   created_at: string;
 };
 
+export type PublicFileShareRow = {
+  id: string;
+  file_id: string;
+  user_id: string;
+  file_name_snapshot: string;
+  enabled: number;
+  created_at: string;
+  enabled_at: string | null;
+  disabled_at: string | null;
+};
+
+export type PublicFileShareAssetRow = {
+  share_id: string;
+  asset_file_id: string;
+  source_ref: string;
+  created_at: string;
+};
+
 export type ResumableUploadState = "uploading" | "finalizing" | "completed" | "cancelled" | "expired";
 export type ResumableUploadRow = {
   id: string;
@@ -447,6 +465,46 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS resumable_uploads_owner_state_idx ON resumable_uploads(user_id,state,expires_at);
       CREATE INDEX IF NOT EXISTS resumable_uploads_conversation_state_idx ON resumable_uploads(conversation_id,state);
       CREATE INDEX IF NOT EXISTS resumable_uploads_expiry_idx ON resumable_uploads(state,expires_at);
+      CREATE TABLE IF NOT EXISTS public_file_shares (
+        id TEXT PRIMARY KEY,
+        file_id TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL,
+        file_name_snapshot TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+        created_at TEXT NOT NULL,
+        enabled_at TEXT,
+        disabled_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS public_file_share_assets (
+        share_id TEXT NOT NULL REFERENCES public_file_shares(id) ON DELETE CASCADE,
+        asset_file_id TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(share_id,source_ref),
+        UNIQUE(share_id,asset_file_id,source_ref)
+      );
+      CREATE TABLE IF NOT EXISTS public_share_access_events (
+        id TEXT PRIMARY KEY,
+        share_id TEXT NOT NULL REFERENCES public_file_shares(id) ON DELETE CASCADE,
+        ip_address TEXT NOT NULL,
+        view_id TEXT NOT NULL,
+        user_agent TEXT,
+        accessed_at TEXT NOT NULL,
+        UNIQUE(share_id,view_id)
+      );
+      CREATE TABLE IF NOT EXISTS public_share_access_rollups (
+        share_id TEXT NOT NULL REFERENCES public_file_shares(id) ON DELETE CASCADE,
+        ip_address TEXT NOT NULL,
+        first_accessed_at TEXT NOT NULL,
+        last_accessed_at TEXT NOT NULL,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(share_id,ip_address)
+      );
+      CREATE INDEX IF NOT EXISTS public_file_shares_user_enabled_idx ON public_file_shares(user_id,enabled);
+      CREATE INDEX IF NOT EXISTS public_file_share_assets_asset_idx ON public_file_share_assets(asset_file_id);
+      CREATE INDEX IF NOT EXISTS public_share_access_events_share_time_idx ON public_share_access_events(share_id,accessed_at);
+      CREATE INDEX IF NOT EXISTS public_share_access_events_time_idx ON public_share_access_events(accessed_at);
+      CREATE INDEX IF NOT EXISTS public_share_access_rollups_last_idx ON public_share_access_rollups(last_accessed_at);
     `);
 
     const conversationColumns = this.columnNames("conversations");
@@ -894,6 +952,94 @@ export class AppDatabase {
 
   listFilesForMessage(messageId: string): FileRow[] {
     return this.sqlite.prepare("SELECT * FROM files WHERE message_id=? ORDER BY created_at,id").all(messageId) as FileRow[];
+  }
+
+  getPublicFileShare(fileId: string): PublicFileShareRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM public_file_shares WHERE file_id=?").get(fileId) as PublicFileShareRow | undefined;
+  }
+
+  getActivePublicFile(fileId: string): { share: PublicFileShareRow; file: FileRow } | undefined {
+    const share = this.getPublicFileShare(fileId);
+    if (!share?.enabled) return undefined;
+    const file = this.getFile(fileId);
+    if (!file || file.kind !== "output") return undefined;
+    const conversation = this.getConversation(file.conversation_id);
+    const user = this.getUser(share.user_id);
+    if (!conversation || conversation.user_id !== share.user_id || conversation.deleted_at || user?.status !== "active") return undefined;
+    return { share, file };
+  }
+
+  listPublicFileShareAssets(shareId: string): PublicFileShareAssetRow[] {
+    return this.sqlite.prepare("SELECT * FROM public_file_share_assets WHERE share_id=? ORDER BY source_ref,asset_file_id")
+      .all(shareId) as PublicFileShareAssetRow[];
+  }
+
+  enablePublicFileShare(input: {
+    id: string;
+    file: FileRow;
+    userId: string;
+    assets: Array<{ sourceRef: string; assetFileId: string }>;
+  }): PublicFileShareRow {
+    const now = new Date().toISOString();
+    const existing = this.getPublicFileShare(input.file.id);
+    const shareId = existing?.id ?? input.id;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.prepare(`
+        INSERT INTO public_file_shares(id,file_id,user_id,file_name_snapshot,enabled,created_at,enabled_at,disabled_at)
+        VALUES(?,?,?,?,1,?,?,NULL)
+        ON CONFLICT(file_id) DO UPDATE SET
+          user_id=excluded.user_id,file_name_snapshot=excluded.file_name_snapshot,
+          enabled=1,enabled_at=excluded.enabled_at,disabled_at=NULL
+      `).run(shareId, input.file.id, input.userId, input.file.original_name, existing?.created_at ?? now, now);
+      this.sqlite.prepare("DELETE FROM public_file_share_assets WHERE share_id=?").run(shareId);
+      const insertAsset = this.sqlite.prepare(`
+        INSERT INTO public_file_share_assets(share_id,asset_file_id,source_ref,created_at) VALUES(?,?,?,?)
+      `);
+      for (const asset of input.assets) insertAsset.run(shareId, asset.assetFileId, asset.sourceRef, now);
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getPublicFileShare(input.file.id)!;
+  }
+
+  disablePublicFileShare(fileId: string, userId: string): PublicFileShareRow | undefined {
+    const share = this.getPublicFileShare(fileId);
+    if (!share || share.user_id !== userId) return undefined;
+    const now = new Date().toISOString();
+    this.sqlite.prepare("UPDATE public_file_shares SET enabled=0,disabled_at=? WHERE file_id=? AND user_id=?")
+      .run(now, fileId, userId);
+    return this.getPublicFileShare(fileId);
+  }
+
+  recordPublicShareAccess(shareId: string, ipAddress: string, viewId: string, userAgent: string | null, accessedAt = new Date().toISOString()): boolean {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const inserted = this.sqlite.prepare(`
+        INSERT OR IGNORE INTO public_share_access_events(id,share_id,ip_address,view_id,user_agent,accessed_at)
+        VALUES(?,?,?,?,?,?)
+      `).run(crypto.randomUUID(), shareId, ipAddress, viewId, userAgent, accessedAt).changes > 0;
+      if (inserted) {
+        this.sqlite.prepare(`
+          INSERT INTO public_share_access_rollups(share_id,ip_address,first_accessed_at,last_accessed_at,access_count)
+          VALUES(?,?,?,?,1)
+          ON CONFLICT(share_id,ip_address) DO UPDATE SET
+            last_accessed_at=excluded.last_accessed_at,
+            access_count=public_share_access_rollups.access_count+1
+        `).run(shareId, ipAddress, accessedAt, accessedAt);
+      }
+      this.sqlite.exec("COMMIT");
+      return inserted;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  prunePublicShareAccessEvents(before: string): number {
+    return Number(this.sqlite.prepare("DELETE FROM public_share_access_events WHERE accessed_at<?").run(before).changes);
   }
 
   updateFilePath(id: string, relativePath: string): void {

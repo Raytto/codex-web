@@ -62,8 +62,22 @@ export function filePreviewUrl(file: Pick<WorkFile, "id">): string {
   return `${BASE_PATH}/files/${encodeURIComponent(file.id)}/preview`;
 }
 
+export function publicFilePreviewUrl(file: Pick<WorkFile, "id">): string {
+  return `${filePreviewUrl(file)}/public`;
+}
+
 export function filePreviewIdFromPath(pathname: string): string | null {
   const match = pathname.match(/\/files\/([^/]+)\/preview\/?$/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+export function publicFilePreviewIdFromPath(pathname: string): string | null {
+  const match = pathname.match(/\/files\/([^/]+)\/preview\/public\/?$/);
   if (!match) return null;
   try {
     return decodeURIComponent(match[1]);
