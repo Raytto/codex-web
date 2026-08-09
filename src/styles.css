@@ -475,21 +475,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-preview-header.public .file-preview-title { max-width: calc(100% - 32px); }
 .file-preview-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 2px; margin-left: auto; }
 .file-preview-share-wrap { position: relative; }
+.file-share-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(18px, env(safe-area-inset-left));
+  background: rgba(12, 15, 29, .56);
+  backdrop-filter: blur(4px);
+}
 .file-share-panel {
-  width: min(360px, calc(100vw - 24px));
-  position: absolute;
-  z-index: 20;
-  top: calc(100% + 7px);
-  right: 0;
-  padding: 14px;
+  width: min(380px, 100%);
+  max-height: min(520px, calc(100dvh - 36px - env(safe-area-inset-top) - env(safe-area-inset-bottom)));
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 16px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 15px;
   color: var(--ink);
   background: var(--paper);
-  box-shadow: 0 14px 34px rgba(15, 17, 32, .16);
+  box-shadow: 0 24px 64px rgba(8, 10, 24, .32);
+  -webkit-overflow-scrolling: touch;
 }
-.file-share-heading { display: flex; align-items: center; gap: 5px; font-size: 14px; }
-.file-share-heading > span { color: #2f7a55; font-size: 12px; font-weight: 750; }
+.file-share-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 14px; }
+.file-share-titleline { min-width: 0; display: flex; align-items: center; gap: 5px; }
+.file-share-titleline > span { color: #2f7a55; font-size: 12px; font-weight: 750; }
+.file-share-close { width: 32px; height: 32px; display: grid; flex: 0 0 32px; place-items: center; padding: 0; border: 0; border-radius: 9px; color: var(--muted); background: var(--surface); cursor: pointer; }
+.file-share-close:hover { color: var(--ink); background: var(--indigo-pale); }
 .file-share-panel p { margin: 8px 0 10px; color: var(--muted); font-size: 12px; line-height: 1.55; }
 .file-share-panel input { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); font: 11px "Cascadia Code", Consolas, monospace; }
 .file-share-error { margin-top: 8px; color: #a9323c; font-size: 11px; line-height: 1.45; }
@@ -730,7 +743,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .file-preview-title > svg { width: 16px; height: 16px; }
   .file-preview-title strong { font-size: 12px; }
   .file-preview-header.public .file-preview-title { max-width: calc(100% - 20px); }
-  .file-share-panel { position: fixed; top: auto; right: max(8px, env(safe-area-inset-right)); bottom: max(8px, env(safe-area-inset-bottom)); left: max(8px, env(safe-area-inset-left)); width: auto; }
+  .file-share-backdrop { padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+  .file-share-panel { width: min(380px, 100%); }
   .file-reader-markdown {
     width: 100%;
     min-height: 100%;
@@ -908,7 +922,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .file-preview-download:hover { background: #303342; }
 :root[data-theme="dark"] .file-share-panel { border-color: #454750; background: #232429; box-shadow: 0 14px 34px rgba(0, 0, 0, .34); }
 :root[data-theme="dark"] .file-share-panel input { border-color: #454750; color: #b7b9c1; background: #292a2f; }
-:root[data-theme="dark"] .file-share-heading > span { color: #91d4b0; }
+:root[data-theme="dark"] .file-share-titleline > span { color: #91d4b0; }
+:root[data-theme="dark"] .file-share-close { color: #b7b9c1; background: #292a2f; }
+:root[data-theme="dark"] .file-share-close:hover { color: #fff; background: #303342; }
 :root[data-theme="dark"] .file-share-error { color: #ffabb3; }
 :root[data-theme="dark"] .file-reader-markdown { border-color: #373940; color: #e4e5ea; background: var(--paper); box-shadow: 0 14px 44px rgba(0, 0, 0, .2); }
 :root[data-theme="dark"] .file-reader-markdown h2,

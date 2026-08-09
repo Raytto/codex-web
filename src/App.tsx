@@ -146,23 +146,27 @@ function FileShareMenu({ file, share, onChange }: { file: WorkFile; share: FileS
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+
+  const closeDialog = useCallback(() => {
+    setOpen(false);
+    setError("");
+    window.requestAnimationFrame(() => trigger.current?.focus({ preventScroll: true }));
+  }, []);
 
   useEffect(() => {
     if (!open) return;
-    const closeOutside = (event: MouseEvent) => {
-      if (!root.current?.contains(event.target as Node)) setOpen(false);
-    };
+    const focusFrame = window.requestAnimationFrame(() => closeButton.current?.focus({ preventScroll: true }));
     const closeEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") closeDialog();
     };
-    document.addEventListener("mousedown", closeOutside);
     document.addEventListener("keydown", closeEscape);
     return () => {
-      document.removeEventListener("mousedown", closeOutside);
+      window.cancelAnimationFrame(focusFrame);
       document.removeEventListener("keydown", closeEscape);
     };
-  }, [open]);
+  }, [closeDialog, open]);
 
   async function enable() {
     setBusy(true); setError("");
@@ -193,21 +197,29 @@ function FileShareMenu({ file, share, onChange }: { file: WorkFile; share: FileS
     } catch { setError("复制失败，请手动复制链接。"); }
   }
 
-  return <div className="file-preview-share-wrap" ref={root}>
-    <button className={`file-preview-share${share.enabled ? " active" : ""}`} type="button" title="公开分享" aria-label="公开分享" aria-expanded={open} onClick={() => { setOpen((value) => !value); setError(""); }}>
+  return <div className="file-preview-share-wrap">
+    <button ref={trigger} className={`file-preview-share${share.enabled ? " active" : ""}`} type="button" title="公开分享" aria-label="公开分享" aria-haspopup="dialog" aria-expanded={open} aria-controls="file-share-dialog" onClick={() => {
+      if (open) closeDialog();
+      else { setOpen(true); setError(""); }
+    }}>
       <Share2 size={18} /><span>分享</span>
     </button>
-    {open && <section className="file-share-panel" aria-label="公开分享设置">
-      <div className="file-share-heading"><strong>公开分享</strong>{share.enabled && <span>● 已开启</span>}</div>
-      <p>{share.enabled ? "任何获得链接的人都能查看此文件及其中引用的图片，无需登录。" : "默认保持私有。开启后，任何获得固定链接的人都能查看。"}</p>
-      {share.enabled && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
-      {error && <div className="file-share-error">{error}</div>}
-      <div className="file-share-actions">
-        {share.enabled
-          ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>{busy ? "正在关闭…" : "关闭分享"}</button></>
-          : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : "开启公开分享"}</button>}
-      </div>
-    </section>}
+    {open && createPortal(<div className="file-share-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
+      <section id="file-share-dialog" className="file-share-panel" role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title">
+        <header className="file-share-heading">
+          <div className="file-share-titleline"><strong id="file-share-dialog-title">公开分享</strong>{share.enabled && <span>● 已开启</span>}</div>
+          <button ref={closeButton} className="file-share-close" type="button" aria-label="关闭分享设置" onClick={closeDialog}><X size={18} /></button>
+        </header>
+        <p>{share.enabled ? "任何获得链接的人都能查看此文件及其中引用的图片，无需登录。" : "默认保持私有。开启后，任何获得固定链接的人都能查看。"}</p>
+        {share.enabled && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
+        {error && <div className="file-share-error">{error}</div>}
+        <div className="file-share-actions">
+          {share.enabled
+            ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>{busy ? "正在关闭…" : "关闭分享"}</button></>
+            : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : "开启公开分享"}</button>}
+        </div>
+      </section>
+    </div>, document.body)}
   </div>;
 }
 
