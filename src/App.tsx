@@ -198,7 +198,7 @@ function FileShareMenu({ file, share, onChange }: { file: WorkFile; share: FileS
   }
 
   return <div className="file-preview-share-wrap">
-    <button ref={trigger} className={`file-preview-share${share.enabled ? " active" : ""}`} type="button" title="公开分享" aria-label="公开分享" aria-haspopup="dialog" aria-expanded={open} aria-controls="file-share-dialog" onClick={() => {
+    <button ref={trigger} className={`file-preview-share${open ? " active" : ""}`} type="button" title="公开分享" aria-label="公开分享" aria-haspopup="dialog" aria-expanded={open} aria-controls="file-share-dialog" onClick={() => {
       if (open) closeDialog();
       else { setOpen(true); setError(""); }
     }}>

@@ -995,6 +995,8 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.match(appSource, /<div className="file-preview-title"><FileText size=\{18\} \/><strong>/);
   assert.match(appSource, /复制链接/);
   assert.match(appSource, /关闭分享/);
+  assert.match(appSource, /className=\{`file-preview-share\$\{open \? " active" : ""\}`\}/);
+  assert.doesNotMatch(appSource, /file-preview-share\$\{share\.enabled/);
   assert.match(appSource, /open && createPortal\(<div className="file-share-backdrop"/);
   assert.match(appSource, /role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title"/);
   assert.match(appSource, /event\.target === event\.currentTarget\) closeDialog\(\)/);
@@ -1002,6 +1004,7 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.doesNotMatch(appSource, /访问记录/);
   assert.match(styles, /\.file-preview-header\s*\{[^}]*min-height:\s*48px/);
   assert.match(styles, /\.file-share-backdrop\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*100;[^}]*place-items:\s*center;/);
+  assert.match(styles, /@media \(hover: hover\)\s*\{[\s\S]*?\.file-preview-share:hover/);
   assert.doesNotMatch(styles, /\.file-share-panel\s*\{[^}]*position:\s*absolute/);
   assert.match(styles, /\.file-share-actions button\.danger\s*\{[^}]*background:\s*#9b303a/);
   assert.match(appSource, /window\.setInterval\(\(\) => void verifySession\(\), 60_000\)/);
