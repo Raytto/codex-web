@@ -21,6 +21,7 @@ import { resolveScrollFollow } from "./scroll-follow";
 import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { formatContextUsage, formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
+import { recoverBrowserSession } from "./session-recovery";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
@@ -44,9 +45,16 @@ export default function App() {
     setCsrf();
     setSession({ authenticated: false });
   }, []);
-
   useEffect(() => {
-    api.session().then((value) => { setCsrf(value.csrfToken); setSession(value); }).finally(() => setLoading(false));
+    const controller = new AbortController();
+    recoverBrowserSession(api.session, { signal: controller.signal }).then((value) => {
+      setCsrf(value.csrfToken);
+      setSession(value);
+      setLoading(false);
+    }).catch((error) => {
+      if (!(error instanceof DOMException && error.name === "AbortError")) console.error("Session recovery failed", error);
+    });
+    return () => controller.abort();
   }, []);
   useEffect(() => {
     const query = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -60,7 +68,7 @@ export default function App() {
     try { window.localStorage.setItem(THEME_PREFERENCE_KEY, themePreference); } catch { /* Storage can be unavailable in private browsing. */ }
   }, [systemPrefersDark, themePreference]);
 
-  if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /></div>;
+  if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
   if (previewFileId) return <FilePreviewPage fileId={previewFileId} onSessionExpired={expireSession} />;
   return <Workspace session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;

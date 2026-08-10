@@ -128,7 +128,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  session: () => request<Session>("/auth/session"),
+  session: () => request<Session>("/auth/session", { cache: "no-store" }),
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   conversations: () => request<{ conversations: Conversation[] }>("/conversations"),

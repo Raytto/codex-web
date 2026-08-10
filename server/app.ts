@@ -411,6 +411,20 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     });
   });
 
+  api.use("/auth", (req, res, next) => {
+    // Session responses contain user-specific, rapidly changing authentication
+    // state. In particular, a cached unauthenticated response must never survive
+    // a mobile tab restore or a later successful login.
+    res.setHeader("Cache-Control", "private, no-store, no-cache, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    // Existing tabs may still carry an ETag cached before these directives were
+    // deployed. Ignore that legacy validator once so Express sends a full body.
+    delete req.headers["if-none-match"];
+    delete req.headers["if-modified-since"];
+    next();
+  });
+
   const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 8,

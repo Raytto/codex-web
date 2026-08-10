@@ -43,6 +43,7 @@ import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, det
 import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../server/cancellation-summary.js";
 import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
 import { normalizeCodexQuotaUsage, normalizeContextTokenUsage } from "../server/app-server-turn.js";
+import { recoverBrowserSession } from "../src/session-recovery.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -60,6 +61,41 @@ test("login form leaves the username empty for each user to enter", () => {
   assert.match(appSource, /const \[username, setUsername\] = useState\(""\)/);
   assert.doesNotMatch(appSource, /useState\("owner"\)/);
   assert.match(appSource, /用户名<input autoComplete="username" autoFocus/);
+});
+
+test("browser session recovery retries transient failures and a briefly missing cookie", async () => {
+  const authenticated = { authenticated: true, csrfToken: "csrf" };
+  const outcomes: Array<Error | { authenticated: boolean; csrfToken?: string }> = [
+    new TypeError("network unavailable while restoring tab"),
+    { authenticated: false },
+    authenticated,
+  ];
+  const waits: number[] = [];
+  const restored = await recoverBrowserSession(async () => {
+    const next = outcomes.shift();
+    if (next instanceof Error) throw next;
+    assert.ok(next);
+    return next;
+  }, {
+    transientRetryDelaysMs: [10],
+    unauthenticatedRetryDelaysMs: [20, 30],
+    wait: async (delayMs) => { waits.push(delayMs); },
+  });
+  assert.deepEqual(restored, authenticated);
+  assert.deepEqual(waits, [10, 20]);
+});
+
+test("browser session recovery eventually accepts a confirmed logged-out state", async () => {
+  let attempts = 0;
+  const restored = await recoverBrowserSession(async () => {
+    attempts += 1;
+    return { authenticated: false };
+  }, {
+    unauthenticatedRetryDelaysMs: [10, 20],
+    wait: async () => {},
+  });
+  assert.deepEqual(restored, { authenticated: false });
+  assert.equal(attempts, 3);
 });
 
 test("composer replaces stop with send as soon as there is sendable input", () => {
@@ -917,6 +953,11 @@ test("single-user login and CSRF protection", async (context) => {
     .send({ chatFontSize: 19 }).expect(200, { chatFontSize: 19 });
   const restoredSession = await agent.get("/codex-web/api/auth/session").expect(200);
   assert.equal(restoredSession.body.chatFontSize, 19);
+  assert.match(restoredSession.headers["cache-control"], /no-store/);
+  const conditionallyRestored = await agent.get("/codex-web/api/auth/session")
+    .set("If-None-Match", restoredSession.headers.etag)
+    .expect(200);
+  assert.equal(conditionallyRestored.body.authenticated, true);
   await agent.put("/codex-web/api/user-settings/chat-font-size")
     .set("X-CSRF-Token", login.body.csrfToken)
     .send({ chatFontSize: "large" }).expect(400);
