@@ -10,8 +10,10 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 
 - A responsive React chat interface for Codex CLI
 - Server-persistent queued prompts with reorder, edit, delete, and steer actions
-- Persistent attachments and generated deliverables
+- Persistent attachments, cancellable/resumable uploads, generated-image capture, and compact server thumbnails
 - Authenticated Markdown reading, sandboxed HTML previews, explicit UTF-8 text responses, and direct original-file downloads
+- Opt-in fixed public links for finished Markdown/HTML reports, with safe same-delivery image rewriting and revocation
+- Self-contained responsive HTML as the default format for reports and other long-form reading
 - Lazy-loaded LaTeX math rendering in Markdown readers, with fenced and inline code left untouched
 - Server-persistent unsent text, quotes, and attachments, restored across conversations, browsers, and devices
 - Codex thread persistence across browser restarts

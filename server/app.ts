@@ -944,6 +944,20 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     limits: { files: 12, fields: 4, fileSize: config.maxUploadFileBytes },
   });
 
+  function enforceMultipartStorageQuota(req: Request, res: Response, next: NextFunction) {
+    const session = res.locals.session as SessionRow;
+    const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
+    const incomingBytes = uploaded.reduce((total, file) => total + file.size, 0);
+    const projectedBytes = db.sumStoredFileBytesForUser(session.user_id)
+      + db.sumActiveResumableBytesForUser(session.user_id)
+      + incomingBytes;
+    if (projectedBytes > config.maxStoredBytesPerUser || availableDiskBytes(true) < config.minimumFreeDiskBytes) {
+      removeUnregisteredUploads(uploaded);
+      return res.status(413).json({ code: "STORAGE_QUOTA_EXCEEDED", error: "文件存储已达到安全上限，请先删除不再需要的文件。" });
+    }
+    return next();
+  }
+
   api.put("/conversations/:id/draft", (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -956,7 +970,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ composerDraft: db.saveComposerDraft(conversation.id, content, quoteExcerpt) ?? null });
   });
 
-  api.post("/conversations/:id/draft/files", upload.array("files", 12), (req, res) => {
+  api.post("/conversations/:id/draft/files", upload.array("files", 12), enforceMultipartStorageQuota, (req, res) => {
     const session = res.locals.session as SessionRow;
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -1084,7 +1098,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     next();
   };
 
-  api.post("/conversations/:id/messages", rejectDuringCodexUpdate, upload.array("files", 12), async (req, res) => {
+  api.post("/conversations/:id/messages", rejectDuringCodexUpdate, upload.array("files", 12), enforceMultipartStorageQuota, async (req, res) => {
     const session = res.locals.session as SessionRow;
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -1213,7 +1227,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ pendingPrompt: db.getPendingPrompt(prompt.id) ?? null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null });
   });
 
-  api.put("/conversations/:id/pending-prompts/:promptId", rejectDuringCodexUpdate, upload.array("files", 12), async (req, res) => {
+  api.put("/conversations/:id/pending-prompts/:promptId", rejectDuringCodexUpdate, upload.array("files", 12), enforceMultipartStorageQuota, async (req, res) => {
     const session = res.locals.session as SessionRow;
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);

@@ -125,7 +125,7 @@ test("the tus browser client is loaded only when a resumable upload starts", () 
 
   const distRoot = path.join(process.cwd(), "dist");
   const builtIndex = fs.readFileSync(path.join(distRoot, "index.html"), "utf8");
-  const entryPath = builtIndex.match(/<script[^>]+src="([^"]+\.js)"/)?.[1].replace(/^\/+/, "");
+  const entryPath = builtIndex.match(/<script[^>]+src="([^"]+\.js)"/)?.[1].replace(/^\/codex-web\//, "").replace(/^\/+/, "");
   assert.ok(entryPath, "the production build should expose its JavaScript entry");
   const assetsRoot = path.join(distRoot, "assets");
   const tusChunks = fs.readdirSync(assetsRoot).filter((name) => {
@@ -574,6 +574,9 @@ test("conversation workspaces stay concise while tenants receive the managed loc
   assert.match(initial, /`CWW_PYTHON_RUNNER`/);
   assert.match(initial, /Never expose absolute paths/);
   assert.match(initial, /Never read codex-home/);
+  assert.match(initial, /one self-contained HTML file rather than duplicate Markdown/);
+  assert.match(initial, /<meta charset="utf-8">/);
+  assert.match(initial, /stack them on narrow screens/);
   fs.appendFileSync(agentsPath, "\n- Keep this custom instruction.\n", "utf8");
   ensureWorkspace(root, conversationId);
   const updated = fs.readFileSync(agentsPath, "utf8");
@@ -965,6 +968,28 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
   await request(instance.app).get(`/api/files/${parentId}/preview/public`).expect(404);
   const reopened = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
   assert.equal(reopened.body.share.publicUrl, enabled.body.share.publicUrl);
+});
+
+test("ordinary multipart uploads honor the same per-user storage ceiling as resumable uploads", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-multipart-quota-"));
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), basePath: "",
+    username: "pp", passwordHash: bcrypt.hashSync("Quota-Password-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
+    maxStoredBytesPerUser: 1, minimumFreeDiskBytes: 1, queueAutoStart: false,
+  });
+  context.after(() => { instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const conversation = instance.db.createConversation(crypto.randomUUID(), "multipart quota");
+  const agent = request.agent(instance.app);
+  const login = await agent.post("/api/auth/login").send({ username: "pp", password: "Quota-Password-2026!" }).expect(200);
+  const rejected = await agent.post(`/api/conversations/${conversation.id}/draft/files`)
+    .set("X-CSRF-Token", login.body.csrfToken)
+    .attach("files", Buffer.from("too large"), { filename: "quota.txt", contentType: "text/plain" })
+    .expect(413);
+  assert.equal(rejected.body.code, "STORAGE_QUOTA_EXCEEDED");
+  assert.equal(instance.db.listFiles(conversation.id).length, 0);
+  const uploadRoot = path.join(ensureTenantWorkspace(path.join(root, "tenants"), LEGACY_USER_ID, conversation.id), "uploads");
+  assert.equal(fs.readdirSync(uploadRoot).length, 0);
 });
 
 test("image file cards use a compact preview without a duplicate file icon", () => {

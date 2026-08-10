@@ -17,6 +17,10 @@ ${MANAGED_INSTRUCTIONS_START}
 - Put intermediate files, extracted assets, caches, and temporary environments in .runtime/; the service deletes it after every turn.
 - Never reveal credentials, authentication files, browser profiles, or unrelated local data.
 - In replies, mention only final filenames the user needs. Never expose absolute paths or list process files.
+- Deliver browser-readable text as UTF-8. Add a UTF-8 BOM to finished Markdown and TXT files.
+- Unless the user requests another format, deliver reports, research, analysis, and other long-form reading as one self-contained HTML file rather than duplicate Markdown. Include \`<meta charset="utf-8">\`; use static HTML/CSS with no scripts or external resources.
+- Style report HTML for comfortable reading: Inter, PingFang SC, Microsoft YaHei, and system fonts; 16px desktop and 15px mobile body text; about 1.75 line height; an approximately 820px content column; light canvas, white paper, dark text, indigo accents, subtle borders, dark mode, and print rules. Keep semantic headings, paragraphs, quotes, lists, tables, and code blocks.
+- Responsive HTML may use side-by-side comparisons on wide screens, but stack them on narrow screens and give wide tables their own horizontal scrolling. Prefer embedded data URIs or inline SVG for charts and images so the report remains a single file.
 - Use the interpreter in \`CWW_SHARED_PYTHON\`; keep temporary scripts and caches in \`CWW_JOB_RUNTIME\`. Never install into the shared environment. If a required package is missing, invoke \`CWW_PYTHON_RUNNER\` in temporary mode instead.
 ${MANAGED_INSTRUCTIONS_END}
 `;
