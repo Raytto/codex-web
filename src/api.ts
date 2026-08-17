@@ -2,7 +2,7 @@ export const BASE_PATH = "/codex-web";
 
 export type Session = { authenticated: boolean; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; voiceEnabled?: boolean };
 export type Conversation = {
-  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; rollout_bytes: number | null; archived_at: string | null; created_at: string; updated_at: string;
+  id: string; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; has_unread_result: number; unread_anchor_message_id: string | null; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; rollout_bytes: number | null; archived_at: string | null; created_at: string; updated_at: string;
 };
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
@@ -106,6 +106,11 @@ export type ConversationDetail = {
   contextUsage: { inputTokens: number; modelContextWindow: number | null; updatedAt: string | null } | null;
   packageQuota: { remainingPercent: number; updatedAt: string } | null;
 };
+export type ConversationActivity = {
+  activeJob: Job | null;
+  latestJob: Job | null;
+  jobEvents: JobEvent[];
+};
 export type MessagePage = { hasMore: boolean; nextCursor: string | null };
 export type ConversationMessagesPage = { messages: Message[]; messagePage: MessagePage };
 export type PendingMutationResponse = {
@@ -135,10 +140,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  session: () => request<Session>("/auth/session", { cache: "no-store" }),
+  session: (signal?: AbortSignal) => request<Session>("/auth/session", { cache: "no-store", signal }),
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
-  conversations: () => request<{ conversations: Conversation[] }>("/conversations"),
+  conversations: (query = "") => request<{ conversations: Conversation[] }>(`/conversations${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   archivedConversations: (query = "") => request<{ conversations: Conversation[] }>(`/conversations/archived${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   agentOptions: () => request<AgentOptions>("/agent-options"),
   updateAgentSelection: (selection: AgentSelection, conversationId?: string) => request<{ selection: AgentSelection }>(
@@ -150,6 +155,7 @@ export const api = {
   }),
   createConversation: () => request<{ conversation: Conversation; agentSelection: AgentSelection }>("/conversations", { method: "POST" }),
   conversation: (id: string) => request<ConversationDetail>(`/conversations/${id}`),
+  conversationActivity: (id: string) => request<ConversationActivity>(`/conversations/${id}/activity`),
   conversationMessages: (id: string, before: string) => request<ConversationMessagesPage>(
     `/conversations/${id}/messages?before=${encodeURIComponent(before)}`,
   ),
@@ -233,7 +239,7 @@ export const api = {
   deletePendingPrompt: (conversationId: string, promptId: string) => request<void>(
     `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "DELETE" },
   ),
-  steerPendingPrompt: (conversationId: string, promptId: string) => request<{ ok: true; turnId: string }>(
+  steerPendingPrompt: (conversationId: string, promptId: string) => request<{ ok: true; mode: "steer" | "insert"; turnId?: string; job?: Job }>(
     `/conversations/${conversationId}/pending-prompts/${promptId}/steer`, { method: "POST" },
   ),
   cancelJob: (id: string) => request<{ ok: true }>(`/jobs/${id}/cancel`, { method: "POST" }),

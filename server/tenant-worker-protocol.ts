@@ -1,6 +1,7 @@
 import type { AgentSelection } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
+import type { ConversationTitleAgentRequest } from "./conversation-title.js";
 
 export type TenantWorkerRunRequest = {
   jobId: string;
@@ -38,11 +39,13 @@ export type TenantWorkerEvent =
 export type WebToSupervisorMessage =
   | { kind: "tenant_run"; jobId: string; userId: string; request: TenantWorkerRunRequest }
   | { kind: "tenant_steer"; jobId: string; requestId: string; prompt: string; imagePaths: string[] }
-  | { kind: "tenant_cancel"; jobId: string };
+  | { kind: "tenant_cancel"; jobId: string }
+  | { kind: "tenant_title_agent"; requestId: string; request: ConversationTitleAgentRequest };
 
 export type SupervisorToWebMessage =
   | { kind: "tenant_event"; jobId: string; event: TenantWorkerEvent }
-  | { kind: "tenant_worker_exit"; jobId: string; message: string };
+  | { kind: "tenant_worker_exit"; jobId: string; message: string }
+  | { kind: "tenant_title_agent_result"; requestId: string; output?: string; error?: string };
 
 export type TenantWorkerInput =
   | { type: "run"; request: TenantWorkerRunRequest }

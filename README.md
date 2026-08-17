@@ -22,12 +22,14 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Cancellation that retains a concise history of completed work so the next turn can resume from it
 - Explicit interrupted-task messages after an unexpected service restart, without unsafe automatic retries
 - Graceful container shutdown that drains in-flight Codex work and leaves queued tasks persisted
-- Automatic short task titles, with manual titles taking precedence
+- Automatic short task titles from a dedicated low-reasoning Codex Luna worker, with manual titles taking precedence and SQLite audit records for every naming attempt
 - A durable live work journal with retained stage feedback and grouped command steps
 - Running work journals expand inline with the page instead of creating a nested vertical scroller
 - Unread-result markers for completed conversations until their detail is viewed
+- Opening an unread conversation positions the reader at the matching user prompt, not only the reply
 - Distinct running and queued indicators, plus a stable overflow menu for task actions
 - One-shot timed or external-event continuation plans that survive browser and service restarts
+- Pending prompts remain queued while a continuation plan is armed; users can explicitly insert one early or steer a currently running turn
 - A 500 MiB Codex rollout warning that suggests archiving very long conversations
 - Per-conversation context-window usage and current Codex package quota in the capacity menu
 - Light, dark, and system-following appearance modes
@@ -37,6 +39,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Bounded automatic retries for transient voice-transcription connection and upstream failures
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
 - A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
+- Touch reordering for pending prompts, bounded session-restore retries, and resilient asynchronous math loading
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them

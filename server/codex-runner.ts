@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
@@ -17,6 +18,16 @@ import { buildAgentSteerPrompt, buildAgentTurnPrompt, type AgentAttachmentContex
 import { detectOptionalAgentCapabilities } from "./optional-capabilities.js";
 import { latestUserCancellationContext } from "./cancellation-summary.js";
 import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wake-automation.js";
+import {
+  buildConversationTitlePrompt,
+  CONVERSATION_TITLE_CODEX_MODEL,
+  CONVERSATION_TITLE_PROMPT_VERSION,
+  CONVERSATION_TITLE_REASONING_EFFORT,
+  CONVERSATION_TITLE_TIMEOUT_MS,
+  extractTitleRequestText,
+  parseConversationTitleOutput,
+  runCodexConversationTitle,
+} from "./conversation-title.js";
 
 type Publish = (jobId: string, eventType: string, payload: unknown) => void;
 
@@ -83,6 +94,7 @@ export class CodexRunner {
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly directExecutions = new Map<string, AppServerTurnExecution>();
   private readonly workerClient: TenantWorkerClient | undefined;
+  private readonly titleRequests = new Map<string, Promise<void>>();
 
   constructor(private readonly config: AppConfig, private readonly db: AppDatabase, private readonly publish: Publish) {
     this.workerClient = config.tenantWorkerIsolation ? new TenantWorkerClient() : undefined;
@@ -187,7 +199,7 @@ export class CodexRunner {
         imagePaths: uploads
           .filter((file) => /^image\/(png|jpeg|webp)$/i.test(file.mime_type))
           .map((file) => resolveInside(workspace, file.relative_path)),
-        outputSchema: shouldGenerateTitle ? AUTO_TITLE_OUTPUT_SCHEMA : undefined,
+        outputSchema: undefined,
         selection,
         networkAccessEnabled: taskPolicy.networkAccessEnabled,
         webSearchMode: taskPolicy.isolated ? "cached" : "live",
@@ -235,9 +247,7 @@ export class CodexRunner {
       this.publish(jobId, "status", { status: "running", label: "正在登记结果文件" });
       const messageId = newId();
       const createdAt = new Date().toISOString();
-      const titledResponse = shouldGenerateTitle ? parseAutoTitleResponse(rawFinalResponse, prompt) : null;
-      const finalResponse = titledResponse?.answer
-        ?? (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse, true) : null)
+      const finalResponse = (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse, true) : null)
         ?? rawFinalResponse;
       const safeFinalResponse = sanitizeAgentMarkdown(finalResponse, this.db.listFiles(conversationId));
       this.db.addMessage({
@@ -291,9 +301,9 @@ export class CodexRunner {
           });
         }
       }
-      if (titledResponse) this.db.setAiConversationTitleIfDefault(conversationId, titledResponse.title);
       this.db.finishJob(jobId, conversationId, "completed");
       this.publish(jobId, "done", { status: "completed" });
+      if (shouldGenerateTitle) this.scheduleConversationTitle(conversationId, conversation.user_id, jobId, prompt, uploads.map((file) => file.original_name));
     } catch (error) {
       const cancelled = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
       const message = cancelled ? "任务已停止" : error instanceof Error ? redactBrandForDisplay(error.message) : "Agent 任务失败";
@@ -314,6 +324,56 @@ export class CodexRunner {
     }
   }
 
+  private scheduleConversationTitle(conversationId: string, userId: string, jobId: string, content: string, attachmentNames: string[]): void {
+    if (this.titleRequests.has(conversationId)) return;
+    const conversation = this.db.getConversation(conversationId);
+    if (!conversation || conversation.title_source !== "default") return;
+    const latestAudit = this.db.getLatestConversationTitleAudit(conversationId);
+    if (latestAudit?.status === "running" || latestAudit?.status === "succeeded") return;
+    const requestText = extractTitleRequestText(content);
+    const prompt = buildConversationTitlePrompt({ requestText, attachmentNames });
+    if (!prompt) return;
+    const auditId = newId();
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    this.db.createConversationTitleAudit({
+      id: auditId,
+      conversation_id: conversationId,
+      user_id: userId,
+      model: CONVERSATION_TITLE_CODEX_MODEL,
+      reasoning_effort: CONVERSATION_TITLE_REASONING_EFFORT,
+      prompt_version: CONVERSATION_TITLE_PROMPT_VERSION,
+      request_excerpt: Array.from(requestText).slice(0, 240).join(""),
+      request_sha256: crypto.createHash("sha256").update(requestText, "utf8").digest("hex"),
+      context_json: JSON.stringify({ attachmentNames: attachmentNames.slice(0, 20), requestCharacters: Array.from(requestText).length, execution: "tenant-local" }),
+      started_at: startedAt,
+    });
+    const controller = new AbortController();
+    const request = this.workerClient
+      ? this.workerClient.generateConversationTitle(userId, prompt, CONVERSATION_TITLE_TIMEOUT_MS)
+      : runCodexConversationTitle({ userId, prompt, timeoutMs: CONVERSATION_TITLE_TIMEOUT_MS }, { signal: controller.signal });
+    const operation = request.then((output) => {
+      const title = parseConversationTitleOutput(output);
+      if (!title) throw new Error("invalid_output");
+      const applied = this.db.setAiConversationTitleIfDefault(conversationId, title);
+      this.db.finishConversationTitleAudit(auditId, {
+        status: "succeeded", outputTitle: title, applied,
+        completedAt: new Date().toISOString(), durationMs: Date.now() - startedMs,
+      });
+      if (applied) this.publish(jobId, "conversation_title", { title });
+    }).catch((error) => {
+      try {
+        this.db.finishConversationTitleAudit(auditId, {
+          status: "failed",
+          error: titleAuditError(error),
+          completedAt: new Date().toISOString(),
+          durationMs: Date.now() - startedMs,
+        });
+      } catch { /* Shutdown can close SQLite before a detached title request returns. */ }
+    }).finally(() => this.titleRequests.delete(conversationId));
+    this.titleRequests.set(conversationId, operation);
+  }
+
   private attachmentContext(uploads: FileRow[], workspace: string): AgentAttachmentContext[] {
     return uploads.map((file) => ({
       name: file.original_name,
@@ -325,6 +385,13 @@ export class CodexRunner {
 
 export function redactBrandForDisplay(value: string): string {
   return value.replace(/chatgpt/gi, "Codex Web");
+}
+
+function titleAuditError(error: unknown): string {
+  const value = error instanceof Error ? error.message : "Codex title request failed";
+  return value.replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9._-]{16,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9_-]{48,})\b/g, "[REDACTED]")
+    .replace(/((?:password|passwd|token|cookie|secret|api[ _-]?key|authorization|密码|口令|私钥|验证码)\s*[=:：]\s*)\S+/gi, "$1[REDACTED]")
+    .slice(0, 2_000);
 }
 
 export function summarizeEvent(event: ThreadEvent): unknown | null {

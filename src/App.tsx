@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type FormEvent, type KeyboardEvent, type SetStateAction } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,7 +7,7 @@ import {
   Copy, CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Share2, Square, Sun,
   Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationDetail, type FileShareState, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
+import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type FileShareState, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -16,7 +16,7 @@ import { resolveAccountIdentity } from "./account-identity";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
 import { applyThemePreference, readStoredThemePreference, THEME_PREFERENCE_KEY, type ThemePreference } from "./theme";
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds } from "./ask-agent-selection";
-import { mergeMessagePages, preservePrependedScrollTop } from "./message-history";
+import { mergeMessagePages, preservePrependedScrollTop, resolveUnreadScrollTarget } from "./message-history";
 import { resolveScrollFollow } from "./scroll-follow";
 import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
@@ -362,6 +362,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [submitting, setSubmitting] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [activities, setActivities] = useState<JobEvent[]>([]);
+  const [activitiesLoading, setActivitiesLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [agentOptions, setAgentOptions] = useState<AgentOptions | null>(null);
@@ -382,11 +383,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const lastScrollTopRef = useRef(0);
   const loadingOlderMessagesRef = useRef(false);
   const prependScrollRestoreRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
+  const unreadScrollTargetRef = useRef<{ conversationId: string; messageId: string } | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const connectedJobRef = useRef<string | null>(null);
   const selectedIdRef = useRef<string | null>(selectedId);
+  const detailRef = useRef<ConversationDetail | null>(detail);
   const editingPendingRef = useRef<PendingPrompt | null>(editingPending);
   const lastEventIdRef = useRef(0);
+  const lastEventJobRef = useRef<string | null>(null);
   const inputRef = useRef(input);
   const askAgentQuoteRef = useRef(askAgentQuote);
   const composerDraftRef = useRef<ComposerDraft | null>(composerDraft);
@@ -400,12 +404,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const draftMutationGenerationRef = useRef(new Map<string, number>());
   const draftSaveTimerRef = useRef<number | null>(null);
   const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const queryRef = useRef(query);
   selectedIdRef.current = selectedId;
+  detailRef.current = detail;
   editingPendingRef.current = editingPending;
   inputRef.current = input;
   askAgentQuoteRef.current = askAgentQuote;
   composerDraftRef.current = composerDraft;
   draftUploadsRef.current = draftUploads;
+  queryRef.current = query;
 
   function askAgentAbout(selectedText: string) {
     const normalized = normalizeAskAgentSelection(selectedText);
@@ -414,8 +421,16 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setComposerFocusRequest((request) => request + 1);
   }
 
-  const refreshList = useCallback(async () => {
-    const result = await api.conversations(); setConversations(result.conversations); return result.conversations;
+  const refreshList = useCallback(async (search = queryRef.current) => {
+    const result = await api.conversations(search);
+    let conversations = result.conversations;
+    const selected = selectedIdRef.current;
+    if (selected && !conversations.some((conversation) => conversation.id === selected)) {
+      const retained = detailRef.current?.conversation.id === selected ? detailRef.current.conversation : null;
+      if (retained) conversations = [...conversations, retained];
+    }
+    setConversations(conversations);
+    return conversations;
   }, []);
 
   const syncConversation = useCallback((conversation: Conversation) => {
@@ -445,10 +460,46 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     return operation;
   }, []);
 
+  const applyActivitySnapshot = useCallback((id: string, snapshot: ConversationActivity, hydrated: boolean) => {
+    if (selectedIdRef.current !== id) return;
+    setJob(snapshot.activeJob);
+    setSending(Boolean(snapshot.activeJob));
+    setActivities(mergeJobEvents([], snapshot.jobEvents));
+    const eventJobId = snapshot.activeJob?.id ?? snapshot.latestJob?.id ?? null;
+    lastEventJobRef.current = eventJobId;
+    lastEventIdRef.current = snapshot.jobEvents.at(-1)?.seq ?? 0;
+    if (hydrated || !snapshot.activeJob) setActivitiesLoading(false);
+  }, []);
+
+  const refreshActivity = useCallback(async (id: string) => {
+    const snapshot = await api.conversationActivity(id);
+    applyActivitySnapshot(id, snapshot, true);
+    return snapshot;
+  }, [applyActivitySnapshot]);
+
   const refreshDetail = useCallback(async (id: string) => {
     const draftGenerationAtRequest = draftMutationGenerationRef.current.get(id) ?? 0;
     let result = await api.conversation(id);
     if (selectedIdRef.current !== id) return result;
+    const unreadAnchorMessageId = result.conversation.has_unread_result
+      ? result.conversation.unread_anchor_message_id
+      : null;
+    let preparedUnreadHistory = false;
+    let unreadScrollTargetMessageId = unreadAnchorMessageId
+      ? resolveUnreadScrollTarget(result.messages, unreadAnchorMessageId, result.messagePage.hasMore)
+      : null;
+    while (unreadAnchorMessageId && !unreadScrollTargetMessageId && result.messagePage.hasMore && result.messagePage.nextCursor) {
+      const older = await api.conversationMessages(id, result.messagePage.nextCursor);
+      if (selectedIdRef.current !== id) return result;
+      result = { ...result, messages: mergeMessagePages(older.messages, result.messages), messagePage: older.messagePage };
+      preparedUnreadHistory = true;
+      unreadScrollTargetMessageId = resolveUnreadScrollTarget(result.messages, unreadAnchorMessageId, result.messagePage.hasMore);
+    }
+    if (unreadScrollTargetMessageId) {
+      unreadScrollTargetRef.current = { conversationId: id, messageId: unreadScrollTargetMessageId };
+      autoFollowRef.current = false;
+      preparedUnreadHistory = true;
+    }
     if (result.conversation.has_unread_result) {
       try {
         const seen = await api.markConversationSeen(id);
@@ -462,14 +513,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       ? {
           ...result,
           messages: mergeMessagePages(current.messages, result.messages),
-          messagePage: current.messagePage,
+          messagePage: preparedUnreadHistory ? result.messagePage : current.messagePage,
         }
       : result);
     setSelectedModel(result.agentSelection.model);
     setReasoningEffort(result.agentSelection.reasoningEffort);
-    setJob(result.activeJob);
-    setSending(Boolean(result.activeJob));
-    setActivities(mergeJobEvents([], result.jobEvents));
+    applyActivitySnapshot(id, { activeJob: result.activeJob, latestJob: result.latestJob, jobEvents: result.jobEvents }, false);
     if (result.editingPrompt) {
       composerDraftRef.current = result.composerDraft;
       setComposerDraft(result.composerDraft);
@@ -535,7 +584,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     lastEventIdRef.current = result.jobEvents.at(-1)?.seq ?? 0;
     if (result.latestJob?.status === "failed") setError(result.jobEvents.findLast((event) => event.message)?.message || "任务处理失败");
     return result;
-  }, [syncConversation]);
+  }, [applyActivitySnapshot, syncConversation]);
 
   useEffect(() => {
     void refreshList().then((items) => {
@@ -543,6 +592,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (next !== selectedIdRef.current) setSelectedId(next);
     });
   }, [refreshList]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refreshList(query).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "任务搜索失败");
+    }), query ? 220 : 0);
+    return () => window.clearTimeout(timer);
+  }, [query, refreshList]);
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshList().catch(() => undefined);
@@ -565,11 +620,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     lastScrollTopRef.current = 0;
     loadingOlderMessagesRef.current = false;
     prependScrollRestoreRef.current = null;
+    unreadScrollTargetRef.current = null;
     setLoadingOlderMessages(false);
     if (!selectedId) {
       window.localStorage.removeItem(SELECTED_CONVERSATION_KEY);
       eventSourceRef.current?.close(); connectedJobRef.current = null;
-      setDetail(null); setJob(null); setSending(false); setActivities([]);
+      setDetail(null); setJob(null); setSending(false); setActivities([]); setActivitiesLoading(false);
       setEditingPending(null); setRemovedEditingFileIds([]); setAskAgentQuote("");
       composerDraftRef.current = null; setComposerDraft(null); setDraftUploads([]); setDraftSaveState("idle");
       draftLoadedConversationRef.current = null;
@@ -580,7 +636,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       return;
     }
     window.localStorage.setItem(SELECTED_CONVERSATION_KEY, selectedId);
-    eventSourceRef.current?.close(); connectedJobRef.current = null; setActivities([]);
+    eventSourceRef.current?.close(); connectedJobRef.current = null; lastEventJobRef.current = null; lastEventIdRef.current = 0; setActivities([]); setActivitiesLoading(true);
     editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setFiles([]); setDraftUploads([]);
     const cached = draftCacheRef.current.get(selectedId);
     draftLoadedConversationRef.current = cached ? selectedId : null;
@@ -646,6 +702,23 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persistComposerDraft]);
   useLayoutEffect(() => {
+    const unreadTarget = unreadScrollTargetRef.current;
+    if (unreadTarget && detail?.conversation.id === unreadTarget.conversationId) {
+      const messages = messagesRef.current;
+      const target = messages
+        ? Array.from(messages.querySelectorAll<HTMLElement>("[data-message-id]")).find((element) => element.dataset.messageId === unreadTarget.messageId)
+        : undefined;
+      if (messages && target) {
+        unreadScrollTargetRef.current = null;
+        prependScrollRestoreRef.current = null;
+        const messagesTop = messages.getBoundingClientRect().top;
+        const targetTop = target.getBoundingClientRect().top;
+        messages.scrollTop = Math.max(0, messages.scrollTop + targetTop - messagesTop - 12);
+        lastScrollTopRef.current = messages.scrollTop;
+        autoFollowRef.current = false;
+        return;
+      }
+    }
     const restore = prependScrollRestoreRef.current;
     if (!restore) return;
     prependScrollRestoreRef.current = null;
@@ -710,11 +783,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function connectJob(activeJob: Job) {
-    if (connectedJobRef.current === activeJob.id && eventSourceRef.current?.readyState !== EventSource.CLOSED) return;
+    if (connectedJobRef.current === activeJob.id && eventSourceRef.current?.readyState !== EventSource.CLOSED) {
+      setActivitiesLoading(false);
+      return;
+    }
     eventSourceRef.current?.close();
     connectedJobRef.current = activeJob.id;
     setJob(activeJob); setSending(true);
-    const after = lastEventIdRef.current;
+    const after = lastEventJobRef.current === activeJob.id ? lastEventIdRef.current : 0;
+    lastEventJobRef.current = activeJob.id;
     const source = new EventSource(`${BASE_PATH}/api/jobs/${activeJob.id}/events${after ? `?after=${after}` : ""}`);
     eventSourceRef.current = source;
     source.onmessage = (event) => {
@@ -722,9 +799,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       const data = JSON.parse(event.data) as JobEvent;
       const seq = Number(event.lastEventId || data.seq || 0);
       const stored = { ...data, seq };
-      if (seq) lastEventIdRef.current = Math.max(lastEventIdRef.current, seq);
+      if (data.type === "replay_complete") {
+        setActivitiesLoading(false);
+        return;
+      }
+      if (seq) {
+        lastEventJobRef.current = activeJob.id;
+        lastEventIdRef.current = Math.max(lastEventIdRef.current, seq);
+      }
       if (data.type && ["status", "progress"].includes(data.type)) setActivities((previous) => mergeJobEvents(previous, [stored]));
       if (data.type && ["done", "failed"].includes(data.type)) {
+        setActivitiesLoading(false);
         source.close(); connectedJobRef.current = null;
         if (data.type === "failed") setError(data.message || "任务处理失败");
         void reconcile(activeJob.conversation_id);
@@ -741,8 +826,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     try {
       const [value] = await Promise.all([refreshDetail(id), refreshList()]);
       if (selectedIdRef.current !== id) return;
+      const activity = await refreshActivity(id);
+      if (selectedIdRef.current !== id) return;
       syncConversation(value.conversation);
-      if (value.activeJob) connectJob(value.activeJob);
+      if (activity.activeJob) connectJob(activity.activeJob);
       else {
         eventSourceRef.current?.close(); eventSourceRef.current = null; connectedJobRef.current = null;
         setSending(false); setJob(null);
@@ -1044,10 +1131,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function steerPendingPrompt(prompt: PendingPrompt) {
-    if (!selectedId || submitting || job?.status !== "running") return;
+    if (!selectedId || submitting) return;
+    const action = job?.status === "running" ? "引导当前任务" : "插入任务";
     setSubmitting(true); setError("");
     try { await api.steerPendingPrompt(selectedId, prompt.id); await reconcile(selectedId); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "引导当前任务失败"); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : `${action}失败`); }
     finally { setSubmitting(false); }
   }
 
@@ -1253,7 +1341,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
   }
 
-  const filtered = useMemo(() => conversations.filter((item) => item.title.toLowerCase().includes(query.toLowerCase())), [conversations, query]);
+  const filtered = conversations;
   const currentDetail = detail?.conversation.id === selectedId ? detail : null;
   const loadingConversation = Boolean(selectedId && !currentDetail);
   const taskMenuConversation = taskMenu ? conversations.find((conversation) => conversation.id === taskMenu.conversationId) : undefined;
@@ -1351,7 +1439,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
     <main className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
-      {currentDetail ? <Chat detail={currentDetail} activities={activities} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={(plan) => cancelActiveWake(currentDetail.conversation).then(() => undefined)} onPostponeWake={postponeWake} onTriggerWake={triggerWake} />
+      {currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={(plan) => cancelActiveWake(currentDetail.conversation).then(() => undefined)} onPostponeWake={postponeWake} onTriggerWake={triggerWake} />
         : loadingConversation ? <ConversationLoading />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
@@ -1364,7 +1452,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onModelChange={changeModel} onReasoningChange={changeReasoning}
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
-        canSteer={job?.status === "running"} onCancelPendingEdit={() => void cancelPendingEdit()}
+        pendingActionMode={job?.status === "running" ? "steer" : "insert"} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
         onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onPauseDraftUpload={pauseComposerDraftUpload} onResumeDraftUpload={resumeComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
@@ -1409,7 +1497,7 @@ function AssistantMarkdown({ content, files, citationFiles }: { content: string;
   >{math.content}</ReactMarkdown></div>;
 }
 
-function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake }: { detail: ConversationDetail; activities: JobEvent[]; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void> }) {
+function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void> }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const chatRef = useRef<HTMLElement>(null);
   const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
@@ -1474,7 +1562,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
   return <section ref={chatRef} className="chat"><div className="chat-header"><div><span className="chat-kicker">CODEX WEB <i>/</i> AI 工作台</span><h1>{detail.conversation.title}</h1></div><div className="chat-header-actions"><span className="message-count">已加载 {detail.messages.length} 条</span>{shouldWarnAboutRollout(detail.rolloutBytes) && <details className="rollout-warning"><summary className="icon-button" aria-label="会话历史容量提醒"><TriangleAlert size={19} /><span /></summary><div className="rollout-warning-panel"><strong>会话历史已达 {formatRolloutBytes(detail.rolloutBytes!)}</strong><p>超长会话会增加加载和续接成本。建议完成当前任务后归档，并新建任务继续。</p></div></details>}<details className="capacity-menu"><summary className="icon-button" aria-label="会话容量" title="会话容量"><MoreHorizontal size={20} /></summary><div className="capacity-menu-panel"><div className="capacity-menu-row" title="Codex 本地会话记录的磁盘占用"><HardDrive size={16} /><span><small>Rollout 文件</small><strong>{detail.rolloutBytes === null ? "暂无数据" : formatRolloutBytes(detail.rolloutBytes)}</strong></span></div><div className="capacity-menu-row" title="最近一次请求使用的输入上下文 / 当前模型上下文窗口"><Bot size={16} /><span><small>Codex 上下文</small><strong>{detail.contextUsage ? formatContextUsage(detail.contextUsage.inputTokens, detail.contextUsage.modelContextWindow) : "暂无数据"}</strong></span></div><div className="capacity-menu-row" title="当前 Codex 套餐周期的剩余额度"><Gauge size={16} /><span><small>套餐额度</small><strong>{detail.packageQuota ? `${Math.round(detail.packageQuota.remainingPercent)}%` : "暂无数据"}</strong></span></div></div></details></div></div>
     <div ref={messagesRef} className="messages" onScroll={onMessagesScroll} style={{ "--chat-font-size": `${chatFontSize}px` } as CSSProperties}>
       {detail.messagePage.hasMore && <div className="history-loader" aria-live="polite">{loadingOlderMessages ? <><LoaderCircle className="spin" size={14} /><span>正在加载更早消息…</span></> : <span>向上滚动加载更早消息</span>}</div>}
-      {detail.messages.map((message) => <article className={`message ${message.role}`} key={message.id}>
+      {detail.messages.map((message) => <article className={`message ${message.role}`} data-message-id={message.id} key={message.id}>
         <div className="message-avatar">{message.role === "assistant" ? <Zap size={15} /> : userInitials}</div>
         <div className="message-body">
           <div className="message-meta"><span className="message-name">{message.role === "assistant" ? "Codex Web" : "你"}</span><time dateTime={message.created_at} title={formatFullDateTime(message.created_at)}>{formatMessageDateTime(message.created_at)}</time></div>
@@ -1486,7 +1574,7 @@ function Chat({ detail, activities, sending, loadingOlderMessages, messagesRef, 
         </div>
       </article>)}
       {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} />}
-      {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={detail.conversation.id} activities={activities} /></div></article>}
+      {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={detail.conversation.id} activities={activities} loading={activitiesLoading} /></div></article>}
       <div />
     </div>{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }}><Zap size={14} /><span>询问 Agent</span></button>}
   </section>;
@@ -1510,7 +1598,10 @@ function WakePlanCard({ plan, onCancel, onPostpone, onTrigger }: { plan: WakePla
   </section>;
 }
 
-function ProcessPanel({ activities }: { activities: JobEvent[] }) {
+function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading: boolean }) {
+  if (loading) return <div className="activity-card activity-loading" role="status" aria-live="polite" aria-busy="true">
+    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>正在加载运行记录</strong><span>正在恢复完整上下文，加载完成后显示实时进度</span></div>
+  </div>;
   const latestStatus = activities.findLast((item) => item.type === "status" || item.kind === "status");
   const queueStatus = activities.findLast((activity) => activity.status === "queued");
   const queued = Boolean(queueStatus) && !activities.some((activity) => activity.status === "running");
@@ -1588,19 +1679,26 @@ function FileCard({ file }: { file: WorkFile }) {
   </div>;
 }
 
-function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, onSteer }: {
+function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, onEdit, onDelete, onSteer }: {
   prompts: PendingPrompt[];
   busy: boolean;
-  canSteer: boolean;
+  actionMode: "steer" | "insert";
+  waitingForWake: boolean;
   onReorder: (ordered: PendingPrompt[]) => void;
   onEdit: (prompt: PendingPrompt) => void;
   onDelete: (prompt: PendingPrompt) => void;
   onSteer: (prompt: PendingPrompt) => void;
 }) {
+  const actionLabel = actionMode === "steer" ? "引导" : "插入";
+  const queueSummary = waitingForWake
+    ? "等待计划结束后依次发送"
+    : actionMode === "steer" ? "当前任务完成后依次发送" : "即将依次发送";
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  function dropOn(targetId: string) {
-    if (!draggingId || draggingId === targetId) return setDraggingId(null);
-    const sourceIndex = prompts.findIndex((prompt) => prompt.id === draggingId);
+  const [dragTargetId, setDragTargetId] = useState<string | null>(null);
+  const touchDragRef = useRef<{ pointerId: number; sourceId: string; targetId: string | null } | null>(null);
+  function dropOn(sourceId: string | null, targetId: string) {
+    if (!sourceId || sourceId === targetId) return setDraggingId(null);
+    const sourceIndex = prompts.findIndex((prompt) => prompt.id === sourceId);
     const targetIndex = prompts.findIndex((prompt) => prompt.id === targetId);
     if (sourceIndex < 0 || targetIndex < 0) return setDraggingId(null);
     const ordered = [...prompts];
@@ -1609,21 +1707,59 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
     setDraggingId(null);
     onReorder(ordered);
   }
-  return <section className="pending-queue" aria-label="待发送任务队列">
-    <div className="pending-queue-heading"><strong>待发送</strong><span>{prompts.length} 个任务 · 当前任务完成后依次发送</span></div>
+  function beginTouchDrag(event: ReactPointerEvent<HTMLButtonElement>, sourceId: string) {
+    if (busy || event.pointerType === "mouse") return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    touchDragRef.current = { pointerId: event.pointerId, sourceId, targetId: null };
+    setDraggingId(sourceId);
+    setDragTargetId(null);
+  }
+  function moveTouchDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    const drag = touchDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".pending-queue-item[data-pending-prompt-id]");
+    const targetId = target?.dataset.pendingPromptId;
+    drag.targetId = targetId && targetId !== drag.sourceId ? targetId : null;
+    setDragTargetId(drag.targetId);
+  }
+  function endTouchDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    const drag = touchDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    touchDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setDragTargetId(null);
+    if (drag.targetId) dropOn(drag.sourceId, drag.targetId);
+    else setDraggingId(null);
+  }
+  function cancelTouchDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    const drag = touchDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    touchDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setDraggingId(null);
+    setDragTargetId(null);
+  }
+  return <section className={`pending-queue ${draggingId ? "drag-active" : ""}`} aria-label="待发送任务队列">
+    <div className="pending-queue-heading"><strong>待发送</strong><span>{prompts.length} 个任务 · {queueSummary}</span></div>
     <div className="pending-queue-list">
-      {prompts.map((prompt) => <article key={prompt.id} className={`pending-queue-item ${draggingId === prompt.id ? "dragging" : ""}`}
-        onDragOver={(event) => { if (draggingId) event.preventDefault(); }} onDrop={() => dropOn(prompt.id)}>
+      {prompts.map((prompt) => <article key={prompt.id} data-pending-prompt-id={prompt.id} className={`pending-queue-item ${draggingId === prompt.id ? "dragging" : ""} ${dragTargetId === prompt.id ? "drag-target" : ""}`}
+        onDragOver={(event) => { if (draggingId) event.preventDefault(); }} onDrop={() => { setDragTargetId(null); dropOn(draggingId, prompt.id); }}>
         <button type="button" className="pending-drag-handle" draggable={!busy}
           onDragStart={(event) => { setDraggingId(prompt.id); event.dataTransfer.effectAllowed = "move"; }}
-          onDragEnd={() => setDraggingId(null)} title="拖动调整顺序" aria-label="拖动调整顺序"><GripVertical size={17} /></button>
+          onDragEnd={() => { setDraggingId(null); setDragTargetId(null); }}
+          onPointerDown={(event) => beginTouchDrag(event, prompt.id)} onPointerMove={moveTouchDrag}
+          onPointerUp={endTouchDrag} onPointerCancel={cancelTouchDrag}
+          title="按住并上下拖动调整顺序" aria-label="按住并上下拖动调整顺序" aria-grabbed={draggingId === prompt.id}><GripVertical size={17} /></button>
         <div className="pending-queue-copy" title={prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、")}>
           <span>{prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、") || "附件任务"}</span>
           {prompt.quote_excerpt && <small><CornerUpLeft size={11} />含引用</small>}
           {prompt.files.length > 0 && <small><Paperclip size={11} />{prompt.files.length} 个附件</small>}
         </div>
         <div className="pending-queue-actions">
-          <button type="button" className="steer-action" disabled={busy || !canSteer} onClick={() => onSteer(prompt)} title={canSteer ? "立即引导当前任务" : "当前任务开始运行后可引导"}><CornerUpLeft size={14} /><span>引导</span></button>
+          <button type="button" className="steer-action" disabled={busy} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>
           <button type="button" disabled={busy} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
           <button type="button" disabled={busy} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
@@ -1632,7 +1768,7 @@ function PendingQueue({ prompts, busy, canSteer, onReorder, onEdit, onDelete, on
   </section>;
 }
 
-function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, canSteer, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
+function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, voiceEnabled, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onSend, onCancel }: {
   conversationId: string | null;
   input: string;
   setInput: (value: string) => void;
@@ -1660,7 +1796,8 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   onEditPending: (prompt: PendingPrompt) => void;
   onDeletePending: (prompt: PendingPrompt) => void;
   onSteerPending: (prompt: PendingPrompt) => void;
-  canSteer: boolean;
+  pendingActionMode: "steer" | "insert";
+  waitingForWake: boolean;
   onCancelPendingEdit: () => void;
   onAddFiles: (files: File[]) => void;
   onCancelDraftUpload: (uploadId: string) => void;
@@ -1890,8 +2027,13 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     : draftSaveState === "error" ? "草稿暂未保存，将在继续编辑时重试"
     : draftSaveState === "saved" || draftFiles.length > 0 ? "草稿已保存到服务器"
     : "";
+  const pendingQueueGuidance = pendingActionMode === "steer"
+    ? "任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。"
+    : waitingForWake
+    ? "会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。"
+    : "新内容会进入待发送队列；可选择“插入”立即发送。";
   return <div className="composer-wrap">
-    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={submitting} canSteer={canSteer}
+    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={submitting} actionMode={pendingActionMode} waitingForWake={waitingForWake}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div className="composer" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); addFiles(e.dataTransfer.files); }}>
@@ -1927,7 +2069,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
           : <button type="button" className="send-button" onClick={() => voiceState === "recording" ? finishRecording(true) : onSend()} disabled={submitting || selectionSaving || draftUploads.length > 0 || voiceState === "transcribing" || (voiceState !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voiceState === "recording" ? "识别语音并发送" : "发送"} aria-label={voiceState === "recording" ? "识别语音并发送" : "发送"}>{submitting || voiceState === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
-  </div><p className="composer-note"><span>{draftStatusLabel || "任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。"}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p></div>;
+  </div><p className="composer-note"><span>{draftStatusLabel || pendingQueueGuidance}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p></div>;
 }
 
 type SettingMenuOption = { id: string; label: string; description?: string };

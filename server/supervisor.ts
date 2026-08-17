@@ -6,6 +6,7 @@ import type { SupervisorToWebMessage, TenantWorkerEvent, TenantWorkerInput, WebT
 
 const projectRoot = process.cwd();
 const workers = new Map<string, ChildProcess>();
+const titleAgentWorkers = new Map<string, ChildProcess>();
 const cancellationTimers = new Map<string, NodeJS.Timeout[]>();
 let stopping = false;
 
@@ -19,6 +20,10 @@ const web = spawn(process.execPath, [path.join(projectRoot, "dist-server", "serv
 
 web.on("message", (message: WebToSupervisorMessage) => {
   if (!message || typeof message !== "object") return;
+  if (message.kind === "tenant_title_agent") {
+    startTitleAgentWorker(message);
+    return;
+  }
   if (message.kind === "tenant_steer") {
     const worker = workers.get(message.jobId);
     if (worker?.stdin?.writable) {
@@ -113,6 +118,58 @@ function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind: "ten
   worker.stdin!.write(`${JSON.stringify(input)}\n`);
 }
 
+function startTitleAgentWorker(message: Extract<WebToSupervisorMessage, { kind: "tenant_title_agent" }>): void {
+  if (titleAgentWorkers.has(message.requestId)) {
+    sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: "Duplicate title request" });
+    return;
+  }
+  const identity = tenantIdentityForUser(message.request.userId);
+  if (!identity) {
+    sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: "No Unix identity is configured for this user" });
+    return;
+  }
+  const tenantRoot = path.join(process.env.TENANT_ROOT ?? path.join(projectRoot, "tenants"), identity.userId);
+  const child = spawn(process.execPath, [path.join(projectRoot, "dist-server", "server", "codex-conversation-title-worker.js")], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      HOME: tenantRoot,
+      CODEX_HOME: path.join(tenantRoot, "codex-home"),
+      CWW_TENANT_USER_ID: identity.userId,
+      CWW_TENANT_UID: String(identity.uid),
+      CWW_TENANT_GID: String(identity.gid),
+    },
+    uid: identity.uid,
+    gid: identity.gid,
+    detached: process.platform !== "win32",
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  titleAgentWorkers.set(message.requestId, child);
+  let settled = false;
+  const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
+  output.on("line", (line) => {
+    try {
+      const event = JSON.parse(line) as { type?: string; output?: string; message?: string };
+      if (event.type === "completed" && !settled) {
+        settled = true;
+        sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, output: event.output });
+      }
+      if (event.type === "failed" && !settled) {
+        settled = true;
+        sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: event.message || "Codex title request failed" });
+      }
+    } catch { /* Ignore non-protocol output. */ }
+  });
+  child.on("error", (error) => {
+    if (!settled) { settled = true; sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: error.message }); }
+  });
+  child.on("exit", (code, signal) => {
+    output.close(); titleAgentWorkers.delete(message.requestId);
+    if (!settled) sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: `Title worker exited before completion (${signal ?? code ?? "unknown"})` });
+  });
+  child.stdin!.end(`${JSON.stringify(message.request)}\n`);
+}
+
 function scheduleForcedCancellation(jobId: string, worker: ChildProcess): void {
   if (cancellationTimers.has(jobId)) return;
   const terminate = setTimeout(() => signalWorkerTree(jobId, worker, "SIGTERM"), 5_000);
@@ -145,6 +202,10 @@ function stopAll(signal: NodeJS.Signals): void {
   stopping = true;
   if (!web.killed) web.kill(signal);
   for (const [jobId, worker] of workers) signalWorkerTree(jobId, worker, signal);
+  for (const worker of titleAgentWorkers.values()) {
+    if (!worker.pid) continue;
+    try { process.platform === "win32" ? worker.kill(signal) : process.kill(-worker.pid, signal); } catch { /* Process may already be gone. */ }
+  }
 }
 
 process.on("SIGINT", () => stopAll("SIGINT"));

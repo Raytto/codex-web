@@ -43,6 +43,30 @@ test("wake plans survive restart and enqueue exactly one continuation", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("pending prompts stay queued during an armed wait and the continuation resumes first", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-pending-"));
+  const db = new AppDatabase(root);
+  const conversationId = crypto.randomUUID();
+  db.createConversation(conversationId, "Waiting queue", selection);
+  const plan = db.createWakePlan({
+    id: crypto.randomUUID(), conversationId, mode: "time", label: "Wait ten minutes",
+    deadlineAt: new Date(Date.now() + 600_000).toISOString(), successPrompt: "resume first",
+    failurePrompt: "resume first", timeoutPrompt: "resume first", selection,
+  });
+  const userPending = db.createPendingPrompt(crypto.randomUUID(), conversationId, "user queued", selection);
+  assert.equal(db.getNextDispatchablePendingPrompt(), undefined);
+  const triggered = db.recordWakeEvent(plan.id, "deadline", "deadline", null, crypto.randomUUID());
+  assert.equal(triggered.status, "triggered");
+  assert.deepEqual(db.listPendingPrompts(conversationId).map((pending) => [pending.content, pending.position]), [
+    ["resume first", 1],
+    ["user queued", 2],
+  ]);
+  assert.equal(db.getNextDispatchablePendingPrompt()?.content, "resume first");
+  assert.equal(db.getPendingPrompt(userPending.id)?.content, "user queued");
+  db.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("wake prompt edits use optimistic revisions and preserve event credentials", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-edit-"));
   const db = new AppDatabase(root);

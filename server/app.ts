@@ -73,6 +73,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     });
   }
 
+  function conversationActivityPayload(conversation: ConversationRow) {
+    const latestJob = db.getLatestJobForConversation(conversation.id) ?? null;
+    const activeJobs = db.listActiveJobsForConversation(conversation.id);
+    const activeJobRow = activeJobs.find((job) => job.status === "running") ?? activeJobs[0] ?? null;
+    const activityJob = activeJobRow ?? latestJob;
+    const jobEvents = activityJob
+      ? db.listEvents(activityJob.id).map((event) => ({ seq: event.seq, type: event.event_type, created_at: event.created_at, ...JSON.parse(event.payload) }))
+      : [];
+    return {
+      activeJob: activeJobRow ? { ...activeJobRow, queuePosition: db.getQueuePosition(activeJobRow.id) } : null,
+      latestJob,
+      jobEvents,
+    };
+  }
+
   function saveAgentSelection(userId: string, rawModel: unknown, rawEffort: unknown, conversation?: ConversationRow): AgentSelection {
     const selection = resolveAgentSelection(optionsForUser(userId), rawModel, rawEffort);
     db.setAgentSelectionPreference(selection, userId);
@@ -545,6 +560,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const plan = job ? db.getWakePlan(String(req.params.planId)) : undefined;
     if (!job || !plan || plan.conversation_id !== job.conversation_id) return res.status(401).json({ error: "Invalid automation credentials." });
     const cancelled = db.cancelWakePlan(plan.id);
+    if (cancelled && config.queueAutoStart) setImmediate(() => void pumpQueue());
     return cancelled ? res.json({ wakePlan: publicWakePlan(cancelled) }) : res.status(409).json({ error: "Wait plan already triggered or cancelled." });
   });
 
@@ -650,9 +666,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     res.json({ ok: true });
   });
 
-  api.get("/conversations", (_req, res) => {
+  api.get("/conversations", (req, res) => {
     const session = res.locals.session as SessionRow;
-    return res.json({ conversations: db.listConversations(session.user_id) });
+    const query = typeof req.query.query === "string" ? req.query.query : "";
+    return res.json({ conversations: db.searchConversations(session.user_id, query) });
   });
 
   api.get("/conversations/archived", (req, res) => {
@@ -724,16 +741,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       db.setConversationRolloutBytes(conversation.id, rolloutBytes);
       conversation = db.getConversationForUser(conversation.id, session.user_id)!;
     }
-    const latestJob = db.getLatestJobForConversation(conversation.id) ?? null;
-    const jobEvents = latestJob
-      ? db.listEvents(latestJob.id).map((event) => ({ seq: event.seq, type: event.event_type, created_at: event.created_at, ...JSON.parse(event.payload) }))
-      : [];
+    const activity = conversationActivityPayload(conversation);
     const messagePage = db.listMessagesPage(conversation.id, undefined, CONVERSATION_MESSAGE_PAGE_SIZE)!;
     const safeMessages = safeConversationMessages(conversation, messagePage.messages);
     const agentSelection = conversationAgentSelection(conversation);
-    const activeJob = latestJob && ["queued", "running"].includes(latestJob.status)
-      ? { ...latestJob, queuePosition: db.getQueuePosition(latestJob.id) }
-      : null;
     const pendingPrompts = db.listPendingPrompts(conversation.id);
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0] ?? null;
     const composerDraft = db.getComposerDraft(conversation.id) ?? null;
@@ -748,9 +759,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       composerDraft,
       wakePlan: publicWakePlan(wakePlan),
       wakeEvents: wakePlan ? db.listWakeEvents(wakePlan.id) : [],
-      activeJob,
-      latestJob,
-      jobEvents,
+      ...activity,
       rolloutBytes,
       contextUsage: conversation.context_input_tokens === null
         ? null
@@ -761,6 +770,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           },
       packageQuota: db.getConversationCodexQuota(conversation.id),
     });
+  });
+
+  api.get("/conversations/:id/activity", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    return res.json(conversationActivityPayload(conversation));
   });
 
   api.get("/conversations/:id/wake-plans/active", (req, res) => {
@@ -798,6 +814,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
     if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ error: "等待计划不存在。" });
     const cancelled = db.cancelWakePlan(plan.id);
+    if (cancelled && config.queueAutoStart) setImmediate(() => void pumpQueue());
     return cancelled ? res.json({ wakePlan: publicWakePlan(cancelled) }) : res.status(409).json({ error: "等待计划已经触发或取消。" });
   });
 
@@ -1289,12 +1306,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id || pending.status !== "queued") return res.status(404).json({ error: "待发送任务不存在。" });
     const running = db.listActiveJobsForConversation(conversation.id).find((job) => job.status === "running");
-    if (!running) return res.status(409).json({ error: "当前任务尚未进入可引导状态。" });
+    if (!running) {
+      const job = db.materializePendingPrompt(pending.id, newId(), newId());
+      if (!job) return res.status(409).json({ error: "待发送队列已经变化，请刷新后重试。" });
+      publishQueuePositions();
+      if (config.queueAutoStart) await pumpQueue();
+      return res.json({ ok: true, mode: "insert", job: db.getJob(job.id) ?? job });
+    }
     try {
       const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
       const message = db.materializeSteeredPrompt(pending.id, newId());
       if (!message) throw new Error("引导已送达，但本地记录队列发生变化，请刷新确认。 ");
-      return res.json({ ok: true, turnId, message });
+      return res.json({ ok: true, mode: "steer", turnId, message });
     } catch (error) {
       return res.status(409).json({ error: error instanceof Error ? error.message : "引导失败。" });
     }
@@ -1313,18 +1336,28 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const after = Number(req.get("last-event-id") ?? req.query.after ?? 0) || 0;
     let lastSent = after;
     res.write("retry: 2000\n\n");
-    for (const event of db.listEvents(job.id, after)) {
-      writeSse(res, event.seq, event.event_type, { created_at: event.created_at, ...JSON.parse(event.payload) });
-      lastSent = event.seq;
-    }
+    const replayFrom = (cursor: number) => {
+      for (const event of db.listEvents(job.id, cursor)) {
+        writeSse(res, event.seq, event.event_type, { created_at: event.created_at, ...JSON.parse(event.payload) });
+        lastSent = event.seq;
+      }
+    };
+    replayFrom(after);
+    const replayComplete = () => res.write(`data: ${JSON.stringify({ type: "replay_complete", lastEventId: lastSent })}\n\n`);
     const terminalStatuses = ["completed", "failed", "cancelled", "interrupted"];
-    if (terminalStatuses.includes(db.getJob(job.id)?.status ?? "interrupted")) return res.end();
+    if (terminalStatuses.includes(db.getJob(job.id)?.status ?? "interrupted")) {
+      replayFrom(lastSent);
+      replayComplete();
+      return res.end();
+    }
     const set = subscribers.get(job.id) ?? new Set<Response>();
     set.add(res);
     subscribers.set(job.id, set);
+    replayFrom(lastSent);
+    replayComplete();
     const checkedJob = db.getJob(job.id);
     if (!checkedJob || terminalStatuses.includes(checkedJob.status)) {
-      for (const event of db.listEvents(job.id, lastSent)) writeSse(res, event.seq, event.event_type, { created_at: event.created_at, ...JSON.parse(event.payload) });
+      replayFrom(lastSent);
       set.delete(res);
       if (set.size === 0) subscribers.delete(job.id);
       return res.end();

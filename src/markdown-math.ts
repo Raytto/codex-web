@@ -18,6 +18,7 @@ type AsyncMarkdownMath = {
 };
 
 let markdownMathPluginsPromise: Promise<MarkdownMathPlugins> | null = null;
+const MATH_LOAD_RETRY_DELAYS_MS = [1_000, 4_000] as const;
 
 const FENCE_START = /^ {0,3}(`{3,}|~{3,})/;
 
@@ -105,19 +106,46 @@ function loadMarkdownMathPlugins(): Promise<MarkdownMathPlugins> {
 export function useAsyncMarkdownMath(markdown: string): AsyncMarkdownMath {
   const prepared = useMemo(() => prepareMarkdownMath(markdown), [markdown]);
   const [plugins, setPlugins] = useState<MarkdownMathPlugins | null>(null);
-  const [failedMarkdown, setFailedMarkdown] = useState<string | null>(null);
-  const failed = prepared.hasMath && failedMarkdown === markdown;
+  const [loadAttempt, setLoadAttempt] = useState({ markdown: "", count: 0 });
+  const attempts = loadAttempt.markdown === markdown ? loadAttempt.count : 0;
+  const failed = prepared.hasMath && attempts > MATH_LOAD_RETRY_DELAYS_MS.length;
 
   useEffect(() => {
     if (!prepared.hasMath || plugins || failed) return;
     let active = true;
+    let retryTimer: number | undefined;
     void loadMarkdownMathPlugins().then((loaded) => {
       if (active) setPlugins(loaded);
     }).catch(() => {
-      if (active) setFailedMarkdown(markdown);
+      if (!active) return;
+      const delay = MATH_LOAD_RETRY_DELAYS_MS[attempts];
+      if (delay === undefined) {
+        setLoadAttempt({ markdown, count: attempts + 1 });
+        return;
+      }
+      retryTimer = window.setTimeout(() => {
+        if (active) setLoadAttempt({ markdown, count: attempts + 1 });
+      }, delay);
     });
-    return () => { active = false; };
-  }, [failed, markdown, plugins, prepared.hasMath]);
+    return () => {
+      active = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, [attempts, failed, markdown, plugins, prepared.hasMath]);
+
+  useEffect(() => {
+    if (!failed) return;
+    const retry = () => setLoadAttempt({ markdown: "", count: 0 });
+    const retryWhenVisible = () => {
+      if (document.visibilityState === "visible") retry();
+    };
+    window.addEventListener("online", retry);
+    document.addEventListener("visibilitychange", retryWhenVisible);
+    return () => {
+      window.removeEventListener("online", retry);
+      document.removeEventListener("visibilitychange", retryWhenVisible);
+    };
+  }, [failed]);
 
   return {
     content: plugins && prepared.hasMath ? prepared.content : markdown,

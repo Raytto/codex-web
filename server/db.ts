@@ -38,6 +38,7 @@ export type ConversationRow = {
   reasoning_effort: string | null;
   status: "idle" | "running";
   has_unread_result: number;
+  unread_anchor_message_id: string | null;
   has_pending_work: number;
   active_wake_count: number;
   next_wake_at: string | null;
@@ -54,6 +55,25 @@ export type ConversationRow = {
 };
 
 export type ConversationTitleSource = "default" | "ai" | "manual" | "legacy";
+
+export type ConversationTitleAuditRow = {
+  id: string;
+  conversation_id: string | null;
+  user_id: string;
+  model: string;
+  reasoning_effort: string;
+  prompt_version: string;
+  request_excerpt: string;
+  request_sha256: string;
+  context_json: string;
+  status: "running" | "succeeded" | "failed";
+  output_title: string | null;
+  applied: number;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+  duration_ms: number | null;
+};
 
 export type MessageRow = {
   id: string;
@@ -279,10 +299,11 @@ export class AppDatabase {
           this.sqlite.prepare("INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)")
             .run(job.id, event.seq, "failed", JSON.stringify({ status: "interrupted", message: error }), now);
           if (job.deleted_at) continue;
+          const noticeMessageId = crypto.randomUUID();
           this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'assistant',?,NULL,?)")
-            .run(crypto.randomUUID(), job.conversation_id, "上一条任务因服务重启而中断，尚未执行完成。为避免重复产生副作用，系统没有自动重试；请重新发送该任务。", now);
-          this.sqlite.prepare("UPDATE conversations SET status='idle',has_unread_result=1,updated_at=? WHERE id=?")
-            .run(now, job.conversation_id);
+            .run(noticeMessageId, job.conversation_id, "上一条任务因服务重启而中断，尚未执行完成。为避免重复产生副作用，系统没有自动重试；请重新发送该任务。", now);
+          this.sqlite.prepare("UPDATE conversations SET status='idle',has_unread_result=1,unread_anchor_message_id=COALESCE(unread_anchor_message_id,?),updated_at=? WHERE id=?")
+            .run(noticeMessageId, now, job.conversation_id);
         }
         this.sqlite.prepare("UPDATE conversations SET status='idle' WHERE status='running'").run();
         this.sqlite.exec("COMMIT");
@@ -314,6 +335,7 @@ export class AppDatabase {
         codex_thread_id TEXT,
         status TEXT NOT NULL DEFAULT 'idle',
         has_unread_result INTEGER NOT NULL DEFAULT 0,
+        unread_anchor_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
         rollout_bytes INTEGER,
         context_input_tokens INTEGER,
         context_window_tokens INTEGER,
@@ -328,6 +350,27 @@ export class AppDatabase {
         remaining_percent REAL NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS conversation_title_audits (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        model TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        request_excerpt TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+        output_title TEXT,
+        applied INTEGER NOT NULL DEFAULT 0 CHECK(applied IN (0,1)),
+        error TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        duration_ms INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS conversation_title_audits_conversation_idx ON conversation_title_audits(conversation_id,started_at);
+      CREATE INDEX IF NOT EXISTS conversation_title_audits_user_idx ON conversation_title_audits(user_id,started_at);
+      CREATE INDEX IF NOT EXISTS conversation_title_audits_status_idx ON conversation_title_audits(status,started_at);
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -512,6 +555,7 @@ export class AppDatabase {
     if (!conversationColumns.has("agent_model")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN agent_model TEXT");
     if (!conversationColumns.has("reasoning_effort")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT");
     if (!conversationColumns.has("has_unread_result")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN has_unread_result INTEGER NOT NULL DEFAULT 0");
+    if (!conversationColumns.has("unread_anchor_message_id")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN unread_anchor_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL");
     if (!conversationColumns.has("rollout_bytes")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN rollout_bytes INTEGER");
     if (!conversationColumns.has("context_input_tokens")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN context_input_tokens INTEGER");
     if (!conversationColumns.has("context_window_tokens")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN context_window_tokens INTEGER");
@@ -519,6 +563,20 @@ export class AppDatabase {
     if (!conversationColumns.has("archived_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN archived_at TEXT");
     if (!conversationColumns.has("deleted_at")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN deleted_at TEXT");
     if (!conversationColumns.has("title_source")) this.sqlite.exec("ALTER TABLE conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'legacy'");
+    this.sqlite.exec(`
+      UPDATE conversations
+      SET unread_anchor_message_id=(
+        SELECT assistant.id FROM messages assistant
+        WHERE assistant.conversation_id=conversations.id AND assistant.role='assistant'
+          AND NOT EXISTS (
+            SELECT 1 FROM messages later_user
+            WHERE later_user.conversation_id=conversations.id AND later_user.role='user'
+              AND (later_user.created_at>assistant.created_at OR (later_user.created_at=assistant.created_at AND later_user.id>assistant.id))
+          )
+        ORDER BY assistant.created_at,assistant.id LIMIT 1
+      )
+      WHERE has_unread_result=1 AND unread_anchor_message_id IS NULL
+    `);
     const messageColumns = this.columnNames("messages");
     if (!messageColumns.has("quote_excerpt")) this.sqlite.exec("ALTER TABLE messages ADD COLUMN quote_excerpt TEXT");
     const pendingPromptColumns = this.columnNames("pending_prompts");
@@ -534,6 +592,12 @@ export class AppDatabase {
     if (!fileColumns.has("pending_prompt_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN pending_prompt_id TEXT REFERENCES pending_prompts(id) ON DELETE CASCADE");
     if (!fileColumns.has("composer_draft_id")) this.sqlite.exec("ALTER TABLE files ADD COLUMN composer_draft_id TEXT REFERENCES composer_drafts(conversation_id) ON DELETE CASCADE");
     if (!fileColumns.has("sha256")) this.sqlite.exec("ALTER TABLE files ADD COLUMN sha256 TEXT");
+    const titleAuditRecoveryAt = new Date().toISOString();
+    this.sqlite.prepare(`
+      UPDATE conversation_title_audits
+      SET status='failed',error='server_restart',completed_at=?,duration_ms=MAX(0,CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER))
+      WHERE status='running'
+    `).run(titleAuditRecoveryAt, titleAuditRecoveryAt);
     this.sqlite.prepare("UPDATE jobs SET queue_seq=rowid WHERE queue_seq IS NULL").run();
 
     const now = new Date().toISOString();
@@ -622,6 +686,24 @@ export class AppDatabase {
     return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE deleted_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC`).all() as ConversationRow[];
   }
 
+  searchConversations(userId: string, rawQuery: string): ConversationRow[] {
+    const query = rawQuery.trim().slice(0, 100);
+    if (!query) return this.listConversations(userId);
+    const escaped = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
+    return this.sqlite.prepare(`
+      SELECT ${conversationSelect} FROM conversations
+      WHERE user_id=? AND deleted_at IS NULL AND archived_at IS NULL
+        AND (
+          title LIKE ? ESCAPE '\\' COLLATE NOCASE
+          OR EXISTS (
+            SELECT 1 FROM messages message
+            WHERE message.conversation_id=conversations.id AND message.content LIKE ? ESCAPE '\\' COLLATE NOCASE
+          )
+        )
+      ORDER BY updated_at DESC,id LIMIT 100
+    `).all(userId, escaped, escaped) as ConversationRow[];
+  }
+
   listArchivedConversations(userId: string, query = ""): ConversationRow[] {
     const normalized = query.trim().slice(0, 100);
     if (!normalized) {
@@ -670,7 +752,7 @@ export class AppDatabase {
   markConversationResultSeenForUser(id: string, userId: string): ConversationRow | undefined {
     const conversation = this.getConversationForUser(id, userId);
     if (!conversation) return undefined;
-    this.sqlite.prepare("UPDATE conversations SET has_unread_result=0 WHERE id=? AND user_id=? AND deleted_at IS NULL").run(id, userId);
+    this.sqlite.prepare("UPDATE conversations SET has_unread_result=0,unread_anchor_message_id=NULL WHERE id=? AND user_id=? AND deleted_at IS NULL").run(id, userId);
     return this.getConversationForUser(id, userId);
   }
 
@@ -743,6 +825,35 @@ export class AppDatabase {
       UPDATE conversations SET title=?,title_source='ai',updated_at=?
       WHERE id=? AND title_source='default' AND deleted_at IS NULL
     `).run(title, new Date().toISOString(), id).changes > 0;
+  }
+
+  createConversationTitleAudit(row: Omit<ConversationTitleAuditRow, "status" | "output_title" | "applied" | "error" | "completed_at" | "duration_ms">): ConversationTitleAuditRow {
+    this.sqlite.prepare(`
+      INSERT INTO conversation_title_audits(
+        id,conversation_id,user_id,model,reasoning_effort,prompt_version,request_excerpt,request_sha256,
+        context_json,status,output_title,applied,error,started_at,completed_at,duration_ms
+      ) VALUES(?,?,?,?,?,?,?,?,?,'running',NULL,0,NULL,?,NULL,NULL)
+    `).run(row.id, row.conversation_id, row.user_id, row.model, row.reasoning_effort, row.prompt_version,
+      row.request_excerpt, row.request_sha256, row.context_json, row.started_at);
+    return this.getConversationTitleAudit(row.id)!;
+  }
+
+  finishConversationTitleAudit(id: string, result: { status: "succeeded" | "failed"; outputTitle?: string | null; applied?: boolean; error?: string | null; completedAt: string; durationMs: number }): ConversationTitleAuditRow | undefined {
+    this.sqlite.prepare(`
+      UPDATE conversation_title_audits SET status=?,output_title=?,applied=?,error=?,completed_at=?,duration_ms=?
+      WHERE id=? AND status='running'
+    `).run(result.status, result.outputTitle ?? null, result.applied ? 1 : 0, result.error?.slice(0, 2_000) ?? null,
+      result.completedAt, Math.max(0, Math.trunc(result.durationMs)), id);
+    return this.getConversationTitleAudit(id);
+  }
+
+  getConversationTitleAudit(id: string): ConversationTitleAuditRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM conversation_title_audits WHERE id=?").get(id) as ConversationTitleAuditRow | undefined;
+  }
+
+  getLatestConversationTitleAudit(conversationId: string): ConversationTitleAuditRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM conversation_title_audits WHERE conversation_id=? ORDER BY started_at DESC,id DESC LIMIT 1")
+      .get(conversationId) as ConversationTitleAuditRow | undefined;
   }
 
   isFirstUserMessage(conversationId: string, messageId: string): boolean {
@@ -1385,12 +1496,12 @@ export class AppDatabase {
       const prompt = cause === "success" ? plan.success_prompt
         : cause === "failure" ? plan.failure_prompt
         : plan.mode === "time" ? plan.success_prompt : plan.timeout_prompt;
-      const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND status='queued'")
-        .get(plan.conversation_id) as { value: number };
+      this.sqlite.prepare("UPDATE pending_prompts SET position=position+1 WHERE conversation_id=? AND status='queued'")
+        .run(plan.conversation_id);
       this.sqlite.prepare(`
         INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
         VALUES(?,?,?,NULL,?,?,?,'queued',?,?)
-      `).run(pendingPromptId, plan.conversation_id, prompt, plan.agent_model, plan.reasoning_effort, next.value, now, now);
+      `).run(pendingPromptId, plan.conversation_id, prompt, plan.agent_model, plan.reasoning_effort, 1, now, now);
       this.sqlite.prepare(`
         UPDATE wake_plans SET state='triggered',trigger_cause=?,triggered_at=?,pending_prompt_id=?,
           last_event_at=?,last_event_kind=?,last_event_summary=?,updated_at=?
@@ -1414,6 +1525,10 @@ export class AppDatabase {
         AND NOT EXISTS (
           SELECT 1 FROM jobs active
           WHERE active.conversation_id=pending.conversation_id AND active.status IN ('queued','running')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_plans wake
+          WHERE wake.conversation_id=pending.conversation_id AND wake.state='armed'
         )
       -- Position is the user-controlled order within each conversation. Putting
       -- it first is essential: created_at would otherwise make drag reordering
@@ -1602,9 +1717,23 @@ export class AppDatabase {
       this.sqlite.prepare("UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?").run(status, error, now, id);
       this.sqlite.prepare(`
         UPDATE conversations
-        SET status='idle', has_unread_result=CASE WHEN ?='completed' THEN 1 ELSE has_unread_result END, updated_at=?
+        SET status='idle',
+          has_unread_result=CASE WHEN ?='completed' THEN 1 ELSE has_unread_result END,
+          unread_anchor_message_id=CASE WHEN ?='completed' THEN COALESCE(
+            unread_anchor_message_id,
+            (
+              SELECT assistant.id
+              FROM messages assistant
+              JOIN jobs job ON job.id=?
+              JOIN messages user_message ON user_message.id=job.message_id
+              WHERE assistant.conversation_id=? AND assistant.role='assistant'
+                AND (assistant.created_at>user_message.created_at OR (assistant.created_at=user_message.created_at AND assistant.id>user_message.id))
+              ORDER BY assistant.created_at,assistant.id LIMIT 1
+            )
+          ) ELSE unread_anchor_message_id END,
+          updated_at=?
         WHERE id=?
-      `).run(status, now, conversationId);
+      `).run(status, status, id, conversationId, now, conversationId);
       this.sqlite.exec("COMMIT");
     } catch (error) {
       this.sqlite.exec("ROLLBACK");

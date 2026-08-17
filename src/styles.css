@@ -610,7 +610,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .pending-queue-item:first-child { border-top-color: transparent; }
 .pending-queue-item:hover { background: rgba(247, 248, 252, .72); }
 .pending-queue-item.dragging { opacity: .45; transform: scale(.99); }
-.pending-drag-handle { width: 22px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; color: #a2a6b5; background: transparent; cursor: grab; }
+.pending-queue-item.drag-target { background: rgba(226, 230, 245, .9); }
+.pending-queue.drag-active, .pending-queue.drag-active * { -webkit-user-select: none; user-select: none; }
+.pending-drag-handle { width: 22px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; color: #a2a6b5; background: transparent; cursor: grab; touch-action: none; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
 .pending-drag-handle:active { cursor: grabbing; }
 .pending-queue-copy { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .pending-queue-copy > span { min-width: 0; overflow: hidden; color: #2d3246; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
@@ -962,6 +964,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .pending-queue-heading strong { color: #d9deff; }
 :root[data-theme="dark"] .pending-queue-item { border-top-color: rgba(135, 138, 150, .24); }
 :root[data-theme="dark"] .pending-queue-item:hover { background: rgba(61, 63, 71, .7); }
+:root[data-theme="dark"] .pending-queue-item.drag-target { background: rgba(70, 74, 91, .9); }
 :root[data-theme="dark"] .pending-drag-handle { color: #999ba4; }
 :root[data-theme="dark"] .pending-queue-copy > span { color: #e2e3e7; }
 :root[data-theme="dark"] .pending-queue-copy small { color: #999ba3; }

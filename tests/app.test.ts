@@ -17,6 +17,7 @@ import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "../server/app.js";
 import { assertProductionConfig, loadConfig } from "../server/config.js";
 import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
+import { buildConversationTitlePrompt, CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_REASONING_EFFORT, normalizeConversationTitle, parseConversationTitleOutput } from "../server/conversation-title.js";
 import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
 import { AppDatabase, LEGACY_USER_ID, type FileRow } from "../server/db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
@@ -33,7 +34,7 @@ import { resolveAccountIdentity } from "../src/account-identity.js";
 import { chooseComposerPrimaryAction } from "../src/composer-action.js";
 import { prepareMarkdownMath } from "../src/markdown-math.js";
 import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection, visibleSelectionBounds } from "../src/ask-agent-selection.js";
-import { mergeMessagePages, preservePrependedScrollTop } from "../src/message-history.js";
+import { mergeMessagePages, preservePrependedScrollTop, resolveUnreadScrollTarget } from "../src/message-history.js";
 import { resolveScrollFollow } from "../src/scroll-follow.js";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { chooseSelectedConversation, isTerminalJob, mergeJobEvents } from "../src/recovery.js";
@@ -99,6 +100,21 @@ test("browser session recovery eventually accepts a confirmed logged-out state",
   });
   assert.deepEqual(restored, { authenticated: false });
   assert.equal(attempts, 3);
+});
+
+test("browser session recovery aborts and retries a stalled mobile restore request", async () => {
+  let attempts = 0;
+  const restored = await recoverBrowserSession((signal) => {
+    attempts += 1;
+    if (attempts > 1) return Promise.resolve({ authenticated: true, csrfToken: "restored" });
+    return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true }));
+  }, {
+    attemptTimeoutMs: 1,
+    transientRetryDelaysMs: [0],
+    wait: async () => undefined,
+  });
+  assert.deepEqual(restored, { authenticated: true, csrfToken: "restored" });
+  assert.equal(attempts, 2);
 });
 
 test("composer replaces stop with send as soon as there is sendable input", () => {
@@ -218,6 +234,19 @@ test("sidebar task actions collapse into a stable overflow menu", () => {
   assert.match(styles, /@media \(hover: none\) \{\s*\.row-actions \{ opacity: 1; pointer-events: auto; \}/);
 });
 
+test("conversation search matches message bodies while retaining the selected task", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-search-body-test-"));
+  const db = new AppDatabase(root);
+  context.after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const bodyMatch = db.createConversation(crypto.randomUUID(), "普通标题");
+  const titleMatch = db.createConversation(crypto.randomUUID(), "英雄养成分析");
+  db.addMessage({ id: crypto.randomUUID(), conversation_id: bodyMatch.id, role: "user", content: "请分析英雄养成效率", created_at: new Date().toISOString() });
+  assert.deepEqual(new Set(db.searchConversations(LEGACY_USER_ID, "英雄养成").map((conversation) => conversation.id)), new Set([bodyMatch.id, titleMatch.id]));
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.match(appSource, /api\.conversations\(search\)/);
+  assert.match(appSource, /if \(selected && !conversations\.some/);
+});
+
 test("mobile Safari restores the non-fixed app viewport after the software keyboard closes", () => {
   const mainSource = fs.readFileSync(path.join(process.cwd(), "src", "main.tsx"), "utf8");
   const viewportSource = fs.readFileSync(path.join(process.cwd(), "src", "mobile-viewport.ts"), "utf8");
@@ -266,12 +295,20 @@ test("conversation capacity tracks context tokens and remaining Codex quota", ()
 test("completed conversations stay visibly unread until their detail is viewed", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
+  const dbSource = fs.readFileSync(path.join(process.cwd(), "server", "db.ts"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /conversation\.has_unread_result \? "unread" : ""/);
   assert.match(appSource, /result\.conversation\.has_unread_result[\s\S]*?api\.markConversationSeen\(id\)/);
   assert.match(appSource, /window\.setInterval\([\s\S]*?refreshList\(\)[\s\S]*?10_000/);
   assert.match(apiSource, /markConversationSeen:[\s\S]*?\/conversations\/\$\{id\}\/seen[\s\S]*?method: "POST"/);
   assert.match(styles, /\.conversation-row\.unread \.conversation-select::after \{[^}]*background: #38c976;[^}]*content: "";/);
+  assert.match(appSource, /resolveUnreadScrollTarget\(result\.messages, unreadAnchorMessageId/);
+  assert.match(appSource, /data-message-id=\{message\.id\}/);
+  assert.match(dbSource, /unread_anchor_message_id=COALESCE\(unread_anchor_message_id,/);
+  assert.equal(resolveUnreadScrollTarget([
+    { id: "prompt", role: "user", created_at: "1" },
+    { id: "reply", role: "assistant", created_at: "2" },
+  ], "reply", false), "prompt");
 });
 
 test("mobile model menus stay inside the viewport and scroll internally", () => {
@@ -331,6 +368,10 @@ test("pending queue stays translucent and vertically compact in both themes", ()
   assert.match(styles, /\.workspace\.has-pending-queue \.composer-wrap \{[^}]*position: relative;[^}]*flex: 0 0 auto;[^}]*align-self: center;[^}]*transform: none;/);
   assert.match(styles, /\.workspace\.has-pending-queue \.messages \{ padding-bottom: 24px; \}/);
   assert.match(styles, /:root\[data-theme="dark"\] \.pending-queue \{[^}]*background: rgba\(40, 41, 46, \.72\);/);
+  assert.match(appSource, /onPointerDown=\{\(event\) => beginTouchDrag\(event, prompt\.id\)\}/);
+  assert.match(styles, /\.pending-drag-handle \{[^}]*touch-action: none;/);
+  assert.match(appSource, /actionMode === "steer" \? "引导" : "插入"/);
+  assert.match(appSource, /等待计划结束后依次发送/);
 });
 
 test("live updates pause while reading older paged messages", () => {
@@ -414,6 +455,16 @@ test("running work journal retains every important direction and compacts repeat
   assert.match(appSource, /完成前持续保留，可随时引导/);
 });
 
+test("running activity waits for a complete snapshot and SSE replay boundary", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const serverSource = fs.readFileSync(path.join(process.cwd(), "server", "app.ts"), "utf8");
+  assert.match(appSource, /正在加载运行记录/);
+  assert.match(appSource, /await refreshActivity\(id\)/);
+  assert.match(appSource, /data\.type === "replay_complete"/);
+  assert.match(serverSource, /api\.get\("\/conversations\/:id\/activity"/);
+  assert.match(serverSource, /const replayComplete = \(\) => res\.write/);
+});
+
 test("running progress expands inline without a nested vertical scroller", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   assert.match(appSource, /<ProcessPanel key=\{detail\.conversation\.id\} activities=\{activities\}/);
@@ -453,7 +504,7 @@ test("a stream that never completes still fails with its last upstream error", a
   }), /stream disconnected before completion/);
 });
 
-test("structured first-turn responses separate the visible answer from a short task title", () => {
+test("legacy structured first-turn envelopes remain readable after title generation moved out of the main turn", () => {
   assert.equal(AUTO_TITLE_OUTPUT_SCHEMA.properties.title.maxLength, 10);
   assert.deepEqual(parseAutoTitleResponse(JSON.stringify({
     answer: "文件已经生成。",
@@ -472,6 +523,39 @@ test("structured first-turn responses separate the visible answer from a short t
   assert.equal(extractLeakedAutoTitleAnswer('{"answer":"用户要求的 JSON","title":"标题","extra":true}'), null);
   assert.equal(extractLeakedAutoTitleAnswer('{"answer":"用户要求的 JSON","title":"这是一个明显超过十个字符的普通字段值"}'), null);
   assert.equal(extractLeakedAutoTitleAnswer('{"answer":"正常回复","title":"NAS 双出口抖动已停止"}', true), "正常回复");
+});
+
+test("dedicated Codex Luna title agent uses precise short titles and keeps an auditable request", (context) => {
+  assert.equal(CONVERSATION_TITLE_CODEX_MODEL, "gpt-5.6-luna");
+  assert.equal(CONVERSATION_TITLE_REASONING_EFFORT, "low");
+  const prompt = buildConversationTitlePrompt({
+    requestText: "请帮我优化 Last War 的英雄养成分析流程",
+    attachmentNames: ["英雄养成表.xlsx"],
+  });
+  assert.match(prompt, /只负责生成标题，不执行用户任务/);
+  assert.match(prompt, /至少使用明确的动宾结构/);
+  assert.match(prompt, /英雄养成表\.xlsx/);
+  assert.equal(parseConversationTitleOutput('{"title":"优化英雄养成分析"}'), "优化英雄养成分析");
+  assert.equal(normalizeConversationTitle("标题：修复登录保持。"), "修复登录保持");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-title-audit-test-"));
+  const db = new AppDatabase(root);
+  context.after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const conversationId = crypto.randomUUID();
+  db.createConversation(conversationId, "新任务");
+  const audit = db.createConversationTitleAudit({
+    id: crypto.randomUUID(), conversation_id: conversationId, user_id: LEGACY_USER_ID,
+    model: CONVERSATION_TITLE_CODEX_MODEL, reasoning_effort: CONVERSATION_TITLE_REASONING_EFFORT,
+    prompt_version: "codex-title-v1", request_excerpt: "优化英雄养成分析", request_sha256: "a".repeat(64),
+    context_json: JSON.stringify({ attachmentNames: ["英雄养成表.xlsx"] }), started_at: new Date().toISOString(),
+  });
+  assert.equal(audit.status, "running");
+  const finished = db.finishConversationTitleAudit(audit.id, {
+    status: "succeeded", outputTitle: "优化英雄养成分析", applied: true,
+    completedAt: new Date().toISOString(), durationMs: 321,
+  });
+  assert.equal(finished?.output_title, "优化英雄养成分析");
+  assert.equal(finished?.applied, 1);
 });
 
 test("transient upstream failures use bounded 15/45/120 retry policy", async () => {
@@ -1050,6 +1134,8 @@ test("assistant cards progressively replace raw LaTeX with asynchronous KaTeX", 
   assert.match(appSource, />\{math\.content\}<\/ReactMarkdown>/);
   assert.match(mathSource, /content: plugins && prepared\.hasMath \? prepared\.content : markdown/);
   assert.match(mathSource, /let markdownMathPluginsPromise:/);
+  assert.match(mathSource, /MATH_LOAD_RETRY_DELAYS_MS = \[1_000, 4_000\]/);
+  assert.match(mathSource, /window\.addEventListener\("online", retry\)/);
   assert.match(styles, /\.message\.assistant \.katex-display,[\s\S]*overflow-x:\s*auto/);
 });
 
@@ -2032,6 +2118,24 @@ test("job finalization makes job and conversation terminal atomically", (context
     assert.equal(db.listEvents(jobId).length, 1);
     if (status === "completed") assert.equal(db.listMessages(conversationId).at(-1)?.content, "result");
   }
+});
+
+test("completed jobs preserve the first unread assistant anchor until the conversation is seen", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-unread-anchor-test-"));
+  const db = new AppDatabase(root);
+  context.after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const conversationId = crypto.randomUUID();
+  const userMessageId = crypto.randomUUID();
+  const assistantMessageId = crypto.randomUUID();
+  const jobId = crypto.randomUUID();
+  db.createConversation(conversationId, "Unread anchor");
+  db.addMessage({ id: userMessageId, conversation_id: conversationId, role: "user", content: "请检查结果", created_at: "2026-08-17T00:00:00.000Z" });
+  db.createJob(jobId, conversationId, userMessageId);
+  db.addMessage({ id: assistantMessageId, conversation_id: conversationId, role: "assistant", content: "检查完成", created_at: "2026-08-17T00:00:01.000Z" });
+  db.finishJob(jobId, conversationId, "completed");
+  assert.equal(db.getConversation(conversationId)?.unread_anchor_message_id, assistantMessageId);
+  db.markConversationResultSeenForUser(conversationId, LEGACY_USER_ID);
+  assert.equal(db.getConversation(conversationId)?.unread_anchor_message_id, null);
 });
 
 test("job progress events refresh the job activity timestamp", (context) => {

@@ -14,6 +14,7 @@ type PendingJob = {
 export class TenantWorkerClient {
   private readonly jobs = new Map<string, PendingJob>();
   private readonly steers = new Map<string, { jobId: string; resolve(turnId: string): void; reject(error: Error): void }>();
+  private readonly titleAgents = new Map<string, { resolve(output: string): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
 
   constructor() {
     process.on("message", (message: SupervisorToWebMessage) => this.handleMessage(message));
@@ -22,6 +23,24 @@ export class TenantWorkerClient {
       this.jobs.clear();
       for (const steer of this.steers.values()) steer.reject(new Error("Tenant worker supervisor disconnected"));
       this.steers.clear();
+      for (const request of this.titleAgents.values()) { clearTimeout(request.timer); request.reject(new Error("Tenant worker supervisor disconnected")); }
+      this.titleAgents.clear();
+    });
+  }
+
+  generateConversationTitle(userId: string, prompt: string, timeoutMs: number): Promise<string> {
+    if (!process.send || !process.connected) return Promise.reject(new Error("Tenant worker isolation is unavailable"));
+    const requestId = crypto.randomUUID();
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.titleAgents.delete(requestId);
+        reject(new Error(`Codex title request timed out after ${Math.ceil(timeoutMs / 1000)} seconds`));
+      }, timeoutMs + 15_000);
+      this.titleAgents.set(requestId, { resolve, reject, timer });
+      process.send!({ kind: "tenant_title_agent", requestId, request: { userId, prompt, timeoutMs } } satisfies WebToSupervisorMessage, (error) => {
+        if (!error) return;
+        clearTimeout(timer); this.titleAgents.delete(requestId); reject(error);
+      });
     });
   }
 
@@ -64,7 +83,17 @@ export class TenantWorkerClient {
   }
 
   private handleMessage(message: SupervisorToWebMessage): void {
-    if (!message || typeof message !== "object" || !("jobId" in message)) return;
+    if (!message || typeof message !== "object") return;
+    if (message.kind === "tenant_title_agent_result") {
+      const pending = this.titleAgents.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer); this.titleAgents.delete(message.requestId);
+      if (message.error) pending.reject(new Error(message.error));
+      else if (typeof message.output === "string") pending.resolve(message.output);
+      else pending.reject(new Error("Codex title request returned no output"));
+      return;
+    }
+    if (!("jobId" in message)) return;
     const pending = this.jobs.get(message.jobId);
     if (!pending) return;
     if (message.kind === "tenant_worker_exit") {
