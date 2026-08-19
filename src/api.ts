@@ -50,6 +50,10 @@ export type WakePlan = {
   success_prompt: string;
   failure_prompt: string;
   timeout_prompt: string;
+  agent_model: string;
+  reasoning_effort: string;
+  new_conversation: number;
+  target_conversation_id: string | null;
   trigger_cause: "success" | "failure" | "deadline" | "manual" | null;
   triggered_at: string | null;
   cancelled_at: string | null;
@@ -63,7 +67,7 @@ export type WakePlan = {
   updated_at: string;
 };
 export type WakeEvent = { wake_plan_id: string; event_id: string; kind: string; summary: string | null; accepted: number; created_at: string };
-export type Job = { id: string; status: string; conversation_id: string; queuePosition?: number };
+export type Job = { id: string; status: string; conversation_id: string; error?: string | null; updated_at?: string; queuePosition?: number };
 // The online Codex catalog is authoritative. Keep this open so a newer CLI can
 // expose a new reasoning level without requiring a front-end release first.
 export type ReasoningEffort = string;
@@ -75,11 +79,13 @@ export type AgentOptions = {
   selection: AgentSelection;
 };
 export type AgentSelection = { model: string; reasoningEffort: ReasoningEffort };
+export type SubagentStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+export type SubagentEventState = { id: string; path?: string; status: SubagentStatus; summary?: string };
 export type JobEvent = {
   seq?: number;
   type?: string;
   created_at?: string;
-  kind?: "status" | "reasoning" | "update" | "command" | "file" | "search" | "tool" | "todo" | "error" | string;
+  kind?: "status" | "reasoning" | "update" | "command" | "file" | "search" | "tool" | "todo" | "error" | "retry" | string;
   label?: string;
   detail?: string;
   files?: string[];
@@ -88,6 +94,7 @@ export type JobEvent = {
   queuePosition?: number;
   jobsAhead?: number;
   message?: string;
+  agents?: SubagentEventState[];
 };
 export type ConversationDetail = {
   conversation: Conversation;
@@ -145,7 +152,7 @@ export const api = {
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   conversations: (query = "") => request<{ conversations: Conversation[] }>(`/conversations${query ? `?query=${encodeURIComponent(query)}` : ""}`),
   archivedConversations: (query = "") => request<{ conversations: Conversation[] }>(`/conversations/archived${query ? `?query=${encodeURIComponent(query)}` : ""}`),
-  agentOptions: () => request<AgentOptions>("/agent-options"),
+  agentOptions: (options: { conversationId?: string } = {}) => request<AgentOptions>(`/agent-options${options.conversationId ? `?conversationId=${encodeURIComponent(options.conversationId)}` : ""}`),
   updateAgentSelection: (selection: AgentSelection, conversationId?: string) => request<{ selection: AgentSelection }>(
     conversationId ? `/conversations/${conversationId}/agent-selection` : "/agent-selection",
     { method: "PUT", body: JSON.stringify(selection) },
@@ -153,7 +160,9 @@ export const api = {
   updateChatFontSize: (chatFontSize: number) => request<{ chatFontSize: number }>("/user-settings/chat-font-size", {
     method: "PUT", body: JSON.stringify({ chatFontSize }),
   }),
-  createConversation: () => request<{ conversation: Conversation; agentSelection: AgentSelection }>("/conversations", { method: "POST" }),
+  createConversation: (reuseEmpty = true) => request<{ conversation: Conversation; agentSelection: AgentSelection; reused: boolean }>("/conversations", {
+    method: "POST", body: JSON.stringify({ reuseEmpty }),
+  }),
   conversation: (id: string) => request<ConversationDetail>(`/conversations/${id}`),
   conversationActivity: (id: string) => request<ConversationActivity>(`/conversations/${id}/activity`),
   conversationMessages: (id: string, before: string) => request<ConversationMessagesPage>(
@@ -165,7 +174,10 @@ export const api = {
   archiveConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/archive`, { method: "POST" }),
   restoreConversation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${id}/restore`, { method: "POST" }),
   cancelConversation: (id: string) => request<{ ok: true }>(`/conversations/${id}/cancel`, { method: "POST" }),
-  createTimeWake: (id: string, input: { delaySeconds: number; label?: string; prompt: string }) => request<{ wakePlan: WakePlan }>(
+  createTimeWake: (id: string, input: { delaySeconds: number; label?: string; prompt: string; newConversation: boolean; model: string; reasoningEffort: string }) => request<{
+    wakePlan: WakePlan;
+    targetConversation?: Conversation;
+  }>(
     `/conversations/${id}/wake-plans`, { method: "POST", body: JSON.stringify(input) },
   ),
   activeWake: (id: string) => request<{ wakePlan: WakePlan | null }>(`/conversations/${id}/wake-plans/active`),

@@ -13,7 +13,7 @@ import { startTenantTurn } from "./tenant-worker-execution.js";
 import { TenantWorkerClient } from "./tenant-worker-client.js";
 import type { TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
 import type { AppServerTurnExecution, CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
-import { isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
+import { isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
 import { buildAgentSteerPrompt, buildAgentTurnPrompt, type AgentAttachmentContext } from "./agent-context.js";
 import { detectOptionalAgentCapabilities } from "./optional-capabilities.js";
 import { latestUserCancellationContext } from "./cancellation-summary.js";
@@ -42,6 +42,25 @@ export const AUTO_TITLE_OUTPUT_SCHEMA = {
 } as const;
 
 type AutoTitleEnvelope = { answer: string; title: string };
+
+export function isMeaningfulExecutionProgress(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return true;
+  const record = payload as { kind?: unknown; status?: unknown };
+  if (record.kind === "status" || record.kind === "error" || typeof record.status === "string") return false;
+  return typeof record.kind === "string";
+}
+
+export function isModelCapacityProgress(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const record = payload as { kind?: unknown; label?: unknown; detail?: unknown; message?: unknown };
+  if (record.kind !== "error") return false;
+  return [record.label, record.detail, record.message].some((value) => typeof value === "string" && isModelCapacityError(value));
+}
+
+export function retryDelayLabel(delayMs: number): string {
+  if (delayMs < 60_000) return `${delayMs / 1_000} 秒`;
+  return `${delayMs / 60_000} 分钟`;
+}
 
 function parseAutoTitleEnvelope(raw: string): AutoTitleEnvelope | null {
   const trimmed = raw.trim();
@@ -143,6 +162,10 @@ export class CodexRunner {
   async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection): Promise<void> {
     const controller = new AbortController();
     let runtimeRoot: string | undefined;
+    let executionObserved = false;
+    let capacityAttemptHadProgress = false;
+    let capacityAttemptReportedError = false;
+    let lastRetryWasCapacity = false;
     this.abortControllers.set(jobId, controller);
     try {
       const conversation = this.db.getConversation(conversationId);
@@ -209,22 +232,36 @@ export class CodexRunner {
       };
       const callbacks = {
         onThreadStarted: (threadId: string) => {
+          executionObserved = true;
           request.codexThreadId = threadId;
           this.db.updateConversation(conversationId, { codexThreadId: threadId });
         },
         onContextUsage: (usage: ContextTokenUsage) => {
+          executionObserved = true;
           this.db.setConversationContextUsage(conversationId, usage);
         },
         onQuotaUsage: (usage: CodexQuotaUsage) => {
+          executionObserved = true;
           this.db.setConversationCodexQuota(conversationId, usage);
         },
-        onProgress: (payload: unknown) => this.publish(jobId, "progress", payload),
+        onProgress: (payload: unknown) => {
+          executionObserved = true;
+          if (isMeaningfulExecutionProgress(payload)) capacityAttemptHadProgress = true;
+          if (isModelCapacityProgress(payload)) capacityAttemptReportedError = true;
+          this.publish(jobId, "progress", payload);
+        },
       };
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
+        capacityAttemptHadProgress = false;
+        capacityAttemptReportedError = false;
         if (retryAttempt > 0) {
+          this.publish(jobId, "progress", {
+            kind: "retry",
+            label: lastRetryWasCapacity ? `正在进行第 ${retryAttempt} 次容量重试` : `正在进行第 ${retryAttempt} 次连接重试`,
+          });
           this.publish(jobId, "status", {
             status: "running",
-            label: `正在进行第 ${retryAttempt}/3 次自动重试`,
+            label: `正在进行第 ${retryAttempt} 次自动重试`,
           });
         }
         if (this.workerClient) return this.workerClient.run(request, callbacks);
@@ -234,14 +271,27 @@ export class CodexRunner {
         finally { if (this.directExecutions.get(jobId) === execution) this.directExecutions.delete(jobId); }
       }, {
         signal: controller.signal,
-        onRetry: ({ attempt, maxAttempts, delayMs }) => this.publish(jobId, "status", {
-          status: "retrying",
-          label: "上游连接短暂中断，正在自动重试",
-          retryAttempt: attempt,
-          retryMaxAttempts: maxAttempts,
-          retryDelaySeconds: delayMs / 1000,
-          retryAt: new Date(Date.now() + delayMs).toISOString(),
-        }),
+        canRetry: (error) => isModelCapacityError(error) ? !capacityAttemptHadProgress : !executionObserved,
+        onRetry: ({ attempt, maxAttempts, delayMs, message }) => {
+          const capacityError = isModelCapacityError(message);
+          lastRetryWasCapacity = capacityError;
+          if (capacityError) {
+            if (!capacityAttemptReportedError) this.publish(jobId, "progress", { kind: "error", label: redactBrandForDisplay(message) });
+            this.publish(jobId, "progress", {
+              kind: "retry",
+              label: `容量不足，将在 ${retryDelayLabel(delayMs)} 后进行第 ${attempt} 次重试`,
+              detail: `本次没有检测到新的命令、文件或阶段进展；系统会持续重试，直到你主动停止任务。错误：${redactBrandForDisplay(message)}`,
+            });
+          }
+          this.publish(jobId, "status", {
+            status: "retrying",
+            label: capacityError ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次重试` : "上游连接短暂中断，正在自动重试",
+            retryAttempt: attempt,
+            ...(maxAttempts !== undefined ? { retryMaxAttempts: maxAttempts } : {}),
+            retryDelaySeconds: delayMs / 1000,
+            retryAt: new Date(Date.now() + delayMs).toISOString(),
+          });
+        },
       });
 
       this.publish(jobId, "status", { status: "running", label: "正在登记结果文件" });
@@ -305,15 +355,20 @@ export class CodexRunner {
       this.publish(jobId, "done", { status: "completed" });
       if (shouldGenerateTitle) this.scheduleConversationTitle(conversationId, conversation.user_id, jobId, prompt, uploads.map((file) => file.original_name));
     } catch (error) {
-      const cancelled = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
-      const message = cancelled ? "任务已停止" : error instanceof Error ? redactBrandForDisplay(error.message) : "Agent 任务失败";
+      const cancelled = controller.signal.aborted;
+      const interrupted = !cancelled && error instanceof Error && (
+        error.name === "TurnInterruptedError" || (executionObserved && isConnectionInterruptionError(error))
+      );
+      const message = cancelled ? "任务已停止" : interrupted
+        ? "连接在本轮开始后中断。为避免重复执行命令或外部副作用，系统没有整轮重试；请确认现场状态后再继续。"
+        : error instanceof Error ? redactBrandForDisplay(error.message) : "Agent 任务失败";
       try {
-        this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : "failed", message);
+        this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message);
       } catch {
         // Keep a single failed job from becoming an unhandled rejection that terminates the service.
       }
       try {
-        this.publish(jobId, cancelled ? "done" : "failed", { status: cancelled ? "cancelled" : "failed", message });
+        this.publish(jobId, cancelled ? "done" : "failed", { status: cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message });
       } catch {
         // The database may already be unavailable; the service must stay alive for recovery and diagnostics.
       }

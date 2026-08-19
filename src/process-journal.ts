@@ -1,7 +1,7 @@
 import type { JobEvent } from "./api";
 
 const NARRATIVE_KINDS = new Set(["reasoning", "update"]);
-const ACTION_KINDS = new Set(["command", "file", "search", "tool", "error"]);
+const ACTION_KINDS = new Set(["command", "file", "search", "tool", "error", "retry"]);
 
 export type ProcessJournalEvent = JobEvent & {
   actionCount?: number;

@@ -9,6 +9,10 @@ Codex Web can persist a one-shot continuation after the current Agent turn ends.
 
 The active plan is stored in SQLite. When it triggers, its selected prompt becomes a normal queued prompt and follows the same per-conversation serialization rules as browser submissions. A resumed turn must create another plan if more waiting is required.
 
+The browser scheduling dialog can continue in the current conversation or create a fresh target immediately. The new target owns the visible armed plan and starts without a Codex thread or inherited messages. The dialog loads the current model catalog, persists the selected model/reasoning pair, and shows that pair on the armed-plan card.
+
+Agent-created plans inherit the running job's model and reasoning effort. CLI `--model` and `--reasoning-effort` overrides are optional and should be passed only when the user explicitly asks for a different selection. `--new-conversation true` likewise requires an explicit fresh-conversation intent.
+
 ## Agent CLI
 
 Running jobs receive these shell variables:
@@ -19,6 +23,8 @@ Running jobs receive these shell variables:
 - `CODEX_WEB_AUTOMATION_TOKEN`: a signed, short-lived, job-scoped bearer token.
 
 Run `node "$CODEX_WEB_WAIT_CLI" --help` before creating a plan. The `event` command writes a receipt containing the external callback credential. Keep that file in a protected runtime directory that remains available to the external supervisor.
+
+Both `after` and `event` accept optional `--new-conversation true --model MODEL --reasoning-effort EFFORT`. Omit them for the default same-conversation, inherited-selection behavior.
 
 ## Security properties
 

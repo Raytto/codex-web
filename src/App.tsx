@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
+  Archive, ArrowLeft, ArrowUp, Bot, Check, ChevronDown, CircleDashed, Clock3, Download, Eye, File as FileIcon, FileImage, FileText, FolderOpen, Gauge, HardDrive,
   Copy, CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Share2, Square, Sun,
   Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
@@ -22,6 +22,7 @@ import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { formatContextUsage, formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 import { recoverBrowserSession } from "./session-recovery";
+import { buildSubagentActivity, subagentStatusLabel } from "./subagent-activity";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
@@ -347,6 +348,7 @@ function PublicFilePreviewPage({ fileId }: { fileId: string }) {
 function Workspace({ session, onLogout, themePreference, onThemePreferenceChange }: { session: Session; onLogout: () => void; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(() => window.localStorage.getItem(SELECTED_CONVERSATION_KEY));
+  const [conversationSelectionReady, setConversationSelectionReady] = useState(false);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -372,6 +374,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
   const [taskMenu, setTaskMenu] = useState<{ conversationId: string; top: number; left: number } | null>(null);
   const [archivedDialogOpen, setArchivedDialogOpen] = useState(false);
+  const [wakeDialogConversation, setWakeDialogConversation] = useState<Conversation | null>(null);
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const [archivedLoading, setArchivedLoading] = useState(false);
   const [chatFontSize, setChatFontSize] = useState(() => normalizeChatFontSize(session.chatFontSize, CHAT_FONT_SIZE_DEFAULT));
@@ -404,6 +407,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const draftMutationGenerationRef = useRef(new Map<string, number>());
   const draftSaveTimerRef = useRef<number | null>(null);
   const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const creatingConversationRef = useRef(false);
   const queryRef = useRef(query);
   selectedIdRef.current = selectedId;
   detailRef.current = detail;
@@ -582,15 +586,18 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       }
     }
     lastEventIdRef.current = result.jobEvents.at(-1)?.seq ?? 0;
-    if (result.latestJob?.status === "failed") setError(result.jobEvents.findLast((event) => event.message)?.message || "任务处理失败");
+    if (["failed", "interrupted"].includes(result.latestJob?.status ?? "") && !result.latestJob?.error) {
+      setError(result.jobEvents.findLast((event) => event.message)?.message || "任务处理失败");
+    }
     return result;
   }, [applyActivitySnapshot, syncConversation]);
 
   useEffect(() => {
     void refreshList().then((items) => {
       const next = chooseSelectedConversation(selectedIdRef.current, items);
-      if (next !== selectedIdRef.current) setSelectedId(next);
-    });
+      if (next !== selectedIdRef.current) { selectedIdRef.current = next; setSelectedId(next); }
+    }).catch((reason) => setError(reason instanceof Error ? reason.message : "任务列表加载失败"))
+      .finally(() => setConversationSelectionReady(true));
   }, [refreshList]);
   useEffect(() => {
     const timer = window.setTimeout(() => void refreshList(query).catch((reason) => {
@@ -811,7 +818,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (data.type && ["done", "failed"].includes(data.type)) {
         setActivitiesLoading(false);
         source.close(); connectedJobRef.current = null;
-        if (data.type === "failed") setError(data.message || "任务处理失败");
+        if (data.type === "failed" && !data.message) setError("任务处理失败");
         void reconcile(activeJob.conversation_id);
       }
     };
@@ -847,9 +854,20 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function newConversation() {
-    setError(""); const result = await api.createConversation();
-    setSelectedModel(result.agentSelection.model); setReasoningEffort(result.agentSelection.reasoningEffort);
-    await refreshList(); setSelectedId(result.conversation.id);
+    if (creatingConversationRef.current) return;
+    creatingConversationRef.current = true;
+    setError("");
+    try {
+      const result = await api.createConversation();
+      setSelectedModel(result.agentSelection.model); setReasoningEffort(result.agentSelection.reasoningEffort);
+      selectedIdRef.current = result.conversation.id;
+      await refreshList();
+      setSelectedId(result.conversation.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "新任务创建失败");
+    } finally {
+      creatingConversationRef.current = false;
+    }
   }
 
   async function mergeCompletedDraftUpload(conversationId: string, upload: DraftUpload, result: { composerDraft: ComposerDraft; uploadedFiles: WorkFile[] }) {
@@ -1230,18 +1248,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   async function scheduleWake(conversation: Conversation) {
     setTaskMenu(null);
-    const rawMinutes = window.prompt("多少分钟后自动继续？", "60");
-    if (rawMinutes === null) return;
-    const minutes = Number(rawMinutes);
-    if (!Number.isFinite(minutes) || minutes <= 0) { setError("请输入大于 0 的分钟数。"); return; }
-    const prompt = window.prompt("届时交给 Agent 的续跑指令：", "继续检查当前任务并向我报告最新结果。");
-    if (!prompt?.trim()) return;
-    try {
-      await api.createTimeWake(conversation.id, { delaySeconds: Math.max(1, Math.round(minutes * 60)), prompt: prompt.trim() });
-      setNotice("已登记自动续跑计划。");
-      await refreshList();
-      if (selectedIdRef.current === conversation.id) await refreshDetail(conversation.id);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "自动续跑登记失败"); }
+    setWakeDialogConversation(conversation);
   }
 
   async function cancelActiveWake(conversation: Conversation) {
@@ -1343,7 +1350,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   const filtered = conversations;
   const currentDetail = detail?.conversation.id === selectedId ? detail : null;
-  const loadingConversation = Boolean(selectedId && !currentDetail);
+  const restoringConversationSelection = !conversationSelectionReady;
+  const loadingConversation = restoringConversationSelection || Boolean(selectedId && !currentDetail);
   const taskMenuConversation = taskMenu ? conversations.find((conversation) => conversation.id === taskMenu.conversationId) : undefined;
   const account = resolveAccountIdentity(session);
 
@@ -1363,7 +1371,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
               <FolderOpen size={16} /><span>{conversation.title}</span>
               {conversation.status === "running"
                 ? <LoaderCircle size={14} className="spin" role="img" aria-label="正在执行" />
-                : Boolean(conversation.has_pending_work)
+                : Boolean(conversation.has_pending_work) && !conversation.active_wake_count
                   ? <CircleDashed size={14} className="conversation-waiting" role="img" aria-label="等待发送" />
                   : Boolean(conversation.active_wake_count)
                     ? <Clock3 size={14} className="conversation-waiting" role="img" aria-label="等待自动续跑" />
@@ -1437,15 +1445,24 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </section>
     </div>, document.body)}
 
+    {wakeDialogConversation && createPortal(<WakePlanDialog conversation={wakeDialogConversation} onClose={() => setWakeDialogConversation(null)} onCreated={(result) => {
+      setWakeDialogConversation(null);
+      setNotice("已登记自动续跑计划。");
+      const nextId = result.targetConversation?.id ?? wakeDialogConversation.id;
+      selectedIdRef.current = nextId;
+      setSelectedId(nextId);
+      void refreshList().then(() => refreshDetail(nextId));
+    }} />, document.body)}
+
     <main className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="mobile-header"><button className="icon-button" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark"><span className="brand-mark small"><Zap size={14} /></span><span className="brand-copy"><strong>Codex Web</strong><small>SELF-HOSTED CODEX WORKSTATION</small></span></div></header>
       {currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={(plan) => cancelActiveWake(currentDetail.conversation).then(() => undefined)} onPostponeWake={postponeWake} onTriggerWake={triggerWake} />
-        : loadingConversation ? <ConversationLoading />
+        : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {error && <div className="toast"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
       {currentDetail?.conversation.archived_at && <div className="archived-conversation-banner"><Archive size={15} /><span>这个任务已归档，历史内容仍可查看。</span><button type="button" onClick={() => void restoreConversation(currentDetail.conversation)}>恢复任务</button></div>}
-      {(!selectedId || (currentDetail && !currentDetail.conversation.archived_at)) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
+      {conversationSelectionReady && (!selectedId || (currentDetail && !currentDetail.conversation.archived_at)) && <Composer key={selectedId ?? "new-conversation"} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving} voiceEnabled={Boolean(session.voiceEnabled)}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -1461,8 +1478,73 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   </div>;
 }
 
-function ConversationLoading() {
-  return <section className="conversation-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={23} /><span>正在加载任务…</span></section>;
+function WakePlanDialog({ conversation, onClose, onCreated }: {
+  conversation: Conversation;
+  onClose: () => void;
+  onCreated: (result: Awaited<ReturnType<typeof api.createTimeWake>>) => void;
+}) {
+  const [delay, setDelay] = useState("2");
+  const [unit, setUnit] = useState<"minutes" | "hours" | "days">("hours");
+  const [label, setLabel] = useState("两小时后自动继续");
+  const [prompt, setPrompt] = useState("请检查之前任务的最新状态和结果，并从中断处继续；如果仍需等待，请根据实际情况再次安排下一次自动续跑。");
+  const [newConversation, setNewConversation] = useState(false);
+  const [options, setOptions] = useState<AgentOptions | null>(null);
+  const [model, setModel] = useState("");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void api.agentOptions({ conversationId: conversation.id }).then((value) => {
+      if (!active) return;
+      setOptions(value); setModel(value.selection.model); setReasoningEffort(value.selection.reasoningEffort);
+    }).catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "续跑模型选项加载失败"); });
+    return () => { active = false; };
+  }, [conversation.id]);
+
+  const selectedModel = options?.models.find((item) => item.id === model);
+  const effortOptions = options?.reasoningEfforts.filter((item) => selectedModel?.reasoningEfforts.includes(item.id)) ?? [];
+  function changeModel(value: string) {
+    setModel(value);
+    const modelOption = options?.models.find((item) => item.id === value);
+    if (!modelOption?.reasoningEfforts.includes(reasoningEffort)) setReasoningEffort(modelOption?.reasoningEfforts[0] ?? "");
+  }
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const amount = Number(delay);
+    const multiplier = unit === "minutes" ? 60 : unit === "hours" ? 3_600 : 86_400;
+    if (!Number.isFinite(amount) || amount <= 0 || !prompt.trim() || !model || !reasoningEffort) {
+      setError("请填写有效的等待时间、续跑指令、模型和思考深度。"); return;
+    }
+    setBusy(true); setError("");
+    try {
+      onCreated(await api.createTimeWake(conversation.id, {
+        delaySeconds: Math.max(1, Math.round(amount * multiplier)), label: label.trim(), prompt: prompt.trim(),
+        newConversation, model, reasoningEffort,
+      }));
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "自动续跑安排失败"); setBusy(false); }
+  }
+  return <div className="wake-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <form className="wake-dialog" role="dialog" aria-modal="true" aria-labelledby="wake-dialog-title" onSubmit={submit}>
+      <header><div><h2 id="wake-dialog-title">安排自动续跑</h2><p>“{conversation.title}”会在时间到达后{newConversation ? "在新会话中" : "回到原会话"}继续。</p></div><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭"><X size={18} /></button></header>
+      <div className="wake-dialog-body">
+        <label>等待时间<div className="wake-delay-row"><input type="number" min="0.1" step="0.1" value={delay} onChange={(event) => setDelay(event.target.value)} /><select value={unit} onChange={(event) => setUnit(event.target.value as typeof unit)}><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label>
+        <label>显示名称<input maxLength={120} value={label} onChange={(event) => setLabel(event.target.value)} /></label>
+        <label className="wake-conversation-toggle"><input type="checkbox" checked={newConversation} onChange={(event) => setNewConversation(event.target.checked)} /><span><strong>新建会话继续</strong><small>{newConversation ? "安排时立即创建一个新会话，等待与结果都留在新会话。" : "保持关闭时，到点后接着当前会话继续。"}</small></span></label>
+        <div className="wake-selection-row"><label>续跑模型<select disabled={!options} value={model} onChange={(event) => changeModel(event.target.value)}>{options?.models.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><label>思考深度<select disabled={!options || effortOptions.length === 0} value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value)}>{effortOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div>
+        {options && <p className="wake-selection-summary">本次续跑：{selectedModel?.label ?? model} · {effortOptions.find((item) => item.id === reasoningEffort)?.label ?? reasoningEffort}</p>}
+        <label>到点后交给 Codex 的指令<textarea maxLength={20_000} rows={6} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+        <p className="wake-plan-note"><Clock3 size={14} />等待不占用 Worker，也不会使用 sleep 保持任务。</p>
+        {error && <div className="wake-dialog-error">{error}</div>}
+      </div>
+      <footer><button type="button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={busy || !options}>{busy ? "正在安排…" : "确认安排"}</button></footer>
+    </form>
+  </div>;
+}
+
+function ConversationLoading({ restoring = false }: { restoring?: boolean }) {
+  return <section className="conversation-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={23} /><span>{restoring ? "正在恢复上次任务…" : "正在加载任务…"}</span></section>;
 }
 
 function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
@@ -1499,6 +1581,7 @@ function AssistantMarkdown({ content, files, citationFiles }: { content: string;
 
 function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void> }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
+  const latestJobError = detail.latestJob && ["failed", "interrupted"].includes(detail.latestJob.status) ? detail.latestJob.error?.trim() ?? "" : "";
   const chatRef = useRef<HTMLElement>(null);
   const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
 
@@ -1573,6 +1656,9 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
           {message.files.length > 0 && <div className="file-grid">{message.files.map((file) => <FileCard key={file.id} file={file} />)}</div>}
         </div>
       </article>)}
+      {latestJobError && <article className="message system error" data-message-id={`job-error-${detail.latestJob?.id}`}>
+        <div className="message-avatar"><TriangleAlert size={16} /></div><div className="message-body"><div className="message-meta"><span className="message-name">任务错误</span>{detail.latestJob?.updated_at && <time dateTime={detail.latestJob.updated_at}>{formatMessageDateTime(detail.latestJob.updated_at)}</time>}</div><div className="error-bubble" role="alert"><TriangleAlert size={17} /><div><strong>任务未完成</strong><p data-agent-selectable="true">{latestJobError}</p></div></div></div>
+      </article>}
       {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} />}
       {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={detail.conversation.id} activities={activities} loading={activitiesLoading} /></div></article>}
       <div />
@@ -1589,7 +1675,7 @@ function WakePlanCard({ plan, onCancel, onPostpone, onTrigger }: { plan: WakePla
   };
   return <section className="wake-plan-card" aria-label="自动续跑计划">
     <div className="wake-plan-icon"><Clock3 size={18} /></div>
-    <div className="wake-plan-copy"><strong>{plan.label || "自动续跑"}</strong><span>{plan.mode === "event_or_deadline" ? "等待外部事件，最晚" : "将在"} {formatFullDateTime(plan.deadline_at)}继续</span></div>
+    <div className="wake-plan-copy"><strong>{plan.label || "自动续跑"}</strong><span>{plan.mode === "event_or_deadline" ? "等待外部事件，最晚" : "将在"} {formatFullDateTime(plan.deadline_at)}继续</span><small>{plan.new_conversation ? "新会话" : "当前会话"} · {plan.agent_model} · {plan.reasoning_effort}</small></div>
     <div className="wake-plan-actions">
       <button type="button" disabled={busy} onClick={() => void run(onPostponeWake)}><Clock3 size={14} />延后 30 分钟</button>
       <button type="button" disabled={busy} onClick={() => void run(onTriggerWake)}><Play size={14} />立即继续</button>
@@ -1608,6 +1694,7 @@ function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading
   const retrying = !queued && latestStatus?.status === "retrying";
   const plan = activities.findLast((activity) => activity.kind === "todo" && Boolean(activity.items?.length));
   const journal = buildProcessJournal(activities);
+  const subagents = buildSubagentActivity(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
 
   return <div className="activity-card" role="status" aria-live="polite">
@@ -1615,14 +1702,15 @@ function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
+    {subagents.agents.length > 0 && <div className="subagent-panel"><div className="process-section-title"><strong>协作 Agent</strong><span>{subagents.active.length ? `${subagents.active.length} 个运行中` : `${subagents.completedCount} 个已完成${subagents.failedCount ? ` · ${subagents.failedCount} 个异常` : ""}`}</span></div><div className="subagent-list">{subagents.agents.map((agent) => <div className={`subagent-row ${agent.status}`} key={agent.id}><span>{["pending", "running"].includes(agent.status) ? <LoaderCircle className="spin" size={13} /> : agent.status === "completed" ? <Check size={13} /> : <TriangleAlert size={13} />}</span><div><strong>{agent.name}</strong><small>{subagentStatusLabel(agent.status)}{agent.summary ? ` · ${agent.summary}` : ""}</small></div></div>)}</div></div>}
     <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
     <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
       ? <ProcessJournalNote activity={activity} key={activity.seq ?? `${activity.kind}-${index}`} />
       : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
-          {activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
+          {activity.kind === "error" ? <TriangleAlert size={14} /> : activity.kind === "retry" ? <Clock3 size={14} /> : activity.label?.startsWith("正在") ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
           <div><span>{activity.label}</span>{activity.created_at && <time dateTime={activity.created_at}>{formatActivityTime(activity.created_at)}</time>}
             {activity.kind === "file" && activity.files?.length ? <small>{activity.files.map((file) => file.split(/[\\/]/).at(-1)).join("、")}</small> : null}
-            {["search", "tool"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
+            {["search", "tool", "error", "retry"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
             {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>{activity.actionCount && activity.actionCount > 1 ? `查看 ${activity.actionCount} 个技术步骤` : "查看技术细节"}</summary><code>{activity.groupedDetails?.join("\n\n") || activity.detail}</code></details> : null}
           </div>
         </div>) : <p className="process-journal-empty">正在建立执行方向…</p>}</div>
@@ -1667,6 +1755,7 @@ function FileCard({ file }: { file: WorkFile }) {
   const icon = image ? null : <FileIcon size={20} />;
   const reader = fileReaderKind(file);
   const previewable = isBrowserPreviewable(file);
+  const previewHref = reader ? filePreviewUrl(file) : previewable ? fileUrl(file) : "";
   const body = <>{image && <img className="file-card-image" src={fileThumbnailUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
   return <div className={`file-card ${image ? "image-file-card" : ""}`}>
     {reader === "html"
@@ -1674,7 +1763,7 @@ function FileCard({ file }: { file: WorkFile }) {
       : reader === "markdown" || previewable
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
-    {reader === "markdown" && <a className="reader-button" href={filePreviewUrl(file)} target="_blank" rel="noreferrer" title="阅读模式" aria-label={`阅读 ${file.original_name}`}><BookOpen size={16} /></a>}
+    {previewHref && <a className="preview-button" href={previewHref} target="_blank" rel="noreferrer" title="预览" aria-label={`预览 ${file.original_name}`}><Eye size={16} /></a>}
     <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>
   </div>;
 }

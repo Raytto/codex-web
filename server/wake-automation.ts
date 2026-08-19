@@ -54,6 +54,7 @@ export const WAIT_AUTOMATION_INSTRUCTIONS = [
   "The CLI path is in CODEX_WEB_WAIT_CLI; authentication and the service URL are already available in the environment. Run its --help command before use.",
   "Use after for a timer. Use event for an external result with a deadline, and keep the receipt in a protected runtime directory that the supervisor can read later.",
   "Each wait plan is one-shot. A resumed turn must create another plan if it still needs to wait; do not keep a model turn alive with sleep or invoke a model-resume command from a supervisor.",
+  "By default the continuation inherits this job's model and reasoning effort. Pass --model and --reasoning-effort only when the user explicitly requested an override. Use --new-conversation true only when the user requested a fresh conversation.",
   "Only claim that continuation is scheduled after the CLI succeeds. Never expose CODEX_WEB_AUTOMATION_TOKEN, the receipt eventToken, or Authorization values in replies, logs, or deliverables.",
 ].join("\n");
 

@@ -57,6 +57,11 @@ type PendingRequest = {
 type RpcResponse = { id: number; result?: unknown; error?: { message?: string; data?: unknown } };
 type RpcNotification = { method: string; params?: JsonObject };
 
+export function appServerNotificationBelongsToThread(threadId: string | null, params: JsonObject): boolean {
+  const notificationThreadId = typeof params.threadId === "string" ? params.threadId : null;
+  return !threadId || !notificationThreadId || notificationThreadId === threadId;
+}
+
 class AppServerTurnClient {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, PendingRequest>();
@@ -64,6 +69,7 @@ class AppServerTurnClient {
   private threadId: string | null = null;
   private activeTurnId: string | null = null;
   private finalResponse = "";
+  private readonly subagents = new Map<string, { path?: string; summary?: string }>();
   private terminal = false;
   private stderr = "";
   private readonly completion: Promise<string>;
@@ -211,6 +217,10 @@ class AppServerTurnClient {
 
   private handleNotification(message: RpcNotification): void {
     const params = message.params ?? {};
+    if (!appServerNotificationBelongsToThread(this.threadId, params)) {
+      this.handleSubagentNotification(message.method, params);
+      return;
+    }
     if (message.method === "turn/started") {
       const turn = params.turn as { id?: string } | undefined;
       if (turn?.id) this.activeTurnId = turn.id;
@@ -238,11 +248,12 @@ class AppServerTurnClient {
     if (message.method === "item/started" || message.method === "item/completed") {
       const item = params.item as JsonObject | undefined;
       if (!item) return;
+      this.registerSubagent(item);
       if (item.type === "agentMessage" && message.method === "item/completed") {
         this.finalResponse = typeof item.text === "string" ? item.text : this.finalResponse;
         if (this.options.outputSchema) return;
       }
-      const progress = summarizeItem(item, message.method === "item/completed");
+      const progress = summarizeAppServerItem(item, message.method === "item/completed");
       if (progress) this.callbacks.onProgress(progress);
       return;
     }
@@ -259,6 +270,46 @@ class AppServerTurnClient {
     const error = new Error(turn?.error?.message || (turn?.status === "interrupted" ? "任务已停止" : "Agent 任务失败"));
     if (turn?.status === "interrupted" || this.callbacks.signal.aborted) error.name = "AbortError";
     this.rejectCompletion(error);
+  }
+
+  private registerSubagent(item: JsonObject): void {
+    if (item.type !== "subAgentActivity") return;
+    const id = typeof item.agentThreadId === "string" ? item.agentThreadId.trim().slice(0, 200) : "";
+    if (!id) return;
+    const path = typeof item.agentPath === "string" ? item.agentPath.trim().slice(0, 500) : "";
+    const current = this.subagents.get(id) ?? {};
+    this.subagents.set(id, { ...current, ...(path ? { path } : {}) });
+  }
+
+  private handleSubagentNotification(method: string, params: JsonObject): void {
+    const threadId = typeof params.threadId === "string" ? params.threadId : "";
+    const tracked = this.subagents.get(threadId);
+    if (!tracked) return;
+    if (method === "item/started" || method === "item/completed") {
+      const item = params.item as JsonObject | undefined;
+      if (!item) return;
+      if (item.type === "subAgentActivity") {
+        this.registerSubagent(item);
+        const progress = summarizeAppServerItem(item, method === "item/completed");
+        if (progress) this.callbacks.onProgress(progress);
+        return;
+      }
+      if (method === "item/completed" && item.type === "agentMessage"
+        && (item.phase === "final_answer" || item.phase === undefined) && typeof item.text === "string") {
+        const summary = redactBrand(sanitizeAgentMarkdown(item.text)).trim().slice(0, 2_000);
+        if (summary) this.subagents.set(threadId, { ...tracked, summary });
+      }
+      return;
+    }
+    if (method !== "turn/completed") return;
+    const turn = params.turn as { status?: string; error?: { message?: string } | null } | undefined;
+    const latest = this.subagents.get(threadId) ?? tracked;
+    const status = turn?.status === "completed" ? "completed" : turn?.status === "interrupted" ? "interrupted" : "failed";
+    const errorSummary = status === "failed" && turn?.error?.message ? redactBrand(sanitizeAgentMarkdown(turn.error.message)).trim().slice(0, 2_000) : "";
+    this.callbacks.onProgress({ kind: "agent", label: "协作 Agent 状态更新", agents: [{
+      id: threadId.slice(0, 200), ...(latest.path ? { path: latest.path } : {}), status,
+      ...(latest.summary || errorSummary ? { summary: latest.summary || errorSummary } : {}),
+    }] });
   }
 
   private fail(error: Error): void {
@@ -324,7 +375,9 @@ function makeUserInput(prompt: string, imagePaths: string[]): JsonObject[] {
   return input;
 }
 
-function summarizeItem(item: JsonObject, completed: boolean): unknown | null {
+export function summarizeAppServerItem(item: JsonObject, completed: boolean): unknown | null {
+  const subagent = summarizeSubagentItem(item);
+  if (subagent) return subagent;
   if (item.type === "reasoning") {
     const summary = [...asStringArray(item.summary), ...asStringArray(item.content)].join("\n\n").trim();
     return summary ? { kind: "reasoning", label: "模型思路摘要", detail: redactBrand(sanitizeAgentMarkdown(summary)) } : null;
@@ -346,6 +399,37 @@ function summarizeItem(item: JsonObject, completed: boolean): unknown | null {
     return detail ? { kind: "update", label: "阶段反馈", detail } : null;
   }
   return null;
+}
+
+function summarizeSubagentItem(item: JsonObject): unknown | null {
+  if (item.type === "subAgentActivity") {
+    const id = typeof item.agentThreadId === "string" ? item.agentThreadId.trim() : "";
+    if (!id) return null;
+    return { kind: "agent", label: "协作 Agent 状态更新", agents: [{
+      id, ...(typeof item.agentPath === "string" && item.agentPath.trim() ? { path: item.agentPath.trim().slice(0, 500) } : {}),
+      status: item.kind === "interrupted" ? "interrupted" : "running",
+    }] };
+  }
+  if (item.type !== "collabAgentToolCall") return null;
+  const rawStates = item.agentsStates && typeof item.agentsStates === "object" && !Array.isArray(item.agentsStates) ? item.agentsStates as JsonObject : {};
+  const receiverIds = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.filter((value): value is string => typeof value === "string" && Boolean(value.trim())).map((value) => value.trim()) : [];
+  const ids = [...new Set([...Object.keys(rawStates), ...receiverIds])];
+  if (!ids.length) return null;
+  const agents = ids.slice(0, 64).map((id) => {
+    const rawState = rawStates[id] && typeof rawStates[id] === "object" && !Array.isArray(rawStates[id]) ? rawStates[id] as JsonObject : {};
+    const summary = typeof rawState.message === "string" ? redactBrand(sanitizeAgentMarkdown(rawState.message)).trim().slice(0, 2_000) : "";
+    return { id: id.slice(0, 200), status: normalizeSubagentStatus(rawState.status, item.status), ...(summary ? { summary } : {}) };
+  });
+  return { kind: "agent", label: "协作 Agent 状态更新", agents };
+}
+
+function normalizeSubagentStatus(agentStatus: unknown, toolStatus: unknown): "pending" | "running" | "completed" | "failed" | "interrupted" {
+  if (agentStatus === "pendingInit") return "pending";
+  if (agentStatus === "running") return "running";
+  if (agentStatus === "completed" || agentStatus === "shutdown") return "completed";
+  if (agentStatus === "interrupted") return "interrupted";
+  if (agentStatus === "errored" || agentStatus === "notFound" || toolStatus === "failed") return "failed";
+  return "pending";
 }
 
 function asStringArray(value: unknown): string[] {

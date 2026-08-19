@@ -175,6 +175,8 @@ export type WakePlanRow = {
   success_prompt: string;
   failure_prompt: string;
   timeout_prompt: string;
+  new_conversation: number;
+  target_conversation_id: string | null;
   agent_model: string;
   reasoning_effort: string;
   event_token_hash: string | null;
@@ -204,6 +206,7 @@ export type WakeTriggerResult = {
   status: "triggered" | "heartbeat" | "duplicate" | "stale" | "missing";
   plan?: WakePlanRow;
   pendingPrompt?: PendingPromptWithFiles;
+  targetConversation?: ConversationRow;
 };
 
 export type ComposerDraftRow = {
@@ -445,6 +448,8 @@ export class AppDatabase {
         success_prompt TEXT NOT NULL,
         failure_prompt TEXT NOT NULL,
         timeout_prompt TEXT NOT NULL,
+        new_conversation INTEGER NOT NULL DEFAULT 0,
+        target_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
         agent_model TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
         event_token_hash TEXT,
@@ -581,6 +586,9 @@ export class AppDatabase {
     if (!messageColumns.has("quote_excerpt")) this.sqlite.exec("ALTER TABLE messages ADD COLUMN quote_excerpt TEXT");
     const pendingPromptColumns = this.columnNames("pending_prompts");
     if (!pendingPromptColumns.has("quote_excerpt")) this.sqlite.exec("ALTER TABLE pending_prompts ADD COLUMN quote_excerpt TEXT");
+    const wakePlanColumns = this.columnNames("wake_plans");
+    if (!wakePlanColumns.has("new_conversation")) this.sqlite.exec("ALTER TABLE wake_plans ADD COLUMN new_conversation INTEGER NOT NULL DEFAULT 0");
+    if (!wakePlanColumns.has("target_conversation_id")) this.sqlite.exec("ALTER TABLE wake_plans ADD COLUMN target_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL");
     const sessionColumns = this.columnNames("sessions");
     if (!sessionColumns.has("user_id")) this.sqlite.exec("ALTER TABLE sessions ADD COLUMN user_id TEXT REFERENCES users(id)");
     const jobColumns = this.columnNames("jobs");
@@ -729,6 +737,72 @@ export class AppDatabase {
       id, userId, title, selection?.model ?? null, selection?.reasoningEffort ?? null, now, now,
     );
     return this.getConversation(id)!;
+  }
+
+  findReusableEmptyConversation(userId: string): ConversationRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT ${conversationSelect} FROM conversations
+      WHERE user_id=? AND title='新任务' AND title_source='default'
+        AND status='idle' AND codex_thread_id IS NULL
+        AND has_unread_result=0 AND unread_anchor_message_id IS NULL
+        AND rollout_bytes IS NULL AND context_input_tokens IS NULL AND context_window_tokens IS NULL
+        AND context_usage_updated_at IS NULL AND archived_at IS NULL AND deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.conversation_id=conversations.id)
+        AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id)
+        AND NOT EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id)
+        AND NOT EXISTS (
+          SELECT 1 FROM composer_drafts
+          WHERE composer_drafts.conversation_id=conversations.id
+            AND (composer_drafts.content<>'' OR composer_drafts.quote_excerpt IS NOT NULL)
+        )
+        AND NOT EXISTS (SELECT 1 FROM files WHERE files.conversation_id=conversations.id)
+        AND NOT EXISTS (
+          SELECT 1 FROM resumable_uploads
+          WHERE resumable_uploads.conversation_id=conversations.id
+            AND resumable_uploads.state IN ('uploading','finalizing')
+        )
+        AND NOT EXISTS (SELECT 1 FROM wake_plans WHERE wake_plans.conversation_id=conversations.id)
+      ORDER BY updated_at DESC,created_at DESC,id DESC LIMIT 1
+    `).get(userId) as ConversationRow | undefined;
+  }
+
+  reuseEmptyConversationForNewTask(userId: string): ConversationRow | undefined {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const reusable = this.findReusableEmptyConversation(userId);
+      if (!reusable) {
+        this.sqlite.exec("COMMIT");
+        return undefined;
+      }
+      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(new Date().toISOString(), reusable.id);
+      const promoted = this.getConversationForUser(reusable.id, userId);
+      if (!promoted) throw new Error("Reusable conversation could not be reloaded");
+      this.sqlite.exec("COMMIT");
+      return promoted;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  createOrReuseEmptyConversation(id: string, selection: StoredAgentSelection, userId: string): { conversation: ConversationRow; reused: boolean } {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const reusable = this.findReusableEmptyConversation(userId);
+      if (reusable) {
+        this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(new Date().toISOString(), reusable.id);
+        const promoted = this.getConversationForUser(reusable.id, userId);
+        if (!promoted) throw new Error("Reusable conversation could not be reloaded");
+        this.sqlite.exec("COMMIT");
+        return { conversation: promoted, reused: true };
+      }
+      const conversation = this.createConversation(id, "新任务", selection, userId);
+      this.sqlite.exec("COMMIT");
+      return { conversation, reused: false };
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   updateConversation(id: string, fields: { title?: string; titleSource?: ConversationTitleSource; codexThreadId?: string; agentSelection?: StoredAgentSelection; status?: "idle" | "running" }): void {
@@ -1362,25 +1436,43 @@ export class AppDatabase {
     successPrompt: string;
     failurePrompt: string;
     timeoutPrompt: string;
+    newConversation?: boolean;
     selection: StoredAgentSelection;
     eventTokenHash?: string | null;
   }): WakePlanRow {
-    const conversation = this.getConversation(input.conversationId);
-    if (!conversation || conversation.deleted_at || conversation.archived_at) throw new Error("会话不存在或已归档");
+    const sourceConversation = this.getConversation(input.conversationId);
+    if (!sourceConversation || sourceConversation.deleted_at || sourceConversation.archived_at) throw new Error("会话不存在或已归档");
     const now = new Date().toISOString();
-    this.sqlite.prepare(`
-      INSERT INTO wake_plans(
-        id,conversation_id,created_by_job_id,mode,state,label,run_id,deadline_at,
-        success_prompt,failure_prompt,timeout_prompt,agent_model,reasoning_effort,event_token_hash,
-        created_at,updated_at
-      ) VALUES(?,?,?,?,'armed',?,?,?,?,?,?,?,?,?,?,?)
-    `).run(
-      input.id, input.conversationId, input.createdByJobId ?? null, input.mode, input.label,
-      input.runId ?? null, input.deadlineAt, input.successPrompt, input.failurePrompt, input.timeoutPrompt,
-      input.selection.model, input.selection.reasoningEffort, input.eventTokenHash ?? null, now, now,
-    );
-    this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, input.conversationId);
-    return this.getWakePlan(input.id)!;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      let planConversation = sourceConversation;
+      let targetConversationId: string | null = null;
+      if (input.newConversation) {
+        planConversation = this.createConversation(
+          crypto.randomUUID(), continuationConversationTitle(input.label), input.selection, sourceConversation.user_id,
+        );
+        targetConversationId = planConversation.id;
+        this.sqlite.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(planConversation.id);
+      }
+      this.sqlite.prepare(`
+        INSERT INTO wake_plans(
+          id,conversation_id,created_by_job_id,mode,state,label,run_id,deadline_at,
+          success_prompt,failure_prompt,timeout_prompt,new_conversation,target_conversation_id,
+          agent_model,reasoning_effort,event_token_hash,created_at,updated_at
+        ) VALUES(?,?,?,?,'armed',?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        input.id, planConversation.id, input.createdByJobId ?? null, input.mode, input.label,
+        input.runId ?? null, input.deadlineAt, input.successPrompt, input.failurePrompt, input.timeoutPrompt,
+        input.newConversation ? 1 : 0, targetConversationId, input.selection.model, input.selection.reasoningEffort,
+        input.eventTokenHash ?? null, now, now,
+      );
+      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, planConversation.id);
+      this.sqlite.exec("COMMIT");
+      return this.getWakePlan(input.id)!;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getWakePlan(id: string): WakePlanRow | undefined {
@@ -1496,21 +1588,25 @@ export class AppDatabase {
       const prompt = cause === "success" ? plan.success_prompt
         : cause === "failure" ? plan.failure_prompt
         : plan.mode === "time" ? plan.success_prompt : plan.timeout_prompt;
+      const targetConversation = plan.target_conversation_id
+        ? this.getConversation(plan.target_conversation_id)
+        : this.getConversation(plan.conversation_id);
+      if (!targetConversation || targetConversation.deleted_at || targetConversation.archived_at) throw new Error("等待计划的目标会话不存在或已归档");
       this.sqlite.prepare("UPDATE pending_prompts SET position=position+1 WHERE conversation_id=? AND status='queued'")
-        .run(plan.conversation_id);
+        .run(targetConversation.id);
       this.sqlite.prepare(`
         INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
         VALUES(?,?,?,NULL,?,?,?,'queued',?,?)
-      `).run(pendingPromptId, plan.conversation_id, prompt, plan.agent_model, plan.reasoning_effort, 1, now, now);
+      `).run(pendingPromptId, targetConversation.id, prompt, plan.agent_model, plan.reasoning_effort, 1, now, now);
       this.sqlite.prepare(`
         UPDATE wake_plans SET state='triggered',trigger_cause=?,triggered_at=?,pending_prompt_id=?,
           last_event_at=?,last_event_kind=?,last_event_summary=?,updated_at=?
         WHERE id=? AND state='armed'
       `).run(cause, now, pendingPromptId, now, kind, summary, now, wakePlanId);
       this.sqlite.prepare("UPDATE wake_events SET accepted=1 WHERE wake_plan_id=? AND event_id=?").run(wakePlanId, eventId);
-      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, plan.conversation_id);
+      this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, targetConversation.id);
       this.sqlite.exec("COMMIT");
-      return { status: "triggered", plan: this.getWakePlan(wakePlanId), pendingPrompt: this.getPendingPrompt(pendingPromptId) };
+      return { status: "triggered", plan: this.getWakePlan(wakePlanId), pendingPrompt: this.getPendingPrompt(pendingPromptId), targetConversation };
     } catch (error) {
       this.sqlite.exec("ROLLBACK");
       throw error;
@@ -1774,4 +1870,9 @@ export class AppDatabase {
   close(): void {
     this.sqlite.close();
   }
+}
+
+function continuationConversationTitle(label: string): string {
+  const normalized = label.trim().replace(/\s+/g, " ").slice(0, 80);
+  return normalized ? `${normalized} · 续跑` : "自动续跑";
 }

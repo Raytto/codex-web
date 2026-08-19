@@ -27,7 +27,7 @@ import { assessTaskPolicy } from "../server/task-policy.js";
 import { listTenantIdentities, tenantIdentityForUser } from "../server/tenant-identities.js";
 import { consumeTenantTurnEvents, validateTenantWorkerRequest } from "../server/tenant-worker-execution.js";
 import type { TenantWorkerRunRequest } from "../server/tenant-worker-protocol.js";
-import { isRetryableUpstreamError, runWithTransientRetries } from "../server/retry-policy.js";
+import { isModelCapacityError, isRetryableUpstreamError, modelCapacityRetryDelayMs, runWithTransientRetries } from "../server/retry-policy.js";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, publicFilePreviewUrl, resolveMessageFileLink } from "../src/file-links.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { resolveAccountIdentity } from "../src/account-identity.js";
@@ -45,9 +45,10 @@ import { buildProcessJournal } from "../src/process-journal.js";
 import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES, buildOptionalCapabilityConfig, detectOptionalAgentCapabilities } from "../server/optional-capabilities.js";
 import { USER_CANCELLED_TASK_MARKER, latestUserCancellationContext } from "../server/cancellation-summary.js";
 import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "../src/rollout-capacity.js";
-import { normalizeCodexQuotaUsage, normalizeContextTokenUsage } from "../server/app-server-turn.js";
+import { appServerNotificationBelongsToThread, normalizeCodexQuotaUsage, normalizeContextTokenUsage, summarizeAppServerItem } from "../server/app-server-turn.js";
 import { recoverBrowserSession } from "../src/session-recovery.js";
 import { PublicShareAssetError, resolvePublicShareAssets, rewritePublicShareDocument } from "../server/public-file-share.js";
+import { buildSubagentActivity } from "../src/subagent-activity.js";
 
 test("user-visible branding uses Codex Web without the private product name", () => {
   const index = fs.readFileSync(path.join(process.cwd(), "index.html"), "utf8");
@@ -209,8 +210,9 @@ test("switching conversations hides stale detail until the selected task loads",
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /currentDetail = detail\?\.conversation\.id === selectedId \? detail : null/);
-  assert.match(appSource, /loadingConversation \? <ConversationLoading \/>/);
-  assert.match(appSource, /\(!selectedId \|\| \(currentDetail && !currentDetail\.conversation\.archived_at\)\) && <Composer/);
+  assert.match(appSource, /loadingConversation \? <ConversationLoading restoring=\{restoringConversationSelection\} \/>/);
+  assert.match(appSource, /conversationSelectionReady && \(!selectedId \|\| \(currentDetail && !currentDetail\.conversation\.archived_at\)\) && <Composer/);
+  assert.match(appSource, /正在恢复上次任务…/);
   assert.match(appSource, /role="status" aria-live="polite"/);
   assert.match(styles, /\.conversation-loading \{[^}]*place-content: center;/);
 });
@@ -585,6 +587,42 @@ test("transient upstream failures use bounded 15/45/120 retry policy", async () 
     throw new Error("authentication failed");
   }, { signal: new AbortController().signal, delaysMs: [0, 0, 0] }), /authentication failed/);
   assert.equal(permanentCalls, 1);
+});
+
+test("model capacity retries use the infinite cancellable 10/30/60/120/180/240/300 then 5m and after 1h 30m policy", async () => {
+  assert.equal(isModelCapacityError("Selected model is at capacity"), true);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map((attempt) => modelCapacityRetryDelayMs(attempt, 0)), [10_000, 30_000, 60_000, 120_000, 180_000, 240_000, 300_000, 300_000]);
+  assert.equal(modelCapacityRetryDelayMs(99, 59 * 60_000), 300_000);
+  assert.equal(modelCapacityRetryDelayMs(99, 60 * 60_000), 1_800_000);
+  let calls = 0;
+  const attempts: number[] = [];
+  const result = await runWithTransientRetries(async () => {
+    calls += 1;
+    if (calls < 4) throw new Error("model is at capacity");
+    return "available";
+  }, { signal: new AbortController().signal, capacityDelayMs: () => 0, onRetry: ({ attempt, maxAttempts }) => { attempts.push(attempt); assert.equal(maxAttempts, undefined); } });
+  assert.equal(result, "available");
+  assert.deepEqual(attempts, [1, 2, 3]);
+});
+
+test("empty conversations are reused and temporarily promoted without affecting non-empty tasks", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-empty-reuse-"));
+  const db = new AppDatabase(root);
+  try {
+    const first = db.createConversation(crypto.randomUUID(), "新任务", { model: "gpt-5", reasoningEffort: "high" });
+    db.createConversation(crypto.randomUUID(), "已命名任务", { model: "gpt-5", reasoningEffort: "high" });
+    const reused = db.reuseEmptyConversationForNewTask(LEGACY_USER_ID);
+    assert.equal(reused?.id, first.id);
+    assert.equal(db.createOrReuseEmptyConversation(crypto.randomUUID(), { model: "gpt-5", reasoningEffort: "high" }, LEGACY_USER_ID).reused, true);
+  } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("sub-agent notifications stay isolated from the parent turn and remain visible as activity", () => {
+  assert.equal(appServerNotificationBelongsToThread("parent", { threadId: "child" }), false);
+  const event = summarizeAppServerItem({ type: "subAgentActivity", agentThreadId: "child", agentPath: "/root/review" }, false) as { kind: string; agents: Array<{ id: string }> };
+  assert.equal(event.kind, "agent");
+  const summary = buildSubagentActivity([{ kind: "agent", created_at: new Date().toISOString(), agents: [{ id: "child", path: "/root/review", status: "running" }] }]);
+  assert.equal(summary.active[0]?.name, "review");
 });
 
 test("path confinement rejects traversal", () => {
@@ -1089,9 +1127,9 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const mathSource = fs.readFileSync(path.join(process.cwd(), "src", "markdown-math.ts"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /reader === "markdown" && <a className="reader-button"/);
+  assert.match(appSource, /previewHref && <a className="preview-button"/);
   assert.match(appSource, /reader === "markdown" \|\| previewable[\s\S]*href=\{fileUrl\(file\)\}/);
-  assert.match(styles, /\.reader-button,[\s\S]*\.download-button\s*\{[^}]*border-left:/);
+  assert.match(styles, /\.preview-button,[\s\S]*\.download-button\s*\{[^}]*border-left:/);
   assert.match(appSource, /<ReactMarkdown[\s\S]*skipHtml[\s\S]*>\{math\.content\}<\/ReactMarkdown>/);
   assert.match(mathSource, /import\("remark-math"\)/);
   assert.match(mathSource, /import\("rehype-katex"\)/);
@@ -1295,7 +1333,11 @@ test("single-user login and CSRF protection", async (context) => {
   await agent.put(`/codex-web/api/conversations/${created.body.conversation.id}/agent-selection`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .send({ model: "gpt-5.6-luna", reasoningEffort: "low" }).expect(200);
-  const second = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
+  const reused = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.equal(reused.body.reused, true);
+  assert.equal(reused.body.conversation.id, created.body.conversation.id);
+  const second = await agent.post("/codex-web/api/conversations").set("X-CSRF-Token", login.body.csrfToken).send({ reuseEmpty: false }).expect(201);
+  assert.notEqual(second.body.conversation.id, created.body.conversation.id);
   assert.deepEqual(second.body.agentSelection, { model: "gpt-5.6-luna", reasoningEffort: "low" });
   const unreadJobId = crypto.randomUUID();
   instance.db.createJob(unreadJobId, created.body.conversation.id);

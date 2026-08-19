@@ -12,6 +12,10 @@ Queued prompts and their attachments are stored by the server. The browser is on
 
 On graceful shutdown, dispatch stops first and the process waits for active Codex executions to finish; queued work remains durable. If the process disappears while a job is running, startup marks that job interrupted and appends a visible message/event. It does not automatically retry a possibly side-effecting turn.
 
+Whole-turn retries are also side-effect aware. Transient connection failures are retried only before the server observes that execution started. A model-capacity rejection has a narrower exception: it may retry indefinitely only when the attempt produced no meaningful command, file, tool, or stage progress. Capacity delays ramp from seconds to five minutes, then switch to thirty minutes after one hour; every error, wait, and retry start is persisted in the live journal and remains cancellable by the user.
+
+Durable waits store their target conversation and model/reasoning selection in SQLite. A fresh-conversation wait creates its target while the plan is armed, so the browser can select it immediately and service restarts cannot create duplicate targets.
+
 Conversation detail checks the current Codex rollout file size without loading the file. The UI warns at 500 MiB and points the user toward archiving the completed conversation and starting a fresh task.
 
 Optional voice transcription receives a bounded context envelope. The budget is shared across the current draft, attachment names, small heads of text attachments, recent messages, technical terms, and at most a few validated images. Temporary audio remains HMAC-signed and short-lived.

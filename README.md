@@ -12,6 +12,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Server-persistent queued prompts with reorder, edit, delete, and steer actions
 - Persistent attachments, cancellable/resumable uploads, generated-image capture, and compact server thumbnails
 - Authenticated Markdown reading, sandboxed HTML previews, explicit UTF-8 text responses, and direct original-file downloads
+- A consistent preview action for Markdown, HTML, images, PDF, plain text, and CSV deliverables
 - Opt-in fixed public links for finished Markdown/HTML reports, with safe same-delivery image rewriting and revocation
 - Self-contained responsive HTML as the default format for reports and other long-form reading
 - Lazy-loaded LaTeX math rendering in Markdown readers, with fenced and inline code left untouched
@@ -24,11 +25,13 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Graceful container shutdown that drains in-flight Codex work and leaves queued tasks persisted
 - Automatic short task titles from a dedicated low-reasoning Codex Luna worker, with manual titles taking precedence and SQLite audit records for every naming attempt
 - A durable live work journal with retained stage feedback and grouped command steps
+- Live child-Agent status with parent/child turn isolation, retained paths, and terminal summaries
 - Running work journals expand inline with the page instead of creating a nested vertical scroller
 - Unread-result markers for completed conversations until their detail is viewed
 - Opening an unread conversation positions the reader at the matching user prompt, not only the reply
 - Distinct running and queued indicators, plus a stable overflow menu for task actions
-- One-shot timed or external-event continuation plans that survive browser and service restarts
+- One-shot timed or external-event continuation plans that survive browser and service restarts, with same/new-conversation targeting and a persisted model/reasoning selection
+- Agent-created continuation plans inherit the current job selection unless the user explicitly requests a model or reasoning override
 - Pending prompts remain queued while a continuation plan is armed; users can explicitly insert one early or steer a currently running turn
 - A 500 MiB Codex rollout warning that suggests archiving very long conversations
 - Per-conversation context-window usage and current Codex package quota in the capacity menu
@@ -40,6 +43,9 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
 - A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
 - Touch reordering for pending prompts, bounded session-restore retries, and resilient asynchronous math loading
+- Mobile session restoration keeps the loading surface visible until the saved conversation is selected, avoiding a transient welcome-screen flash
+- Repeated “new task” clicks reuse a truly empty conversation and temporarily promote it to the top; later activity naturally takes priority
+- Capacity-only failures retry until user cancellation: 10s, 30s, 1–5m, then every 5m; after one hour, every 30m
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them

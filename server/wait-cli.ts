@@ -26,24 +26,26 @@ async function main(): Promise<void> {
 async function armAfter(): Promise<void> {
   const seconds = requiredPositiveInteger("seconds");
   const prompt = requiredText("prompt", "prompt-file");
-  safePrint(await agentRequest("POST", "/wake-plans", {
+  safePrint(await agentRequest("POST", "/wake-plans", withSelectionOverride({
     mode: "time", delaySeconds: seconds,
     label: optional("label") || `Continue after ${formatDuration(seconds)}`,
     successPrompt: prompt,
-  }));
+    newConversation: booleanOption("new-conversation"),
+  })));
 }
 
 async function armEvent(): Promise<void> {
   const seconds = requiredPositiveInteger("deadline-seconds");
   const receiptPath = required("receipt");
-  const response = await agentRequest("POST", "/wake-plans", {
+  const response = await agentRequest("POST", "/wake-plans", withSelectionOverride({
     mode: "event_or_deadline", delaySeconds: seconds,
     label: optional("label") || `Wait for an event, at most ${formatDuration(seconds)}`,
     runId: optional("run-id") || null,
     successPrompt: requiredText("success-prompt", "success-prompt-file"),
     failurePrompt: requiredText("failure-prompt", "failure-prompt-file"),
     timeoutPrompt: requiredText("timeout-prompt", "timeout-prompt-file"),
-  }) as JsonObject;
+    newConversation: booleanOption("new-conversation"),
+  })) as JsonObject;
   const wakePlan = response.wakePlan as JsonObject | undefined;
   const signal = response.signal as JsonObject | undefined;
   if (typeof wakePlan?.id !== "string" || typeof wakePlan.deadline_at !== "string"
@@ -119,6 +121,8 @@ function required(name: string): string { const value = optional(name); if (!val
 function optional(name: string): string { return args.get(name)?.trim() ?? ""; }
 function requiredPositiveInteger(name: string): number { const value = Number(required(name)); if (!Number.isInteger(value) || value <= 0) throw new Error(`--${name} must be positive integer seconds`); return value; }
 function numberOption(name: string, fallback: number): number { const raw = optional(name); if (!raw) return fallback; const value = Number(raw); if (!Number.isFinite(value)) throw new Error(`--${name} must be a number`); return value; }
+function booleanOption(name: string): boolean { const value = optional(name).toLowerCase(); if (!value) return false; if (["true", "1", "yes"].includes(value)) return true; if (["false", "0", "no"].includes(value)) return false; throw new Error(`--${name} must be true or false`); }
+function withSelectionOverride(body: JsonObject): JsonObject { const model = optional("model"); const effort = optional("reasoning-effort"); if (model) body.model = model; if (effort) body.reasoningEffort = effort; return body; }
 function requiredText(inlineName: string, fileName: string): string { const value = textOption(inlineName, fileName); if (!value) throw new Error(`Missing --${inlineName} or --${fileName}`); return value; }
 function textOption(inlineName: string, fileName: string): string { const inline = optional(inlineName); if (inline) return inline; const file = optional(fileName); return file ? fs.readFileSync(path.resolve(file), "utf8").replace(/^\uFEFF/, "").trim() : ""; }
 function requiredEnvironment(name: string): string { const value = process.env[name]?.trim(); if (!value) throw new Error(`This task has no ${name}; verify that Codex Web started this turn`); return value; }
@@ -144,8 +148,8 @@ function safePrint(value: unknown): void { process.stdout.write(`${JSON.stringif
 function formatDuration(seconds: number): string { if (seconds % 3600 === 0) return `${seconds / 3600}h`; if (seconds % 60 === 0) return `${seconds / 60}m`; return `${seconds}s`; }
 function printHelp(): void {
   process.stdout.write("Codex Web durable wait CLI\n\n");
-  process.stdout.write("Timer:\n  node $CODEX_WEB_WAIT_CLI after --seconds 7200 --prompt-file continue.txt [--label text]\n\n");
-  process.stdout.write("Event or deadline:\n  node $CODEX_WEB_WAIT_CLI event --deadline-seconds 3600 --success-prompt-file success.txt --failure-prompt-file failure.txt --timeout-prompt-file timeout.txt --receipt wait-receipt.json [--run-id ID]\n\n");
+  process.stdout.write("Timer:\n  node $CODEX_WEB_WAIT_CLI after --seconds 7200 --prompt-file continue.txt [--label text] [--new-conversation true] [--model MODEL] [--reasoning-effort EFFORT]\n\n");
+  process.stdout.write("Event or deadline:\n  node $CODEX_WEB_WAIT_CLI event --deadline-seconds 3600 --success-prompt-file success.txt --failure-prompt-file failure.txt --timeout-prompt-file timeout.txt --receipt wait-receipt.json [--run-id ID] [--new-conversation true] [--model MODEL] [--reasoning-effort EFFORT]\n\n");
   process.stdout.write("Signal:\n  node <wait-cli.js> signal --receipt wait-receipt.json --status success|failure|heartbeat [--event-id ID] [--summary-file summary.txt] [--retry-seconds 3600]\n\n");
   process.stdout.write("Cancel:\n  node $CODEX_WEB_WAIT_CLI cancel --id WAIT_ID\n");
 }

@@ -527,24 +527,33 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const successPrompt = wakeText(req.body?.successPrompt);
     const failurePrompt = mode === "event_or_deadline" ? wakeText(req.body?.failurePrompt) : successPrompt;
     const timeoutPrompt = mode === "event_or_deadline" ? wakeText(req.body?.timeoutPrompt) : successPrompt;
-    if (!deadlineAt || !["time", "event_or_deadline"].includes(mode) || !successPrompt || !failurePrompt || !timeoutPrompt) {
+    if ((req.body?.newConversation !== undefined && typeof req.body.newConversation !== "boolean")
+      || (req.body?.model !== undefined && typeof req.body.model !== "string")
+      || (req.body?.reasoningEffort !== undefined && typeof req.body.reasoningEffort !== "string")
+      || !deadlineAt || !["time", "event_or_deadline"].includes(mode) || !successPrompt || !failurePrompt || !timeoutPrompt) {
       return res.status(400).json({ error: "Invalid wait mode, deadline, or continuation prompt." });
     }
     const eventToken = mode === "event_or_deadline" ? crypto.randomBytes(32).toString("base64url") : null;
     try {
       const conversation = db.getConversation(job.conversation_id)!;
+      const inheritedSelection = job.agent_model && job.reasoning_effort
+        ? { model: job.agent_model, reasoningEffort: job.reasoning_effort }
+        : conversationAgentSelection(conversation);
+      const selection = req.body?.model !== undefined || req.body?.reasoningEffort !== undefined
+        ? resolveAgentSelection(optionsForUser(conversation.user_id), req.body?.model ?? inheritedSelection.model, req.body?.reasoningEffort ?? inheritedSelection.reasoningEffort)
+        : inheritedSelection;
       const plan = db.createWakePlan({
         id: newId(), conversationId: job.conversation_id, createdByJobId: job.id, mode,
         label: wakeText(req.body?.label, 120) || (mode === "time" ? "Scheduled continuation" : "Waiting for external event"),
         runId: wakeText(req.body?.runId, 200) || null, deadlineAt, successPrompt, failurePrompt, timeoutPrompt,
-        selection: job.agent_model && job.reasoning_effort
-          ? { model: job.agent_model, reasoningEffort: job.reasoning_effort }
-          : conversationAgentSelection(conversation),
+        newConversation: req.body?.newConversation === true,
+        selection,
         eventTokenHash: eventToken ? hashWakeEventToken(config.sessionSecret, eventToken) : null,
       });
       const baseUrl = config.publicBaseUrl.replace(/\/$/, "") || `http://127.0.0.1:${config.port}${config.basePath}`;
       return res.status(201).json({
         wakePlan: publicWakePlan(plan),
+        targetConversation: plan.target_conversation_id ? db.getConversation(plan.target_conversation_id) : undefined,
         signal: eventToken ? { url: `${baseUrl}/api/automation/wake-plans/${encodeURIComponent(plan.id)}/events`, token: eventToken } : undefined,
       });
     } catch (error) {
@@ -678,10 +687,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ conversations: db.listArchivedConversations(session.user_id, query) });
   });
 
-  api.get("/agent-options", (_req, res) => {
+  api.get("/agent-options", (req, res) => {
     const session = res.locals.session as SessionRow;
     const options = optionsForUser(session.user_id);
-    return res.json({ ...options, selection: userAgentSelection(session.user_id, options) });
+    const conversationId = typeof req.query.conversationId === "string" ? req.query.conversationId : "";
+    const conversation = conversationId ? db.getConversationForUser(conversationId, session.user_id) : undefined;
+    if (conversationId && !conversation) return res.status(404).json({ error: "会话不存在。" });
+    return res.json({ ...options, selection: conversation ? conversationAgentSelection(conversation, options) : userAgentSelection(session.user_id, options) });
   });
 
   api.put("/agent-selection", (req, res) => {
@@ -700,12 +712,33 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ chatFontSize });
   });
 
-  api.post("/conversations", (_req, res) => {
+  api.post("/conversations", (req, res) => {
     const session = res.locals.session as SessionRow;
+    if (req.body?.reuseEmpty !== undefined && typeof req.body.reuseEmpty !== "boolean") {
+      return res.status(400).json({ error: "新任务复用选项无效。" });
+    }
+    const reuseEmpty = req.body?.reuseEmpty !== false;
+    if (reuseEmpty) {
+      const reusable = db.reuseEmptyConversationForNewTask(session.user_id);
+      if (reusable) return res.json({ conversation: reusable, agentSelection: conversationAgentSelection(reusable), reused: true });
+    }
     const id = newId();
-    ensureTenantWorkspace(config.tenantRoot, session.user_id, id);
     const agentSelection = userAgentSelection(session.user_id);
-    res.status(201).json({ conversation: db.createConversation(id, "新任务", agentSelection, session.user_id), agentSelection });
+    const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, id);
+    try {
+      const result = reuseEmpty
+        ? db.createOrReuseEmptyConversation(id, agentSelection, session.user_id)
+        : { conversation: db.createConversation(id, "新任务", agentSelection, session.user_id), reused: false };
+      if (result.reused) fs.rmSync(workspace, { recursive: true, force: true });
+      return res.status(result.reused ? 200 : 201).json({
+        conversation: result.conversation,
+        agentSelection: result.reused ? conversationAgentSelection(result.conversation) : agentSelection,
+        reused: result.reused,
+      });
+    } catch (error) {
+      fs.rmSync(workspace, { recursive: true, force: true });
+      throw error;
+    }
   });
 
   api.post("/conversations/:id/archive", (req, res) => {
@@ -793,15 +826,26 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (conversation.archived_at) return res.status(409).json({ error: "会话已归档。" });
     const deadlineAt = wakeDeadline(req.body?.delaySeconds);
     const prompt = wakeText(req.body?.prompt);
-    if (!deadlineAt || !prompt) return res.status(400).json({ error: "等待时间或续跑指令无效。" });
+    if ((req.body?.newConversation !== undefined && typeof req.body.newConversation !== "boolean")
+      || (req.body?.model !== undefined && typeof req.body.model !== "string")
+      || (req.body?.reasoningEffort !== undefined && typeof req.body.reasoningEffort !== "string")
+      || !deadlineAt || !prompt) return res.status(400).json({ error: "等待时间、续跑位置或续跑配置无效。" });
     try {
+      const inheritedSelection = conversationAgentSelection(conversation);
+      const selection = req.body?.model !== undefined || req.body?.reasoningEffort !== undefined
+        ? resolveAgentSelection(optionsForUser(session.user_id), req.body?.model ?? inheritedSelection.model, req.body?.reasoningEffort ?? inheritedSelection.reasoningEffort)
+        : inheritedSelection;
       const plan = db.createWakePlan({
         id: newId(), conversationId: conversation.id, mode: "time",
         label: wakeText(req.body?.label, 120) || "定时自动继续", deadlineAt,
         successPrompt: prompt, failurePrompt: prompt, timeoutPrompt: prompt,
-        selection: conversationAgentSelection(conversation),
+        newConversation: req.body?.newConversation === true,
+        selection,
       });
-      return res.status(201).json({ wakePlan: publicWakePlan(plan) });
+      return res.status(201).json({
+        wakePlan: publicWakePlan(plan),
+        targetConversation: plan.target_conversation_id ? db.getConversation(plan.target_conversation_id) : undefined,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "等待计划创建失败。";
       return res.status(/UNIQUE constraint/i.test(message) ? 409 : 400).json({ error: /UNIQUE constraint/i.test(message) ? "这个会话已经有一个等待计划。" : message });

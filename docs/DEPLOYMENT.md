@@ -14,6 +14,8 @@ curl --fail http://127.0.0.1:37821/codex-web/api/health
 
 Back up all three named volumes before upgrades. Keep `.env` outside source control.
 
+Recent releases add SQLite columns for continuation targets and selections. Migrations are additive and run on startup, but the pre-upgrade volume backup remains the rollback boundary; do not start an older image against a database already migrated by a newer release unless that version is documented as backward compatible.
+
 Docker grants the application up to 30 minutes after `SIGTERM` to drain active Codex work. New dispatch stops immediately, queued jobs stay persisted, and the container exits once active executions finish. Avoid overriding `stop_grace_period` with a shorter value unless you accept interrupted jobs.
 
 ## Reverse proxy
@@ -36,3 +38,5 @@ docker compose up -d --build
 The container seeds a newer bundled Codex CLI into the persistent runtime volume on startup. Existing login and thread state remain in the tenant volume.
 
 After upgrading, verify that archived conversations remain listed under personal settings and that any job interrupted by an ungraceful previous stop has a visible interruption message instead of being retried.
+
+Also verify one empty-task reuse, one timed continuation with the intended same/new-conversation target and model selection, and a normal stop action. The health endpoint confirms the web process; these authenticated checks confirm the migrated queue and browser flow.

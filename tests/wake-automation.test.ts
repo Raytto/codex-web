@@ -43,6 +43,23 @@ test("wake plans survive restart and enqueue exactly one continuation", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("fresh-conversation waits persist their model selection and trigger only in the created target", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-target-"));
+  const db = new AppDatabase(root);
+  try {
+    const sourceId = crypto.randomUUID();
+    db.createConversation(sourceId, "Source", selection);
+    const plan = db.createWakePlan({ id: crypto.randomUUID(), conversationId: sourceId, mode: "time", label: "Later", deadlineAt: new Date(Date.now() + 60_000).toISOString(), successPrompt: "continue", failurePrompt: "continue", timeoutPrompt: "continue", selection, newConversation: true });
+    assert.equal(plan.new_conversation, 1);
+    assert.ok(plan.target_conversation_id);
+    assert.equal(plan.agent_model, selection.model);
+    assert.equal(plan.reasoning_effort, selection.reasoningEffort);
+    const triggered = db.recordWakeEvent(plan.id, crypto.randomUUID(), "manual", null, crypto.randomUUID());
+    assert.equal(triggered.pendingPrompt?.conversation_id, plan.target_conversation_id);
+    assert.equal(db.listPendingPrompts(sourceId).length, 0);
+  } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("pending prompts stay queued during an armed wait and the continuation resumes first", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-pending-"));
   const db = new AppDatabase(root);
