@@ -1579,6 +1579,59 @@ function AssistantMarkdown({ content, files, citationFiles }: { content: string;
   >{math.content}</ReactMarkdown></div>;
 }
 
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy command failed");
+  } finally {
+    textarea.remove();
+  }
+}
+
+function AssistantCopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const resetTimerRef = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
+  }, []);
+
+  async function copyReply() {
+    if (!content || copied) return;
+    try {
+      await copyTextToClipboard(content);
+      setCopied(true);
+      setFailed(false);
+      if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+      setFailed(true);
+      if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = window.setTimeout(() => setFailed(false), 2200);
+    }
+  }
+
+  return <div className="assistant-message-actions">
+    <button type="button" className="assistant-copy-button" onClick={() => void copyReply()} aria-label={failed ? "复制失败，重试" : copied ? "已复制" : "复制回复"} title={failed ? "复制失败，点击重试" : copied ? "已复制" : "复制回复"}>
+      {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
+      <span>{failed ? "重试" : copied ? "已复制" : "复制"}</span>
+    </button>
+  </div>;
+}
+
 function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void> }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const latestJobError = detail.latestJob && ["failed", "interrupted"].includes(detail.latestJob.status) ? detail.latestJob.error?.trim() ?? "" : "";
@@ -1649,7 +1702,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
         <div className="message-avatar">{message.role === "assistant" ? <Zap size={15} /> : userInitials}</div>
         <div className="message-body">
           <div className="message-meta"><span className="message-name">{message.role === "assistant" ? "Codex Web" : "你"}</span><time dateTime={message.created_at} title={formatFullDateTime(message.created_at)}>{formatMessageDateTime(message.created_at)}</time></div>
-          {message.role === "assistant" ? <AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} /> : <>
+          {message.role === "assistant" ? <><AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} />{message.content && <AssistantCopyButton content={message.content} />}</> : <>
             {message.quote_excerpt && <div className="message-reference" title={message.quote_excerpt}><CornerUpLeft size={14} /><span><strong>引用</strong>{message.quote_excerpt}</span></div>}
             {message.content && <p data-agent-selectable="true">{message.content}</p>}
           </>}

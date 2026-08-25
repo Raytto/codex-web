@@ -412,6 +412,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: #fff;
   box-shadow: 0 7px 22px rgba(15, 17, 32, .05);
 }
+.assistant-message-actions { display: flex; align-items: center; min-height: 22px; margin: 3px 2px 0; }
+.assistant-copy-button { display: inline-flex; align-items: center; gap: 4px; min-height: 22px; padding: 2px 5px; border: 0; border-radius: 5px; color: #969aa8; background: transparent; cursor: pointer; font: inherit; font-size: 10px; font-weight: 600; line-height: 1; opacity: .72; transition: color .14s ease, background .14s ease, opacity .14s ease; }
+.assistant-copy-button:hover, .assistant-copy-button:focus-visible { color: #4e588f; background: rgba(72, 85, 156, .08); opacity: 1; }
+.assistant-copy-button:focus-visible { outline: 2px solid rgba(72, 85, 156, .28); outline-offset: 1px; }
+.assistant-copy-button svg { flex: 0 0 auto; }
 .error-bubble { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border: 1px solid #d8dbe4; border-radius: 12px; color: #4e5260; background: rgba(255, 255, 255, .86); }
 .error-bubble > svg { flex: 0 0 auto; margin-top: 1px; color: #a04a55; }
 .error-bubble strong { display: block; margin-bottom: 3px; color: #5d3d43; font-size: 12px; }
@@ -937,6 +942,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .message-meta time { color: #8f9199; }
 :root[data-theme="dark"] .live-label { color: #abb5ee; }
 :root[data-theme="dark"] .message.assistant .markdown { border-color: #373940; background: var(--paper); box-shadow: 0 7px 22px rgba(0, 0, 0, .16); }
+:root[data-theme="dark"] .assistant-copy-button { color: #9296a5; }
+:root[data-theme="dark"] .assistant-copy-button:hover, :root[data-theme="dark"] .assistant-copy-button:focus-visible { color: #c3cbff; background: rgba(150, 161, 235, .12); }
 :root[data-theme="dark"] .message.user .message-body > p { color: #f3f3f5; background: linear-gradient(145deg, #363842, #2b2c33); box-shadow: 0 8px 24px rgba(0, 0, 0, .24); }
 :root[data-theme="dark"] .message-reference { border-color: #41434b; color: #b7b9c1; background: #25262b; box-shadow: 0 4px 12px rgba(0, 0, 0, .14); }
 :root[data-theme="dark"] .message-reference > svg { color: #aeb9f5; }
