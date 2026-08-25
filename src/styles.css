@@ -740,6 +740,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .editing-pending-files > span.removed { opacity: .55; text-decoration: line-through; }
 .paste-notice { width: fit-content; display: flex; align-items: center; gap: 6px; margin: 0 5px 4px; padding: 5px 8px; border-radius: 8px; color: var(--indigo); background: var(--indigo-pale); font-size: 11px; }
 .paste-notice svg { flex: 0 0 auto; }
+.voice-notice { width: fit-content; display: flex; align-items: center; gap: 6px; margin: 0 5px 4px; padding: 5px 8px; border-radius: 8px; color: #735514; background: #fff5d9; font-size: 11px; }
+.voice-notice svg { flex: 0 0 auto; }
 .toast { position: absolute; top: 88px; left: 50%; z-index: 20; max-width: min(520px, 90%); display: flex; align-items: center; gap: 12px; transform: translateX(-50%); padding: 10px 13px; border: 1px solid #f0c7cd; border-radius: 10px; color: var(--danger); background: #fff6f7; box-shadow: 0 9px 25px rgba(80, 20, 30, .1); font-size: 12px; }
 .toast.info { border-color: #bed8c5; color: #28563a; background: #f1faf3; box-shadow: 0 9px 25px rgba(24, 91, 48, .1); }
 .toast button { border: 0; background: transparent; cursor: pointer; }

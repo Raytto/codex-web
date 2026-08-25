@@ -1956,6 +1956,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   const [pasteNotice, setPasteNotice] = useState("");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
   const [voiceElapsed, setVoiceElapsed] = useState(0);
+  const [voiceNotice, setVoiceNotice] = useState("");
   const [voiceError, setVoiceError] = useState("");
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -2042,6 +2043,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   async function startRecording() {
     if (voiceState !== "idle" || submitting || selectionSaving) return;
     setVoiceError("");
+    setVoiceNotice("");
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setVoiceError("当前浏览器不支持录音，请改用最新版 Chrome、Edge 或 Safari。");
       return;
@@ -2057,7 +2059,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       recorder.onerror = () => {
         discardRecordingRef.current = true;
         if (recorder.state === "recording") recorder.stop();
-        setVoiceError("录音中断，请检查麦克风权限后重试。"); releaseAudio(); setVoiceState("idle");
+        setVoiceNotice(""); setVoiceError("录音中断，请检查麦克风权限后重试。"); releaseAudio(); setVoiceState("idle");
       };
       recorder.onstop = () => void processRecording(recorder.mimeType || mimeType || "audio/webm");
       recorder.start(250);
@@ -2067,6 +2069,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       recordingLimitRef.current = window.setTimeout(() => {
         if (recorder.state === "recording") {
           sendAfterTranscriptionRef.current = false;
+          setVoiceNotice("已达到 5 分钟录音上限，正在识别…");
           recorder.stop();
           setVoiceState("transcribing");
         }
@@ -2097,14 +2100,14 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     discardRecordingRef.current = true;
     recorderRef.current.stop();
     releaseAudio();
-    setVoiceState("idle"); setVoiceElapsed(0);
+    setVoiceState("idle"); setVoiceElapsed(0); setVoiceNotice("");
   }
 
   async function processRecording(mimeType: string) {
     releaseAudio(); recorderRef.current = null;
     if (discardRecordingRef.current) { chunksRef.current = []; return; }
     const blob = new Blob(chunksRef.current, { type: mimeType }); chunksRef.current = [];
-    if (blob.size === 0) { setVoiceError("没有录到声音，请重新录制。"); setVoiceState("idle"); return; }
+    if (blob.size === 0) { setVoiceNotice(""); setVoiceError("没有录到声音，请重新录制。"); setVoiceState("idle"); return; }
     const extension = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "mp4" : "webm";
     try {
       const retainedNames = (editingPendingRef.current?.files ?? [])
@@ -2118,9 +2121,10 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
       });
       const existing = inputRef.current;
       const combined = existing ? `${existing}${/\s$/.test(existing) ? "" : "\n"}${result.text}` : result.text;
-      inputRef.current = combined; setInput(combined); setVoiceState("idle"); setVoiceElapsed(0);
+      inputRef.current = combined; setInput(combined); setVoiceState("idle"); setVoiceElapsed(0); setVoiceNotice("");
       if (sendAfterTranscriptionRef.current) onSendRef.current(combined);
     } catch (reason) {
+      setVoiceNotice("");
       setVoiceError(reason instanceof Error ? reason.message : "语音识别失败，请重试。");
       setVoiceState("idle");
     } finally { sendAfterTranscriptionRef.current = false; }
@@ -2194,6 +2198,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     </span>)}</div>}
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
+    {voiceNotice && <div className="voice-notice" role="status" aria-live="polite"><Check size={14} />{voiceNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
     <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
     {voiceState !== "idle" && <div className={`voice-panel ${voiceState}`}>

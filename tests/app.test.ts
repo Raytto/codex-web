@@ -126,6 +126,13 @@ test("composer replaces stop with send as soon as there is sendable input", () =
   assert.equal(chooseComposerPrimaryAction({ running: false, hasText: false, hasAttachments: false, voiceActive: false }), "send");
 });
 
+test("voice input explains the five-minute recording limit before transcription starts", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.match(appSource, /5 \* 60 \* 1000/);
+  assert.match(appSource, /已达到 5 分钟录音上限，正在识别…/);
+  assert.match(appSource, /className="voice-notice" role="status" aria-live="polite"/);
+});
+
 test("uploading composer attachments expose per-file cancellation backed by AbortController", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
