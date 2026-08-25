@@ -14,7 +14,7 @@ export type PublicFilePreview = {
   content: string;
 };
 export type Message = {
-  id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; created_at: string; files: WorkFile[];
+  id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
   id: string;

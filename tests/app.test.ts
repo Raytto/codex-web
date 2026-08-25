@@ -149,6 +149,15 @@ test("personal settings close on outside click and Escape", () => {
   assert.match(appSource, /event\.key === "Escape"/);
 });
 
+test("scheduled prompts use an amber clock identity instead of impersonating the user", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /const scheduledMessage = message\.role === "user" && Boolean\(message\.is_scheduled\)/);
+  assert.match(appSource, /scheduledMessage \? <Clock3 size=\{15\} \/>/);
+  assert.match(appSource, /scheduledMessage \? "定时任务"/);
+  assert.match(styles, /\.message\.user \.message-avatar\.scheduled \{[^}]*background: linear-gradient\(145deg, #f8bb55, var\(--amber\)\);/);
+});
+
 test("uploading composer attachments expose per-file cancellation backed by AbortController", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");

@@ -81,6 +81,7 @@ export type MessageRow = {
   role: "user" | "assistant" | "system";
   content: string;
   quote_excerpt?: string | null;
+  is_scheduled?: number;
   created_at: string;
 };
 
@@ -380,6 +381,7 @@ export class AppDatabase {
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         quote_excerpt TEXT,
+        is_scheduled INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS pending_prompts (
@@ -584,6 +586,15 @@ export class AppDatabase {
     `);
     const messageColumns = this.columnNames("messages");
     if (!messageColumns.has("quote_excerpt")) this.sqlite.exec("ALTER TABLE messages ADD COLUMN quote_excerpt TEXT");
+    if (!messageColumns.has("is_scheduled")) this.sqlite.exec("ALTER TABLE messages ADD COLUMN is_scheduled INTEGER NOT NULL DEFAULT 0");
+    this.sqlite.exec(`
+      UPDATE messages SET is_scheduled=1
+      WHERE id IN (
+        SELECT job.message_id FROM wake_plans wake
+        JOIN jobs job ON job.id=wake.job_id
+        WHERE job.message_id IS NOT NULL
+      )
+    `);
     const pendingPromptColumns = this.columnNames("pending_prompts");
     if (!pendingPromptColumns.has("quote_excerpt")) this.sqlite.exec("ALTER TABLE pending_prompts ADD COLUMN quote_excerpt TEXT");
     const wakePlanColumns = this.columnNames("wake_plans");
@@ -947,8 +958,8 @@ export class AppDatabase {
   }
 
   addMessage(message: MessageRow): void {
-    this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,?,?,?,?)").run(
-      message.id, message.conversation_id, message.role, message.content, message.quote_excerpt ?? null, message.created_at,
+    this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,is_scheduled,created_at) VALUES(?,?,?,?,?,?,?)").run(
+      message.id, message.conversation_id, message.role, message.content, message.quote_excerpt ?? null, message.is_scheduled ? 1 : 0, message.created_at,
     );
     this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(message.created_at, message.conversation_id);
   }
@@ -1641,8 +1652,9 @@ export class AppDatabase {
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'user',?,?,?)")
-        .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, now);
+      const scheduled = this.sqlite.prepare("SELECT 1 AS value FROM wake_plans WHERE pending_prompt_id=? AND state='triggered'").get(pendingId) as { value: number } | undefined;
+      this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,is_scheduled,created_at) VALUES(?,?,'user',?,?,?,?)")
+        .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, scheduled ? 1 : 0, now);
       this.sqlite.prepare("UPDATE files SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
       const next = this.sqlite.prepare("SELECT COALESCE(MAX(queue_seq),0)+1 AS value FROM jobs").get() as { value: number };
       this.sqlite.prepare(`

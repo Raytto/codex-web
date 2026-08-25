@@ -423,6 +423,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .error-bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.58; font-size: .84em; }
 .message.user { grid-template-columns: minmax(0, 1fr) 32px; }
 .message.user .message-avatar { grid-column: 2; grid-row: 1; color: #fff; border-color: rgba(72, 85, 156, .48); background: linear-gradient(145deg, #4a58a0, #28336b); }
+.message.user .message-avatar.scheduled { color: var(--navy); border-color: rgba(240, 170, 60, .52); background: linear-gradient(145deg, #f8bb55, var(--amber)); }
 .message.user .message-body { grid-column: 1; grid-row: 1; max-width: min(640px, 78%); justify-self: end; }
 .message.user .message-meta { flex-direction: row-reverse; }
 .message-body > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.68; }
@@ -953,6 +954,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .message-reference > svg { color: #aeb9f5; }
 :root[data-theme="dark"] .message-reference strong { color: #d7dcff; }
 :root[data-theme="dark"] .message.user .message-avatar { border-color: #626a9d; background: linear-gradient(145deg, #4f598f, #343b69); }
+:root[data-theme="dark"] .message.user .message-avatar.scheduled { color: var(--navy); border-color: rgba(240, 170, 60, .58); background: linear-gradient(145deg, #f8bb55, var(--amber)); }
 :root[data-theme="dark"] .markdown a { color: #b9c3ff; text-decoration-color: rgba(185, 195, 255, .46); }
 :root[data-theme="dark"] .markdown blockquote { border-left-color: #626674; }
 :root[data-theme="dark"] .markdown pre { border-color: #3b3d45; color: #e7e8ed; background: #111216; }
