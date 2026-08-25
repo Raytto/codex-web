@@ -11,6 +11,10 @@ The active plan is stored in SQLite. When it triggers, its selected prompt becom
 
 The browser scheduling dialog can continue in the current conversation or create a fresh target immediately. The new target owns the visible armed plan and starts without a Codex thread or inherited messages. The dialog loads the current model catalog, persists the selected model/reasoning pair, and shows that pair on the armed-plan card.
 
+When a user postpones a plan by a relative duration, that duration is added to the plan's
+current deadline rather than recalculated from the click time. The conversation renders the
+triggered prompt with a distinct scheduled clock identity.
+
 Agent-created plans inherit the running job's model and reasoning effort. CLI `--model` and `--reasoning-effort` overrides are optional and should be passed only when the user explicitly asks for a different selection. `--new-conversation true` likewise requires an explicit fresh-conversation intent.
 
 ## Agent CLI
@@ -34,5 +38,10 @@ Both `after` and `event` accept optional `--new-conversation true --model MODEL 
 - Event ids are idempotent: duplicate receipts do not enqueue duplicate prompts.
 - Only one armed plan is allowed per conversation.
 - Receipt contents and bearer tokens must never appear in replies, application logs, or deliverables.
+
+Capacity interruptions are handled separately from durable wake plans. A retry that has not
+produced meaningful execution progress may retry the original prompt; after progress is
+observed, the next capacity attempt uses a continuation prompt in the existing Codex thread and
+does not resend the original attachments.
 
 Set `PUBLIC_BASE_URL` when an external supervisor must call the event endpoint through a reverse proxy. The URL must include the configured base path when the deployment does not mount Codex Web at the origin root.

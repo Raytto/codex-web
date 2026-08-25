@@ -62,6 +62,15 @@ export function retryDelayLabel(delayMs: number): string {
   return `${delayMs / 60_000} 分钟`;
 }
 
+export const MODEL_CAPACITY_CONTINUATION_PROMPT = [
+  "继续刚才因模型容量不足而中断、尚未完成的任务。",
+  "先检查原会话中的最新进展、已经执行的命令、已有文件和现场状态，不要重复已经完成的步骤或外部操作；只完成剩余工作，并在完成后给出最终结果。",
+].join("\n\n");
+
+export function capacityRetryPrompt(originalPrompt: string, continuationRequired: boolean): string {
+  return continuationRequired ? MODEL_CAPACITY_CONTINUATION_PROMPT : originalPrompt;
+}
+
 function parseAutoTitleEnvelope(raw: string): AutoTitleEnvelope | null {
   const trimmed = raw.trim();
   const json = trimmed.startsWith("```")
@@ -165,6 +174,7 @@ export class CodexRunner {
     let executionObserved = false;
     let capacityAttemptHadProgress = false;
     let capacityAttemptReportedError = false;
+    let capacityContinuationRequired = false;
     let lastRetryWasCapacity = false;
     this.abortControllers.set(jobId, controller);
     try {
@@ -206,6 +216,14 @@ export class CodexRunner {
           : undefined,
         isolationReason: taskPolicy.isolated ? taskPolicy.reason : undefined,
       }));
+      const continuationEffectivePrompt = buildAgentTurnPrompt({
+        userPrompt: MODEL_CAPACITY_CONTINUATION_PROMPT,
+        attachments: [],
+        runtimeWarning: !pythonRuntime.ready
+          ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
+          : undefined,
+        isolationReason: taskPolicy.isolated ? taskPolicy.reason : undefined,
+      });
       const request: TenantWorkerRunRequest = {
         jobId,
         userId: conversation.user_id,
@@ -254,14 +272,22 @@ export class CodexRunner {
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
         capacityAttemptHadProgress = false;
         capacityAttemptReportedError = false;
+        const continuationAttempt = capacityContinuationRequired;
+        request.effectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
+        request.imagePaths = continuationAttempt ? [] : uploads
+          .filter((file) => /^image\/(png|jpeg|webp)$/i.test(file.mime_type))
+          .map((file) => resolveInside(workspace, file.relative_path));
         if (retryAttempt > 0) {
           this.publish(jobId, "progress", {
             kind: "retry",
-            label: lastRetryWasCapacity ? `正在进行第 ${retryAttempt} 次容量重试` : `正在进行第 ${retryAttempt} 次连接重试`,
+            label: lastRetryWasCapacity
+              ? continuationAttempt ? `正在进行第 ${retryAttempt} 次容量续接` : `正在进行第 ${retryAttempt} 次容量重试`
+              : `正在进行第 ${retryAttempt} 次连接重试`,
+            ...(continuationAttempt ? { detail: "正在原会话中继续未完成的任务，不会重发原始用户指令。" } : {}),
           });
           this.publish(jobId, "status", {
             status: "running",
-            label: `正在进行第 ${retryAttempt} 次自动重试`,
+            label: continuationAttempt ? `正在进行第 ${retryAttempt} 次自动续接` : `正在进行第 ${retryAttempt} 次自动重试`,
           });
         }
         if (this.workerClient) return this.workerClient.run(request, callbacks);
@@ -271,21 +297,25 @@ export class CodexRunner {
         finally { if (this.directExecutions.get(jobId) === execution) this.directExecutions.delete(jobId); }
       }, {
         signal: controller.signal,
-        canRetry: (error) => isModelCapacityError(error) ? !capacityAttemptHadProgress : !executionObserved,
+        canRetry: (error) => isModelCapacityError(error) || !executionObserved,
         onRetry: ({ attempt, maxAttempts, delayMs, message }) => {
           const capacityError = isModelCapacityError(message);
           lastRetryWasCapacity = capacityError;
           if (capacityError) {
+            const continueExistingWork = capacityAttemptHadProgress || capacityContinuationRequired;
+            capacityContinuationRequired = continueExistingWork;
             if (!capacityAttemptReportedError) this.publish(jobId, "progress", { kind: "error", label: redactBrandForDisplay(message) });
             this.publish(jobId, "progress", {
               kind: "retry",
-              label: `容量不足，将在 ${retryDelayLabel(delayMs)} 后进行第 ${attempt} 次重试`,
-              detail: `本次没有检测到新的命令、文件或阶段进展；系统会持续重试，直到你主动停止任务。错误：${redactBrandForDisplay(message)}`,
+              label: `容量不足，将在 ${retryDelayLabel(delayMs)} 后进行第 ${attempt} 次${continueExistingWork ? "续接" : "重试"}`,
+              detail: continueExistingWork
+                ? `本次已经产生执行进展；系统会在原会话中自动继续未完成的任务，不会重发原始用户指令，并持续尝试直到你主动停止。错误：${redactBrandForDisplay(message)}`
+                : `本次没有检测到新的命令、文件或阶段进展；系统会持续重试，直到你主动停止任务。错误：${redactBrandForDisplay(message)}`,
             });
           }
           this.publish(jobId, "status", {
             status: "retrying",
-            label: capacityError ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次重试` : "上游连接短暂中断，正在自动重试",
+            label: capacityError ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次${capacityContinuationRequired ? "续接" : "重试"}` : "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt,
             ...(maxAttempts !== undefined ? { retryMaxAttempts: maxAttempts } : {}),
             retryDelaySeconds: delayMs / 1000,

@@ -16,7 +16,7 @@ import sharp from "sharp";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles } from "../server/app.js";
 import { assertProductionConfig, loadConfig } from "../server/config.js";
-import { AUTO_TITLE_OUTPUT_SCHEMA, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
+import { AUTO_TITLE_OUTPUT_SCHEMA, MODEL_CAPACITY_CONTINUATION_PROMPT, capacityRetryPrompt, extractLeakedAutoTitleAnswer, parseAutoTitleResponse, redactBrandForDisplay, summarizeEvent } from "../server/codex-runner.js";
 import { buildConversationTitlePrompt, CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_REASONING_EFFORT, normalizeConversationTitle, parseConversationTitleOutput } from "../server/conversation-title.js";
 import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
 import { AppDatabase, LEGACY_USER_ID, type FileRow } from "../server/db.js";
@@ -63,9 +63,15 @@ test("user-visible branding uses Codex Web without the private product name", ()
 
 test("login form leaves the username empty for each user to enter", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
+  const serverSource = fs.readFileSync(path.join(process.cwd(), "server", "app.ts"), "utf8");
   assert.match(appSource, /const \[username, setUsername\] = useState\(""\)/);
   assert.doesNotMatch(appSource, /useState\("owner"\)/);
   assert.match(appSource, /用户名<input autoComplete="username" autoFocus/);
+  assert.match(appSource, /密码<input autoComplete="current-password" type="password"/);
+  assert.match(apiSource, /login: \(username: string, password: string\)/);
+  assert.match(serverSource, /api\.post\("\/auth\/login"[\s\S]*req\.body\?\.username[\s\S]*req\.body\?\.password/);
+  assert.doesNotMatch(`${appSource}\n${apiSource}\n${serverSource}`, /phone|sms|手机号|短信/i);
 });
 
 test("browser session recovery retries transient failures and a briefly missing cookie", async () => {
@@ -147,6 +153,12 @@ test("personal settings close on outside click and Escape", () => {
   assert.match(appSource, /accountAreaRef/);
   assert.match(appSource, /setAccountSettingsOpen\(false\)/);
   assert.match(appSource, /event\.key === "Escape"/);
+});
+
+test("model capacity retries continue an already-started task without replaying it", () => {
+  assert.equal(capacityRetryPrompt("原始任务", false), "原始任务");
+  assert.equal(capacityRetryPrompt("原始任务", true), MODEL_CAPACITY_CONTINUATION_PROMPT);
+  assert.match(MODEL_CAPACITY_CONTINUATION_PROMPT, /不要重复已经完成的步骤/);
 });
 
 test("scheduled prompts use an amber clock identity instead of impersonating the user", () => {

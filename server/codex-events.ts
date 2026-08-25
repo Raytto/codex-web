@@ -1,13 +1,15 @@
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
-import { isRetryableUpstreamError } from "./retry-policy.js";
+import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.js";
 
 export function redactBrandForDisplay(value: string): string {
   return value.replace(/chatgpt|codex/gi, "Codex Web");
 }
 export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (event.type === "turn.started") return { kind: "status", label: "已开始分析" };
-  if (event.type === "error") return isRetryableUpstreamError(event.message)
+  if (event.type === "error") return isModelCapacityError(event.message)
+    ? { kind: "error", label: redactBrandForDisplay(event.message) }
+    : isRetryableUpstreamError(event.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
     : { kind: "error", label: redactBrandForDisplay(event.message) };
   if (event.type === "turn.completed") return { kind: "status", label: "工作已完成，正在整理结果" };
@@ -25,7 +27,9 @@ export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (item.type === "web_search") return { kind: "search", label: "正在搜索资料", detail: item.query };
   if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${redactBrandForDisplay(item.server)}`, detail: redactBrandForDisplay(item.tool) };
   if (item.type === "todo_list") return { kind: "todo", label: "任务计划已更新", items: item.items };
-  if (item.type === "error") return isRetryableUpstreamError(item.message)
+  if (item.type === "error") return isModelCapacityError(item.message)
+    ? { kind: "error", label: redactBrandForDisplay(item.message) }
+    : isRetryableUpstreamError(item.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
     : { kind: "error", label: redactBrandForDisplay(item.message) };
   if (item.type === "agent_message" && event.type === "item.completed") {

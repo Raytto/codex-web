@@ -39,4 +39,11 @@ The container seeds a newer bundled Codex CLI into the persistent runtime volume
 
 After upgrading, verify that archived conversations remain listed under personal settings and that any job interrupted by an ungraceful previous stop has a visible interruption message instead of being retried.
 
+The public sign-in contract remains username plus password. Keep `APP_USERNAME` and
+`APP_PASSWORD_HASH` in the private `.env`; do not add phone-number, SMS, or external credential
+proxy settings to a public deployment.
+
+New deployments default to a 14-day Web session (`SESSION_TTL_HOURS=336`). Shorten this value
+for shared or higher-risk devices; changing it affects newly issued sessions.
+
 Also verify one empty-task reuse, one timed continuation with the intended same/new-conversation target and model selection, and a normal stop action. The health endpoint confirms the web process; these authenticated checks confirm the migrated queue and browser flow.

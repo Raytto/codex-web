@@ -37,15 +37,18 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Per-conversation context-window usage and current Codex package quota in the capacity menu
 - Light, dark, and system-following appearance modes
 - Select message text and attach it as a removable, server-persisted reference to a new Agent question
+- Copy an assistant reply from its compact message action without selecting the whole bubble
 - Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
+- A five-minute recording-limit notice and a 650 ms long-press shortcut on an empty mobile composer
 - Bounded automatic retries for transient voice-transcription connection and upstream failures
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
 - A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
 - Touch reordering for pending prompts, bounded session-restore retries, and resilient asynchronous math loading
 - Mobile session restoration keeps the loading surface visible until the saved conversation is selected, avoiding a transient welcome-screen flash
 - Repeated “new task” clicks reuse a truly empty conversation and temporarily promote it to the top; later activity naturally takes priority
-- Capacity-only failures retry until user cancellation: 10s, 30s, 1–5m, then every 5m; after one hour, every 30m
+- Capacity-only failures retry until user cancellation: no-progress failures retry the request, while an already-started task continues in the same thread without replaying its original prompt or attachments
+- Scheduled prompts use a distinct clock identity, and relative postponements accumulate from the plan's current deadline
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
@@ -179,6 +182,8 @@ For the public build, the web process has no Docker socket, host filesystem moun
 - Node.js 22+ only if you want to run the test suite or password helper locally
 
 ## Quick start
+
+> Deploying Codex Web on a new cloud server? Follow the [AI cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md). It covers SSH administration, the owner web account, Codex authentication, Docker, Nginx, optional domain and TLS setup, backups, updates, and production acceptance checks. The steps below are the minimal local quick start.
 
 1. Copy the configuration template:
 

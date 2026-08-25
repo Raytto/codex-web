@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
-import { isRetryableUpstreamError } from "./retry-policy.js";
+import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.js";
 import { buildOptionalCapabilityConfig, type OptionalAgentCapabilities } from "./optional-capabilities.js";
 
 type JsonObject = Record<string, unknown>;
@@ -240,7 +240,9 @@ class AppServerTurnClient {
     if (message.method === "error") {
       const error = params.error as { message?: string } | undefined;
       const detail = error?.message || "上游处理发生错误";
-      this.callbacks.onProgress(isRetryableUpstreamError(detail)
+      this.callbacks.onProgress(isModelCapacityError(detail)
+        ? { kind: "error", label: redactBrand(detail) }
+        : isRetryableUpstreamError(detail)
         ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
         : { kind: "error", label: redactBrand(detail) });
       return;
