@@ -412,8 +412,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: #fff;
   box-shadow: 0 7px 22px rgba(15, 17, 32, .05);
 }
-.assistant-message-actions { display: flex; align-items: center; min-height: 22px; margin: 3px 2px 0; }
-.assistant-copy-button { display: inline-flex; align-items: center; gap: 4px; min-height: 22px; padding: 2px 5px; border: 0; border-radius: 5px; color: #969aa8; background: transparent; cursor: pointer; font: inherit; font-size: 10px; font-weight: 600; line-height: 1; opacity: .72; transition: color .14s ease, background .14s ease, opacity .14s ease; }
+.assistant-message-actions { display: flex; align-items: center; height: 16px; min-height: 16px; margin: 0 2px -10px; }
+.assistant-copy-button { width: 22px; height: 18px; display: inline-flex; align-items: center; justify-content: center; padding: 1px; border: 0; border-radius: 5px; color: #969aa8; background: transparent; cursor: pointer; opacity: .72; transition: color .14s ease, background .14s ease, opacity .14s ease; }
 .assistant-copy-button:hover, .assistant-copy-button:focus-visible { color: #4e588f; background: rgba(72, 85, 156, .08); opacity: 1; }
 .assistant-copy-button:focus-visible { outline: 2px solid rgba(72, 85, 156, .28); outline-offset: 1px; }
 .assistant-copy-button svg { flex: 0 0 auto; }

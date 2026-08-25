@@ -1626,8 +1626,7 @@ function AssistantCopyButton({ content }: { content: string }) {
 
   return <div className="assistant-message-actions">
     <button type="button" className="assistant-copy-button" onClick={() => void copyReply()} aria-label={failed ? "复制失败，重试" : copied ? "已复制" : "复制回复"} title={failed ? "复制失败，点击重试" : copied ? "已复制" : "复制回复"}>
-      {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
-      <span>{failed ? "重试" : copied ? "已复制" : "复制"}</span>
+      {copied ? <Check size={12} aria-hidden="true" /> : failed ? <CircleAlert size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
     </button>
   </div>;
 }
