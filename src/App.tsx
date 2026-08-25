@@ -26,6 +26,8 @@ import { buildSubagentActivity, subagentStatusLabel } from "./subagent-activity"
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
+const COMPOSER_LONG_PRESS_DELAY_MS = 650;
+const COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX = 12;
 const FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
 const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -1969,6 +1971,9 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   const discardRecordingRef = useRef(false);
   const waveformRef = useRef<HTMLCanvasElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressPointerRef = useRef<{ pointerId: number; startX: number; startY: number; triggered: boolean } | null>(null);
+  const [longPressArmed, setLongPressArmed] = useState(false);
   const handledFocusRequestRef = useRef(focusRequest);
   const inputRef = useRef(input);
   const filesRef = useRef(files);
@@ -1985,8 +1990,64 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
   removedEditingFileIdsRef.current = removedEditingFileIds;
   onSendRef.current = onSend;
 
+  function resetLongPress(pointerId?: number) {
+    if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = null;
+    const pointer = longPressPointerRef.current;
+    const textarea = textareaRef.current;
+    if (pointer && (pointerId === undefined || pointer.pointerId === pointerId) && textarea?.hasPointerCapture(pointer.pointerId)) {
+      try { textarea.releasePointerCapture(pointer.pointerId); } catch {}
+    }
+    if (pointerId === undefined || pointer?.pointerId === pointerId) {
+      longPressPointerRef.current = null;
+      setLongPressArmed(false);
+    }
+  }
+
+  function canArmLongPress() {
+    return voiceState === "idle" && !submitting && !selectionSaving && !voiceNotice && !voiceError
+      && !inputRef.current.trim() && !askAgentQuote && filesRef.current.length === 0
+      && draftFilesRef.current.length === 0 && draftUploadsRef.current.length === 0 && !editingPendingRef.current;
+  }
+
+  function beginLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
+    if (event.pointerType !== "touch" || !event.isPrimary || !canArmLongPress()) return;
+    resetLongPress();
+    event.preventDefault();
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch {}
+    longPressPointerRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, triggered: false };
+    setLongPressArmed(true);
+    longPressTimerRef.current = window.setTimeout(() => {
+      const pointer = longPressPointerRef.current;
+      if (!pointer || pointer.pointerId !== event.pointerId || !canArmLongPress()) return resetLongPress(event.pointerId);
+      pointer.triggered = true;
+      longPressTimerRef.current = null;
+      setLongPressArmed(false);
+      void startRecording();
+    }, COMPOSER_LONG_PRESS_DELAY_MS);
+  }
+
+  function moveLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
+    const pointer = longPressPointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId || pointer.triggered) return;
+    if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX) resetLongPress(event.pointerId);
+  }
+
+  function endLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
+    const pointer = longPressPointerRef.current;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    const wasTriggered = pointer.triggered;
+    resetLongPress(event.pointerId);
+    if (!wasTriggered) {
+      event.preventDefault();
+      event.currentTarget.focus();
+      event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length);
+    }
+  }
+
   useEffect(() => () => {
     window.clearTimeout(pasteTimer.current);
+    resetLongPress();
     discardRecordingRef.current = true;
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     releaseAudio();
@@ -2200,7 +2261,7 @@ function Composer({ conversationId, input, setInput, askAgentQuote, onClearAskAg
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
     {voiceNotice && <div className="voice-notice" role="status" aria-live="polite"><Check size={14} />{voiceNotice}</div>}
     {voiceError && <div className="voice-error" role="alert"><span>{voiceError}</span><button type="button" onClick={() => setVoiceError("")}><X size={13} /></button></div>}
-    <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
+    <textarea ref={textareaRef} className={longPressArmed ? "long-press-armed" : undefined} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} onPointerDown={beginLongPress} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={(event) => resetLongPress(event.pointerId)} onBlur={() => resetLongPress()} placeholder={voiceState === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voiceState === "transcribing"} />
     {voiceState !== "idle" && <div className={`voice-panel ${voiceState}`}>
       {voiceState === "recording" ? <><button type="button" className="voice-cancel" onClick={cancelRecording} title="取消录音"><X size={15} /></button><canvas ref={waveformRef} aria-label="实时音量波形" /><time>{formatVoiceDuration(voiceElapsed)}</time><button type="button" className="voice-stop" onClick={() => finishRecording(false)} title="停止并转成文字"><Square size={12} fill="currentColor" /></button></> : <><LoaderCircle className="spin" size={17} /><span>正在识别语音…</span></>}
     </div>}

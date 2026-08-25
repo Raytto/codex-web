@@ -673,6 +673,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .composer { padding: 10px 11px; border: 1px solid rgba(36, 42, 78, .17); border-radius: 16px; background: #fff; box-shadow: 0 14px 40px rgba(15, 17, 32, .1); transition: border-color .16s ease, box-shadow .16s ease; }
 .composer:focus-within { border-color: #8e98c2; box-shadow: 0 16px 44px rgba(15, 17, 32, .13), 0 0 0 3px rgba(72, 85, 156, .08); }
 .composer textarea { display: block; width: 100%; min-height: 56px; max-height: 160px; resize: none; padding: 8px 9px; border: 0; outline: 0; color: var(--ink); background: transparent; line-height: 1.55; }
+.composer textarea { touch-action: manipulation; -webkit-touch-callout: none; }
+.composer textarea.long-press-armed { background: var(--indigo-pale); border-radius: 8px; }
 .composer textarea::placeholder { color: #9699a8; }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; }
 .composer-primary-actions { min-width: 0; display: flex; align-items: center; gap: 7px; }

@@ -133,6 +133,15 @@ test("voice input explains the five-minute recording limit before transcription 
   assert.match(appSource, /className="voice-notice" role="status" aria-live="polite"/);
 });
 
+test("empty mobile composer long-press starts voice input without changing ordinary taps", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  assert.match(appSource, /COMPOSER_LONG_PRESS_DELAY_MS = 650/);
+  assert.match(appSource, /onPointerDown=\{beginLongPress\}/);
+  assert.match(appSource, /void startRecording\(\)/);
+  assert.match(styles, /\.composer textarea\.long-press-armed/);
+});
+
 test("uploading composer attachments expose per-file cancellation backed by AbortController", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");
