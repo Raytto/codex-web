@@ -61,7 +61,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     displayName: overrides.displayName ?? process.env.APP_DISPLAY_NAME ?? "Owner",
     passwordHash: overrides.passwordHash ?? process.env.APP_PASSWORD_HASH ?? "",
     sessionSecret: overrides.sessionSecret ?? process.env.SESSION_SECRET ?? "",
-    sessionTtlHours: overrides.sessionTtlHours ?? Number(process.env.SESSION_TTL_HOURS ?? 168),
+    sessionTtlHours: overrides.sessionTtlHours ?? Number(process.env.SESSION_TTL_HOURS ?? 336),
     projectRoot,
     dataRoot: overrides.dataRoot ?? (process.env.DATA_ROOT || path.join(projectRoot, "data")),
     workspaceRoot: overrides.workspaceRoot ?? (process.env.WORKSPACE_ROOT || path.join(projectRoot, "workspaces")),

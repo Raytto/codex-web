@@ -509,6 +509,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return new Date(Date.now() + seconds * 1000).toISOString();
   }
 
+  function relativeWakeDeadline(currentDeadlineAt: string, value: unknown): string | null {
+    const seconds = Number(value);
+    const currentTimestamp = Date.parse(currentDeadlineAt);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 365 * 24 * 60 * 60 || !Number.isFinite(currentTimestamp)) return null;
+    return new Date(currentTimestamp + seconds * 1000).toISOString();
+  }
+
   function wakeText(value: unknown, max = 20_000): string {
     return typeof value === "string" ? value.trim().slice(0, max) : "";
   }
@@ -866,8 +873,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     const plan = conversation ? db.getWakePlanForUser(String(req.params.planId), session.user_id) : undefined;
-    const deadlineAt = wakeDeadline(req.body?.delaySeconds);
     if (!conversation || !plan || plan.conversation_id !== conversation.id) return res.status(404).json({ error: "等待计划不存在。" });
+    const deadlineAt = relativeWakeDeadline(plan.deadline_at, req.body?.delaySeconds);
     if (!deadlineAt) return res.status(400).json({ error: "等待时间无效。" });
     const updated = db.rescheduleWakePlan(plan.id, deadlineAt);
     return updated ? res.json({ wakePlan: publicWakePlan(updated) }) : res.status(409).json({ error: "等待计划已经触发或取消。" });
