@@ -142,6 +142,13 @@ test("empty mobile composer long-press starts voice input without changing ordin
   assert.match(styles, /\.composer textarea\.long-press-armed/);
 });
 
+test("personal settings close on outside click and Escape", () => {
+  const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  assert.match(appSource, /accountAreaRef/);
+  assert.match(appSource, /setAccountSettingsOpen\(false\)/);
+  assert.match(appSource, /event\.key === "Escape"/);
+});
+
 test("uploading composer attachments expose per-file cancellation backed by AbortController", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf8");

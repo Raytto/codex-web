@@ -384,6 +384,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const accountAreaRef = useRef<HTMLDivElement>(null);
   const autoFollowRef = useRef(true);
   const lastScrollTopRef = useRef(0);
   const loadingOlderMessagesRef = useRef(false);
@@ -1222,6 +1223,21 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     };
   }, [taskMenu]);
 
+  useEffect(() => {
+    const closeAccountSettings = (event: PointerEvent) => {
+      if (event.target instanceof Node && !accountAreaRef.current?.contains(event.target)) setAccountSettingsOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setAccountSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeAccountSettings);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeAccountSettings);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, []);
+
   async function openArchivedConversations() {
     setAccountSettingsOpen(false);
     setArchivedDialogOpen(true);
@@ -1386,7 +1402,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           {filtered.length === 0 && <div className="empty-list">{query ? "没有匹配任务" : "还没有任务"}</div>}
         </div>
       </div>
-      <div className="account-area">
+      <div className="account-area" ref={accountAreaRef}>
         {accountSettingsOpen && <section className="account-settings" aria-label="个人设置">
           <div className="account-settings-heading"><Settings2 size={15} /><strong>个人设置</strong></div>
           <div className="font-size-setting">
