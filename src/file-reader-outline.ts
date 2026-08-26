@@ -9,14 +9,14 @@ export type PreparedHtmlDocument = {
 };
 
 /**
- * HTML reports are stitched into the PP Agent document rather than loaded in
+ * HTML reports are stitched into the Codex Web document rather than loaded in
  * an iframe. Keep their author CSS inside the reader surface so generic rules
  * such as `main`, `body`, `*`, and `button` cannot restyle the outer shell.
  * The report templates only use ordinary CSS rules and media/supports blocks;
  * this small parser deliberately preserves declarations and keyframe bodies
  * while recursively scoping selector-bearing blocks.
  */
-export const HTML_READER_SCOPE = ".file-reader-html .pp-agent-reader-body";
+export const HTML_READER_SCOPE = ".file-reader-html .codex-web-reader-body";
 
 const SCOPED_CSS_AT_RULES = new Set(["media", "supports", "layer", "container", "document", "scope", "starting-style", "nest"]);
 
@@ -26,7 +26,7 @@ function collectKeyframeNames(source: string): Map<string, string> {
   for (const match of source.matchAll(pattern)) {
     const original = match[1];
     const key = original.toLowerCase();
-    if (!names.has(key)) names.set(key, `pp-agent-reader-kf-${names.size}-${original}`);
+    if (!names.has(key)) names.set(key, `codex-web-reader-kf-${names.size}-${original}`);
   }
   return names;
 }
@@ -264,12 +264,12 @@ export function markdownReaderOutline(source: string): FileReaderOutlineItem[] {
 }
 
 /**
- * Prepare an HTML deliverable for the PP Agent reader.
+ * Prepare an HTML deliverable for the Codex Web reader.
  *
  * Parsing is deliberately performed in the browser with DOMParser. Active
  * content is removed and every author stylesheet is scoped before the final
  * fragment is stitched into the reader DOM. This keeps mobile text selection
- * and scrolling native without allowing generic report CSS to restyle PP Agent.
+ * and scrolling native without allowing generic report CSS to restyle Codex Web.
  */
 export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark" = "light"): PreparedHtmlDocument {
   if (typeof DOMParser === "undefined") return { content: source, outline: [] };
@@ -284,9 +284,9 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
 
   // Older report templates embedded their own desktop and mobile TOCs. The
   // surrounding reader now owns this UI, so remove those duplicate controls.
-  document.querySelectorAll("nav.toc, details.toc-mobile, [data-pp-agent-toc]").forEach((node) => node.remove());
+  document.querySelectorAll("nav.toc, details.toc-mobile, [data-codex-web-toc]").forEach((node) => node.remove());
 
-  // Keep the document static before it enters PP Agent's own DOM. Stylesheet
+  // Keep the document static before it enters Codex Web's own DOM. Stylesheet
   // links are removed because their selectors cannot be reliably rewritten;
   // user-facing reports are already required to be self-contained.
   document.querySelectorAll("script, noscript, form, iframe, object, embed, base, link, meta, title").forEach((node) => node.remove());
@@ -297,7 +297,7 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
     });
   });
 
-  // Reader links must never navigate the PP Agent shell itself.
+  // Reader links must never navigate the Codex Web shell itself.
   document.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((anchor) => {
     const href = anchor.getAttribute("href")?.trim() ?? "";
     if (/^javascript:/i.test(href)) { anchor.removeAttribute("href"); return; }
@@ -310,20 +310,20 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
   });
 
   const contentRoot = document.body.querySelector<HTMLElement>("main.report-content, main, article, [data-report-root], .report-shell");
-  contentRoot?.classList.add("pp-agent-reader-content");
+  contentRoot?.classList.add("codex-web-reader-content");
   const contentShell = contentRoot?.closest<HTMLElement>(".report-shell");
-  contentShell?.classList.add("pp-agent-reader-shell");
+  contentShell?.classList.add("codex-web-reader-shell");
 
   const authorStyles = Array.from(document.querySelectorAll("style"), (style) => scopeReaderStyles(style.textContent ?? ""));
   document.querySelectorAll("style").forEach((style) => style.remove());
 
-  const contentSelectors = `${HTML_READER_SCOPE} .pp-agent-reader-content,
-    ${HTML_READER_SCOPE} .pp-agent-reader-shell,
+  const contentSelectors = `${HTML_READER_SCOPE} .codex-web-reader-content,
+    ${HTML_READER_SCOPE} .codex-web-reader-shell,
     ${HTML_READER_SCOPE} > main:first-of-type,
     ${HTML_READER_SCOPE} > article:first-of-type,
     ${HTML_READER_SCOPE} > .report-shell`;
-  const contentPaddingSelectors = `${HTML_READER_SCOPE} .pp-agent-reader-content,
-    ${HTML_READER_SCOPE} .pp-agent-reader-shell > main:first-of-type,
+  const contentPaddingSelectors = `${HTML_READER_SCOPE} .codex-web-reader-content,
+    ${HTML_READER_SCOPE} .codex-web-reader-shell > main:first-of-type,
     ${HTML_READER_SCOPE} > main:first-of-type,
     ${HTML_READER_SCOPE} > article:first-of-type`;
   const viewerStyles = `
@@ -337,7 +337,7 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
   `;
 
   return {
-    content: `${authorStyles.map((style) => `<style data-pp-agent-author>${style}</style>`).join("")}<style data-pp-agent-reader>${viewerStyles}</style><div class="pp-agent-reader-body">${document.body.innerHTML}</div>`,
+    content: `${authorStyles.map((style) => `<style data-codex-web-author>${style}</style>`).join("")}<style data-codex-web-reader>${viewerStyles}</style><div class="codex-web-reader-body">${document.body.innerHTML}</div>`,
     outline,
   };
 }

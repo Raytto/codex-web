@@ -1,4 +1,5 @@
 export const THEME_PREFERENCE_KEY = "codex-web:theme";
+export const GUEST_READER_THEME_PREFERENCE_KEY = "codex-web:guest-reader-theme";
 
 export type ThemePreference = "light" | "dark" | "system";
 export type ResolvedTheme = "light" | "dark";
@@ -23,9 +24,9 @@ export function themeCanvasColor(theme: ResolvedTheme): string {
   return THEME_CANVAS_COLORS[theme];
 }
 
-export function readStoredThemePreference(storage: Pick<Storage, "getItem"> = window.localStorage): ThemePreference {
+export function readStoredThemePreference(storage: Pick<Storage, "getItem"> = window.localStorage, key = THEME_PREFERENCE_KEY): ThemePreference {
   try {
-    return normalizeThemePreference(storage.getItem(THEME_PREFERENCE_KEY));
+    return normalizeThemePreference(storage.getItem(key));
   } catch {
     return "light";
   }

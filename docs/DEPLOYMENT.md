@@ -16,6 +16,11 @@ Back up all three named volumes before upgrades. Keep `.env` outside source cont
 
 Recent releases add SQLite columns for continuation targets and selections, plus the `voice_transcription_receipts` table used for idempotent voice retries. Migrations are additive and run on startup, but the pre-upgrade volume backup remains the rollback boundary; do not start an older image against a database already migrated by a newer release unless that version is documented as backward compatible.
 
+Older installations may still have the legacy workspace layout; the startup
+migration preserves those files while converging new tenants on the current
+`tenants/<user-id>/conversations/` layout (旧布局 is not a reason to copy data
+into the public repository).
+
 Docker grants the application up to 30 minutes after `SIGTERM` to drain active Codex work. New dispatch stops immediately, queued jobs stay persisted, and the container exits once active executions finish. Avoid overriding `stop_grace_period` with a shorter value unless you accept interrupted jobs.
 
 ## Reverse proxy
@@ -34,10 +39,16 @@ To verify the offline-retry path, start a recording, interrupt connectivity afte
 
 ```bash
 git pull --ff-only
-docker compose up -d --build
+docker compose up -d
 ```
 
 The container seeds a newer bundled Codex CLI into the persistent runtime volume on startup. Existing login and thread state remain in the tenant volume.
+
+For source-based publishing, use `deploy/codex-web-request-rebuild` and the
+single-consumer `deploy/codex-web-rebuild-coordinator`; the optional
+`codex-web-self-maintain.service` and `.path` units can watch the persisted
+queue. Configure paths through `CODEX_WEB_*` variables and keep queue, status,
+logs, backups, and credentials outside Git.
 
 Managed skills are copied from the repository's `skills/` directory when a tenant is initialized. The default set includes `local-spreadsheets` and `html-report`; the latter also installs its relative `references/`, `assets/`, and `scripts/` files, so a newly created user can follow and validate the report workflow without any extra volume or environment setting. Do not manually place these managed skills under `.system/`.
 

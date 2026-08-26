@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { JobEventRow, MessageRow } from "./db.js";
 
-export const USER_CANCELLED_TASK_MARKER = "User explicitly stopped the task.";
+export const USER_CANCELLED_TASK_MARKER = "用户主动终止了任务。";
 
 type StoredEventPayload = {
   kind?: string;
@@ -30,11 +30,11 @@ export function buildUserCancellationSummary(events: JobEventRow[]): string {
       category = "plan";
       const completed = payload.items.filter((item) => item.completed).length;
       const current = payload.items.find((item) => !item.completed)?.text?.trim();
-      text = `Plan completed ${completed}/${payload.items.length}${current ? `; active when stopped: ${compactText(current, 180)}` : ""}`;
+      text = `执行计划完成 ${completed}/${payload.items.length}${current ? `，终止时正在处理：${compactText(current, 180)}` : ""}`;
     } else if (["command", "file", "search", "tool", "error"].includes(kind) && payload.label?.trim()) {
       category = "action";
       const fileNames = kind === "file" && payload.files?.length
-        ? `: ${payload.files.map((file) => path.basename(file)).join(", ")}`
+        ? `：${payload.files.map((file) => path.basename(file)).join("、")}`
         : "";
       text = `${compactText(payload.label, 180)}${fileNames}`;
     }
@@ -48,8 +48,12 @@ export function buildUserCancellationSummary(events: JobEventRow[]): string {
     ...entries.filter((entry) => entry.category === "action").slice(-4),
     ...entries.filter((entry) => entry.category === "plan").slice(-1),
   ].sort((left, right) => left.seq - right.seq).slice(-8);
-  const lines = [`> **${USER_CANCELLED_TASK_MARKER}** Key execution history was retained so the task can resume later.`];
-  if (selected.length > 0) lines.push("", "**Key work completed before cancellation**", ...selected.map((entry) => `- ${entry.text}`));
+  const lines = [
+    `> **${USER_CANCELLED_TASK_MARKER}** 已保留终止前的关键执行记录，后续可以从这里继续。`,
+  ];
+  if (selected.length > 0) {
+    lines.push("", "**终止前的关键执行过程**", ...selected.map((entry) => `- ${entry.text}`));
+  }
   return lines.join("\n");
 }
 

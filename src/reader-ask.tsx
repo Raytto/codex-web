@@ -270,8 +270,7 @@ type ReaderPanelGeometry = { left: number; top: number; width: number; height: n
 type ReaderPanelDrag = ReaderPanelGeometry & { pointerId: number; startX: number; startY: number };
 type ReaderPanelResize = ReaderPanelGeometry & { pointerId: number; startX: number; startY: number; direction: "top-left" | "bottom-right" };
 
-export function ReaderAskBubble({ accountId, conversationId, conversationTitle, quoteExcerpt, quoteLabel, userInitials, open, closing, onClose }: {
-  accountId?: string | null;
+export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerpt, quoteLabel, userInitials, open, closing, onClose }: {
   conversationId: string;
   conversationTitle: string;
   quoteExcerpt: string;
@@ -315,7 +314,7 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
   }, []);
 
   const refreshConversation = useCallback(async () => {
-    const value = await api.conversation(conversationId);
+    const value = await api.conversation(conversationId, 20);
     if ("restoring" in value) { setError("历史正在恢复，请稍后再试。"); return null; }
     setDetail(value); syncActivity(value);
     return value;
@@ -349,7 +348,7 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
     if (loading) return;
     setLoading(true); setError("");
     try {
-      const [conversationValue, options] = await Promise.all([api.conversation(conversationId), api.agentOptions({ conversationId })]);
+      const [conversationValue, options] = await Promise.all([api.conversation(conversationId, 20), api.agentOptions({ conversationId })]);
       if ("restoring" in conversationValue) { setError("历史正在恢复，请稍后再试。"); return; }
       setDetail(conversationValue); syncActivity(conversationValue);
       setAgentOptions(options);
@@ -398,20 +397,20 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
     const previousTop = container?.scrollTop ?? 0;
     setHistoryLoading(true);
     try {
-      const older = await api.conversationMessages(conversationId, page.nextCursor);
+      const older = await api.conversationMessages(conversationId, page.nextCursor, 20);
       setDetail((current) => current ? mergeOlderMessages(current, older) : current);
       window.requestAnimationFrame(() => { if (container) container.scrollTop = previousTop + container.scrollHeight - previousHeight; });
     } catch (reason) { setError(reason instanceof Error ? reason.message : "更早消息加载失败。"); }
     finally { setHistoryLoading(false); }
   }
 
-  async function send(messageOverride?: string, transcriptionIds = voiceIds) {
-    const message = (messageOverride ?? input).trim();
+  async function send() {
+    const message = input.trim();
     if (!message || submitting || !selection) return;
     setSubmitting(true); setError(""); setPendingQuestion(message); setInput(""); setStreamingContent("");
     window.requestAnimationFrame(() => { const container = historyRef.current; if (container) container.scrollTop = container.scrollHeight; });
     try {
-      const result = await api.sendMessage(conversationId, message, files, quote, false, transcriptionIds, selection);
+      const result = await api.sendMessage(conversationId, message, files, quote, false, voiceIds, selection);
       setFiles([]);
       setVoiceIds([]);
       if (result.job) connectJob(result.job);
@@ -523,7 +522,7 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
     onClose();
   }
 
-  const active = Boolean(detail?.activeJob || detail?.conversation.status === "running");
+  const active = Boolean(detail?.activeJob || detail?.externalStatus === "running" || detail?.conversationStatus === "running");
   const visibleMessages = detail?.messages ?? [];
 
   if (!open) return null;
@@ -542,7 +541,7 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
         return {
           avatar: scheduled ? <Clock size={15} /> : message.role === "assistant" ? <Zap size={15} /> : userInitials,
           avatarClassName: scheduled ? "scheduled" : undefined,
-          name: scheduled ? "定时任务" : message.role === "assistant" ? "PP Agent" : "你",
+          name: scheduled ? "定时任务" : message.role === "assistant" ? "Codex Web" : "你",
           timeLabel: formatConversationMessageDateTime(message.created_at),
           timeTitle: formatConversationFullDateTime(message.created_at),
         };
@@ -550,7 +549,6 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
     </div>
     {error && <div className="reader-ask-error-banner" role="alert">{error}</div>}
     <ConversationComposer
-      accountId={accountId}
       conversationId={conversationId}
       value={input}
       quote={quote.trim() ? quote : undefined}
@@ -582,7 +580,6 @@ export function ReaderAskBubble({ accountId, conversationId, conversationTitle, 
       onSend={() => void send()}
       onStop={() => void stop()}
       onTranscript={(text, id) => { setInput((current) => current ? `${current}${/\s$/.test(current) ? "" : "\n"}${text}` : text); setVoiceIds((current) => [...current, id].slice(-20)); }}
-      onSendAfterTranscription={(text, ids) => void send(text, ids)}
       onVoiceStateChange={setReaderVoiceState}
     />
   </aside>;

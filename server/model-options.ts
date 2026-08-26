@@ -16,6 +16,16 @@ export type AgentOptions = {
   defaults: { model: string; reasoningEffort: ModelReasoningEffort };
 };
 
+export type ExecutorRuntimeStatus = {
+  installedVersion: string;
+  latestVersion: string | null;
+  versionCheckedAt: string | null;
+  catalogUpdatedAt: string | null;
+  updateState: "idle" | "checking" | "updating" | "failed";
+  updateError: string | null;
+  agentOptions: AgentOptions | null;
+};
+
 export type AgentSelection = {
   model: string;
   reasoningEffort: ModelReasoningEffort;
@@ -79,6 +89,48 @@ function orderedEfforts(efforts: ModelReasoningEffort[]): ModelReasoningEffort[]
   const unique = [...new Set(efforts)];
   const known = EFFORT_ORDER.filter((effort) => unique.includes(effort as ModelReasoningEffort)) as ModelReasoningEffort[];
   return [...known, ...unique.filter((effort) => !(EFFORT_ORDER as readonly string[]).includes(effort))];
+}
+
+export function agentOptionsFromAppServer(value: unknown): AgentOptions | null {
+  const data = value && typeof value === "object" && Array.isArray((value as { data?: unknown }).data)
+    ? (value as { data: unknown[] }).data
+    : [];
+  const candidates = data.flatMap((item, priority): Array<AgentModelOption & { priority: number; isDefault: boolean; defaultEffort: ModelReasoningEffort | null }> => {
+    if (!item || typeof item !== "object") return [];
+    const model = item as Record<string, unknown>;
+    const id = typeof model.model === "string" ? model.model : typeof model.id === "string" ? model.id : "";
+    if (model.hidden === true || !/^[a-z0-9][a-z0-9._-]{1,80}$/i.test(id)) return [];
+    const efforts = reasoningEfforts(Array.isArray(model.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts.map((option) => option && typeof option === "object" && "reasoningEffort" in option
+        ? (option as { reasoningEffort: unknown }).reasoningEffort
+        : option)
+      : []);
+    if (efforts.length === 0) return [];
+    const defaultEffort = typeof model.defaultReasoningEffort === "string" && efforts.includes(model.defaultReasoningEffort as ModelReasoningEffort)
+      ? model.defaultReasoningEffort as ModelReasoningEffort
+      : null;
+    return [{
+      id,
+      label: typeof model.displayName === "string" && model.displayName.trim() ? model.displayName : id,
+      description: typeof model.description === "string" ? model.description : "",
+      reasoningEfforts: efforts,
+      priority,
+      isDefault: model.isDefault === true,
+      defaultEffort,
+    }];
+  });
+  if (candidates.length === 0) return null;
+  const explicitDefault = candidates.find((model) => model.isDefault) ?? candidates.find((model) => model.id === strongestModel(candidates)) ?? candidates[0];
+  const defaultReasoning = explicitDefault.defaultEffort
+    ?? (explicitDefault.reasoningEfforts.includes(DEFAULT_REASONING_EFFORT) ? DEFAULT_REASONING_EFFORT : explicitDefault.reasoningEfforts.at(-1)!);
+  const models = candidates.sort((left, right) => left.priority - right.priority)
+    .map(({ priority: _priority, isDefault: _isDefault, defaultEffort: _defaultEffort, ...model }) => model);
+  const offeredEfforts = orderedEfforts(models.flatMap((model) => model.reasoningEfforts));
+  return {
+    models,
+    reasoningEfforts: offeredEfforts.map((id) => ({ id, label: EFFORT_LABELS[id] ?? id })),
+    defaults: { model: explicitDefault.id, reasoningEffort: defaultReasoning },
+  };
 }
 
 function catalogModels(config: AppConfig, codexHome = config.codexHome): AgentModelOption[] {

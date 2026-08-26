@@ -4,10 +4,16 @@ export type ResolvedMessageLink =
   | { kind: "preview"; href: string }
   | { kind: "raw"; href: string }
   | { kind: "download"; href: string }
-  | { kind: "unavailable" }
+  | { kind: "unavailable"; path?: string }
   | { kind: "regular"; href: string };
 
 export type FileReaderKind = "markdown" | "html";
+
+export type RemoteMessageFileReference = {
+  sourcePath: string;
+  label: string;
+};
+
 function decodePath(value: string): string {
   let decoded = value.trim().replace(/^<|>$/g, "");
   for (let index = 0; index < 2; index += 1) {
@@ -22,11 +28,14 @@ function decodePath(value: string): string {
   return decoded;
 }
 
-function normalizePath(value: string): string | null {
-  let normalized = decodePath(value).replace(/^file:\/+/i, "").replace(/\\/g, "/");
+function normalizePath(value: string, allowParentSegments = false): string | null {
+  let normalized = decodePath(value)
+    .replace(/^file:\/\/\/(?=[a-z]:)/i, "")
+    .replace(/^file:\/\//i, "")
+    .replace(/\\/g, "/");
   if (/^\/[a-z]:\//i.test(normalized)) normalized = normalized.slice(1);
   const parts = normalized.split("/");
-  if (parts.some((part) => part === "..") || normalized.includes("\0")) return null;
+  if ((!allowParentSegments && parts.some((part) => part === "..")) || normalized.includes("\0")) return null;
   return normalized.replace(/^\.\//, "").replace(/\/{2,}/g, "/");
 }
 
@@ -86,17 +95,19 @@ export function publicFilePreviewIdFromPath(pathname: string): string | null {
   }
 }
 
-export function resolveMessageFileLink(href: string | undefined, files: WorkFile[]): ResolvedMessageLink {
+export function resolveMessageFileLink(href: string | undefined, files: WorkFile[], allowRemoteRelative = false): ResolvedMessageLink {
   if (!href) return { kind: "unavailable" };
-  const normalized = normalizePath(href);
+  const normalized = normalizePath(href, allowRemoteRelative);
   if (!normalized) return { kind: "unavailable" };
   const folded = normalized.toLocaleLowerCase();
   const candidates = files.map((file) => ({
     file,
     relative: normalizePath(file.relative_path)?.toLocaleLowerCase() ?? "",
+    source: normalizePath(file.source_path ?? "")?.toLocaleLowerCase() ?? "",
     name: normalizePath(file.original_name)?.toLocaleLowerCase() ?? "",
   }));
-  const exact = candidates.find((candidate) => candidate.relative && (folded === candidate.relative || folded.endsWith(`/${candidate.relative}`)));
+  const exact = candidates.find((candidate) => (candidate.source && folded === candidate.source)
+    || (candidate.relative && (folded === candidate.relative || folded.endsWith(`/${candidate.relative}`))));
   const basename = folded.split("/").pop() ?? "";
   const named = candidates.find((candidate) => candidate.name && basename === candidate.name);
   const matched = exact ?? named;
@@ -106,6 +117,21 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
     if (readerKind === "markdown") return { kind: "raw", href: fileUrl(matched.file) };
     return { kind: "download", href: fileUrl(matched.file, true) };
   }
-  if (/^sandbox:/i.test(href) || isLocalMachinePath(href, normalized) || /^(?:outputs|uploads)\//i.test(normalized)) return { kind: "unavailable" };
+  const relativeRemotePath = allowRemoteRelative && !/^(?:#|\/api\/|[a-z][a-z0-9+.-]*:)/i.test(normalized);
+  if (/^sandbox:/i.test(href) || isLocalMachinePath(href, normalized) || /^(?:outputs|uploads)\//i.test(normalized) || relativeRemotePath) {
+    return { kind: "unavailable", path: normalized };
+  }
   return { kind: "regular", href };
+}
+
+export function remoteMessageFileReferences(markdown: string, files: WorkFile[], allowRemoteRelative = false): RemoteMessageFileReference[] {
+  const references = new Map<string, RemoteMessageFileReference>();
+  const markdownLink = /(?<!!)\[([^\]\n]+)\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+["'][^"']*["'])?\s*\)/g;
+  for (const match of markdown.matchAll(markdownLink)) {
+    const resolved = resolveMessageFileLink(match[2] ?? match[3], files, allowRemoteRelative);
+    if (resolved.kind !== "unavailable" || !resolved.path) continue;
+    const key = resolved.path.toLocaleLowerCase();
+    if (!references.has(key)) references.set(key, { sourcePath: resolved.path, label: match[1] });
+  }
+  return [...references.values()];
 }

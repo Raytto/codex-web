@@ -1,45 +1,38 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import type { AppConfig } from "./config.js";
-import { AppDatabase, type FileRow } from "./db.js";
-import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, newId, normalizeStoredRelativePath, persistDeliverable, resolveGeneratedImage, resolveInside, snapshotDeliverables, snapshotGeneratedImages } from "./paths.js";
-import { cleanupJobRuntime, prepareJobRuntime, resolvePythonRuntime } from "./python-runtime.js";
+import { AppDatabase, type FileRow, type JobFinalizationPayload } from "./db.js";
+import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, normalizeStoredRelativePath, resolveGeneratedImage, resolveInside, snapshotDeliverables, snapshotGeneratedImages } from "./paths.js";
+import { cleanupJobRuntime, jobRuntimeRoot, prepareJobRuntime, resolvePythonRuntime, type JobRuntimeCleanupTarget } from "./python-runtime.js";
 import { assessTaskPolicy } from "./task-policy.js";
+import { latestUserCancellationContext } from "./cancellation-summary.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
-import type { AgentSelection } from "./model-options.js";
+import type { AgentSelection, ExecutorRuntimeStatus } from "./model-options.js";
 import { startTenantTurn } from "./tenant-worker-execution.js";
 import { TenantWorkerClient } from "./tenant-worker-client.js";
-import type { TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
-import type { AppServerTurnExecution, CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
+import type { TenantWorkerEvent, TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
+import type { AppServerTurnExecution } from "./app-server-turn.js";
+import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 import { isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
-import { buildAgentSteerPrompt, buildAgentTurnPrompt, type AgentAttachmentContext } from "./agent-context.js";
-import { detectOptionalAgentCapabilities } from "./optional-capabilities.js";
-import { latestUserCancellationContext } from "./cancellation-summary.js";
+import { isHostRootUser } from "./host-root-user.js";
+import { HostRootWorkerClient } from "./host-root-worker-client.js";
+import type { HostRootRunRequest } from "./host-root-protocol.js";
+import type { CodexAccountLoginView, CodexAccountView } from "./codex-account-manager.js";
+import { loadAccountSkillBundle } from "./account-skills.js";
+import { appendPersonalContextToUserPrompt, buildAgentSteerPrompt, buildAgentTurnPrompt, decideImageInput, isSupportedImageAttachment, type AgentAttachmentContext } from "./agent-context.js";
+import { containsPersonalContext, loadPersonalContextForTurn, stripPersonalContext } from "./personal-context.js";
+import { buildOptionalCapabilityRoutingHint, detectOptionalAgentCapabilities, updateOptionalAgentCapabilities } from "./optional-capabilities.js";
+import { RemoteWorkerGateway, type StoredArtifact } from "./remote-worker-gateway.js";
+import { remoteWorkerHasCapacity } from "./remote-worker-capacity.js";
+import { HOST_EXECUTOR_ID, workerIdFromExecutor } from "./remote-worker-protocol.js";
+import { TENANT_LOCAL_EXECUTOR_ID, assertTenantProjectRoot, createTenantProjectDirectory, initializeTenantProjectDirectory, listTenantProjectDirectories, validateTenantProjectDirectory } from "./tenant-projects.js";
+import { CODEX_EGRESS_FALLBACK_NOTICE, selectCodexEgress } from "./codex-egress.js";
 import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wake-automation.js";
-import {
-  buildConversationTitlePrompt,
-  CONVERSATION_TITLE_CODEX_MODEL,
-  CONVERSATION_TITLE_PROMPT_VERSION,
-  CONVERSATION_TITLE_REASONING_EFFORT,
-  CONVERSATION_TITLE_TIMEOUT_MS,
-  extractTitleRequestText,
-  parseConversationTitleOutput,
-  runCodexConversationTitle,
-} from "./conversation-title.js";
+import { cleanupFinalizationDirectory, prepareFinalizationFiles, recoverPreparedFinalization, rollbackUncommittedFinalization, sweepFinalizationOrphans, type FinalizationFileSource } from "./job-finalization.js";
+import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
 
 type Publish = (jobId: string, eventType: string, payload: unknown) => void;
-
-export const AUTO_TITLE_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    answer: { type: "string", description: "给用户显示的完整最终回复" },
-    title: { type: "string", minLength: 1, maxLength: 10, description: "准确概括首条请求的简短中文任务名，不超过十个字符" },
-  },
-  required: ["answer", "title"],
-  additionalProperties: false,
-} as const;
 
 type AutoTitleEnvelope = { answer: string; title: string };
 
@@ -71,6 +64,11 @@ export function capacityRetryPrompt(originalPrompt: string, continuationRequired
   return continuationRequired ? MODEL_CAPACITY_CONTINUATION_PROMPT : originalPrompt;
 }
 
+export function isAlreadyAbsentRemoteThread(error: unknown, threadId: string): boolean {
+  return error instanceof Error
+    && error.message.trim().toLowerCase() === `no rollout found for thread id ${threadId}`.toLowerCase();
+}
+
 function parseAutoTitleEnvelope(raw: string): AutoTitleEnvelope | null {
   const trimmed = raw.trim();
   const json = trimmed.startsWith("```")
@@ -93,39 +91,38 @@ export function extractLeakedAutoTitleAnswer(raw: string, tolerateSchemaTitleOve
   const envelope = parseAutoTitleEnvelope(raw);
   if (!envelope) return null;
   const title = envelope.title.trim();
-  const maxTitleLength = tolerateSchemaTitleOverflow ? 80 : AUTO_TITLE_OUTPUT_SCHEMA.properties.title.maxLength;
+  const maxTitleLength = tolerateSchemaTitleOverflow ? 80 : 10;
   if (!title || Array.from(title).length > maxTitleLength || /[\r\n]/.test(title)) return null;
   return envelope.answer;
-}
-
-export function parseAutoTitleResponse(raw: string, prompt: string): { answer: string; title: string } {
-  const parsed = parseAutoTitleEnvelope(raw);
-  if (parsed) return { answer: parsed.answer, title: normalizeTaskTitle(parsed.title, prompt) };
-  return { answer: raw, title: normalizeTaskTitle("", prompt) };
-}
-
-function normalizeTaskTitle(value: string, prompt: string): string {
-  const clean = value
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^[`'"“”‘’《》【】\[\]()（）]+|[`'"“”‘’《》【】\[\]()（）。！？!?，,；;：:]+$/g, "")
-    .trim();
-  const fallback = prompt
-    .replace(/\s+/g, " ")
-    .replace(/^(?:请|麻烦|能否|可以)?(?:帮我|给我)?(?:一下)?/u, "")
-    .trim() || "任务处理";
-  const candidate = clean && clean !== "新任务" ? clean : fallback;
-  return Array.from(candidate).slice(0, 10).join("");
 }
 
 export class CodexRunner {
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly directExecutions = new Map<string, AppServerTurnExecution>();
   private readonly workerClient: TenantWorkerClient | undefined;
-  private readonly titleRequests = new Map<string, Promise<void>>();
+  private readonly hostWorkerClient: HostRootWorkerClient;
 
-  constructor(private readonly config: AppConfig, private readonly db: AppDatabase, private readonly publish: Publish) {
+  constructor(private readonly config: AppConfig, private readonly db: AppDatabase, private readonly publish: Publish, private readonly remoteWorkers: RemoteWorkerGateway) {
     this.workerClient = config.tenantWorkerIsolation ? new TenantWorkerClient() : undefined;
+    this.hostWorkerClient = new HostRootWorkerClient(config.hostRootSocketPath);
+  }
+
+  reviewVoiceLexicon(userId: string, prompt: string, timeoutMs: number): Promise<string> {
+    if (isHostRootUser(userId)) return this.hostWorkerClient.reviewVoiceLexicon(userId, prompt, timeoutMs);
+    if (!this.workerClient) return Promise.reject(new Error("Tenant worker isolation is required for Codex voice review"));
+    return this.workerClient.reviewVoiceLexicon(userId, prompt, timeoutMs);
+  }
+
+  generateConversationTitle(userId: string, executorId: string, prompt: string, timeoutMs: number): Promise<string> {
+    const remoteWorkerId = workerIdFromExecutor(executorId);
+    if (remoteWorkerId) return this.remoteWorkers.generateConversationTitle(executorId, prompt, timeoutMs);
+    if (executorId === HOST_EXECUTOR_ID) {
+      if (!isHostRootUser(userId)) return Promise.reject(new Error("Host title executor is not available to this account"));
+      return this.hostWorkerClient.generateConversationTitle(userId, prompt, timeoutMs);
+    }
+    if (!this.workerClient) return Promise.reject(new Error("Tenant worker isolation is required for Codex title generation"));
+    if (executorId !== TENANT_LOCAL_EXECUTOR_ID) return Promise.reject(new Error("Conversation title executor is invalid"));
+    return this.workerClient.generateConversationTitle(userId, prompt, timeoutMs);
   }
 
   cancel(jobId: string): boolean {
@@ -134,6 +131,8 @@ export class CodexRunner {
     controller.abort();
     this.directExecutions.get(jobId)?.interrupt();
     this.workerClient?.cancel(jobId);
+    this.hostWorkerClient.cancel(jobId);
+    this.remoteWorkers.cancel(jobId);
     return true;
   }
 
@@ -141,10 +140,285 @@ export class CodexRunner {
     return this.abortControllers.size;
   }
 
-  conversationRolloutBytes(conversationId: string): number | null {
+  async recoverJobFinalizations(): Promise<{ resumed: number; rolledBack: number; published: number; orphaned: number; errors: string[] }> {
+    const report = { resumed: 0, rolledBack: 0, published: 0, orphaned: 0, errors: [] as string[] };
+    const recoverable = this.db.listRecoverableJobFinalizations();
+    for (const job of recoverable) {
+      try {
+        const payload = parseFinalizationPayload(job.finalization_payload);
+        if (!payload || payload.message.conversation_id !== job.conversation_id) throw new Error("Invalid persisted finalization payload");
+        let ready = payload;
+        if (job.finalization_state === "staging") {
+          const recovered = await recoverPreparedFinalization(this.config.dataRoot, job.id, payload);
+          if (!recovered) {
+            await rollbackUncommittedFinalization(this.config.dataRoot, job.id, payload);
+            this.db.abandonJobFinalization(job.id, "Incomplete staging was rolled back during startup recovery");
+            report.rolledBack += 1;
+            continue;
+          }
+          ready = recovered;
+          this.db.markJobFilesReady(job.id, ready);
+        }
+        if (["staging", "files_ready"].includes(job.finalization_state)) {
+          this.db.finalizeJob(job.id, job.conversation_id, ready);
+          report.resumed += 1;
+        }
+        if (!this.db.hasJobEvent(job.id, "done")) this.publish(job.id, "done", { status: "completed", recovered: true });
+        this.db.publishJobFinalization(job.id);
+        await cleanupFinalizationDirectory(this.config.dataRoot, job.id);
+        report.published += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.db.failJobFinalization(job.id, message);
+        report.errors.push(`${job.id}: ${message}`);
+      }
+    }
+    const protectedIds = new Set([
+      ...this.db.listRecoverableJobFinalizations().map((job) => job.id),
+      ...this.db.listRunningJobSummaries().map((job) => job.id),
+    ]);
+    report.orphaned = (await sweepFinalizationOrphans(this.config.dataRoot, protectedIds)).length;
+    return report;
+  }
+
+  async cleanupTerminalJobRuntimes(): Promise<{
+    removed: number;
+    absent: number;
+    failed: Array<{ jobId: string; message: string }>;
+  }> {
+    const targets = this.db.listTerminalJobRuntimes()
+      .map<JobRuntimeCleanupTarget>((job) => ({
+        userId: job.user_id,
+        conversationId: job.conversation_id,
+        jobId: job.job_id,
+      }))
+      .filter((target) => {
+        try { return fs.existsSync(jobRuntimeRoot(this.config.tenantRoot, target)); }
+        catch { return false; }
+      });
+    const hostTargets = targets.filter((target) => isHostRootUser(target.userId));
+    const tenantTargets = targets.filter((target) => !isHostRootUser(target.userId));
+    const report = {
+      removed: 0,
+      absent: 0,
+      failed: [] as Array<{ jobId: string; message: string }>,
+    };
+
+    if (hostTargets.length > 0) {
+      try {
+        const result = await this.hostWorkerClient.cleanupJobRuntimes(
+          hostTargets[0].userId,
+          hostTargets.map(({ conversationId, jobId }) => ({ conversationId, jobId })),
+        );
+        report.removed += result.removed;
+        report.absent += result.absent;
+        report.failed.push(...result.failed);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Host runtime cleanup failed";
+        report.failed.push(...hostTargets.map((target) => ({ jobId: target.jobId, message })));
+      }
+    }
+
+    if (tenantTargets.length > 0) {
+      if (this.workerClient) {
+        try {
+          const result = await this.workerClient.cleanupJobRuntimes(tenantTargets);
+          report.removed += result.removed;
+          report.absent += result.absent;
+          report.failed.push(...result.failed);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Tenant runtime cleanup failed";
+          report.failed.push(...tenantTargets.map((target) => ({ jobId: target.jobId, message })));
+        }
+      } else {
+        for (const target of tenantTargets) {
+          const result = cleanupJobRuntime(jobRuntimeRoot(this.config.tenantRoot, target));
+          if (result.status === "removed") report.removed += 1;
+          else if (result.status === "absent") report.absent += 1;
+          else report.failed.push({ jobId: target.jobId, message: result.error?.message ?? "Runtime cleanup failed" });
+        }
+      }
+    }
+    return report;
+  }
+
+  async deleteCodexThread(userId: string, conversationId: string, threadId: string): Promise<number | null> {
+    if (!isHostRootUser(userId)) return null;
+    const conversation = this.db.getConversation(conversationId);
+    if (!conversation || conversation.user_id !== userId) return null;
+    const project = conversation?.project_id ? this.db.getProjectForUser(conversation.project_id, userId) : undefined;
+    const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
+    if (remoteWorkerId) {
+      try { await this.remoteWorkers.archiveThread(remoteWorkerId, threadId); }
+      catch (error) {
+        // Deletion is an idempotent saga step. A previous canonical
+        // conversation may already have archived this same Remote thread.
+        if (!isAlreadyAbsentRemoteThread(error, threadId)) throw error;
+        return 0;
+      }
+      return 1;
+    }
+    return this.hostWorkerClient.deleteThread(userId, threadId);
+  }
+
+  async conversationRolloutBytes(conversationId: string): Promise<number | null> {
     const conversation = this.db.getConversation(conversationId);
     if (!conversation?.codex_thread_id) return null;
-    return codexThreadRolloutBytes(ensureTenant(this.config.tenantRoot, conversation.user_id).codexHome, conversation.codex_thread_id);
+    if (conversation.cold_storage_state !== "local") return conversation.rollout_bytes;
+    if (!isHostRootUser(conversation.user_id)) {
+      return codexThreadRolloutBytes(ensureTenant(this.config.tenantRoot, conversation.user_id).codexHome, conversation.codex_thread_id);
+    }
+    const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+    if (project && workerIdFromExecutor(project.executor_id)) return conversation.rollout_bytes;
+    return this.hostWorkerClient.threadRolloutBytes(conversation.user_id, conversation.codex_thread_id);
+  }
+
+  async restoreColdConversation(userId: string, conversationId: string): Promise<void> {
+    const restored = await this.hostWorkerClient.restoreColdConversation(userId, conversationId);
+    if (!restored) throw new Error("冷存储恢复未完成");
+  }
+
+  projectDirectories(userId: string, executorId: string, directory: string) {
+    if (!isHostRootUser(userId)) {
+      if (executorId !== TENANT_LOCAL_EXECUTOR_ID) throw new Error("当前账号只能使用个人受限工作区");
+      return listTenantProjectDirectories(ensureTenant(this.config.tenantRoot, userId), directory);
+    }
+    const resolvedDirectory = executorId === HOST_EXECUTOR_ID && !directory
+      ? path.dirname(this.config.hostKnowledgeRoot)
+      : directory;
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.projectDirectories(userId, resolvedDirectory)
+      : this.remoteWorkers.projectFs(executorId, "list", resolvedDirectory);
+  }
+
+  validateProjectDirectory(userId: string, executorId: string, directory: string) {
+    if (!isHostRootUser(userId)) {
+      if (executorId !== TENANT_LOCAL_EXECUTOR_ID) throw new Error("当前账号只能使用个人受限工作区");
+      return validateTenantProjectDirectory(ensureTenant(this.config.tenantRoot, userId), directory);
+    }
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.validateProjectDirectory(userId, directory)
+      : this.remoteWorkers.projectFs(executorId, "validate", directory);
+  }
+
+  createProjectDirectory(userId: string, executorId: string, parent: string, name: string) {
+    if (!isHostRootUser(userId)) {
+      if (executorId !== TENANT_LOCAL_EXECUTOR_ID) throw new Error("当前账号只能使用个人受限工作区");
+      return createTenantProjectDirectory(ensureTenant(this.config.tenantRoot, userId), parent, name);
+    }
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.createProjectDirectory(userId, parent, name)
+      : this.remoteWorkers.projectFs(executorId, "create", parent, name);
+  }
+
+  initializeProjectDirectory(userId: string, executorId: string, directory: string, content: string) {
+    if (!isHostRootUser(userId)) {
+      if (executorId !== TENANT_LOCAL_EXECUTOR_ID) throw new Error("当前账号只能使用个人受限工作区");
+      return initializeTenantProjectDirectory(ensureTenant(this.config.tenantRoot, userId), directory, content);
+    }
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.initializeProjectDirectory(userId, directory, content)
+      : this.remoteWorkers.projectFs(executorId, "initialize", directory, undefined, content);
+  }
+
+  refreshExecutorRuntime(userId: string, executorId: string, checkLatest = true): Promise<ExecutorRuntimeStatus> {
+    if (!isHostRootUser(userId)) throw new Error("当前账号不能管理执行机器");
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.runtimeStatus(userId, checkLatest)
+      : this.remoteWorkers.refreshRuntime(executorId, checkLatest);
+  }
+
+  async upgradeExecutorCodex(userId: string, executorId: string, version: string): Promise<ExecutorRuntimeStatus> {
+    if (!isHostRootUser(userId)) throw new Error("当前账号不能管理执行机器");
+    if (this.db.countRunningJobsForExecutor(executorId) > 0) throw new Error("目标机器仍有任务执行，暂不能升级 Codex");
+    if (executorId === HOST_EXECUTOR_ID) {
+      return this.hostWorkerClient.upgradeCodex(userId, version);
+    }
+    return this.remoteWorkers.upgradeCodex(executorId, version);
+  }
+
+  async listCodexAccounts(userId: string, executorId = HOST_EXECUTOR_ID): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    const previousAccountId = this.db.getExecutorActiveCodexAccount(executorId);
+    const state = executorId === HOST_EXECUTOR_ID
+      ? await this.hostWorkerClient.listCodexAccounts(userId)
+      : await this.remoteWorkers.listCodexAccounts(executorId);
+    this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId);
+    if (previousAccountId !== state.activeAccountId) this.remoteWorkers.emit("quota_usage", { executorId });
+    return this.withAccountQuotas(executorId, state);
+  }
+
+  beginCodexAccountLogin(userId: string, label: string, executorId = HOST_EXECUTOR_ID): Promise<CodexAccountLoginView> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.beginCodexAccountLogin(userId, label)
+      : this.remoteWorkers.beginCodexAccountLogin(executorId, label);
+  }
+
+  codexAccountLoginStatus(userId: string, loginId: string, executorId = HOST_EXECUTOR_ID): Promise<CodexAccountLoginView> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.codexAccountLoginStatus(userId, loginId)
+      : this.remoteWorkers.codexAccountLoginStatus(executorId, loginId);
+  }
+
+  cancelCodexAccountLogin(userId: string, loginId: string, executorId = HOST_EXECUTOR_ID): Promise<CodexAccountLoginView> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.cancelCodexAccountLogin(userId, loginId)
+      : this.remoteWorkers.cancelCodexAccountLogin(executorId, loginId);
+  }
+
+  async activateCodexAccount(userId: string, accountId: string, executorId = HOST_EXECUTOR_ID): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    const state = executorId === HOST_EXECUTOR_ID
+      ? await this.hostWorkerClient.activateCodexAccount(userId, accountId)
+      : await this.remoteWorkers.activateCodexAccount(executorId, accountId);
+    this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId);
+    this.remoteWorkers.emit("quota_usage", { executorId });
+    return this.withAccountQuotas(executorId, state);
+  }
+
+  deleteCodexAccount(userId: string, accountId: string, executorId = HOST_EXECUTOR_ID): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
+    return (executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.deleteCodexAccount(userId, accountId)
+      : this.remoteWorkers.deleteCodexAccount(executorId, accountId)).then((state) => this.withAccountQuotas(executorId, state));
+  }
+
+  private withAccountQuotas(executorId: string, state: { accounts: CodexAccountView[]; activeAccountId: string }): { accounts: CodexAccountView[]; activeAccountId: string } {
+    return {
+      ...state,
+      accounts: state.accounts.map((account) => {
+        const quota = this.db.getExecutorCodexQuota(executorId, account.id);
+        return {
+          ...account,
+          quotaRemainingPercent: quota?.remainingPercent ?? null,
+          quotaResetAt: quota?.resetAt ?? null,
+          quotaUpdatedAt: quota?.updatedAt ?? null,
+        };
+      }),
+    };
+  }
+
+  canDispatchConversation(conversationId: string): boolean {
+    const conversation = this.db.getConversation(conversationId);
+    if (!conversation?.project_id) return true;
+    const project = this.db.getProjectForUser(conversation.project_id, conversation.user_id);
+    if (!project) return true;
+    const executor = this.remoteWorkers.executor(project.executor_id);
+    if (!workerIdFromExecutor(project.executor_id)) return true;
+    return Boolean(executor?.status === "online"
+      && this.remoteWorkers.canRun(project.executor_id)
+      && remoteWorkerHasCapacity(this.db.countRunningJobsForExecutor(project.executor_id), executor.capacity));
+  }
+
+  async renameRemoteThread(conversationId: string, name: string): Promise<void> {
+    const conversation = this.db.getConversation(conversationId);
+    if (!conversation?.project_id || !conversation.codex_thread_id) return;
+    const project = this.db.getProjectForUser(conversation.project_id, conversation.user_id);
+    const workerId = project ? workerIdFromExecutor(project.executor_id) : null;
+    if (workerId) await this.remoteWorkers.renameThread(workerId, conversation.codex_thread_id, name);
   }
 
   async steer(jobId: string, prompt: string, uploads: FileRow[]): Promise<string> {
@@ -153,14 +427,32 @@ export class CodexRunner {
     const conversation = this.db.getConversation(job.conversation_id);
     if (!conversation) throw new Error("会话不存在");
     const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversation.id);
-    const effectivePrompt = buildAgentSteerPrompt(
-      prompt,
-      this.attachmentContext(uploads, workspace),
-    );
-    const imagePaths = uploads
-      .filter((file) => /^image\/(png|jpeg|webp)$/i.test(file.mime_type))
+    const hostRoot = isHostRootUser(conversation.user_id);
+    const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+    const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
+    const agentWorkspace = hostRoot ? this.hostWorkspace(conversation.user_id, conversation.id) : workspace;
+    const attachmentContext = this.attachmentContext(uploads, workspace, agentWorkspace, hostRoot);
+    const imageInputDecision = decideImageInput(attachmentContext);
+    const effectivePrompt = buildAgentSteerPrompt(prompt, attachmentContext, imageInputDecision);
+    const selectedImages = imageInputDecision.preload
+      ? uploads.filter((file) => isSupportedImageAttachment(file.original_name, file.mime_type))
+      : [];
+    const imagePaths = selectedImages
       .map((file) => resolveInside(workspace, file.relative_path));
-    const turnId = this.workerClient
+    const imageRelativePaths = selectedImages
+      .map((file) => file.relative_path);
+    const remoteTurnContext = remoteWorkerId && project && this.remoteWorkers.supportsAgentTurnContext(project.executor_id)
+      ? {
+          version: 1 as const,
+          userPrompt: prompt,
+          imageInput: imageInputDecision.preload ? "preload" as const : "none" as const,
+        }
+      : undefined;
+    const turnId = remoteWorkerId
+      ? await this.remoteWorkers.steer(jobId, prompt, uploads.map((row) => ({ row, absolutePath: resolveInside(workspace, row.relative_path) })), remoteTurnContext)
+      : hostRoot
+      ? await this.hostWorkerClient.steer(jobId, effectivePrompt, imageRelativePaths)
+      : this.workerClient
       ? await this.workerClient.steer(jobId, effectivePrompt, imagePaths)
       : await this.directExecutions.get(jobId)?.steer(effectivePrompt, imagePaths);
     if (!turnId) throw new Error("当前任务尚未进入可引导状态，请稍后重试");
@@ -168,9 +460,11 @@ export class CodexRunner {
     return turnId;
   }
 
-  async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection): Promise<void> {
+  async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection, options: { resumeRemote?: boolean } = {}): Promise<void> {
     const controller = new AbortController();
     let runtimeRoot: string | undefined;
+    let remoteArtifacts: StoredArtifact[] = [];
+    let remoteOmittedArtifacts: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]> = [];
     let executionObserved = false;
     let capacityAttemptHadProgress = false;
     let capacityAttemptReportedError = false;
@@ -180,67 +474,105 @@ export class CodexRunner {
     try {
       const conversation = this.db.getConversation(conversationId);
       if (!conversation) throw new Error("会话不存在");
-      const automation = {
+      const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
+      const accountSkills = loadAccountSkillBundle(tenant.library);
+      const personalContextSnapshot = loadPersonalContextForTurn(
+        tenant.library, conversation.codex_thread_id, conversation.personal_context_revision,
+        this.db.getPersonalMemoryState(conversation.user_id).revision, prompt,
+      );
+      const personalContext = personalContextSnapshot?.content;
+      const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversationId);
+      const hostRoot = isHostRootUser(conversation.user_id);
+      const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+      const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
+      const localCodexHome = hostRoot ? this.config.hostRootCodexHome : tenant.codexHome;
+      const generatedImagesBeforeThreadId = conversation.codex_thread_id;
+      const generatedImagesBefore = !remoteWorkerId && generatedImagesBeforeThreadId
+        ? await snapshotGeneratedImages(localCodexHome, generatedImagesBeforeThreadId)
+        : new Map<string, string>();
+      const agentWorkspace = hostRoot ? this.hostWorkspace(conversation.user_id, conversationId) : workspace;
+      const waitAutomationSupported = !remoteWorkerId || Boolean(project && this.remoteWorkers.supportsWaitAutomation(project.executor_id));
+      const automation = waitAutomationSupported ? {
         baseUrl: this.config.publicBaseUrl.replace(/\/$/, "") || `http://127.0.0.1:${this.config.port}${this.config.basePath}`,
         token: createJobAutomationToken(this.config.sessionSecret, jobId, conversationId),
-      };
-      const job = this.db.getJob(jobId);
-      const shouldGenerateTitle = conversation.title_source === "default"
-        && Boolean(job?.message_id && this.db.isFirstUserMessage(conversationId, job.message_id));
-      const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
-      const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversationId);
-      const generatedImagesBeforeThreadId = conversation.codex_thread_id;
-      const generatedImagesBefore = generatedImagesBeforeThreadId
-        ? await snapshotGeneratedImages(tenant.codexHome, generatedImagesBeforeThreadId)
-        : new Map<string, string>();
+        receiptDirectory: path.join(agentWorkspace, ".automation", "wake-receipts"),
+      } : undefined;
       const before = await snapshotDeliverables(workspace);
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
-      const conversationMessages = this.db.listMessages(conversationId);
-      const interruptedContext = latestUserCancellationContext(conversationMessages);
-      const optionalCapabilities = detectOptionalAgentCapabilities([
-        ...conversationMessages.filter((message) => message.role === "user").map((message) => message.content),
-        prompt,
-      ]);
+      const latestAssistant = this.db.getLatestAssistantMessage(conversationId);
+      const interruptedContext = latestUserCancellationContext(latestAssistant ? [{
+        id: latestAssistant.id,
+        conversation_id: conversationId,
+        role: "assistant",
+        content: latestAssistant.content,
+        created_at: "",
+      }] : []);
+      const storedCapabilities = this.db.getConversationOptionalCapabilities(conversationId);
+      const optionalCapabilities = storedCapabilities
+        ? updateOptionalAgentCapabilities(storedCapabilities, [prompt])
+        : detectOptionalAgentCapabilities(this.db.listUserMessageContents(conversationId));
+      this.db.setConversationOptionalCapabilities(conversationId, optionalCapabilities);
       this.db.updateJob(jobId, "running");
       this.db.updateConversation(conversationId, { status: "running" });
-      this.publish(jobId, "status", { status: "running", label: taskPolicy.isolated ? "正在隔离模式中处理" : "Codex Web 正在处理" });
+      const executionBoundaryLabel = remoteWorkerId
+        ? "正在远程电脑上以本机用户高权限处理（非隔离）"
+        : hostRoot
+        ? "正在 CODEX_WEB 服务器上以 root 高权限处理（非隔离）"
+        : taskPolicy.isolated
+        ? "正在受限容器的离线隔离模式中处理"
+        : "正在受限容器工作区中处理";
+      this.publish(jobId, "status", { status: "running", label: executionBoundaryLabel });
 
-      const effectivePrompt = appendWaitAutomationInstructions(buildAgentTurnPrompt({
+      const attachments = this.attachmentContext(uploads, workspace, agentWorkspace, hostRoot);
+      const imageInputDecision = decideImageInput(attachments);
+      const baseEffectivePrompt = buildAgentTurnPrompt({
         userPrompt: prompt,
-        attachments: this.attachmentContext(uploads, workspace),
+        attachments,
+        personalContext,
         interruptedContext,
-        runtimeWarning: !pythonRuntime.ready
+        runtimeWarning: !hostRoot && !pythonRuntime.ready
           ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
           : undefined,
-        isolationReason: taskPolicy.isolated ? taskPolicy.reason : undefined,
-      }));
+        capabilityRoutingHint: optionalCapabilities.remotePlugin ? buildOptionalCapabilityRoutingHint(prompt) : undefined,
+        isolationReason: !hostRoot && !remoteWorkerId && taskPolicy.isolated ? taskPolicy.reason : undefined,
+        imageInputDecision,
+      });
+      const remoteUnifiedContext = Boolean(remoteWorkerId && project && this.remoteWorkers.supportsAgentTurnContext(project.executor_id));
+      const remoteDynamicWait = Boolean(remoteWorkerId && project && this.remoteWorkers.supportsDynamicWaitTool(project.executor_id));
+      const legacyWaitInstructions = Boolean(automation && remoteWorkerId && !remoteDynamicWait && !conversation.codex_thread_id);
+      const effectivePrompt = appendWaitAutomationInstructions(baseEffectivePrompt, legacyWaitInstructions);
       const continuationEffectivePrompt = buildAgentTurnPrompt({
         userPrompt: MODEL_CAPACITY_CONTINUATION_PROMPT,
         attachments: [],
-        runtimeWarning: !pythonRuntime.ready
+        personalContext,
+        runtimeWarning: !hostRoot && !pythonRuntime.ready
           ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
           : undefined,
-        isolationReason: taskPolicy.isolated ? taskPolicy.reason : undefined,
+        capabilityRoutingHint: optionalCapabilities.remotePlugin ? buildOptionalCapabilityRoutingHint(prompt) : undefined,
+        isolationReason: !hostRoot && !remoteWorkerId && taskPolicy.isolated ? taskPolicy.reason : undefined,
       });
+      const selectedImagePaths = imageInputDecision.preload
+        ? uploads.filter((file) => isSupportedImageAttachment(file.original_name, file.mime_type))
+        : [];
       const request: TenantWorkerRunRequest = {
         jobId,
         userId: conversation.user_id,
         conversationId,
         projectRoot: this.config.projectRoot,
+        projectDirectory: project && !hostRoot
+          ? assertTenantProjectRoot(tenant, project.root_path)
+          : tenant.library,
         pythonRuntimeRoot: this.config.pythonRuntimeRoot,
         tenantRoot: tenant.root,
         workspace,
         runtimeRoot,
         codexHome: tenant.codexHome,
-        library: tenant.library,
         codexThreadId: conversation.codex_thread_id,
         effectivePrompt,
-        imagePaths: uploads
-          .filter((file) => /^image\/(png|jpeg|webp)$/i.test(file.mime_type))
+        imagePaths: selectedImagePaths
           .map((file) => resolveInside(workspace, file.relative_path)),
-        outputSchema: undefined,
         selection,
         networkAccessEnabled: taskPolicy.networkAccessEnabled,
         webSearchMode: taskPolicy.isolated ? "cached" : "live",
@@ -248,11 +580,40 @@ export class CodexRunner {
         optionalCapabilities,
         automation,
       };
+      const hostRequest: HostRootRunRequest = {
+        jobId,
+        userId: conversation.user_id,
+        conversationId,
+        projectRoot: conversation.project_id
+          ? this.db.getProjectForUser(conversation.project_id, conversation.user_id)?.root_path ?? this.config.hostKnowledgeRoot
+          : this.config.hostKnowledgeRoot,
+        codexThreadId: conversation.codex_thread_id,
+        effectivePrompt,
+        imageRelativePaths: selectedImagePaths
+          .map((file) => file.relative_path),
+        selection,
+        optionalCapabilities,
+        accountSkills,
+        automation,
+      };
+      let remoteThreadId = conversation.codex_thread_id;
       const callbacks = {
         onThreadStarted: (threadId: string) => {
+          // Synchronizing the thread prevents accidental duplicate thread creation. It does
+          // not make a started turn or its external side effects safe to replay.
           executionObserved = true;
           request.codexThreadId = threadId;
-          this.db.updateConversation(conversationId, { codexThreadId: threadId });
+          hostRequest.codexThreadId = threadId;
+          remoteThreadId = threadId;
+          // The read-only Remote observer can publish a brand-new thread a few
+          // milliseconds before this controlled run reports thread_started.
+          // Claiming atomically merges that observer placeholder and prevents a
+          // second visible conversation for the same project/thread.
+          this.db.claimCodexThreadForConversation(conversationId, threadId);
+          const latest = this.db.getConversation(conversationId);
+          if (remoteWorkerId && latest && latest.title_source !== "default") {
+            void this.remoteWorkers.renameThread(remoteWorkerId, threadId, latest.title).catch(() => undefined);
+          }
         },
         onContextUsage: (usage: ContextTokenUsage) => {
           executionObserved = true;
@@ -261,35 +622,89 @@ export class CodexRunner {
         onQuotaUsage: (usage: CodexQuotaUsage) => {
           executionObserved = true;
           this.db.setConversationCodexQuota(conversationId, usage);
+          if (!remoteWorkerId && project) this.remoteWorkers.emit("quota_usage", { executorId: project.executor_id });
         },
         onProgress: (payload: unknown) => {
           executionObserved = true;
           if (isMeaningfulExecutionProgress(payload)) capacityAttemptHadProgress = true;
           if (isModelCapacityProgress(payload)) capacityAttemptReportedError = true;
+          if (containsPersonalContext(payload)) return;
           this.publish(jobId, "progress", payload);
         },
       };
+      if (!remoteWorkerId) {
+        const codexEgress = await selectCodexEgress({ signal: controller.signal });
+        request.codexEgressKind = codexEgress.kind;
+        hostRequest.codexEgressKind = codexEgress.kind;
+        if (codexEgress.kind === "backup") {
+          this.publish(jobId, "progress", {
+            kind: "status",
+            status: "warning",
+            label: CODEX_EGRESS_FALLBACK_NOTICE,
+          });
+        }
+      }
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
         capacityAttemptHadProgress = false;
         capacityAttemptReportedError = false;
         const continuationAttempt = capacityContinuationRequired;
-        request.effectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
-        request.imagePaths = continuationAttempt ? [] : uploads
-          .filter((file) => /^image\/(png|jpeg|webp)$/i.test(file.mime_type))
+        const attemptUserPrompt = capacityRetryPrompt(prompt, continuationAttempt);
+        const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
+        const attemptRemotePrompt = appendPersonalContextToUserPrompt(attemptUserPrompt, personalContext);
+        const attemptUploads = continuationAttempt ? [] : uploads;
+        request.effectivePrompt = attemptEffectivePrompt;
+        request.imagePaths = continuationAttempt ? [] : selectedImagePaths
           .map((file) => resolveInside(workspace, file.relative_path));
+        hostRequest.effectivePrompt = attemptEffectivePrompt;
+        hostRequest.imageRelativePaths = continuationAttempt ? [] : selectedImagePaths
+          .map((file) => file.relative_path);
         if (retryAttempt > 0) {
           this.publish(jobId, "progress", {
             kind: "retry",
             label: lastRetryWasCapacity
-              ? continuationAttempt ? `正在进行第 ${retryAttempt} 次容量续接` : `正在进行第 ${retryAttempt} 次容量重试`
+              ? continuationAttempt
+                ? `正在进行第 ${retryAttempt} 次容量续接`
+                : `正在进行第 ${retryAttempt} 次容量重试`
               : `正在进行第 ${retryAttempt} 次连接重试`,
             ...(continuationAttempt ? { detail: "正在原会话中继续未完成的任务，不会重发原始用户指令。" } : {}),
           });
           this.publish(jobId, "status", {
             status: "running",
-            label: continuationAttempt ? `正在进行第 ${retryAttempt} 次自动续接` : `正在进行第 ${retryAttempt} 次自动重试`,
+            label: continuationAttempt
+              ? `正在进行第 ${retryAttempt} 次自动续接`
+              : `正在进行第 ${retryAttempt} 次自动重试`,
           });
         }
+        if (remoteWorkerId && project) {
+          const result = options.resumeRemote
+            ? await this.remoteWorkers.resume(jobId, remoteWorkerId, callbacks)
+            : await this.remoteWorkers.run(remoteWorkerId, {
+            jobId,
+            conversationId,
+            projectRoot: project.root_path,
+            codexThreadId: remoteThreadId,
+            prompt: appendWaitAutomationInstructions(attemptRemotePrompt, continuationAttempt ? false : legacyWaitInstructions),
+            selection,
+            optionalCapabilities,
+            ...(this.remoteWorkers.supportsAccountSkills(project.executor_id) ? { accountSkills } : {}),
+            automation: automation ? {
+              token: automation.token,
+              ...(remoteDynamicWait ? { dynamicTool: true as const } : {}),
+            } : undefined,
+            ...(remoteUnifiedContext ? {
+              turnContext: {
+                version: 1 as const,
+                userPrompt: attemptRemotePrompt,
+                ...(!continuationAttempt && interruptedContext ? { interruptedContext } : {}),
+                imageInput: !continuationAttempt && imageInputDecision.preload ? "preload" as const : "none" as const,
+              },
+            } : {}),
+          }, attemptUploads.map((row) => ({ row, absolutePath: resolveInside(workspace, row.relative_path) })), callbacks);
+          remoteArtifacts = result.artifacts;
+          remoteOmittedArtifacts = result.omittedArtifacts;
+          return result.finalResponse;
+        }
+        if (hostRoot) return this.hostWorkerClient.run(hostRequest, callbacks);
         if (this.workerClient) return this.workerClient.run(request, callbacks);
         const execution = startTenantTurn(request, { signal: controller.signal, ...callbacks });
         this.directExecutions.set(jobId, execution);
@@ -297,6 +712,10 @@ export class CodexRunner {
         finally { if (this.directExecutions.get(jobId) === execution) this.directExecutions.delete(jobId); }
       }, {
         signal: controller.signal,
+        // A no-progress capacity rejection safely retries the original prompt. Once an
+        // attempt has produced meaningful work, the next capacity retry starts a fresh turn
+        // in the same thread with an explicit continuation prompt instead of replaying the
+        // original user request. Transport retries retain the stricter whole-operation rule.
         canRetry: (error) => isModelCapacityError(error) || !executionObserved,
         onRetry: ({ attempt, maxAttempts, delayMs, message }) => {
           const capacityError = isModelCapacityError(message);
@@ -304,7 +723,10 @@ export class CodexRunner {
           if (capacityError) {
             const continueExistingWork = capacityAttemptHadProgress || capacityContinuationRequired;
             capacityContinuationRequired = continueExistingWork;
-            if (!capacityAttemptReportedError) this.publish(jobId, "progress", { kind: "error", label: redactBrandForDisplay(message) });
+            if (!capacityAttemptReportedError) this.publish(jobId, "progress", {
+              kind: "error",
+              label: redactBrandForDisplay(message),
+            });
             this.publish(jobId, "progress", {
               kind: "retry",
               label: `容量不足，将在 ${retryDelayLabel(delayMs)} 后进行第 ${attempt} 次${continueExistingWork ? "续接" : "重试"}`,
@@ -315,7 +737,9 @@ export class CodexRunner {
           }
           this.publish(jobId, "status", {
             status: "retrying",
-            label: capacityError ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次${capacityContinuationRequired ? "续接" : "重试"}` : "上游连接短暂中断，正在自动重试",
+            label: capacityError
+              ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次${capacityContinuationRequired ? "续接" : "重试"}`
+              : "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt,
             ...(maxAttempts !== undefined ? { retryMaxAttempts: maxAttempts } : {}),
             retryDelaySeconds: delayMs / 1000,
@@ -324,79 +748,127 @@ export class CodexRunner {
         },
       });
 
-      this.publish(jobId, "status", { status: "running", label: "正在登记结果文件" });
+      this.publish(jobId, "status", { status: "running", label: "正在校验并原子登记结果" });
       const messageId = newId();
       const createdAt = new Date().toISOString();
-      const finalResponse = (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse, true) : null)
-        ?? rawFinalResponse;
-      const safeFinalResponse = sanitizeAgentMarkdown(finalResponse, this.db.listFiles(conversationId));
-      this.db.addMessage({
+      const finalResponse = stripPersonalContext(
+        (conversation.title_source === "ai" ? extractLeakedAutoTitleAnswer(rawFinalResponse, true) : null)
+          ?? rawFinalResponse,
+      );
+      const remoteArtifactCandidates = remoteArtifacts.map((artifact) => ({
+        artifact,
+        deliveryName: remoteArtifactDeliveryName(artifact.name),
+      }));
+      const rejectedRemoteArtifacts = remoteArtifactCandidates.filter((item) => !item.deliveryName);
+      const omissionItems = [
+        ...remoteOmittedArtifacts.map((item) => `${item.path}（${remoteOmissionReason(item.reason)}）`),
+        ...rejectedRemoteArtifacts.map(({ artifact }) => `${remoteArtifactDisplayName(artifact.name)}（隐藏或异常文件名不允许交付）`),
+      ];
+      const omissionNotice = omissionItems.length > 0
+        ? `\n\n> Remote Worker 结果文件提示：${omissionItems.join("；")}`
+        : "";
+      const safeFinalResponse = sanitizeAgentMarkdown(`${finalResponse}${omissionNotice}`, this.db.listFiles(conversationId));
+      const message = {
         id: messageId,
         conversation_id: conversationId,
-        role: "assistant",
+        role: "assistant" as const,
         content: safeFinalResponse || "任务已完成。",
         created_at: createdAt,
-      });
-      const after = await snapshotDeliverables(workspace);
-      let hasExplicitImageOutput = false;
-      for (const [relativePath, fingerprint] of after) {
-        if (before.get(relativePath) === fingerprint) continue;
-        const portablePath = normalizeStoredRelativePath(relativePath);
-        const absolute = resolveInside(workspace, portablePath);
-        const stat = await fs.promises.stat(absolute);
-        const mimeType = guessMime(relativePath);
-        if (mimeType.startsWith("image/")) hasExplicitImageOutput = true;
-        const fileId = newId();
-        const storedPath = await persistDeliverable(this.config.dataRoot, workspace, portablePath, fileId);
-        const file: FileRow = {
-          id: fileId, conversation_id: conversationId, message_id: messageId,
-          original_name: path.basename(portablePath), relative_path: storedPath,
-          mime_type: mimeType, size: stat.size, kind: "output", created_at: createdAt,
-        };
-        this.db.addFile(file);
-      }
-      const generatedImageThreadId = request.codexThreadId;
-      if (!hasExplicitImageOutput && generatedImageThreadId) {
-        const baseline = generatedImagesBeforeThreadId === generatedImageThreadId
-          ? generatedImagesBefore
-          : new Map<string, string>();
-        const generatedImagesAfter = await snapshotGeneratedImages(tenant.codexHome, generatedImageThreadId);
-        const newGeneratedImages = [...generatedImagesAfter]
-          .filter(([fileName, fingerprint]) => baseline.get(fileName) !== fingerprint);
-        for (const [index, [fileName]] of newGeneratedImages.entries()) {
-          const source = resolveGeneratedImage(tenant.codexHome, generatedImageThreadId, fileName);
-          const stat = await fs.promises.lstat(source);
-          if (!stat.isFile() || stat.isSymbolicLink()) continue;
-          const extension = path.extname(fileName).toLowerCase();
-          const originalName = newGeneratedImages.length === 1 ? `AI生成图片${extension}` : `AI生成图片-${index + 1}${extension}`;
+      };
+      const fileSources: FinalizationFileSource[] = [];
+      if (remoteWorkerId) {
+        for (const { artifact, deliveryName } of remoteArtifactCandidates) {
+          if (!deliveryName) continue;
           const fileId = newId();
-          const storedPath = path.posix.join("deliverables", fileId, originalName);
-          const destination = resolveInside(this.config.dataRoot, storedPath);
-          await fs.promises.mkdir(path.dirname(destination), { recursive: true });
-          await fs.promises.copyFile(source, destination);
-          this.db.addFile({
+          const storedPath = path.posix.join("deliverables", fileId, deliveryName);
+          fileSources.push({ row: {
             id: fileId, conversation_id: conversationId, message_id: messageId,
-            original_name: originalName, relative_path: storedPath,
-            mime_type: guessMime(fileName), size: stat.size, kind: "output", created_at: createdAt,
-          });
+            original_name: deliveryName, relative_path: storedPath, mime_type: artifact.mimeType,
+            size: artifact.size, kind: "output", created_at: createdAt,
+          }, sourcePath: artifact.tempPath, expectedSha256: artifact.sha256 });
+        }
+      } else {
+        const after = await snapshotDeliverables(workspace);
+        let hasExplicitImageOutput = false;
+        for (const [relativePath, fingerprint] of after) {
+          if (before.get(relativePath) === fingerprint) continue;
+          const portablePath = normalizeStoredRelativePath(relativePath);
+          const absolute = resolveInside(workspace, portablePath);
+          const stat = await fs.promises.stat(absolute);
+          const mimeType = guessMime(relativePath);
+          if (mimeType.startsWith("image/")) hasExplicitImageOutput = true;
+          const fileId = newId();
+          const storedPath = path.posix.join("deliverables", fileId, path.basename(portablePath));
+          const file: FileRow = {
+            id: fileId, conversation_id: conversationId, message_id: messageId,
+            original_name: path.basename(portablePath), relative_path: storedPath,
+            mime_type: mimeType, size: stat.size, kind: "output", created_at: createdAt,
+          };
+          fileSources.push({ row: file, sourcePath: absolute });
+        }
+        // The built-in image generator writes to CODEX_HOME/generated_images and tells
+        // the model that the image is already visible. Codex Web messages are persisted
+        // from text plus registered files, so collect thread-owned images when the agent
+        // did not explicitly copy an image into outputs/ itself.
+        const generatedImageThreadId = request.codexThreadId;
+        if (!hasExplicitImageOutput && generatedImageThreadId) {
+          const baseline = generatedImagesBeforeThreadId === generatedImageThreadId
+            ? generatedImagesBefore
+            : new Map<string, string>();
+          const generatedImagesAfter = await snapshotGeneratedImages(localCodexHome, generatedImageThreadId);
+          const newGeneratedImages = [...generatedImagesAfter]
+            .filter(([fileName, fingerprint]) => baseline.get(fileName) !== fingerprint);
+          for (const [index, [fileName]] of newGeneratedImages.entries()) {
+            const absolute = resolveGeneratedImage(localCodexHome, generatedImageThreadId, fileName);
+            const stat = await fs.promises.lstat(absolute);
+            if (!stat.isFile() || stat.isSymbolicLink()) continue;
+            const extension = path.extname(fileName).toLowerCase();
+            const originalName = newGeneratedImages.length === 1
+              ? `AI生成图片${extension}`
+              : `AI生成图片-${index + 1}${extension}`;
+            const fileId = newId();
+            const storedPath = path.posix.join("deliverables", fileId, originalName);
+            fileSources.push({ row: {
+              id: fileId, conversation_id: conversationId, message_id: messageId,
+              original_name: originalName, relative_path: storedPath,
+              mime_type: guessMime(fileName), size: stat.size, kind: "output", created_at: createdAt,
+            }, sourcePath: absolute });
+          }
         }
       }
-      this.db.finishJob(jobId, conversationId, "completed");
-      this.publish(jobId, "done", { status: "completed" });
-      if (shouldGenerateTitle) this.scheduleConversationTitle(conversationId, conversation.user_id, jobId, prompt, uploads.map((file) => file.original_name));
+      const stagedPayload: JobFinalizationPayload = { message, files: fileSources.map(({ row }) => row) };
+      this.db.stageJobFinalization(jobId, stagedPayload);
+      const preparedFiles = await prepareFinalizationFiles(this.config.dataRoot, jobId, fileSources);
+      const readyPayload: JobFinalizationPayload = { message, files: preparedFiles };
+      this.db.markJobFilesReady(jobId, readyPayload);
+      this.db.finalizeJob(jobId, conversationId, readyPayload);
+      if (personalContextSnapshot) {
+        this.db.setConversationPersonalContextRevision(conversationId, personalContextSnapshot.revision);
+      }
+      if (!this.db.hasJobEvent(jobId, "done")) this.publish(jobId, "done", { status: "completed" });
+      this.db.publishJobFinalization(jobId);
+      if (remoteWorkerId) this.remoteWorkers.release(jobId);
+      await cleanupFinalizationDirectory(this.config.dataRoot, jobId).catch((error) => {
+        console.warn("Finalization staging cleanup failed", error instanceof Error ? error.message : error);
+      });
     } catch (error) {
       const cancelled = controller.signal.aborted;
       const interrupted = !cancelled && error instanceof Error && (
-        error.name === "TurnInterruptedError" || (executionObserved && isConnectionInterruptionError(error))
+        error.name === "TurnInterruptedError"
+        || (executionObserved && isConnectionInterruptionError(error))
       );
-      const message = cancelled ? "任务已停止" : interrupted
+      const message = cancelled
+        ? "任务已停止"
+        : interrupted
         ? "连接在本轮开始后中断。为避免重复执行命令或外部副作用，系统没有整轮重试；请确认现场状态后再继续。"
         : error instanceof Error ? redactBrandForDisplay(error.message) : "Agent 任务失败";
       try {
-        this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message);
+        this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message,
+          interrupted ? `本轮已经开始执行，但随后连接中断。为避免重复产生副作用，系统没有自动重放。\n\n${message}` : undefined);
       } catch {
         // Keep a single failed job from becoming an unhandled rejection that terminates the service.
       }
+      this.remoteWorkers.release(jobId);
       try {
         this.publish(jobId, cancelled ? "done" : "failed", { status: cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message });
       } catch {
@@ -406,81 +878,62 @@ export class CodexRunner {
       this.abortControllers.delete(jobId);
       this.directExecutions.delete(jobId);
       if (runtimeRoot) cleanupJobRuntime(runtimeRoot);
+      try { cleanupOwnedStagingDirectory(this.config.dataRoot, "remote-worker-staging", jobId); }
+      catch { /* Staging cleanup must not mask the job result. */ }
     }
   }
 
-  private scheduleConversationTitle(conversationId: string, userId: string, jobId: string, content: string, attachmentNames: string[]): void {
-    if (this.titleRequests.has(conversationId)) return;
-    const conversation = this.db.getConversation(conversationId);
-    if (!conversation || conversation.title_source !== "default") return;
-    const latestAudit = this.db.getLatestConversationTitleAudit(conversationId);
-    if (latestAudit?.status === "running" || latestAudit?.status === "succeeded") return;
-    const requestText = extractTitleRequestText(content);
-    const prompt = buildConversationTitlePrompt({ requestText, attachmentNames });
-    if (!prompt) return;
-    const auditId = newId();
-    const startedAt = new Date().toISOString();
-    const startedMs = Date.now();
-    this.db.createConversationTitleAudit({
-      id: auditId,
-      conversation_id: conversationId,
-      user_id: userId,
-      model: CONVERSATION_TITLE_CODEX_MODEL,
-      reasoning_effort: CONVERSATION_TITLE_REASONING_EFFORT,
-      prompt_version: CONVERSATION_TITLE_PROMPT_VERSION,
-      request_excerpt: Array.from(requestText).slice(0, 240).join(""),
-      request_sha256: crypto.createHash("sha256").update(requestText, "utf8").digest("hex"),
-      context_json: JSON.stringify({ attachmentNames: attachmentNames.slice(0, 20), requestCharacters: Array.from(requestText).length, execution: "tenant-local" }),
-      started_at: startedAt,
-    });
-    const controller = new AbortController();
-    const request = this.workerClient
-      ? this.workerClient.generateConversationTitle(userId, prompt, CONVERSATION_TITLE_TIMEOUT_MS)
-      : runCodexConversationTitle({ userId, prompt, timeoutMs: CONVERSATION_TITLE_TIMEOUT_MS }, { signal: controller.signal });
-    const operation = request.then((output) => {
-      const title = parseConversationTitleOutput(output);
-      if (!title) throw new Error("invalid_output");
-      const applied = this.db.setAiConversationTitleIfDefault(conversationId, title);
-      this.db.finishConversationTitleAudit(auditId, {
-        status: "succeeded", outputTitle: title, applied,
-        completedAt: new Date().toISOString(), durationMs: Date.now() - startedMs,
-      });
-      if (applied) this.publish(jobId, "conversation_title", { title });
-    }).catch((error) => {
-      try {
-        this.db.finishConversationTitleAudit(auditId, {
-          status: "failed",
-          error: titleAuditError(error),
-          completedAt: new Date().toISOString(),
-          durationMs: Date.now() - startedMs,
-        });
-      } catch { /* Shutdown can close SQLite before a detached title request returns. */ }
-    }).finally(() => this.titleRequests.delete(conversationId));
-    this.titleRequests.set(conversationId, operation);
+  recoverRemoteJobs(): Promise<void> {
+    const recoveries: Promise<void>[] = [];
+    for (const job of this.db.listRunningJobs()) {
+      const conversation = this.db.getConversation(job.conversation_id);
+      const project = conversation?.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+      if (!conversation || !project || !workerIdFromExecutor(project.executor_id) || !job.message_id) continue;
+      const message = this.db.getMessage(job.message_id);
+      if (!message) continue;
+      const selection: AgentSelection = {
+        model: job.agent_model ?? "gpt-5.6-sol",
+        reasoningEffort: (job.reasoning_effort ?? "high") as AgentSelection["reasoningEffort"],
+      };
+      recoveries.push(this.run(job.id, conversation.id, message.content, this.db.listFilesForMessage(message.id), selection, { resumeRemote: true }));
+    }
+    return Promise.allSettled(recoveries).then(() => undefined);
   }
 
-  private attachmentContext(uploads: FileRow[], workspace: string): AgentAttachmentContext[] {
+  private hostWorkspace(userId: string, conversationId: string): string {
+    return path.join(this.config.hostTenantRoot, userId, "conversations", conversationId);
+  }
+
+  private attachmentContext(uploads: FileRow[], workspace: string, agentWorkspace: string, hostRoot: boolean): AgentAttachmentContext[] {
     return uploads.map((file) => ({
       name: file.original_name,
       mimeType: file.mime_type,
-      path: normalizeStoredRelativePath(path.relative(workspace, resolveInside(workspace, file.relative_path))),
+      path: hostRoot
+        ? resolveInside(agentWorkspace, file.relative_path)
+        : resolveInside(workspace, file.relative_path),
     }));
   }
 }
 
-export function redactBrandForDisplay(value: string): string {
-  return value.replace(/chatgpt/gi, "Codex Web");
+function parseFinalizationPayload(value: string | null): JobFinalizationPayload | null {
+  if (!value) return null;
+  try {
+    const payload = JSON.parse(value) as JobFinalizationPayload;
+    if (!payload || typeof payload !== "object" || !payload.message || !Array.isArray(payload.files)) return null;
+    if (typeof payload.message.id !== "string" || typeof payload.message.conversation_id !== "string" || payload.message.role !== "assistant") return null;
+    if (payload.files.some((file) => !file || typeof file.id !== "string" || typeof file.relative_path !== "string" || file.kind !== "output")) return null;
+    return payload;
+  } catch { return null; }
 }
 
-function titleAuditError(error: unknown): string {
-  const value = error instanceof Error ? error.message : "Codex title request failed";
-  return value.replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9._-]{16,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9_-]{48,})\b/g, "[REDACTED]")
-    .replace(/((?:password|passwd|token|cookie|secret|api[ _-]?key|authorization|密码|口令|私钥|验证码)\s*[=:：]\s*)\S+/gi, "$1[REDACTED]")
-    .slice(0, 2_000);
+export function redactBrandForDisplay(value: string): string {
+  return value.replace(/chatgpt|codex/gi, "Codex Web");
 }
 
 export function summarizeEvent(event: ThreadEvent): unknown | null {
-  if (event.type === "error") return isRetryableUpstreamError(event.message)
+  if (event.type === "error") return isModelCapacityError(event.message)
+    ? { kind: "error", label: redactBrandForDisplay(event.message) }
+    : isRetryableUpstreamError(event.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
     : { kind: "error", label: redactBrandForDisplay(event.message) };
   if (event.type === "turn.started") return { kind: "status", label: "已开始分析" };
@@ -503,7 +956,9 @@ export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (item.type === "web_search") return { kind: "search", label: "正在搜索资料", detail: item.query };
   if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${redactBrandForDisplay(item.server)}`, detail: redactBrandForDisplay(item.tool) };
   if (item.type === "todo_list") return { kind: "todo", label: "任务计划已更新", items: item.items };
-  if (item.type === "error") return isRetryableUpstreamError(item.message)
+  if (item.type === "error") return isModelCapacityError(item.message)
+    ? { kind: "error", label: redactBrandForDisplay(item.message) }
+    : isRetryableUpstreamError(item.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
     : { kind: "error", label: redactBrandForDisplay(item.message) };
   if (item.type === "agent_message" && event.type === "item.completed") {
@@ -538,6 +993,29 @@ function commandProgressLabel(command: string, status: "in_progress" | "complete
     return running ? "正在检查文件与工作区" : "文件与工作区检查完成";
   }
   return running ? "正在执行本机处理步骤" : "本机处理步骤完成";
+}
+
+function remoteOmissionReason(reason: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]>[number]["reason"]): string {
+  return ({
+    count_limit: "超过单轮 20 个文件上限",
+    outside_project: "路径不在项目根目录内",
+    missing: "完成时文件已不存在",
+    not_file: "目标不是普通文件",
+    too_large: "超过单文件 100 MiB 上限",
+    manifest_limit: "其余省略项已合并计数",
+  })[reason];
+}
+
+export function remoteArtifactDeliveryName(name: string): string | null {
+  const normalized = normalizeStoredRelativePath(name);
+  const deliveryName = path.posix.basename(normalized);
+  if (!deliveryName || /[\u0000-\u001f\u007f]/.test(deliveryName)) return null;
+  const probeId = "00000000-0000-4000-8000-000000000000";
+  return isPersistedDeliverablePath(path.posix.join("deliverables", probeId, deliveryName)) ? deliveryName : null;
+}
+
+function remoteArtifactDisplayName(name: string): string {
+  return normalizeStoredRelativePath(name).replace(/[\u0000-\u001f\u007f]/g, "_").slice(0, 200) || "未命名文件";
 }
 
 function guessMime(filePath: string): string {

@@ -24,8 +24,9 @@ export function mergeJobEvents(current: JobEvent[], incoming: JobEvent[]): JobEv
     .slice(-RETAINED_STAGE_FEEDBACK_LIMIT);
   const rolling = ordered.slice(rollingStart);
   const rollingSet = new Set(rolling);
-  const retainedAgents = retainExpiredAgentEvents(ordered, rollingStart).filter((event) => !rollingSet.has(event));
-  return [...new Set([...retainedStageFeedback, ...retainedAgents, ...rolling])].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
+  const retainedAgentEvents = retainExpiredAgentEvents(ordered, rollingStart).filter((event) => !rollingSet.has(event));
+  return [...new Set([...retainedStageFeedback, ...retainedAgentEvents, ...rolling])]
+    .sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0));
 }
 
 function retainExpiredAgentEvents(events: JobEvent[], rollingStart: number): JobEvent[] {
@@ -33,7 +34,11 @@ function retainExpiredAgentEvents(events: JobEvent[], rollingStart: number): Job
   const pathByAgent = new Map<string, JobEvent>();
   for (const event of events) {
     if (event.kind !== "agent" || !Array.isArray(event.agents)) continue;
-    for (const agent of event.agents) { if (!agent?.id) continue; latestByAgent.set(agent.id, event); if (agent.path?.trim()) pathByAgent.set(agent.id, event); }
+    for (const agent of event.agents) {
+      if (!agent?.id) continue;
+      latestByAgent.set(agent.id, event);
+      if (agent.path?.trim()) pathByAgent.set(agent.id, event);
+    }
   }
   const expired = new Set(events.slice(0, rollingStart));
   return [...new Set([...latestByAgent.values(), ...pathByAgent.values()])].filter((event) => expired.has(event));

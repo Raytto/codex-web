@@ -56,12 +56,18 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - A managed `html-report` skill with its style guide, self-contained report template, and validator; new tenants receive it automatically with the managed skills
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
+- Project mode, project sidebar, cross-project conversation moves, and project-scoped Skills
+- Optional host/root bridge and Remote Worker gateway for explicitly trusted executors
+- Optional account management and shared Codex authentication policy (credentials stay in operator state)
+- Optional personal context and editable memory files (the repository ships empty templates only)
+- Optional encrypted cold storage for conversations and voice recordings; it is inert without a configured provider and key files
+- Queue-aware self-publish coordinator and matching `skills/self-publish` instructions for operators who choose to install them
 
 ## How the system fits together
 
 Codex Web is the reusable, self-hosted core of a larger personal Agent workstation design. The core turns the Codex CLI into a durable web service: the browser can disappear, but conversations, drafts, queued prompts, attachments, progress events, thread IDs, and finished files remain on the server.
 
-The full PP Agent deployment pattern adds a second execution tier for an administrator. Restricted member accounts still run inside isolated Docker tenants, while the administrator can route project work either to a trusted server-side executor or to a Remote Worker on another computer. This repository intentionally ships only the low-privilege public core as a safe default; the administrator host bridge, project mode, Remote Worker gateway, and production provisioning are extension components, not turnkey public settings.
+The full Codex Web deployment pattern can add a second execution tier for an administrator. Restricted member accounts still run inside isolated Docker tenants, while an administrator can route project work either to a trusted server-side executor or to a Remote Worker on another computer. The optional modules are shipped as reusable code, but their sockets, tokens, provider endpoints, cloud binaries, and credentials are disabled by default and must be configured by each operator.
 
 ### Roles and execution boundaries
 
@@ -69,13 +75,13 @@ The full PP Agent deployment pattern adds a second execution tier for an adminis
 | --- | --- | --- | --- |
 | Restricted member | Non-root tenant worker inside Docker | Its own conversations, library, uploads, outputs, and Codex Home | A friend or team member who should not access the host or another tenant |
 | Public owner | The same isolated tenant model | Its own self-hosted workspace and service settings | The default single-owner setup in this repository |
-| PP Agent administrator | Explicitly selected local or remote project executor | Projects the administrator has added, plus their retained task history | Managing trusted server projects and Codex sessions on connected computers |
+| Codex Web administrator | Explicitly selected local or remote project executor | Projects the administrator has added, plus their retained task history | Managing trusted server projects and Codex sessions on connected computers |
 
 ```mermaid
 flowchart TB
     member["Restricted member"] --> web
     owner["Public owner"] --> web
-    admin["PP Agent administrator"] --> web
+    admin["Codex Web administrator"] --> web
 
     subgraph core["Public Codex Web core"]
         web["React UI + Express API"]
@@ -92,7 +98,7 @@ flowchart TB
 
     tenant --> tenantCodex["Codex CLI"]
 
-    subgraph extension["PP Agent administrator extension"]
+    subgraph extension["Codex Web administrator extension"]
         router["Project + executor router"]
         hostBridge["Trusted local host bridge"]
         gateway["Remote Worker WSS gateway"]
@@ -120,7 +126,7 @@ A Remote Worker does not expose an inbound shell, RDP endpoint, or generic tunne
 sequenceDiagram
     autonumber
     actor A as Administrator
-    participant API as PP Agent API
+    participant API as Codex Web API
     participant G as Worker gateway
     participant W as Remote Worker
     participant C as Local codex app-server
@@ -176,7 +182,7 @@ This architecture separates four kinds of durable state:
 
 Long-running workflows may explicitly register a one-shot continuation plan. The scheduler and external event receipts are durable, but the Agent turn itself is never kept alive with `sleep`; see [Durable continuation](docs/WAKE_AUTOMATION.md).
 
-For the public build, the web process has no Docker socket, host filesystem mount, or root bridge. See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) before adapting the extension pattern to your own environment.
+The default Compose file has no host bridge mount, Remote Worker enrollment token, cloud provider, or shared-auth credential. Enabling any extension is an explicit trust decision; review [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) before mounting sockets or adding credentials.
 
 ## Requirements
 
@@ -207,7 +213,7 @@ For the public build, the web process has no Docker socket, host filesystem moun
 4. Build and start the service:
 
    ```bash
-   docker compose up -d --build
+   docker compose up -d
    ```
 
 5. Sign the isolated owner worker into Codex:
@@ -222,6 +228,12 @@ For the public build, the web process has no Docker socket, host filesystem moun
 6. Open [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/).
 
 State is stored in Docker named volumes. Closing the browser does not remove queued work, attachments, unsent composer drafts, or archived conversations.
+
+For an auditable source-based publish, enqueue a clean commit with
+`deploy/codex-web-request-rebuild` and let `deploy/codex-web-rebuild-coordinator`
+consume it, or install the optional `codex-web-self-maintain.service` and
+`.path` templates. Queue, status, and rollback evidence stay in the operator's
+state root and are never committed.
 
 ## Optional voice transcription
 

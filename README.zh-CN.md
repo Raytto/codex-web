@@ -21,7 +21,7 @@ npm run hash-password -- '请设置一个至少十二位的独立密码'
 把生成的哈希填入 `.env` 的 `APP_PASSWORD_HASH`，并设置至少 32 个字符的随机 `SESSION_SECRET`。然后执行：
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 docker compose exec --user 11001:11001 \
   -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
   -e CODEX_HOME=/app/tenants/00000000-0000-4000-8000-000000000001/codex-home \
@@ -29,6 +29,8 @@ docker compose exec --user 11001:11001 \
 ```
 
 打开 [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/) 即可使用。队列、附件、会话、归档记录、Codex 线程，以及输入框中尚未发送的正文、引用和附件都保存在服务器端；切换会话、关闭浏览器或换设备后仍可继续编辑。
+
+需要可审计的源码自发布时，可用 `deploy/codex-web-request-rebuild` 把干净提交放入队列，再由 `deploy/codex-web-rebuild-coordinator` 串行构建、验证、启动和健康检查；`codex-web-self-maintain.service/.path` 是可选的 systemd 模板。队列、状态和回滚证据写入操作者自行指定的状态目录，不进入仓库。
 
 运行中的工作记录先加载完整快照，再接入实时事件，不再要求刷新页面才能看到完整过程；记录按现有上限随页面自然展开。协作 Agent 会显示各自运行/完成/异常状态，子 Agent 通知不会误改父任务终态。排队与运行状态使用不同图标；任务操作收进稳定的菜单。会话处于定时或事件等待时，普通待发送任务继续排队，用户可以明确选择“插入”，运行中则使用“引导”。用户终止任务后，关键执行过程会保留为历史消息；服务意外重启也会明确标记未完成任务，避免把中断误认为完成或自动重复执行。
 
@@ -44,7 +46,7 @@ docker compose exec --user 11001:11001 \
 
 Codex Web 是个人 Agent 工作站中可复用、可公开部署的核心。它把一次性的 Codex CLI 交互变成持久服务：即使关闭浏览器，会话、草稿、待发送任务、附件、过程事件、Codex thread ID 和最终文件仍保存在服务器上，换设备后也能继续。
 
-完整的 PP Agent 部署会在这个核心之上增加管理员执行层：朋友或普通成员继续在彼此隔离的 Docker tenant 中运行；管理员则可以按项目明确选择服务器本机执行器，或选择另一台电脑上主动连入的 Remote Worker。为了让公开版本保持安全默认值，本仓库只直接发布低权限核心；管理员宿主桥、项目模式、远端 Worker 网关和生产账号配置属于扩展组件，并不是克隆本仓库后自动启用的功能。
+完整的 Codex Web 部署会在这个核心之上增加管理员执行层：朋友或普通成员继续在彼此隔离的 Docker tenant 中运行；管理员则可以按项目明确选择服务器本机执行器，或选择另一台电脑上主动连入的 Remote Worker。项目模式、项目侧栏、跨项目移动、宿主 root bridge、Remote Worker、账号管理、共享认证、个人记忆/上下文和冷存储的实现都随仓库提供，但默认没有令牌、端点、socket、云盘 CLI 或真实数据，因此克隆后不会自动启用。
 
 ### 账号角色与执行边界
 
@@ -52,13 +54,13 @@ Codex Web 是个人 Agent 工作站中可复用、可公开部署的核心。它
 | --- | --- | --- | --- |
 | 受限朋友账号 | Docker 内的非 root tenant worker | 仅自己的会话、知识库、附件、输出和 Codex Home | 允许朋友使用 Agent，但不能接触宿主机或其他用户数据 |
 | 公开版所有者 | 同样使用隔离 tenant | 自己的工作区与服务配置 | 本仓库默认的单所有者自托管方式 |
-| PP Agent 管理员 | 明确选择的本机或远端项目执行器 | 管理员主动添加的项目及其历史任务 | 管理可信服务器项目，以及已连接电脑上的 Codex |
+| Codex Web 管理员 | 明确选择的本机或远端项目执行器 | 管理员主动添加的项目及其历史任务 | 管理可信服务器项目，以及已连接电脑上的 Codex |
 
 ```mermaid
 flowchart TB
     member["受限朋友账号"] --> web
     owner["公开版所有者"] --> web
-    admin["PP Agent 管理员"] --> web
+    admin["Codex Web 管理员"] --> web
 
     subgraph core["公开 Codex Web 核心"]
         web["React 界面 + Express API"]
@@ -75,7 +77,7 @@ flowchart TB
 
     tenant --> tenantCodex["Codex CLI"]
 
-    subgraph extension["PP Agent 管理员扩展层"]
+    subgraph extension["Codex Web 管理员扩展层"]
         router["项目与执行器路由"]
         hostBridge["可信本机宿主桥"]
         gateway["远端 Worker WSS 网关"]
@@ -93,7 +95,7 @@ flowchart TB
     class router,hostBridge,gateway,hostCodex,remoteWorker,appServer,remoteState extensionNode;
 ```
 
-这里最重要的安全边界是“执行器”，而不只是浏览器账号。受限账号不能把普通 Web 请求变成宿主机访问：任务先经过路径和用户校验，再交给固定 Unix 身份，只能触达自己的 tenant。管理员项目模式则代表一次额外、明确的信任选择，所以它不会混进公开版的默认部署。
+这里最重要的安全边界是“执行器”，而不只是浏览器账号。受限账号不能把普通 Web 请求变成宿主机访问：任务先经过路径和用户校验，再交给固定 Unix 身份，只能触达自己的 tenant。管理员项目模式代表一次额外、明确的信任选择；只有配置 host bridge socket、Remote Worker 配对凭据等条件后才会启用。
 
 ### 管理远端电脑上的 Codex
 
@@ -103,7 +105,7 @@ Remote Worker 不开放入站 Shell、远程桌面或通用隧道。它主动向
 sequenceDiagram
     autonumber
     actor A as 管理员
-    participant API as PP Agent API
+    participant API as Codex Web API
     participant G as Worker 网关
     participant W as 远端 Worker
     participant C as 本机 codex app-server
@@ -164,7 +166,7 @@ stateDiagram-v2
 
 长流程可以显式登记一次性续跑计划。调度时间和外部事件回执会持久化，但不会用 `sleep` 长时间占住 Agent 回合；详见 [持久续跑](docs/WAKE_AUTOMATION.md)。
 
-公开版 Web 进程没有 Docker socket、宿主文件系统挂载或 root bridge。准备根据扩展架构搭建自己的管理员与远端执行能力前，请先阅读[架构说明](docs/ARCHITECTURE.md)和[安全说明](docs/SECURITY.md)。
+默认 Compose 不挂载 Docker socket、宿主文件系统或 root bridge，也不包含共享认证登录态。若要启用这些可选能力，请先阅读[架构说明](docs/ARCHITECTURE.md)和[安全说明](docs/SECURITY.md)，逐项配置并审计权限。
 
 ## 可选语音输入
 

@@ -85,7 +85,8 @@ export function resolvePublicShareAssets(
     const matches = images.filter((file) => {
       const name = file.original_name.replace(/\\/g, "/").toLocaleLowerCase();
       if (name === reference.key || path.posix.basename(name) === basename) return true;
-      return false;
+      const source = file.source_path?.replace(/\\/g, "/").toLocaleLowerCase();
+      return Boolean(source && (source === reference.key || source.endsWith(`/${reference.key}`)));
     });
     if (matches.length !== 1) {
       const reason = matches.length ? "存在多个同名图片" : "没有找到同次交付的已登记图片";

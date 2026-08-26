@@ -3,11 +3,14 @@ import readline from "node:readline";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.js";
 import { buildOptionalCapabilityConfig, type OptionalAgentCapabilities } from "./optional-capabilities.js";
+import { applyCodexProxyEnvironment, CODEX_EGRESS_FALLBACK_NOTICE, resolveCodexEgressChoice, selectCodexEgress, type CodexEgressKind } from "./codex-egress.js";
+import { callWaitDynamicTool, WAIT_DYNAMIC_TOOL_NAME, WAIT_DYNAMIC_TOOL_SPEC, type WaitDynamicToolConfig } from "./wait-dynamic-tool.js";
 
 type JsonObject = Record<string, unknown>;
 
 type AppServerCallbacks = {
   signal: AbortSignal;
+  onAuthReady?(): void | Promise<void>;
   onThreadStarted(threadId: string): void;
   onProgress(payload: unknown): void;
   onContextUsage?(usage: ContextTokenUsage): void;
@@ -22,6 +25,7 @@ export type ContextTokenUsage = {
 
 export type CodexQuotaUsage = {
   remainingPercent: number;
+  resetAt?: string | null;
 };
 
 export type AppServerTurnOptions = {
@@ -29,6 +33,7 @@ export type AppServerTurnOptions = {
   cwd: string;
   env: NodeJS.ProcessEnv;
   threadId: string | null;
+  threadInstructions?: string;
   prompt: string;
   imagePaths: string[];
   outputSchema?: Record<string, unknown>;
@@ -41,6 +46,8 @@ export type AppServerTurnOptions = {
   sandbox?: "workspace-write" | "danger-full-access";
   runtimeWorkspaceRoots?: string[];
   optionalCapabilities: OptionalAgentCapabilities;
+  codexEgressKind?: CodexEgressKind;
+  waitAutomation?: WaitDynamicToolConfig;
 };
 
 export type AppServerTurnExecution = {
@@ -56,9 +63,12 @@ type PendingRequest = {
 
 type RpcResponse = { id: number; result?: unknown; error?: { message?: string; data?: unknown } };
 type RpcNotification = { method: string; params?: JsonObject };
+type RpcServerRequest = { id: number; method: string; params?: JsonObject };
 
 export function appServerNotificationBelongsToThread(threadId: string | null, params: JsonObject): boolean {
   const notificationThreadId = typeof params.threadId === "string" ? params.threadId : null;
+  // Older app-server versions did not attach threadId to every notification.
+  // When it is present, keep child-agent threads from mutating the parent turn state.
   return !threadId || !notificationThreadId || notificationThreadId === threadId;
 }
 
@@ -69,8 +79,12 @@ class AppServerTurnClient {
   private threadId: string | null = null;
   private activeTurnId: string | null = null;
   private finalResponse = "";
+  private streamingAgentItemId: string | null = null;
+  private streamingAgentText = "";
   private readonly subagents = new Map<string, { path?: string; summary?: string }>();
   private terminal = false;
+  private quotaRefreshInFlight = false;
+  private authReadyNotified = false;
   private stderr = "";
   private readonly completion: Promise<string>;
   private resolveCompletion!: (value: string) => void;
@@ -134,12 +148,7 @@ class AppServerTurnClient {
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       this.notify("initialized");
-      void this.request("account/rateLimits/read", {})
-        .then((result) => {
-          const usage = normalizeCodexQuotaUsage(result);
-          if (usage) this.callbacks.onQuotaUsage?.(usage);
-        })
-        .catch(() => undefined);
+      void this.refreshQuotaUsage();
       const common = {
         model: this.options.model,
         cwd: this.options.cwd,
@@ -156,12 +165,18 @@ class AppServerTurnClient {
           hide_agent_reasoning: false,
           show_raw_agent_reasoning: false,
           web_search: this.options.webSearchMode,
-          ...buildOptionalCapabilityConfig(this.options.optionalCapabilities),
+          tool_output_token_limit: 8_000,
+          tools: { view_image: true },
+          ...buildOptionalCapabilityConfig(this.options.optionalCapabilities, this.options.prompt),
         },
       };
       const threadResult = this.options.threadId
         ? await this.request("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true })
-        : await this.request("thread/start", common);
+        : await this.request("thread/start", {
+            ...common,
+            ...(this.options.threadInstructions ? { developerInstructions: this.options.threadInstructions } : {}),
+            ...(this.options.waitAutomation ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC] } : {}),
+          });
       const thread = (threadResult as { thread?: { id?: string } })?.thread;
       if (!thread?.id) throw new Error("Codex app server did not return a thread id");
       this.threadId = thread.id;
@@ -201,9 +216,13 @@ class AppServerTurnClient {
   }
 
   private handleLine(line: string): void {
-    let message: RpcResponse | RpcNotification;
-    try { message = JSON.parse(line) as RpcResponse | RpcNotification; }
+    let message: RpcResponse | RpcNotification | RpcServerRequest;
+    try { message = JSON.parse(line) as RpcResponse | RpcNotification | RpcServerRequest; }
     catch { return; }
+    if ("id" in message && "method" in message) {
+      void this.handleServerRequest(message);
+      return;
+    }
     if ("id" in message) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -213,6 +232,26 @@ class AppServerTurnClient {
       return;
     }
     this.handleNotification(message);
+  }
+
+  private async handleServerRequest(message: RpcServerRequest): Promise<void> {
+    if (!this.child.stdin.writable) return;
+    const reply = (result: unknown) => this.child.stdin.write(`${JSON.stringify({ id: message.id, result })}\n`);
+    if (message.method !== "item/tool/call" || !this.options.waitAutomation) {
+      reply({ contentItems: [{ type: "inputText", text: "Unsupported dynamic tool request" }], success: false });
+      return;
+    }
+    const params = message.params ?? {};
+    if (params.tool !== WAIT_DYNAMIC_TOOL_NAME) {
+      reply({ contentItems: [{ type: "inputText", text: "Unknown dynamic tool" }], success: false });
+      return;
+    }
+    try {
+      const result = await callWaitDynamicTool(this.options.waitAutomation, params.arguments);
+      reply({ contentItems: [{ type: "inputText", text: result }], success: true });
+    } catch (error) {
+      reply({ contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });
+    }
   }
 
   private handleNotification(message: RpcNotification): void {
@@ -233,8 +272,9 @@ class AppServerTurnClient {
       return;
     }
     if (message.method === "account/rateLimits/updated") {
-      const usage = normalizeCodexQuotaUsage(params);
-      if (usage) this.callbacks.onQuotaUsage?.(usage);
+      // Notifications are sparse rolling updates. Refetch the complete snapshot
+      // instead of treating omitted windows or buckets as empty quota.
+      void this.refreshQuotaUsage();
       return;
     }
     if (message.method === "error") {
@@ -247,12 +287,32 @@ class AppServerTurnClient {
         : { kind: "error", label: redactBrand(detail) });
       return;
     }
+    if (message.method === "item/agentMessage/delta") {
+      const itemId = typeof params.itemId === "string" ? params.itemId : "";
+      const turnId = typeof params.turnId === "string" ? params.turnId : "";
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!itemId || !delta || (turnId && this.activeTurnId && turnId !== this.activeTurnId)) return;
+      if (this.streamingAgentItemId !== itemId) {
+        this.streamingAgentItemId = itemId;
+        this.streamingAgentText = "";
+      }
+      this.streamingAgentText = `${this.streamingAgentText}${delta}`.slice(-100_000);
+      this.callbacks.onProgress({
+        kind: "assistant_stream",
+        label: "正在生成回答",
+        detail: redactBrand(sanitizeAgentMarkdown(this.streamingAgentText)),
+      });
+      return;
+    }
     if (message.method === "item/started" || message.method === "item/completed") {
+      void this.markAuthReady();
       const item = params.item as JsonObject | undefined;
       if (!item) return;
       this.registerSubagent(item);
       if (item.type === "agentMessage" && message.method === "item/completed") {
         this.finalResponse = typeof item.text === "string" ? item.text : this.finalResponse;
+        this.streamingAgentItemId = null;
+        this.streamingAgentText = "";
         if (this.options.outputSchema) return;
       }
       const progress = summarizeAppServerItem(item, message.method === "item/completed");
@@ -260,6 +320,7 @@ class AppServerTurnClient {
       return;
     }
     if (message.method !== "turn/completed") return;
+    void this.markAuthReady();
     const turn = params.turn as { id?: string; status?: string; error?: { message?: string } | null } | undefined;
     if (turn?.id && this.activeTurnId && turn.id !== this.activeTurnId) return;
     this.terminal = true;
@@ -269,8 +330,9 @@ class AppServerTurnClient {
       this.resolveCompletion(this.finalResponse);
       return;
     }
-    const error = new Error(turn?.error?.message || (turn?.status === "interrupted" ? "任务已停止" : "Agent 任务失败"));
-    if (turn?.status === "interrupted" || this.callbacks.signal.aborted) error.name = "AbortError";
+    const error = new Error(turn?.error?.message || (turn?.status === "interrupted" ? "上游报告本轮已中断" : "Agent 任务失败"));
+    if (this.callbacks.signal.aborted) error.name = "AbortError";
+    else if (turn?.status === "interrupted") error.name = "TurnInterruptedError";
     this.rejectCompletion(error);
   }
 
@@ -306,18 +368,49 @@ class AppServerTurnClient {
     if (method !== "turn/completed") return;
     const turn = params.turn as { status?: string; error?: { message?: string } | null } | undefined;
     const latest = this.subagents.get(threadId) ?? tracked;
-    const status = turn?.status === "completed" ? "completed" : turn?.status === "interrupted" ? "interrupted" : "failed";
-    const errorSummary = status === "failed" && turn?.error?.message ? redactBrand(sanitizeAgentMarkdown(turn.error.message)).trim().slice(0, 2_000) : "";
-    this.callbacks.onProgress({ kind: "agent", label: "协作 Agent 状态更新", agents: [{
-      id: threadId.slice(0, 200), ...(latest.path ? { path: latest.path } : {}), status,
-      ...(latest.summary || errorSummary ? { summary: latest.summary || errorSummary } : {}),
-    }] });
+    const status = turn?.status === "completed" ? "completed"
+      : turn?.status === "interrupted" ? "interrupted"
+      : "failed";
+    const errorSummary = status === "failed" && turn?.error?.message
+      ? redactBrand(sanitizeAgentMarkdown(turn.error.message)).trim().slice(0, 2_000)
+      : "";
+    this.callbacks.onProgress({
+      kind: "agent",
+      label: "协作 Agent 状态更新",
+      agents: [{
+        id: threadId.slice(0, 200),
+        ...(latest.path ? { path: latest.path } : {}),
+        status,
+        ...(latest.summary || errorSummary ? { summary: latest.summary || errorSummary } : {}),
+      }],
+    });
   }
 
   private fail(error: Error): void {
     if (this.terminal) return;
     this.terminal = true;
     this.rejectCompletion(error);
+  }
+
+  private async refreshQuotaUsage(): Promise<void> {
+    if (!this.callbacks.onQuotaUsage || this.quotaRefreshInFlight || !this.child.stdin.writable) return;
+    this.quotaRefreshInFlight = true;
+    try {
+      const usage = normalizeCodexQuotaUsage(await this.request("account/rateLimits/read", {}));
+      await this.markAuthReady();
+      if (usage) this.callbacks.onQuotaUsage(usage);
+    } catch {
+      // Quota is informational and must not fail an otherwise healthy turn.
+    } finally {
+      this.quotaRefreshInFlight = false;
+    }
+  }
+
+  private async markAuthReady(): Promise<void> {
+    if (this.authReadyNotified) return;
+    this.authReadyNotified = true;
+    try { await this.callbacks.onAuthReady?.(); }
+    catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
   }
 
   private dispose(): void {
@@ -343,15 +436,50 @@ export function normalizeContextTokenUsage(params: JsonObject): ContextTokenUsag
 export function normalizeCodexQuotaUsage(value: unknown): CodexQuotaUsage | null {
   if (!value || typeof value !== "object") return null;
   const source = value as JsonObject;
-  const rateLimits = source.rateLimits && typeof source.rateLimits === "object"
-    ? source.rateLimits as JsonObject
-    : source;
-  const primary = rateLimits.primary && typeof rateLimits.primary === "object"
-    ? rateLimits.primary as JsonObject
+  const byLimitId = source.rateLimitsByLimitId && typeof source.rateLimitsByLimitId === "object"
+    ? source.rateLimitsByLimitId as JsonObject
     : null;
-  const usedPercent = primary?.usedPercent;
-  if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) return null;
-  return { remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent)) };
+  const explicitCodexLimit = byLimitId?.codex && typeof byLimitId.codex === "object"
+    ? byLimitId.codex as JsonObject
+    : null;
+  const rateLimits = explicitCodexLimit
+    ?? (source.rateLimits && typeof source.rateLimits === "object" ? source.rateLimits as JsonObject : source);
+  const windows = [rateLimits.primary, rateLimits.secondary].flatMap((window): JsonObject[] => {
+    if (!window || typeof window !== "object") return [];
+    const usedPercent = quotaUsedPercent(window as JsonObject);
+    return usedPercent !== null
+      ? [window as JsonObject]
+      : [];
+  });
+  if (windows.length === 0) return null;
+  const selected = windows.reduce((current, window) => (quotaUsedPercent(window) ?? 0) > (quotaUsedPercent(current) ?? 0) ? window : current);
+  const usedPercent = quotaUsedPercent(selected) ?? 0;
+  const resetAt = normalizeQuotaResetAt(selected.resetAt ?? selected.reset_at ?? selected.resetsAt ?? selected.resets_at);
+  return {
+    remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent)),
+    ...(resetAt ? { resetAt } : {}),
+  };
+}
+
+function quotaUsedPercent(window: JsonObject): number | null {
+  const value = window.usedPercent ?? window.used_percent;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizeQuotaResetAt(value: unknown): string | null {
+  let timestamp: number;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    timestamp = value > 10_000_000_000 ? value : value * 1_000;
+  } else if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    timestamp = Number.isFinite(numeric)
+      ? (numeric > 10_000_000_000 ? numeric : numeric * 1_000)
+      : Date.parse(value);
+  } else {
+    return null;
+  }
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 function finiteNonNegativeInteger(value: unknown): number | null {
@@ -363,11 +491,30 @@ function finitePositiveInteger(value: unknown): number | null {
 }
 
 export function startAppServerTurn(options: AppServerTurnOptions, callbacks: AppServerCallbacks): AppServerTurnExecution {
-  const client = new AppServerTurnClient(options, callbacks);
+  let client: AppServerTurnClient | null = null;
+  let interrupted = false;
+  const result = (async () => {
+    const choice = options.codexEgressKind
+      ? resolveCodexEgressChoice(options.codexEgressKind)
+      : await selectCodexEgress({ signal: callbacks.signal });
+    if (!options.codexEgressKind && choice.kind === "backup") {
+      callbacks.onProgress({ kind: "status", status: "warning", label: CODEX_EGRESS_FALLBACK_NOTICE });
+    }
+    const selectedOptions = {
+      ...options,
+      env: applyCodexProxyEnvironment({ ...options.env }, choice.proxyUrl),
+      shellEnvironment: applyCodexProxyEnvironment({ ...options.shellEnvironment }, choice.proxyUrl),
+    };
+    client = new AppServerTurnClient(selectedOptions, callbacks);
+    if (interrupted) client.interrupt();
+    return client.run();
+  })();
   return {
-    result: client.run(),
-    steer: (prompt, imagePaths) => client.steer(prompt, imagePaths),
-    interrupt: () => client.interrupt(),
+    result,
+    steer: (prompt, imagePaths) => client
+      ? client.steer(prompt, imagePaths)
+      : Promise.reject(new Error("当前任务正在选择网络出口，请稍后再引导")),
+    interrupt: () => { interrupted = true; client?.interrupt(); },
   };
 }
 
@@ -407,20 +554,35 @@ function summarizeSubagentItem(item: JsonObject): unknown | null {
   if (item.type === "subAgentActivity") {
     const id = typeof item.agentThreadId === "string" ? item.agentThreadId.trim() : "";
     if (!id) return null;
-    return { kind: "agent", label: "协作 Agent 状态更新", agents: [{
-      id, ...(typeof item.agentPath === "string" && item.agentPath.trim() ? { path: item.agentPath.trim().slice(0, 500) } : {}),
-      status: item.kind === "interrupted" ? "interrupted" : "running",
-    }] };
+    const status = item.kind === "interrupted" ? "interrupted" : "running";
+    return {
+      kind: "agent",
+      label: "协作 Agent 状态更新",
+      agents: [{
+        id,
+        ...(typeof item.agentPath === "string" && item.agentPath.trim() ? { path: item.agentPath.trim().slice(0, 500) } : {}),
+        status,
+      }],
+    };
   }
   if (item.type !== "collabAgentToolCall") return null;
-  const rawStates = item.agentsStates && typeof item.agentsStates === "object" && !Array.isArray(item.agentsStates) ? item.agentsStates as JsonObject : {};
-  const receiverIds = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.filter((value): value is string => typeof value === "string" && Boolean(value.trim())).map((value) => value.trim()) : [];
+  const rawStates = item.agentsStates && typeof item.agentsStates === "object" && !Array.isArray(item.agentsStates)
+    ? item.agentsStates as JsonObject
+    : {};
+  const receiverIds = Array.isArray(item.receiverThreadIds)
+    ? item.receiverThreadIds.filter((value): value is string => typeof value === "string" && Boolean(value.trim())).map((value) => value.trim())
+    : [];
   const ids = [...new Set([...Object.keys(rawStates), ...receiverIds])];
-  if (!ids.length) return null;
+  if (ids.length === 0) return null;
   const agents = ids.slice(0, 64).map((id) => {
-    const rawState = rawStates[id] && typeof rawStates[id] === "object" && !Array.isArray(rawStates[id]) ? rawStates[id] as JsonObject : {};
-    const summary = typeof rawState.message === "string" ? redactBrand(sanitizeAgentMarkdown(rawState.message)).trim().slice(0, 2_000) : "";
-    return { id: id.slice(0, 200), status: normalizeSubagentStatus(rawState.status, item.status), ...(summary ? { summary } : {}) };
+    const rawState = rawStates[id] && typeof rawStates[id] === "object" && !Array.isArray(rawStates[id])
+      ? rawStates[id] as JsonObject
+      : {};
+    const status = normalizeSubagentStatus(rawState.status, item.status);
+    const summary = typeof rawState.message === "string"
+      ? redactBrand(sanitizeAgentMarkdown(rawState.message)).trim().slice(0, 2_000)
+      : "";
+    return { id: id.slice(0, 200), status, ...(summary ? { summary } : {}) };
   });
   return { kind: "agent", label: "协作 Agent 状态更新", agents };
 }

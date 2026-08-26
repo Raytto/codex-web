@@ -1,0 +1,22 @@
+{
+  "name": "codex-web-remote-worker",
+  "version": "1.18.7",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && npm run test:powershell && node --test dist/src/*.test.js",
+    "test:powershell": "node scripts/check-powershell-syntax.mjs",
+    "test:powershell:required": "node scripts/check-powershell-syntax.mjs --required",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  }
+}

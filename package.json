@@ -9,9 +9,13 @@
     "dev": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite --host 127.0.0.1 --port 5173\"",
     "build": "vite build && tsc -p tsconfig.server.json",
     "start": "node dist-server/server/index.js",
+    "user": "node dist-server/server/manage-user.js",
     "hash-password": "node scripts/hash-password.mjs",
-    "test": "npm run build && node --import tsx --test tests/*.test.ts",
-    "lint": "tsc --noEmit"
+    "test": "npm run test:app",
+    "test:app": "npm run build && node --import tsx --test tests/*.test.ts",
+    "test:worker": "npm --prefix remote-worker test",
+    "lint": "tsc --noEmit",
+    "verify": "npm run lint && npm run test:app && npm run test:worker"
   },
   "dependencies": {
     "@openai/codex-sdk": "^0.144.1",
@@ -21,6 +25,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "helmet": "^8.3.0",
+    "js-tiktoken": "1.0.21",
     "katex": "^0.16.47",
     "lucide-react": "^1.24.0",
     "multer": "^2.2.0",
@@ -44,15 +49,17 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@types/supertest": "^7.2.0",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "6.0.2",
-    "concurrently": "^10.0.3",
+    "concurrently": "^10.0.4",
     "supertest": "^7.2.2",
     "tsx": "^4.23.0",
     "typescript": "5.9.3",
     "vite": "8.1.5"
   },
+  "type": "module",
   "overrides": {
-    "shell-quote": "^1.9.0"
-  },
-  "type": "module"
+    "shell-quote": "^1.9.0",
+    "nanoid": "^3.3.18"
+  }
 }

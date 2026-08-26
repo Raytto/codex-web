@@ -63,6 +63,11 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
     } else {
       doc.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT);
     }
+    // A visualViewport scroll is also emitted while Safari is showing the
+    // text-selection loupe/handles. Never force the document back to (0, 0)
+    // in that frame: doing so can make WebKit discard the browser-owned
+    // selection. Resize/focus recovery still requests the reset when the
+    // keyboard actually closes.
     const nativeSelection = doc.getSelection();
     const textSelectionActive = Boolean(nativeSelection && !nativeSelection.isCollapsed && nativeSelection.rangeCount > 0);
     const textSelectionRecentlyActive = lastTextSelectionAt > 0 && Date.now() - lastTextSelectionAt < TEXT_SELECTION_RESET_GRACE_MS;
@@ -92,6 +97,9 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
     const textSelectionActive = Boolean(nativeSelection && !nativeSelection.isCollapsed && nativeSelection.rangeCount > 0);
     const textSelectionRecentlyActive = lastTextSelectionAt > 0 && Date.now() - lastTextSelectionAt < TEXT_SELECTION_RESET_GRACE_MS;
     if (textSelectionActive || textSelectionRecentlyActive) {
+      // A selection/loupe scroll must win over a stale resize reset queued in
+      // the same animation frame. Ordinary keyboard/toolbar scroll keeps the
+      // normal root-scroll recovery path.
       resetRootScrollOnNextApply = false;
       schedule(false);
     } else schedule();

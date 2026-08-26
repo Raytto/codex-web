@@ -2,6 +2,7 @@ import readline from "node:readline";
 import { startTenantTurn, validateTenantWorkerRequest } from "./tenant-worker-execution.js";
 import type { AppServerTurnExecution } from "./app-server-turn.js";
 import type { TenantWorkerEvent, TenantWorkerInput } from "./tenant-worker-protocol.js";
+import { cleanupJobRuntime } from "./python-runtime.js";
 
 const expectedUserId = process.env.CWW_TENANT_USER_ID ?? "";
 const expectedTenantRoot = process.env.CWW_TENANT_ROOT ?? "";
@@ -44,6 +45,7 @@ input.on("line", (line) => {
   if (message.type !== "run" || started) return;
   started = true;
   void (async () => {
+    let terminalEvent: Extract<TenantWorkerEvent, { type: "completed" | "failed" }>;
     try {
       if (process.platform !== "win32" && (process.getuid?.() !== expectedUid || process.getgid?.() !== expectedGid)) {
         throw new Error("Worker Unix identity mismatch");
@@ -51,24 +53,27 @@ input.on("line", (line) => {
       validateTenantWorkerRequest(message.request, expectedUserId, expectedTenantRoot);
       activeExecution = startTenantTurn(message.request, {
         signal: controller.signal,
+        onAuthReady: () => send({ type: "auth_ready" }),
         onThreadStarted: (threadId) => send({ type: "thread_started", threadId }),
         onContextUsage: (usage) => send({ type: "context_usage", usage }),
         onQuotaUsage: (usage) => send({ type: "quota_usage", usage }),
         onProgress: (payload) => send({ type: "progress", payload }),
       });
       const finalResponse = await activeExecution.result;
-      send({ type: "completed", finalResponse });
+      terminalEvent = { type: "completed", finalResponse };
       process.exitCode = 0;
     } catch (error) {
       const cancelled = controller.signal.aborted;
-      send({
+      terminalEvent = {
         type: "failed",
         message: cancelled ? "任务已停止" : error instanceof Error ? error.message : "Agent 任务失败",
         cancelled,
-      });
+      };
       process.exitCode = cancelled ? 0 : 1;
     } finally {
       activeExecution = null;
+      cleanupJobRuntime(message.request.runtimeRoot);
+      send(terminalEvent!);
       input.close();
     }
   })();

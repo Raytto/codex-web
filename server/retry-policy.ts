@@ -4,7 +4,9 @@ export const MODEL_CAPACITY_STEADY_RETRY_DELAY_MS = 5 * 60_000;
 export const MODEL_CAPACITY_LONG_RETRY_AFTER_MS = 60 * 60_000;
 export const MODEL_CAPACITY_LONG_RETRY_DELAY_MS = 30 * 60_000;
 
-/** Capacity retries never exhaust and remain cancellable through AbortSignal. */
+/** Capacity retries never exhaust. The elapsed clock starts at the first
+ * capacity rejection so a user can stop the Job at any point via AbortSignal.
+ */
 export function modelCapacityRetryDelayMs(retryAttempt: number, elapsedMs: number): number {
   if (elapsedMs >= MODEL_CAPACITY_LONG_RETRY_AFTER_MS) return MODEL_CAPACITY_LONG_RETRY_DELAY_MS;
   return MODEL_CAPACITY_INITIAL_RETRY_DELAYS_MS[retryAttempt] ?? MODEL_CAPACITY_STEADY_RETRY_DELAY_MS;
@@ -35,6 +37,10 @@ export function isRetryableUpstreamError(error: unknown): boolean {
   ].some((pattern) => pattern.test(message));
 }
 
+/** Errors that mean the upstream transport itself broke after a turn started.
+ * Model capacity is retryable before execution, but it is not a connection
+ * interruption and must not be rewritten as one in the final job status.
+ */
 export function isConnectionInterruptionError(error: unknown): boolean {
   const message = upstreamErrorMessage(error).toLowerCase();
   return [
@@ -62,6 +68,7 @@ export async function runWithTransientRetries<T>(
     delaysMs?: readonly number[];
     capacityDelayMs?: (retryAttempt: number, elapsedMs: number) => number;
     onRetry?: (notice: RetryNotice) => void;
+    /** A whole-operation retry is only safe while the caller can prove no work started. */
     canRetry?: (error: unknown, retryAttempt: number) => boolean;
   },
 ): Promise<T> {

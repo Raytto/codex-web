@@ -25,6 +25,8 @@ export function formatTokenCount(tokens: number): string {
 
 export function formatContextUsage(inputTokens: number, modelContextWindow: number | null): string {
   const used = formatTokenCount(inputTokens);
-  if (typeof modelContextWindow !== "number" || !Number.isFinite(modelContextWindow) || modelContextWindow <= 0) return used;
+  if (typeof modelContextWindow !== "number" || !Number.isFinite(modelContextWindow) || modelContextWindow <= 0) {
+    return used;
+  }
   return `${used} / ${formatTokenCount(modelContextWindow)}`;
 }

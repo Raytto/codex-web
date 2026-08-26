@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="${CODEX_WEB_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+STATE_ROOT="${CODEX_WEB_STATE_ROOT:-$PROJECT_DIR/.state}"
+REQUEST_ROOT="${CODEX_WEB_DEPLOY_REQUEST_ROOT:-$STATE_ROOT/deploy}"
+STATE_DB="${CODEX_WEB_DEPLOY_STATE_DB:-$REQUEST_ROOT/state.sqlite}"
+STATE_HELPER="${CODEX_WEB_DEPLOY_STATE_HELPER:-$PROJECT_DIR/deploy/codex-web-deploy-state.py}"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[[ -d "$PROJECT_DIR/.git" ]] || die "Git repository is unavailable"
+[[ -z "$(git -C "$PROJECT_DIR" status --porcelain)" ]] || die "Repository has uncommitted changes"
+branch="$(git -C "$PROJECT_DIR" branch --show-current)"
+[[ "$branch" == "main" || "$branch" == "master" ]] || die "Deployment requests must come from main or master"
+commit="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+base="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^' 2>/dev/null || true)"
+mkdir -p "$REQUEST_ROOT"
+python3 "$STATE_HELPER" --db "$STATE_DB" --status-file "$REQUEST_ROOT/status.json" init >/dev/null
+python3 "$STATE_HELPER" --db "$STATE_DB" --status-file "$REQUEST_ROOT/status.json" enqueue --target "$commit" --base "$base" --source "${CODEX_WEB_DEPLOY_REQUEST_SOURCE:-manual}" >/dev/null
+printf '%s\n' "$commit" >"$REQUEST_ROOT/pending-commit"
+printf 'Queued deployment request for %s\n' "$commit"
+
+if [[ "${CODEX_WEB_START_COORDINATOR:-false}" == "true" ]]; then
+  exec "$PROJECT_DIR/deploy/codex-web-rebuild-coordinator"
+fi

@@ -6,7 +6,6 @@ import { SettingMenu } from "./SettingMenu";
 import type { ConversationVoiceState } from "./conversation-types";
 
 export type ConversationComposerProps = {
-  accountId?: string | null;
   conversationId?: string | null;
   value: string;
   quote?: string;
@@ -75,7 +74,7 @@ export function ConversationComposerReference({ reference, onRemove, className }
   </div>;
 }
 
-export function ConversationComposer({ accountId, conversationId, value, quote, reference, files, model, reasoningEffort, agentOptions, disabled, submitting, canSend, placeholder = "输入你想问的问题…", className, controlsClassName, attachmentClassName, sendClassName, voiceClassName, voicePanelClassName, voiceControlClassName, voiceMicClassName, maxFiles = 10, attachmentNames, onChange, onQuoteRemove, onFilesChange, onModelChange, onReasoningChange, onSend, onStop, onTranscript, onVoiceStateChange, onSendAfterTranscription }: ConversationComposerProps) {
+export function ConversationComposer({ conversationId, value, quote, reference, files, model, reasoningEffort, agentOptions, disabled, submitting, canSend, placeholder = "输入你想问的问题…", className, controlsClassName, attachmentClassName, sendClassName, voiceClassName, voicePanelClassName, voiceControlClassName, voiceMicClassName, maxFiles = 10, attachmentNames, onChange, onQuoteRemove, onFilesChange, onModelChange, onReasoningChange, onSend, onStop, onTranscript, onVoiceStateChange, onSendAfterTranscription }: ConversationComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [openMenu, setOpenMenu] = useState<"model" | "effort" | null>(null);
   const selectedModel = agentOptions?.models.find((candidate) => candidate.id === model);
@@ -93,7 +92,7 @@ export function ConversationComposer({ accountId, conversationId, value, quote, 
         <SettingMenu className="model" label="模型" value={model} options={agentOptions?.models.map((option) => ({ id: option.id, label: option.label, description: option.description })) ?? []} placeholder="加载中" title={selectedModel?.description || "选择任务使用的模型"} disabled={Boolean(!agentOptions || disabled || submitting)} open={openMenu === "model"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenMenu(open ? "model" : openMenu === "model" ? null : openMenu)} onChange={onModelChange} />
         <SettingMenu className="effort" label="思考" value={reasoningEffort} options={effortOptions} placeholder="加载中" title="选择模型的思考深度" disabled={Boolean(!selectedModel || disabled || submitting)} open={openMenu === "effort"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenMenu(open ? "effort" : openMenu === "effort" ? null : openMenu)} onChange={onReasoningChange} />
       </div>
-      <ConversationVoiceInput accountId={accountId} persistDraft conversationId={conversationId} draftText={value} attachmentNames={attachmentNames ?? files.map((file) => file.name)} disabled={disabled || submitting} className={voiceClassName} panelClassName={voicePanelClassName} controlClassName={voiceControlClassName} micClassName={voiceMicClassName} onStateChange={onVoiceStateChange} onTranscript={onTranscript} onSendAfterTranscription={onSendAfterTranscription} />
+      <ConversationVoiceInput conversationId={conversationId} draftText={value} attachmentNames={attachmentNames ?? files.map((file) => file.name)} disabled={disabled || submitting} className={voiceClassName} panelClassName={voicePanelClassName} controlClassName={voiceControlClassName} micClassName={voiceMicClassName} onStateChange={onVoiceStateChange} onTranscript={onTranscript} onSendAfterTranscription={onSendAfterTranscription} />
       {submitting && onStop
         ? <button type="button" className={`send-button stop conversation-send-button ${sendClassName ?? ""}`} onClick={onStop} aria-label="停止当前任务" title="停止当前任务"><Square size={15} fill="currentColor" /></button>
         : <button type="button" className={`send-button conversation-send-button ${sendClassName ?? ""}`} onClick={onSend} disabled={disabled || submitting || !canSend} aria-label="发送" title="发送">{submitting ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}

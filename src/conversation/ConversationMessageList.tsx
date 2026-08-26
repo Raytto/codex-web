@@ -33,7 +33,7 @@ export type ConversationMessageProps = {
 export function ConversationMessage({ message, variant = "main", className: extraClassName, avatar, avatarClassName, name, timeLabel, timeTitle, statusLabel, beforeContent, afterContent, hideQuote, renderAssistant, renderUser }: ConversationMessageProps) {
   const reader = variant === "reader";
   const className = `${reader ? "reader-ask-message " : ""}message ${message.role}`;
-  const messageName = name ?? (message.role === "assistant" ? "PP Agent" : message.role === "user" ? "你" : "系统");
+  const messageName = name ?? (message.role === "assistant" ? "Codex Web" : message.role === "user" ? "你" : "系统");
   const time = timeLabel ?? (message.created_at ? new Date(message.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "");
   const content = <>
       {beforeContent}
@@ -79,7 +79,7 @@ export function ConversationMessageList({ messages, variant = "main", loading, l
     {beforeMessages}
     {messages.map((message) => <ConversationMessage key={message.id} message={message} variant={variant} renderAssistant={renderAssistant} renderUser={renderUser} {...messageProps?.(message)} />)}
     {pendingQuestion && <ConversationMessage message={{ id: "pending-question", role: "user", content: pendingQuestion, quote_excerpt: null, attachment_references: [], created_at: new Date().toISOString(), files: [] }} variant={variant} className="pending" avatar={userAvatar} statusLabel={pendingLabel} timeLabel={pendingLabel ? "" : undefined} />}
-    {streamingContent && <article className={`${reader ? "reader-ask-message " : ""}message assistant running streaming`}><div className="message-avatar">{assistantAvatar ?? <Zap size={15} />}</div><div className="message-body"><div className="message-meta"><span className="message-name">PP Agent</span><span className="live-label"><LoaderCircle className="spin" size={12} />正在生成</span></div><ConversationMarkdown content={streamingContent} className={reader ? "reader-ask-markdown markdown" : "assistant-markdown markdown"} /></div></article>}
+    {streamingContent && <article className={`${reader ? "reader-ask-message " : ""}message assistant running streaming`}><div className="message-avatar">{assistantAvatar ?? <Zap size={15} />}</div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label"><LoaderCircle className="spin" size={12} />正在生成</span></div><ConversationMarkdown content={streamingContent} className={reader ? "reader-ask-markdown markdown" : "assistant-markdown markdown"} /></div></article>}
     {progressLabel && <div className={reader ? "reader-ask-progress" : "conversation-progress"}><LoaderCircle className="spin" size={14} /><span>{progressLabel}</span></div>}
     {afterMessages}
   </div>;

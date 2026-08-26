@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { applyCodexProxyEnvironment, selectCodexEgress } from "./codex-egress.js";
 
 export const CONVERSATION_TITLE_CODEX_MODEL = "gpt-5.6-luna";
 export const CONVERSATION_TITLE_REASONING_EFFORT = "low";
@@ -10,16 +11,37 @@ export const CONVERSATION_TITLE_TIMEOUT_MS = 60_000;
 const TITLE_LIMIT = 10;
 const REQUEST_LIMIT = 12_000;
 
-export type ConversationTitleAgentRequest = { userId: string; prompt: string; timeoutMs: number };
+export type ConversationTitleAgentRequest = {
+  userId: string;
+  prompt: string;
+  timeoutMs: number;
+};
+
+export type ConversationTitleContext = {
+  requestText: string;
+  projectName?: string | null;
+  projectDirectory?: string | null;
+  attachmentNames?: string[];
+  trigger: "first_message" | "remote_import";
+};
+
+export type ConversationTitleGenerationInput = ConversationTitleContext & { userId: string; executorId: string };
+
+export class ConversationTitleService {
+  constructor(private readonly execute: (userId: string, executorId: string, prompt: string, timeoutMs: number) => Promise<string>) {}
+
+  async generate(input: ConversationTitleGenerationInput): Promise<string | null> {
+    const prompt = buildConversationTitlePrompt(input);
+    if (!prompt) return null;
+    const output = await this.execute(input.userId, input.executorId, prompt, CONVERSATION_TITLE_TIMEOUT_MS);
+    return parseConversationTitleOutput(output);
+  }
+}
+
 export type ConversationTitleWorkerEvent =
   | { type: "auth_ready" }
   | { type: "completed"; output: string }
   | { type: "failed"; message: string };
-
-export type ConversationTitleContext = {
-  requestText: string;
-  attachmentNames?: string[];
-};
 
 export const CONVERSATION_TITLE_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -31,6 +53,8 @@ export const CONVERSATION_TITLE_OUTPUT_SCHEMA: Record<string, unknown> = {
 export function buildConversationTitlePrompt(context: ConversationTitleContext): string {
   const requestText = extractTitleRequestText(context.requestText);
   if (!requestText) return "";
+  const project = cleanContext(context.projectName, 120);
+  const directory = cleanContext(context.projectDirectory, 120);
   const attachments = [...new Set((context.attachmentNames ?? []).map((name) => cleanContext(name, 160)).filter(Boolean))].slice(0, 20);
   return [
     "你是 Codex Web 的专用会话命名器。只负责生成标题，不执行用户任务。",
@@ -38,10 +62,13 @@ export function buildConversationTitlePrompt(context: ConversationTitleContext):
     "规则：",
     "1. 优先 6～10 个汉字，绝对不超过 10 个字符。",
     "2. 至少使用明确的动宾结构，最好表达‘对什么对象做什么处理’；项目、游戏、产品或对象名重要时应保留。",
-    "3. 使用具体动作，如优化、修复、分析、整理、部署、验证、设计、制作；避免空泛标题。",
+    "3. 使用具体动作，如优化、修复、分析、整理、部署、验证、设计、制作；避免‘处理问题’‘执行任务’‘相关优化’等空泛标题。",
     "4. 不写主观语气、时间、序号、标点、引号或‘标题’前缀。",
     "5. 仅输出符合 schema 的 JSON。",
     "",
+    `触发来源：${context.trigger === "remote_import" ? "本机 Codex 新任务同步" : "Codex Web 首条需求"}`,
+    project ? `项目名：${project}` : "项目名：未提供",
+    directory ? `项目目录名：${directory}` : "项目目录名：未提供",
     attachments.length ? `附件名：${attachments.join("、")}` : "附件名：无",
     "用户首条需求：",
     requestText,
@@ -77,23 +104,35 @@ export function validateConversationTitleRequest(request: ConversationTitleAgent
   if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 15_000 || request.timeoutMs > 120_000) throw new Error("Codex title timeout is invalid");
 }
 
-export async function runCodexConversationTitle(request: ConversationTitleAgentRequest, callbacks: { signal: AbortSignal; onAuthReady?(): void }): Promise<string> {
+export async function runCodexConversationTitle(
+  request: ConversationTitleAgentRequest,
+  callbacks: { signal: AbortSignal; onAuthReady?(): void },
+): Promise<string> {
   validateConversationTitleRequest(request, process.env.CWW_TENANT_USER_ID || undefined);
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-title-"));
   const schemaPath = path.join(temporaryRoot, "schema.json");
   const outputPath = path.join(temporaryRoot, "output.json");
   fs.writeFileSync(schemaPath, JSON.stringify(CONVERSATION_TITLE_OUTPUT_SCHEMA), { encoding: "utf8", mode: 0o600 });
   try {
-    return await runCodexProcess(request, callbacks, temporaryRoot, schemaPath, outputPath);
+    const egress = await selectCodexEgress({ signal: callbacks.signal });
+    const environment = applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl);
+    return await runCodexProcess(request, callbacks, temporaryRoot, schemaPath, outputPath, environment);
   } finally {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   }
 }
 
-function runCodexProcess(request: ConversationTitleAgentRequest, callbacks: { signal: AbortSignal; onAuthReady?(): void }, cwd: string, schemaPath: string, outputPath: string): Promise<string> {
+async function runCodexProcess(
+  request: ConversationTitleAgentRequest,
+  callbacks: { signal: AbortSignal; onAuthReady?(): void },
+  cwd: string,
+  schemaPath: string,
+  outputPath: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const child = spawn(process.env.CODEX_RUNTIME_PATH || "codex", codexConversationTitleArguments(schemaPath, outputPath), {
-      cwd, env: process.env, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
+      cwd, env, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
     });
     let settled = false;
     let authReady = false;

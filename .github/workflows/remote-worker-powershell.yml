@@ -1,0 +1,44 @@
+name: Remote Worker PowerShell gate
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  powershell-contract:
+    name: Windows PowerShell 5.1 and PowerShell 7
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: remote-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: remote-worker/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Parse every script with Windows PowerShell 5.1
+        run: npm run test:powershell:required
+        env:
+          POWERSHELL_EXE: powershell.exe
+          REQUIRE_POWERSHELL: "1"
+      - name: Exercise update hardening with Windows PowerShell 5.1
+        shell: powershell
+        run: .\scripts\test-update-hardening.ps1 -WorkerRoot .
+      - name: Parse every script with PowerShell 7
+        run: npm run test:powershell:required
+        env:
+          POWERSHELL_EXE: pwsh.exe
+          REQUIRE_POWERSHELL: "1"
+      - name: Exercise update hardening with PowerShell 7
+        shell: pwsh
+        run: .\scripts\test-update-hardening.ps1 -WorkerRoot .
+      - name: Run Remote Worker tests
+        run: node --test dist/src/*.test.js

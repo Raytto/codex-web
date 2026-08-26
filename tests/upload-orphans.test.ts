@@ -1,0 +1,30 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { sweepUploadOrphans, uploadOwnershipKey } from "../server/upload-orphans.js";
+
+test("upload orphan sweep removes only old unregistered UUID files in strict tenant ownership paths", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-upload-sweep-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const userId = crypto.randomUUID();
+  const conversationId = crypto.randomUUID();
+  const uploads = path.join(root, userId, "conversations", conversationId, "uploads");
+  fs.mkdirSync(uploads, { recursive: true });
+  const registered = `${crypto.randomUUID()}.txt`;
+  const orphan = `${crypto.randomUUID()}.bin`;
+  const recent = `${crypto.randomUUID()}.txt`;
+  const manual = "manual-notes.txt";
+  for (const name of [registered, orphan, recent, manual]) fs.writeFileSync(path.join(uploads, name), name);
+  const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  for (const name of [registered, orphan, manual]) fs.utimesSync(path.join(uploads, name), old, old);
+  const result = await sweepUploadOrphans(root, new Set([uploadOwnershipKey(userId, conversationId, registered)]));
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(result.removed, [uploadOwnershipKey(userId, conversationId, orphan)]);
+  assert.equal(fs.existsSync(path.join(uploads, registered)), true);
+  assert.equal(fs.existsSync(path.join(uploads, recent)), true);
+  assert.equal(fs.existsSync(path.join(uploads, manual)), true);
+  assert.equal(fs.existsSync(path.join(uploads, orphan)), false);
+});

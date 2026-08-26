@@ -3,27 +3,42 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: codex-web:local
+    image: ${CODEX_WEB_IMAGE:-codex-web:local}
     restart: unless-stopped
     init: true
     environment:
       HOST: 0.0.0.0
       PORT: 37821
-      BASE_PATH: /codex-web
+      BASE_PATH: ""
       CONTAINERIZED: "true"
       DATA_ROOT: /app/data
       TENANT_ROOT: /app/tenants
       PYTHON_RUNTIME_ROOT: /opt/cww-python
-      CODEX_RUNTIME_PATH: /opt/codex-runtime/current/bin/codex
+      CODEX_HOME: /home/cww/.codex
+      CODEX_RUNTIME_PATH: ${CWW_CODEX_RUNTIME_PATH:-/opt/codex-runtime/current/bin/codex}
+      HOME: /home/cww
       TENANT_WORKER_ISOLATION: "true"
-      TZ: ${TZ:-UTC}
+      CWW_SHARED_CODEX_AUTH_FILE: /app/shared-codex-auth/auth.json
+      CWW_SHARED_CODEX_AUTH_LOCK: /app/shared-codex-auth/refresh.lock
+      CWW_SHARED_CODEX_AUTH_POLICY_FILE: /app/shared-codex-auth/policy.json
+      CODEX_WEB_HOST_SOCKET_PATH: ${CODEX_WEB_HOST_SOCKET_PATH:-}
+      CODEX_WEB_DEPLOY_STATUS_FILE: /app/deploy-status/status.json
+      CODEX_WEB_HOST_TENANT_ROOT: ${CODEX_WEB_HOST_TENANT_ROOT:-}
+      CODEX_WEB_KNOWLEDGE_ROOT: ${CODEX_WEB_KNOWLEDGE_ROOT:-}
+      TZ: Asia/Shanghai
     ports:
-      - "127.0.0.1:${CODEX_WEB_PORT:-37821}:37821"
+      - "127.0.0.1:${CWW_BIND_PORT:-37821}:37821"
     volumes:
-      - ./.env:/app/.env:ro
-      - app-data:/app/data
-      - tenant-data:/app/tenants
-      - codex-runtime:/opt/codex-runtime
+      - ${CODEX_WEB_ENV_FILE:-./.env}:/app/.env:ro
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/data:/app/data
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/tenants:/app/tenants
+      - ${CODEX_WEB_SHARED_AUTH_ROOT:-./.state/shared-codex-auth}:/app/shared-codex-auth
+      - ${CODEX_WEB_MARKETPLACE_ROOT:-./.state/codex-marketplaces}:/opt/codex-marketplaces:ro
+      - ${CODEX_WEB_RUNTIME_ROOT:-./.state/codex-runtime}:/opt/codex-runtime
+      - ${CODEX_WEB_HOST_BRIDGE_DIR:-./.state/host-bridge}:/run/codex-web-host:ro
+      - ${CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-./.state/deploy-status}:/app/deploy-status:ro
+    networks:
+      - egress
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=512m,mode=1777
@@ -35,15 +50,17 @@ services:
       - KILL
     security_opt:
       - no-new-privileges:true
+      # Codex uses bubblewrap for its own workspace sandbox. Docker's default
+      # seccomp/AppArmor profiles block the user namespaces bubblewrap needs.
       - seccomp=unconfined
       - apparmor=unconfined
     pids_limit: 1024
     mem_limit: 8g
     cpus: 3.5
-    # Let SIGTERM drain in-flight Codex jobs before Docker sends SIGKILL.
+    # Give SIGTERM shutdown enough time to drain in-flight local and remote jobs.
     stop_grace_period: 30m
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/codex-web/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 20s
       timeout: 5s
       retries: 5
@@ -54,7 +71,7 @@ services:
         max-size: 20m
         max-file: "5"
 
-volumes:
-  app-data:
-  tenant-data:
-  codex-runtime:
+networks:
+  egress:
+    external: true
+    name: codex-web-egress

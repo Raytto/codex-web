@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="${CODEX_WEB_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+STATE_ROOT="${CODEX_WEB_STATE_ROOT:-$PROJECT_DIR/.state}"
+REQUEST_ROOT="${CODEX_WEB_DEPLOY_REQUEST_ROOT:-$STATE_ROOT/deploy}"
+COMPOSE_FILE="${CODEX_WEB_COMPOSE_FILE:-$PROJECT_DIR/compose.yaml}"
+EXPECTED="${CODEX_WEB_EXPECTED_COMMIT:-$(git -C "$PROJECT_DIR" rev-parse HEAD)}"
+BACKUP_ROOT="${CODEX_WEB_BACKUP_ROOT:-$REQUEST_ROOT/backups}"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[[ "$EXPECTED" =~ ^[0-9a-f]{40}$ ]] || die "Invalid expected commit"
+[[ "$(git -C "$PROJECT_DIR" rev-parse HEAD)" == "$EXPECTED" ]] || die "Source commit changed before rebuild"
+[[ -z "$(git -C "$PROJECT_DIR" status --porcelain)" ]] || die "Repository is not clean"
+mkdir -p "$BACKUP_ROOT"
+stamp="$(date '+%Y%m%d-%H%M%S')"
+backup="$BACKUP_ROOT/$stamp"
+mkdir -p "$backup"
+printf '%s\n' "$EXPECTED" >"$backup/target-commit.txt"
+printf '%s\n' "$(git -C "$PROJECT_DIR" rev-parse HEAD^ 2>/dev/null || true)" >"$backup/previous-commit.txt"
+
+compose=(docker compose --project-directory "$PROJECT_DIR" -f "$COMPOSE_FILE")
+"${compose[@]}" build
+if [[ "${CODEX_WEB_SKIP_TESTS:-false}" != "true" ]]; then
+  "${compose[@]}" run --rm app npm run verify
+fi
+"${compose[@]}" up -d
+if command -v curl >/dev/null 2>&1; then
+  url="${CODEX_WEB_HEALTH_URL:-http://127.0.0.1:${CODEX_WEB_PORT:-37821}/}"
+  for _ in $(seq 1 "${CODEX_WEB_HEALTH_RETRIES:-30}"); do
+    curl --fail --silent --show-error "$url" >/dev/null 2>&1 && exit 0
+    sleep 2
+  done
+  die "Codex Web health endpoint did not become ready"
+fi

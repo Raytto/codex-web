@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Queue-aware, single-consumer self-publish coordinator.  All paths and
+# commands are configurable; the defaults stay inside the cloned repository.
+PROJECT_DIR="${CODEX_WEB_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+STATE_ROOT="${CODEX_WEB_STATE_ROOT:-$PROJECT_DIR/.state}"
+REQUEST_ROOT="${CODEX_WEB_DEPLOY_REQUEST_ROOT:-$STATE_ROOT/deploy}"
+STATE_DB="${CODEX_WEB_DEPLOY_STATE_DB:-$REQUEST_ROOT/state.sqlite}"
+STATE_HELPER="${CODEX_WEB_DEPLOY_STATE_HELPER:-$PROJECT_DIR/deploy/codex-web-deploy-state.py}"
+REBUILD_COMMAND="${CODEX_WEB_REBUILD_COMMAND:-$PROJECT_DIR/deploy/codex-web-rebuild}"
+LOCK_FILE="${CODEX_WEB_DEPLOY_CONTROLLER_LOCK:-$REQUEST_ROOT/coordinator.lock}"
+PENDING_FILE="$REQUEST_ROOT/pending-commit"
+DEPLOYED_FILE="$REQUEST_ROOT/deployed-commit"
+FAILED_FILE="$REQUEST_ROOT/failed-commit"
+
+log() { printf '%s %s\n' "$(date '+%F %T%z')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+state() { python3 "$STATE_HELPER" --db "$STATE_DB" --status-file "$REQUEST_ROOT/status.json" "$@"; }
+
+main() {
+  [[ -f "$STATE_HELPER" && -x "$REBUILD_COMMAND" ]] || die "Deployment helper or rebuild command is unavailable"
+  mkdir -p "$REQUEST_ROOT"
+  state init >/dev/null
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another coordinator is already running"
+  while :; do
+    local request target base id result
+    request="$(state claim)"
+    [[ "$request" != "null" ]] || { rm -f -- "$PENDING_FILE"; log "No queued deployment request remains"; return 0; }
+    id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$request")"
+    target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_sha"])' <<<"$request")"
+    base="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("base_sha") or "")' <<<"$request")"
+    log "Building deployment request $id for $target"
+    result=0
+    CODEX_WEB_EXPECTED_COMMIT="$target" CODEX_WEB_BASE_COMMIT="$base" CODEX_WEB_REQUEST_ID="$id" \
+      CODEX_WEB_DEPLOY_STATE_DB="$STATE_DB" "$REBUILD_COMMAND" || result=$?
+    if [[ "$result" -eq 0 ]]; then
+      state update --id "$id" --status deployed >/dev/null
+      printf '%s\n' "$target" >"$DEPLOYED_FILE"
+      rm -f -- "$FAILED_FILE"
+      log "Deployment request $id completed"
+      continue
+    fi
+    if [[ "$result" -eq 75 ]]; then
+      state update --id "$id" --status conflict --error-code "$result" --error-summary "target does not contain the live commit" >/dev/null || true
+      log "Deployment request $id conflicts with the live commit; continuing"
+      continue
+    fi
+    if [[ "$result" -eq 74 ]]; then
+      state update --id "$id" --status deferred --error-code "$result" --error-summary "drain deadline reached" >/dev/null || true
+      log "Deployment request $id was deferred"
+      continue
+    fi
+    state update --id "$id" --status failed --error-code "$result" --error-summary "rebuild exited with code $result" >/dev/null || true
+    printf '%s\n' "$target" >"$FAILED_FILE"
+    rm -f -- "$PENDING_FILE"
+    log "Deployment request $id failed; queue paused"
+    exit "$result"
+  done
+}
+
+main "$@"

@@ -5,6 +5,7 @@ import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.j
 export function redactBrandForDisplay(value: string): string {
   return value.replace(/chatgpt|codex/gi, "Codex Web");
 }
+
 export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (event.type === "turn.started") return { kind: "status", label: "已开始分析" };
   if (event.type === "error") return isModelCapacityError(event.message)
@@ -32,6 +33,10 @@ export function summarizeEvent(event: ThreadEvent): unknown | null {
     : isRetryableUpstreamError(item.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
     : { kind: "error", label: redactBrandForDisplay(item.message) };
+  if (item.type === "agent_message" && event.type === "item.updated") {
+    const detail = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    return detail ? { kind: "assistant_stream", label: "正在生成回答", detail } : null;
+  }
   if (item.type === "agent_message" && event.type === "item.completed") {
     const detail = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
     return detail ? { kind: "update", label: "阶段反馈", detail } : null;

@@ -53,12 +53,14 @@ async function loadWithTimeout(
   const abortFromParent = () => controller.abort();
   signal?.addEventListener("abort", abortFromParent, { once: true });
   let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = globalThis.setTimeout(() => {
       controller.abort();
       reject(new SessionAttemptTimeoutError());
     }, timeoutMs);
   });
+
   try {
     return await Promise.race([load(controller.signal), timeout]);
   } finally {

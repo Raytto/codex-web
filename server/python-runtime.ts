@@ -9,6 +9,22 @@ export type PythonRuntime = {
   ready: boolean;
 };
 
+export type JobRuntimeCleanupTarget = {
+  userId: string;
+  conversationId: string;
+  jobId: string;
+};
+
+export type JobRuntimeCleanupResult = {
+  status: "removed" | "absent" | "failed";
+  error?: Error;
+};
+
+type JobRuntimeCleanupOptions = {
+  remove?: typeof fs.rmSync;
+  log?: (message: string) => void;
+};
+
 export function resolvePythonRuntime(config: Pick<AppConfig, "projectRoot" | "pythonRuntimeRoot">): PythonRuntime {
   const windows = process.platform === "win32";
   const uvPath = path.join(config.pythonRuntimeRoot, "bin", windows ? "uv.exe" : "uv");
@@ -30,13 +46,24 @@ export function prepareJobRuntime(workspace: string, jobId: string): string {
   return runtimeRoot;
 }
 
-export function cleanupJobRuntime(runtimeRoot: string): void {
+export function jobRuntimeRoot(tenantRoot: string, target: JobRuntimeCleanupTarget): string {
+  for (const value of [target.userId, target.conversationId, target.jobId]) {
+    if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error("Invalid job runtime identifier");
+  }
+  return path.join(path.resolve(tenantRoot), target.userId, "conversations", target.conversationId, ".runtime", "jobs", target.jobId);
+}
+
+export function cleanupJobRuntime(runtimeRoot: string, options: JobRuntimeCleanupOptions = {}): JobRuntimeCleanupResult {
+  const existed = fs.existsSync(runtimeRoot);
   try {
-    fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-  } catch {
-    // Sandbox-created children can have a restrictive Windows ACL. Each job uses
-    // an independent directory, so an undeletable stale directory cannot block
-    // later turns in the same conversation.
+    (options.remove ?? fs.rmSync)(runtimeRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    return { status: existed ? "removed" : "absent" };
+  } catch (error) {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    (options.log ?? ((message) => process.stderr.write(`${message}\n`)))(
+      `Job runtime cleanup failed for ${runtimeRoot}: ${normalized.message}`,
+    );
+    return { status: "failed", error: normalized };
   }
 }
 

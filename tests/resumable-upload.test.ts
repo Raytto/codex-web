@@ -8,7 +8,7 @@ import bcrypt from "bcryptjs";
 import request from "supertest";
 import { createApp } from "../server/app.js";
 
-const PASSWORD = "Resumable-Test-Password-2026!";
+const PASSWORD = "fixture";
 const TUS_HEADERS = { "Tus-Resumable": "1.0.0" };
 
 function metadata(values: Record<string, string>): string {
@@ -23,7 +23,6 @@ test("tus upload persists confirmed offsets, enforces ownership and registers an
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-tus-api-"));
   const instance = createApp({
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
-    basePath: "",
     username: "owner", passwordHash: bcrypt.hashSync(PASSWORD, 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
     minimumFreeDiskBytes: 1, maxStoredBytesPerUser: 100,
@@ -100,7 +99,6 @@ test("startup recovery finalizes a fully written partial and expiry cleanup rele
   const legacyDataRoot = fs.mkdtempSync(path.join(fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir(), "codex-web-tus-legacy-"));
   const instance = createApp({
     projectRoot: process.cwd(), dataRoot: legacyDataRoot, tenantRoot: path.join(root, "tenants"),
-    basePath: "",
     username: "recover", passwordHash: bcrypt.hashSync(PASSWORD, 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
     minimumFreeDiskBytes: 1, maxStoredBytesPerUser: 1_000,

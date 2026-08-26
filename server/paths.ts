@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { syncManagedSkills } from "./managed-skills.js";
+import { ensureAccountSkillLibrary, loadAccountSkillBundle, syncAccountSkills } from "./account-skills.js";
 
 const LEGACY_WORKSPACE_AGENTS = `# Conversation workspace\n\n- Work only inside this conversation directory unless the user explicitly asks otherwise.\n- User uploads are in uploads/. Save only finished deliverables in outputs/.\n- Put intermediate files, extracted assets, caches, and temporary environments in .runtime/; the service deletes it after every turn.\n- Prefer replying in Chinese unless the user requests another language.\n- Never reveal credentials, authentication files, browser profiles, or unrelated local data.\n- When a task creates useful files, mention only the final filenames the user needs. Do not list process files.\n`;
 
@@ -17,16 +18,11 @@ ${MANAGED_INSTRUCTIONS_START}
 - Put intermediate files, extracted assets, caches, and temporary environments in .runtime/; the service deletes it after every turn.
 - Never reveal credentials, authentication files, browser profiles, or unrelated local data.
 - In replies, mention only final filenames the user needs. Never expose absolute paths or list process files.
-- Deliver browser-readable text as UTF-8. Add a UTF-8 BOM to finished Markdown and TXT files.
-- Unless the user requests another format, deliver reports, research, analysis, and other long-form reading as one self-contained HTML file rather than duplicate Markdown. Include \`<meta charset="utf-8">\`; use static HTML/CSS with no scripts or external resources.
-- Style report HTML for comfortable reading: Inter, PingFang SC, Microsoft YaHei, and system fonts; 16px desktop and 15px mobile body text; about 1.75 line height; an approximately 820px content column; light canvas, white paper, dark text, indigo accents, subtle borders, dark mode, and print rules. Keep semantic headings, paragraphs, quotes, lists, tables, and code blocks.
-- Responsive HTML may use side-by-side comparisons on wide screens, but stack them on narrow screens and give wide tables their own horizontal scrolling. Prefer embedded data URIs or inline SVG for charts and images so the report remains a single file.
-- The runtime-provided Available skills list is authoritative: read a named skill from its exact source locator and follow relative references, assets, and scripts from that file. Do not rewrite an account or managed skill under \`.system/\` or search only the project \`.agents/skills/\` directory.
 - Use the interpreter in \`CWW_SHARED_PYTHON\`; keep temporary scripts and caches in \`CWW_JOB_RUNTIME\`. Never install into the shared environment. If a required package is missing, invoke \`CWW_PYTHON_RUNNER\` in temporary mode instead.
 ${MANAGED_INSTRUCTIONS_END}
 `;
 
-const GLOBAL_AGENTS = `# Codex Web Agent
+const LEGACY_GLOBAL_AGENTS = `# Personal Codex Web
 
 - Prefer replying in Chinese unless the user requests another language.
 - The persistent user knowledge library is in ../library relative to this file.
@@ -35,7 +31,15 @@ const GLOBAL_AGENTS = `# Codex Web Agent
 - Conversation uploads and generated deliverables stay in that conversation unless the user asks to organize or retain them in the library.
 `;
 
-const LIBRARY_AGENTS = `# Long-term knowledge library
+const GLOBAL_AGENTS = `# Personal Codex Web
+
+- Prefer replying in Chinese unless the user requests another language.
+- The current working directory is the selected project and is the durable knowledge boundary for this conversation.
+- Read and update durable project knowledge only when it is relevant and user-approved. Never save credentials, cookies, tokens, private keys, or authentication files.
+- Conversation uploads, generated deliverables, and temporary files use the separate paths supplied by the platform; do not create delivery folders in the project root.
+`;
+
+export const LEGACY_LIBRARY_AGENTS = `# Long-term knowledge library
 
 - This directory belongs to one web user and persists across conversations.
 - PROFILE.md stores stable preferences; INDEX.md catalogs durable topics and projects.
@@ -74,18 +78,15 @@ export function tenantPaths(tenantRoot: string, userId: string): TenantPaths {
 
 export function ensureTenant(tenantRoot: string, userId: string): TenantPaths {
   const paths = tenantPaths(tenantRoot, userId);
-  for (const directory of [paths.codexHome, paths.library, paths.conversations, path.join(paths.library, "inbox"), path.join(paths.library, "projects"), path.join(paths.library, "archive")]) {
+  for (const directory of [paths.codexHome, paths.library, paths.conversations]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   const globalAgents = path.join(paths.codexHome, "AGENTS.md");
   if (!fs.existsSync(globalAgents)) fs.writeFileSync(globalAgents, GLOBAL_AGENTS, "utf8");
+  else if (fs.readFileSync(globalAgents, "utf8") === LEGACY_GLOBAL_AGENTS) fs.writeFileSync(globalAgents, GLOBAL_AGENTS, "utf8");
   syncManagedSkills(paths.codexHome);
-  const libraryAgents = path.join(paths.library, "AGENTS.md");
-  if (!fs.existsSync(libraryAgents)) fs.writeFileSync(libraryAgents, LIBRARY_AGENTS, "utf8");
-  const profile = path.join(paths.library, "PROFILE.md");
-  if (!fs.existsSync(profile)) fs.writeFileSync(profile, "# User profile\n\n<!-- Store stable preferences here. -->\n", "utf8");
-  const index = path.join(paths.library, "INDEX.md");
-  if (!fs.existsSync(index)) fs.writeFileSync(index, "# Knowledge index\n\n<!-- Keep a concise catalog of durable topics and projects here. -->\n", "utf8");
+  ensureAccountSkillLibrary(paths.library, userId);
+  syncAccountSkills(paths.codexHome, loadAccountSkillBundle(paths.library));
   return paths;
 }
 
