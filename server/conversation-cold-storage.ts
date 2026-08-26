@@ -446,6 +446,11 @@ function runAliyun(roots: ColdStorageRoots, args: string[], timeout = 6 * 60 * 6
   return execFileSync(roots.aliyunpan, args, { encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024 });
 }
 
+function assertColdStorageConfigured(roots: ColdStorageRoots): void {
+  if (!roots.aliyunpan.trim() || !roots.driveId.trim()) throw new Error("冷存储 provider/Drive ID 尚未配置");
+  if (!fs.existsSync(roots.ageRecipient) || !fs.existsSync(roots.ageIdentity)) throw new Error("age 密钥边界不可用");
+}
+
 function remoteTree(roots: ColdStorageRoots, remotePath: string): string {
   return runAliyun(roots, ["tree", "--driveId", roots.driveId, "-fp", remotePath]);
 }
@@ -569,7 +574,7 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     if (!row) throw new Error("会话不存在");
     const candidate = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
     if (!candidate.eligible) throw new Error(`会话不满足冷存储条件: ${candidate.reasons.join(",")}`);
-    if (!fs.existsSync(roots.ageRecipient) || !fs.existsSync(roots.ageIdentity)) throw new Error("age 密钥边界不可用");
+    assertColdStorageConfigured(roots);
     const generation = row.generation + 1;
     row = transition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { generation, retry_count: 0, last_error: null });
     work = fs.mkdtempSync(path.join(path.dirname(roots.isolationRoot), `.package-${conversationId}-`));
@@ -688,6 +693,7 @@ export function restoreColdConversation(rootsInput: Partial<ColdStorageRoots>, c
     let row = rowForConversation(sqlite, conversationId, userId);
     if (!row) throw new Error("会话不存在或账号不匹配");
     if (row.storage_state === "local") return;
+    assertColdStorageConfigured(roots);
     if (!row.remote_path || !row.archive_sha256 || !row.manifest_sha256 || !row.manifest_json) throw new Error("冷存储清单不完整");
     const remotePath = row.remote_path;
     const manifestSha256 = row.manifest_sha256;
@@ -916,7 +922,7 @@ export function archiveVoiceRecording(rootsInput: Partial<ColdStorageRoots>, tra
     if (!row.audio_relative_path || !row.audio_sha256 || !row.audio_bytes) throw new Error("语音文件清单不完整");
     const candidate = listVoiceRecordingCandidates(roots).find((item) => item.transcriptionId === transcriptionId);
     if (!candidate?.eligible) throw new Error(`语音不满足冷存储条件: ${candidate?.reasons.join(",") || "不存在"}`);
-    if (!fs.existsSync(roots.ageRecipient) || !fs.existsSync(roots.ageIdentity)) throw new Error("age 密钥边界不可用");
+    assertColdStorageConfigured(roots);
     row = voiceTransition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { audio_generation: row.audio_generation + 1, audio_last_error: null });
     work = fs.mkdtempSync(path.join(path.dirname(roots.voiceIsolationRoot), `.voice-package-${transcriptionId}-`));
     const source = voiceAbsolutePath(roots, row.audio_relative_path!); if (fs.statSync(source).size !== row.audio_bytes || sha256File(source) !== row.audio_sha256) throw new Error("本地语音 SHA-256/字节数不一致");
@@ -947,6 +953,7 @@ export function restoreVoiceRecording(rootsInput: Partial<ColdStorageRoots>, tra
   const lock = acquireOperationLock(roots, `voice-${transcriptionId}`); const sqlite = openDb(roots.databasePath); let downloadWork = ""; let work = "";
   try {
     let row = voiceRow(sqlite, transcriptionId, userId); if (!row) throw new Error("语音记录不存在或账号不匹配"); if (row.audio_storage_state === "local") return;
+    assertColdStorageConfigured(roots);
     if (!row.audio_remote_path || !row.audio_archive_sha256 || !row.audio_archive_bytes || !row.audio_relative_path) throw new Error("语音远端清单不完整");
     if (!["cold", "restoring", "error"].includes(row.audio_storage_state)) throw new Error(`当前语音状态不能恢复: ${row.audio_storage_state}`);
     if (row.audio_storage_state !== "restoring") row = voiceTransition(sqlite, row, ["cold", "error"], "restoring", "restore_begin");
