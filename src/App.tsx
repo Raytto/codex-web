@@ -283,8 +283,10 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
   const download = file ? fileUrl(file, true) : "";
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
-      <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
-      <div className="file-preview-title"><FileText size={18} /><strong>{file?.original_name || "正在读取文件…"}</strong></div>
+      <div className="file-preview-header-start">
+        <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
+      </div>
+      <div className="file-preview-title"><strong>{file?.original_name || "正在读取文件…"}</strong></div>
       <div className="file-preview-actions">
         {file && share && <FileShareMenu file={file} share={share} onChange={setShare} />}
         {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
@@ -337,7 +339,8 @@ function PublicFilePreviewPage({ fileId }: { fileId: string }) {
 
   return <main className={`file-preview-page public ${readerKind ?? ""}`}>
     <header className="file-preview-header public">
-      <div className="file-preview-title"><FileText size={18} /><strong>{file?.original_name || "公开文件"}</strong></div>
+      <div className="file-preview-header-start" />
+      <div className="file-preview-title"><strong>{file?.original_name || "公开文件"}</strong></div>
     </header>
     <section className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在读取公开文件…</p></div>}

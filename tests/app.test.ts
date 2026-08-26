@@ -310,6 +310,12 @@ test("mobile Safari restores the non-fixed app viewport after the software keybo
   assert.match(viewportSource, /height \+ validOffsetTop/);
   assert.match(viewportSource, /requestAnimationFrame\(apply\)/);
   assert.match(viewportSource, /addEventListener\("focusout", scheduleSettled\)/);
+  assert.match(viewportSource, /const handleViewportScroll = \(\) => \{/);
+  assert.match(viewportSource, /resetRootScrollOnNextApply = false;/);
+  assert.match(viewportSource, /viewport\.addEventListener\("scroll", handleViewportScroll\)/);
+  assert.match(viewportSource, /const nativeSelection = doc\.getSelection\(\)/);
+  assert.match(viewportSource, /TEXT_SELECTION_RESET_GRACE_MS/);
+  assert.match(viewportSource, /addEventListener\("selectionchange", handleSelectionChange\)/);
   assert.match(viewportSource, /documentElement\.scrollTop = 0/);
 });
 
@@ -1190,7 +1196,8 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-scripts/);
   assert.doesNotMatch(appSource, /sandbox="[^"]*allow-same-origin/);
   assert.doesNotMatch(appSource, /HTML 隔离预览|Markdown 阅读/);
-  assert.match(appSource, /<div className="file-preview-title"><FileText size=\{18\} \/><strong>/);
+  assert.match(appSource, /<div className="file-preview-header-start">[\s\S]*file-preview-title"><strong>/);
+  assert.doesNotMatch(appSource, /className="file-preview-title"><FileText/);
   assert.match(appSource, /复制链接/);
   assert.match(appSource, /关闭分享/);
   assert.match(appSource, /className=\{`file-preview-share\$\{open \? " active" : ""\}`\}/);
@@ -1201,6 +1208,11 @@ test("rich document readers keep Markdown inert and HTML isolated from the app o
   assert.match(appSource, /aria-label="关闭分享设置" onClick=\{closeDialog\}/);
   assert.doesNotMatch(appSource, /访问记录/);
   assert.match(styles, /\.file-preview-header\s*\{[^}]*min-height:\s*48px/);
+  assert.match(styles, /grid-template-columns:\s*auto minmax\(0, 1fr\) auto/);
+  assert.match(styles, /--file-preview-header-gap:\s*8px/);
+  assert.match(styles, /\.file-preview-header-start\s*\{[^}]*gap:\s*var\(--file-preview-header-gap\)/);
+  assert.match(styles, /\.file-preview-actions\s*\{[^}]*gap:\s*var\(--file-preview-header-gap\)/);
+  assert.doesNotMatch(styles, /\.file-preview-title\s*>\s*svg/);
   assert.match(styles, /\.file-share-backdrop\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*100;[^}]*place-items:\s*center;/);
   assert.match(styles, /@media \(hover: hover\)\s*\{[\s\S]*?\.file-preview-share:hover/);
   assert.doesNotMatch(styles, /\.file-share-panel\s*\{[^}]*position:\s*absolute/);

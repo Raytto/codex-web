@@ -41,6 +41,10 @@ Managed skills are copied from the repository's `skills/` directory when a tenan
 
 After upgrading, verify that archived conversations remain listed under personal settings and that any job interrupted by an ungraceful previous stop has a visible interruption message instead of being retried.
 
+On mobile Safari, also verify that selecting text in a Markdown reader survives a viewport/loupe
+scroll and that the reader header keeps its back action, title, and file actions usable at narrow
+widths.
+
 The public sign-in contract remains username plus password. Keep `APP_USERNAME` and
 `APP_PASSWORD_HASH` in the private `.env`; do not add phone-number, SMS, or external credential
 proxy settings to a public deployment.

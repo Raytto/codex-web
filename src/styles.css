@@ -469,18 +469,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .preview-button:hover { background: var(--indigo-pale); }
 .file-preview-page { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; background: var(--canvas); }
 .file-preview-header {
+  --file-preview-header-gap: 8px;
   min-width: 0;
   min-height: 48px;
   position: relative;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  column-gap: var(--file-preview-header-gap);
   padding: 4px max(12px, env(safe-area-inset-right)) 4px max(12px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, .94);
   backdrop-filter: blur(18px);
 }
+.file-preview-header-start { min-width: 0; display: flex; align-items: center; gap: var(--file-preview-header-gap); grid-column: 1; }
 .file-preview-back,
 .file-preview-share,
 .file-preview-download {
@@ -504,12 +506,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .file-preview-share:hover,
   .file-preview-download:hover { background: var(--indigo-pale); }
 }
-.file-preview-title { min-width: 0; max-width: calc(100% - 330px); position: absolute; left: 50%; display: flex; align-items: center; justify-content: center; gap: 8px; transform: translateX(-50%); }
-.file-preview-title > svg { flex: 0 0 auto; color: var(--indigo); }
-.file-preview-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.file-preview-header.public { justify-content: center; }
-.file-preview-header.public .file-preview-title { max-width: calc(100% - 32px); }
-.file-preview-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 2px; margin-left: auto; }
+.file-preview-title { min-width: 0; max-width: 100%; display: flex; align-items: center; justify-content: center; grid-column: 2; }
+.file-preview-title strong { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.file-preview-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: var(--file-preview-header-gap); grid-column: 3; }
 .file-preview-share-wrap { position: relative; }
 .file-share-backdrop {
   position: fixed;
@@ -571,6 +570,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-reader-markdown p { margin: .72em 0; }
 .file-reader-markdown hr { margin: 2em 0; border: 0; border-top: 1px solid var(--line); }
 .file-reader-markdown img { max-width: 100%; height: auto; border-radius: 10px; }
+.file-reader-markdown img,
+.file-reader-markdown video,
+.file-reader-markdown canvas,
+.file-reader-html img,
+.file-reader-html video,
+.file-reader-html canvas { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none; }
+/* Keep selection in the ordinary document scroller; nested momentum layers can race Safari handles. */
+.file-preview-scroll { -webkit-overflow-scrolling: auto; }
 .file-reader-markdown .katex-display { max-width: 100%; margin: 1.15em 0; padding: .18em 0; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
 .file-reader-markdown .file-reader-table { max-width: 100%; margin: 1em 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .file-reader-markdown .file-reader-table table { margin: 0; white-space: normal; }
@@ -780,7 +787,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .message.assistant .markdown { padding: 13px 14px; }
   .file-preview-header {
     min-height: 46px;
-    gap: 2px;
+    --file-preview-header-gap: 8px;
     padding: 4px max(5px, env(safe-area-inset-right)) 4px max(5px, env(safe-area-inset-left));
   }
   .file-preview-back,
@@ -789,10 +796,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .file-preview-back > span,
   .file-preview-share > span,
   .file-preview-download > span { display: none; }
-  .file-preview-title { max-width: calc(100% - 166px); gap: 6px; }
-  .file-preview-title > svg { width: 16px; height: 16px; }
   .file-preview-title strong { font-size: 12px; }
-  .file-preview-header.public .file-preview-title { max-width: calc(100% - 20px); }
   .file-share-backdrop { padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
   .file-share-panel { width: min(380px, 100%); }
   .file-reader-markdown {
@@ -977,7 +981,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .file-preview-back,
 :root[data-theme="dark"] .file-preview-share,
 :root[data-theme="dark"] .file-preview-download,
-:root[data-theme="dark"] .file-preview-title > svg { color: #b9c3ff; }
 :root[data-theme="dark"] .file-preview-share.active { background: #303342; }
 @media (hover: hover) {
   :root[data-theme="dark"] .file-preview-back:hover,

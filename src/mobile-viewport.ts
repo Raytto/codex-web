@@ -3,6 +3,7 @@ const APP_VIEWPORT_HEIGHT = "--app-viewport-height";
 const KEYBOARD_HEIGHT_DELTA = 120;
 // WebKit can publish the final visual viewport only after the keyboard animation.
 const SETTLE_DELAYS_MS = [80, 240, 500] as const;
+const TEXT_SELECTION_RESET_GRACE_MS = 700;
 
 export function isTextEntryElement(element: Element | null): boolean {
   return Boolean(element?.matches(
@@ -32,6 +33,8 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
 
   let frame = 0;
   let previousHeight = viewport.height;
+  let resetRootScrollOnNextApply = false;
+  let lastTextSelectionAt = 0;
   const settleTimers = new Set<number>();
 
   const resetRootScroll = () => {
@@ -42,6 +45,8 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
 
   const apply = () => {
     frame = 0;
+    const shouldResetRootScroll = resetRootScrollOnNextApply;
+    resetRootScrollOnNextApply = false;
     const next = mobileViewportUpdate(
       isTextEntryElement(doc.activeElement),
       viewport.height,
@@ -55,10 +60,14 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
     } else {
       doc.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT);
     }
-    if (next.resetRootScroll) resetRootScroll();
+    const nativeSelection = doc.getSelection();
+    const textSelectionActive = Boolean(nativeSelection && !nativeSelection.isCollapsed && nativeSelection.rangeCount > 0);
+    const textSelectionRecentlyActive = lastTextSelectionAt > 0 && Date.now() - lastTextSelectionAt < TEXT_SELECTION_RESET_GRACE_MS;
+    if (next.resetRootScroll && shouldResetRootScroll && !textSelectionActive && !textSelectionRecentlyActive) resetRootScroll();
   };
 
-  const schedule = () => {
+  const schedule = (resetRootScroll = true) => {
+    if (resetRootScroll) resetRootScrollOnNextApply = true;
     if (frame) win.cancelAnimationFrame(frame);
     frame = win.requestAnimationFrame(apply);
   };
@@ -75,12 +84,27 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
       settleTimers.add(timer);
     }
   };
+  const handleViewportScroll = () => {
+    const nativeSelection = doc.getSelection();
+    const textSelectionActive = Boolean(nativeSelection && !nativeSelection.isCollapsed && nativeSelection.rangeCount > 0);
+    const textSelectionRecentlyActive = lastTextSelectionAt > 0 && Date.now() - lastTextSelectionAt < TEXT_SELECTION_RESET_GRACE_MS;
+    if (textSelectionActive || textSelectionRecentlyActive) {
+      resetRootScrollOnNextApply = false;
+      schedule(false);
+    } else schedule();
+  };
+  const handleViewportResize = () => schedule();
+  const handleSelectionChange = () => {
+    const nativeSelection = doc.getSelection();
+    if (nativeSelection && !nativeSelection.isCollapsed && nativeSelection.rangeCount > 0) lastTextSelectionAt = Date.now();
+  };
 
   doc.addEventListener("focusin", scheduleSettled);
   doc.addEventListener("focusout", scheduleSettled);
-  viewport.addEventListener("resize", schedule);
-  viewport.addEventListener("scroll", schedule);
-  win.addEventListener("resize", schedule);
+  doc.addEventListener("selectionchange", handleSelectionChange);
+  viewport.addEventListener("resize", handleViewportResize);
+  viewport.addEventListener("scroll", handleViewportScroll);
+  win.addEventListener("resize", handleViewportResize);
   win.addEventListener("orientationchange", scheduleSettled);
   win.addEventListener("pageshow", scheduleSettled);
   schedule();
@@ -88,9 +112,10 @@ export function installMobileViewportRecovery(win: Window = window, doc: Documen
   return () => {
     doc.removeEventListener("focusin", scheduleSettled);
     doc.removeEventListener("focusout", scheduleSettled);
-    viewport.removeEventListener("resize", schedule);
-    viewport.removeEventListener("scroll", schedule);
-    win.removeEventListener("resize", schedule);
+    doc.removeEventListener("selectionchange", handleSelectionChange);
+    viewport.removeEventListener("resize", handleViewportResize);
+    viewport.removeEventListener("scroll", handleViewportScroll);
+    win.removeEventListener("resize", handleViewportResize);
     win.removeEventListener("orientationchange", scheduleSettled);
     win.removeEventListener("pageshow", scheduleSettled);
     if (frame) win.cancelAnimationFrame(frame);
