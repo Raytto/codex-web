@@ -8,7 +8,7 @@ Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。�
 
 ## 快速开始
 
-面向新云服务器的完整部署、登录、备份、更新与验收步骤，请参阅 [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)。公开版网页登录始终使用 `.env` 中的 `APP_USERNAME` 与 `APP_PASSWORD_HASH`；本仓库不提供手机号或短信登录。
+面向新云服务器的完整部署、登录、备份、更新与验收步骤，请参阅 [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)。想先按“基础版 → 逐项询问扩展”的方式搭建，请阅读[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。公开版网页登录始终使用 `.env` 中的 `APP_USERNAME` 与 `APP_PASSWORD_HASH`；本仓库不提供手机号或短信登录。
 
 环境要求：Docker Engine、Docker Compose v2，以及可登录 Codex CLI 的账号。
 
@@ -21,6 +21,8 @@ npm run hash-password -- '请设置一个至少十二位的独立密码'
 把生成的哈希填入 `.env` 的 `APP_PASSWORD_HASH`，并设置至少 32 个字符的随机 `SESSION_SECRET`。然后执行：
 
 ```bash
+docker network inspect codex-web-egress >/dev/null 2>&1 \
+  || docker network create codex-web-egress
 docker compose up -d
 docker compose exec --user 11001:11001 \
   -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
@@ -178,4 +180,4 @@ stateDiagram-v2
 
 公网部署请配置 HTTPS；浏览器通常只允许在 HTTPS 或 localhost 页面调用麦克风。
 
-更多信息请参阅 [部署说明](docs/DEPLOYMENT.md)、[架构说明](docs/ARCHITECTURE.md) 与 [安全说明](docs/SECURITY.md)。
+更多信息请参阅 [部署说明](docs/DEPLOYMENT.md)、[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)、[架构说明](docs/ARCHITECTURE.md) 与 [安全说明](docs/SECURITY.md)。

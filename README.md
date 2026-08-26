@@ -63,6 +63,17 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Optional encrypted cold storage for conversations and voice recordings; it is inert without a configured provider and key files
 - Queue-aware self-publish coordinator and matching `skills/self-publish` instructions for operators who choose to install them
 
+## Deployment choices
+
+Start with the base Compose profile, then opt in to extensions one at a time.
+Voice, personal-memory extraction, the host/root bridge, Remote Worker, cold
+storage, shared Codex authentication, and self-publish are all shipped as
+optional modules but remain inert until their configuration is present. The
+[deployment options guide](docs/DEPLOYMENT_OPTIONS.md) gives the yes/no
+questionnaire, authority and data disclosures, prerequisites, acceptance tests,
+and reversible disable steps. The [full AI runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
+applies the same sequence to a new Ubuntu server.
+
 ## How the system fits together
 
 Codex Web is the reusable, self-hosted core of a larger personal Agent workstation design. The core turns the Codex CLI into a durable web service: the browser can disappear, but conversations, drafts, queued prompts, attachments, progress events, thread IDs, and finished files remain on the server.
@@ -193,7 +204,7 @@ The default Compose file has no host bridge mount, Remote Worker enrollment toke
 
 ## Quick start
 
-> Deploying Codex Web on a new cloud server? Follow the [AI cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md). It covers SSH administration, the owner web account, Codex authentication, Docker, Nginx, optional domain and TLS setup, backups, updates, and production acceptance checks. The steps below are the minimal local quick start.
+> Deploying Codex Web on a new cloud server? Follow the [AI cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md) and its [deployment options guide](docs/DEPLOYMENT_OPTIONS.md). They cover SSH administration, the base owner account, Codex authentication, Docker, Nginx, optional domain/TLS, backups, updates, and the yes/no flow for each extension. The steps below are the minimal local quick start.
 
 1. Copy the configuration template:
 
@@ -213,6 +224,8 @@ The default Compose file has no host bridge mount, Remote Worker enrollment toke
 4. Build and start the service:
 
    ```bash
+   docker network inspect codex-web-egress >/dev/null 2>&1 \
+     || docker network create codex-web-egress
    docker compose up -d
    ```
 
@@ -261,7 +274,13 @@ The default development URL is `http://127.0.0.1:5173/codex-web/`.
 
 ## Security model
 
-Codex runs as a dedicated non-root Unix user. The web process can coordinate that worker through a local supervisor but the public edition has no Docker socket, no host filesystem bridge, and no host-root execution path. Review [Security](docs/SECURITY.md) before exposing an instance to the internet.
+Codex runs as a dedicated non-root Unix user by default. The default profile has
+no Docker socket, host filesystem bridge, host-root process, desktop Worker, or
+cloud provider credentials. Optional trusted-executor modules are present in the
+source but require an explicit operator decision and remain fail-closed without
+their socket, token, endpoint, provider CLI, and policy files. Review
+[Security](docs/SECURITY.md) and [Deployment choices](docs/DEPLOYMENT_OPTIONS.md)
+before exposing an instance to the internet.
 
 ## License
 

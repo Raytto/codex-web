@@ -35,8 +35,10 @@ tag and commit, atomically switches release directories, and requires the new
 Worker to authenticate within 90 seconds. Failure automatically restores and
 restarts the previous package. Node updates do not use Git, `npm ci`, a compiler
 or the repository working tree.
-The full release and recovery contract is documented in
-`docs/WORKER_UPDATES.md` at the repository root.
+The release and recovery contract is covered by this section and the scripts
+under `remote-worker/scripts/`; the repository intentionally does not install a
+separate update service on the server. Keep the Worker package and its local
+state outside the Git working tree.
 
 For an existing installation, keep the Worker checkout in an operator-selected
 local directory (the examples use `C:\codex-web-worker`) and choose a stable

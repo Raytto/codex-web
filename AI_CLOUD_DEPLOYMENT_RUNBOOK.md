@@ -1,6 +1,6 @@
 ﻿# Codex Web 新云服务器部署与运维手册（供 AI 执行）
 
-> 核验日期：2026-08-10
+> 核验日期：2026-08-26
 >
 > 适用范围：全新的 Ubuntu 24.04 LTS 云服务器；Ubuntu 22.04 可参考执行。其他发行版必须先改写软件源、包名和服务命令，不得直接照抄。
 >
@@ -8,9 +8,9 @@
 
 本文是一份“可交给另一个 AI 执行”的部署运行手册。执行者必须逐阶段完成检查，记录非敏感证据，并在每个验收点通过后再继续。不要为了让命令成功而降低隔离、公开内部端口或跳过认证。
 
-> **部署结果边界：**完整执行本文可以得到一个可登录、可提交任务、可持久运行的**单一 Owner 公开版 Codex Web**。它不等于带管理员宿主桥、网页账号管理、多个可执行租户和桌面 Remote Worker 网关的私有完整 Agent 平台；这些扩展未随公开仓库发布。
+> **部署结果边界：**本文默认先交付一个可登录、可提交任务、可持久运行的基础版。宿主/root bridge、Remote Worker、语音、个人记忆提取、冷存储、共享 Codex 认证和自发布协调器都随公开仓库提供实现，但默认关闭，必须逐项询问、配置和验收。不要因为源码存在就自动启用高权限或外发数据的功能。
 
-## 1. 先确认部署模式
+## 1. 先确认基础版和可选扩展
 
 Codex Web 公开版当前支持的完整部署链路是：
 
@@ -29,15 +29,23 @@ Supervisor → 租户 Worker（非 root UID 11001）→ Codex CLI
 持久化卷：应用状态、租户目录、Codex 运行时
 ```
 
-术语容易混淆，执行前必须选择以下一种或多种模式：
+先让用户逐项回答下面的问题，并把答案写入部署记录；只记录“是/否”和配置名称，不记录秘密。基础版先完成，扩展一次只开一个：
 
 | 模式 | 状态 | 用途 |
 | --- | --- | --- |
-| A. 云端内置租户 Worker | **默认且公开仓库已支持** | Codex Web 与 Codex CLI 都在云服务器容器内运行。本文第 3～10 节完成这一模式。 |
-| B. 从本机通过 SSH 使用远端 Codex | **可选，独立于 Codex Web 队列** | 运维者用 SSH 终端，或用支持 SSH 连接的 Codex 客户端，直接连接云服务器上的 Codex。见第 11 节。 |
-| C. 本机 Remote Worker 接入 Codex Web | **可选扩展，公开仓库目前未随附** | 让办公电脑主动连回 Web 网关并在本机项目中执行任务。必须同时取得协议兼容的服务端网关和 Worker 包；见第 12 节。 |
+| 基础版：云端内置租户 Worker | **默认** | Codex Web 与 Codex CLI 在云服务器容器内运行。先完成本文第 3～10 节。 |
+| SSH 远端 Codex | 可选 | 运维者通过 SSH 直接使用宿主机 Codex，不加入 Web 队列，见第 11 节。 |
+| 语音转写 | 可选 | 同时配置 `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL` 和 HTTPS `PUBLIC_BASE_URL`，见 [`docs/DEPLOYMENT_OPTIONS.md`](docs/DEPLOYMENT_OPTIONS.md)。 |
+| 个人记忆/上下文提取 | 可选 | 同时配置 `PERSONAL_MEMORY_API_KEY`、`PERSONAL_MEMORY_BASE_URL`，先完成数据披露和小样本验收。 |
+| 宿主/root bridge | **高风险、必须明确同意** | 独立 root 进程可访问配置的宿主路径并运行宿主 Codex；见第 12 节和可选部署指南。 |
+| 办公电脑 Remote Worker | 可选 | 需要保留的 host-root Web 账号、HTTPS、Enrollment Token 和随仓库构建的发布包；见第 13 节。 |
+| 加密冷存储 | 可选、高级 | Provider CLI、远端 ID、`age` recipient/identity 和单独调度器必须全部准备，见可选部署指南。 |
+| 共享 Codex 认证/账号管理 | 可选、高风险 | 需要 root bridge 和审核过的共享认证策略；不包含维护者当前登录状态。 |
+| 自发布协调器 | 可选 | `deploy/` 下的队列与 systemd 模板必须审阅路径、备份和回滚后才安装。 |
 
-如果用户说“部署本机 Worker”，AI 必须先确认他指的是模式 A 的“云服务器本机租户 Worker”，还是模式 C 的“用户办公电脑 Remote Worker”。模式 A 随 Compose 自动启动，不要再创建第二套服务。模式 C 不能仅凭公开仓库中的架构说明自行虚构安装命令。
+如果用户说“部署本机 Worker”，AI 必须先确认他指的是基础版 Compose 自动管理的云端租户 Worker，还是办公电脑 Remote Worker。后者使用网页中的 **＋新建远程 Worker** 生成一次性安装器；不要再创建第二套常驻服务，也不要把私有登录文件带入公开仓库。
+
+详细的逐项询问、依赖、禁用和验收流程见 [`docs/DEPLOYMENT_OPTIONS.md`](docs/DEPLOYMENT_OPTIONS.md)。本手册的后续章节负责基础版生产部署；用户回答“否”的扩展保持 `.env` 空值并跳过，不得为了“完整”而配置。
 
 ## 2. AI 执行纪律与停止条件
 
@@ -58,7 +66,10 @@ Supervisor → 租户 Worker（非 root UID 11001）→ Codex CLI
 - 云安全组、DNS、域名所有权、SSH 密钥或 Codex 登录需要用户操作。
 - 内存低于 4 GiB、磁盘空间明显不足，或无法满足备份要求。建议至少 8 GiB 内存和 30 GiB 可用磁盘；实际容量还要考虑用户上传文件、镜像和日志增长。
 - 任何命令将覆盖现有 Nginx、数据库、证书、用户文件或防火墙策略。
-- 用户要求模式 C，但仓库中没有实际的服务端网关和 Worker 包。
+- 用户要求宿主/root bridge，但没有书面授权、备份、绝对路径、root 服务运行时或共享认证策略。
+- 用户要求 Remote Worker，但没有 host-root Web 账号、HTTPS `PUBLIC_BASE_URL`、至少 32 字符的 Enrollment Token 或当前提交构建出的发布包。
+- 用户要求冷存储，但缺少 provider CLI、远端 ID、`age` recipient/identity、恢复演练或独立调度器。
+- 用户要求语音/个人记忆，但未完成数据发送范围、费用和失败后的禁用方式确认。
 
 ### 2.3 账号模型和“可使用”的准确含义
 
@@ -70,7 +81,7 @@ Supervisor → 租户 Worker（非 root UID 11001）→ Codex CLI
 | Codex Web Owner | `.env` 中的 `APP_USERNAME`、`APP_DISPLAY_NAME`、`APP_PASSWORD_HASH` | 登录网页工作区 | 是，第 7 节 |
 | OpenAI/Codex 身份 | Owner 租户的 `CODEX_HOME` | 让 Codex CLI 真正执行 Agent 任务 | 是，第 8 节，但必须由人类完成授权 |
 | 域名与 DNS 管理身份 | 域名注册商或 DNS 服务商 | 设置解析、完成可选证书签发 | 流程覆盖，外部账号由用户提供 |
-| Remote Worker 机器身份 | 可选扩展的 Enrollment 与机器凭据 | 注册办公电脑执行器 | 公开版不提供，见第 12 节 |
+| Remote Worker 机器身份 | 可选扩展的短期安装授权、Enrollment Token 与机器凭据 | 注册办公电脑执行器 | 第 13 节；令牌只在可信终端使用 |
 
 默认部署**没有默认明文密码**，也没有开放注册。应用第一次启动时，会使用 `.env` 中的配置建立或更新固定 Owner 账号；Owner 必须同时满足以下条件才能真正使用平台：
 
@@ -81,14 +92,15 @@ Supervisor → 租户 Worker（非 root UID 11001）→ Codex CLI
 
 Web 密码与 OpenAI/Codex 登录是两套凭据：Web 密码正确但 Codex 未授权时，用户能进入页面却不能正常完成 Agent 任务；反过来，Codex 已授权也不代表知道 Web 密码。
 
-公开版数据库已经具备按用户隔离部分 Web 数据的基础结构，但当前公开运行时只配置了固定 Owner 的 Unix 租户身份，也没有受支持的账号管理页面、注册接口或建号 CLI。**不要手工向 SQLite 的 `users` 表插入账号**：新账号即使可以登录，也没有对应的受控 Unix Worker 身份，任务执行会失败。要交付真正的多账号平台，必须另行实现并审查以下能力：
+公开版数据库和运行时已经提供受保护的用户管理 CLI、固定 host-root 身份、项目/账号隔离和可选共享认证；但这些能力不是基础版自动部署的一部分。**不要手工向 SQLite 的 `users` 表插入账号**，也不要在没有 UID/GID、租户目录和认证策略审查时批量建号。需要多账号时使用仓库提供的 CLI，并逐个完成租户、配额、备份和删除验收。
 
-- 账号创建、改密、禁用、强制注销和审计界面或受保护 CLI；
-- 每个账号固定且不复用的 Unix UID/GID、租户目录和 Worker 生命周期；
-- 每租户 Codex 认证策略，或经过明确安全评估的共享认证策略；
-- 配额、备份、删除、迁移和跨账号隔离测试。
+启用多账号或 host-root 前，仍必须逐项验收：账号创建、改密、禁用、
+强制注销和审计；固定且不复用的 Unix UID/GID、租户目录和 Worker
+生命周期；每租户 Codex 认证策略或审核过的共享认证策略；以及配额、
+备份、删除、迁移和跨账号隔离。公开仓库提供的是受保护 CLI 和可选模块，
+不是“创建账号即完成隔离”的承诺。
 
-在这些能力进入公开仓库并通过测试前，本文的完成标准始终是“一个 Owner 可用”，而不是“任意创建多个账号”。
+基础版完成标准仍然是“一个普通 Web 账号可用”。如果启用 host-root，必须额外创建保留用户名 `owner`、UUID `00000000-0000-4000-8000-000000000010` 的账号；因此普通基础账号不要占用 `owner`，否则先改名再创建 host-root。Remote Worker 的引导和执行器管理当前也只开放给这个 host-root 账号。
 
 ### 2.4 Owner 改密、改名与强制下线
 
@@ -121,6 +133,23 @@ Codex 授权的撤销与重登必须仍以 UID 11001 和第 8 节相同的 `HOME
 | `LE_EMAIL` | 可空 | 申请 Let's Encrypt 证书时使用。 |
 | `APP_USERNAME` | 由用户决定 | Web 登录账号。 |
 | `APP_DISPLAY_NAME` | 由用户决定 | 页面显示名。 |
+
+再逐项询问扩展选择（只记录是否启用）：
+
+| 选择 | 启用条件 | 默认值 |
+| --- | --- | --- |
+| 语音转写 | DashScope/OpenAI-compatible ASR 的 Key、Base URL、HTTPS 公网地址 | 关闭；两个 `DASHSCOPE_*` 留空 |
+| 个人记忆提取 | 外部模型 Key、Base URL，并同意发送范围 | 关闭；两个 `PERSONAL_MEMORY_*` 留空 |
+| 宿主/root bridge | 明确 root 授权、宿主绝对路径、root 服务和共享认证策略 | 关闭；四个 `CODEX_WEB_*` 路径留空 |
+| Remote Worker | host-root Web 账号、HTTPS、≥32 字符 Enrollment Token、匹配发布包 | 关闭；`REMOTE_WORKER_ENROLLMENT_TOKEN` 留空 |
+| 加密冷存储 | Provider CLI、远端 ID、age 密钥、恢复演练和独立调度器 | 关闭；四个 `CODEX_WEB_COLD_STORAGE_*` 留空 |
+| 共享 Codex 认证/账号管理 | root bridge 与审核过的 source/lock/policy 文件 | 关闭；认证文件不挂载 |
+| 自发布协调器 | 审阅过的路径、备份/回滚策略和 systemd 安装许可 | 关闭；不安装 `deploy/` units |
+
+如果未来可能启用 host-root 或 Remote Worker，基础版的 `APP_USERNAME`
+不要取 `owner`：该名称保留给 UUID
+`00000000-0000-4000-8000-000000000010` 的 host-root 账号。已有安装若占用
+`owner`，先在安全窗口改为其他唯一用户名并重建 app，再创建 host-root。
 
 SSH 登录后先做只读检查：
 
@@ -263,6 +292,12 @@ SESSION_SECRET=<至少 32 字节的随机值>
 PUBLIC_BASE_URL=<见下文>
 ```
 
+`.env.example` 中标为 Optional 的配置默认全部留空。不要为了消除“未配置”
+提示而填写伪值：语音、个人记忆、host-root、Remote Worker 和冷存储都会
+以“未启用”状态安全运行。需要扩展时，按
+[`docs/DEPLOYMENT_OPTIONS.md`](docs/DEPLOYMENT_OPTIONS.md) 一次只配置一项，
+重启并完成该项验收后再继续。
+
 值的生成规则：
 
 - `SESSION_SECRET` 可由人类在可信终端运行 `openssl rand -base64 48` 生成，然后直接粘贴到服务器的安全编辑器。不要让 AI 回显结果。
@@ -295,6 +330,14 @@ git status --short
 预期 `git status` 不显示 `.env`；如果显示，立即停止并检查 `.gitignore`，不要提交。
 
 ## 8. 构建、启动并登录云端 Codex
+
+Compose 使用一个预先存在的外部网络；首次部署时创建一次，后续不要在
+`down` 时删除它：
+
+```bash
+sudo docker network inspect codex-web-egress >/dev/null 2>&1 \
+  || sudo docker network create codex-web-egress
+```
 
 构建并启动完整栈：
 
@@ -452,6 +495,10 @@ AI 必须逐项通过并将**非敏感摘要**写入交付报告：
 - [ ] `docker compose restart` 后登录状态、对话和附件仍然存在。
 - [ ] 备份流程已执行一次，并在隔离环境至少演练过一次恢复。
 
+基础版通过后，只有用户在第 1 节回答“是”的扩展才进入额外验收。每个
+扩展必须单独记录配置名称、数据去向、测试结果和可逆禁用动作；回答“否”
+的项目应明确写成“未启用”，不能用“代码已存在”代替运行证据。
+
 排查日志时限制行数并先脱敏：
 
 ```bash
@@ -511,47 +558,84 @@ codex login
 
 登录材料不得进入 Shell 历史或聊天。使用 API Key 时应从环境变量通过标准输入传递，并在完成后清除临时环境变量。
 
-## 12. 可选：部署办公电脑上的 Remote Worker
+## 12. 可选：宿主/root bridge（高风险，必须明确同意）
 
-### 12.1 当前公开版边界
+这不是普通“本机 Worker”开关。它会在宿主机启动独立的 **root Node.js
+进程**，以 `HOME=/root` 运行 Codex，并按配置访问宿主知识库、项目和
+Codex Home。只有用户明确理解该权限边界、同意路径和备份/撤销方案后
+才可以继续；没有同意时保持四个 `CODEX_WEB_*` 路径为空。
 
-公开 Codex Web 仓库描述了 Remote Worker 扩展边界，但目前不包含可直接部署的管理员宿主桥、Remote Worker 服务端网关或桌面 Worker 包。因此 AI 在执行前必须检查：
+保留用户名 `owner` 和 UUID
+`00000000-0000-4000-8000-000000000010` 专用于 host-root。普通基础账号
+如果已经使用 `owner`，先改 `.env` 的 `APP_USERNAME` 为其他唯一名称并
+重建 app，再执行 `manage-user.js create-host-root owner`；禁止手工修改
+SQLite `users` 表。Remote Worker 的引导和执行器管理也只对该 host-root
+账号开放。
 
-```bash
-cd /opt/codex-web
-find . -maxdepth 3 -type d -iname '*remote*worker*' -print
-rg -n "Remote Worker|remote-worker|worker gateway" README.md docs server scripts 2>/dev/null
-```
+### 12.1 前置检查和路径边界
 
-如果只有文档或协议说明而没有实际服务端和客户端实现，必须停止模式 C，报告“公开版缺少配套组件”，并建议使用模式 A 或第 11 节的 SSH 方案。不得创建一个看似成功、实际没有接入 Web 调度的本地常驻进程。
+- 用户已确认 root 进程能够读写哪些绝对路径，且已有可恢复备份。
+- 宿主安装 Node.js ≥22.13；在与 app 相同的提交上执行 `npm ci && npm run build`。
+- 准备 `CODEX_WEB_HOST_TENANT_ROOT`、`CODEX_WEB_KNOWLEDGE_ROOT`、
+  `CODEX_WEB_CODEX_HOME` 和 socket 目录；目录权限按 root 与 Web GID
+  明确设置，不使用整个 `/` 或宿主 home 作为未审查根目录。
+- app 容器看 socket 的路径（例如 `/run/codex-web-host/host.sock`）和
+  root 服务看 socket 的路径（例如 `/opt/codex-web/.state/host-bridge/host.sock`）
+  可以不同，不能把容器路径误写给宿主服务。
+- 共享 Codex 认证必须提供 source、lock、policy 三个受保护文件；不把
+  当前登录信息、`auth.json` 或密钥提交到仓库。
 
-### 12.2 取得扩展后必须满足的架构要求
+### 12.2 启用、验收和禁用
 
-只有拿到与当前 Codex Web 提交协议兼容的**服务端网关和 Worker 包**后，才继续。实现应至少满足：
+1. 备份并记录用户同意；先确认 socket 目录没有被其他服务占用。
+2. 在 app `.env` 设置四个路径（socket 使用容器路径），配置并审核共享
+   认证策略；执行 `docker compose config --quiet`。
+3. 仅在基础账号不再占用 `owner` 后创建保留账号：
 
-- Worker 只主动建立出站 `WSS` 连接，不在办公电脑开放入站端口。
-- 首次注册使用短期 Enrollment 凭据，随后换取可轮换、可撤销的机器凭据；秘密不写入 Git、命令行历史或普通日志。
-- 每个任务启动独立的本地 `codex app-server`，限定工作目录或项目白名单，完成后清理子进程。
-- 服务端有身份校验、离线队列、容量控制、幂等任务 ID、断线重连和审计记录。
-- 文件传输校验大小和哈希，禁止任意路径读取与路径穿越。
-- Worker 版本、协议版本、Node.js/Codex CLI 版本有明确兼容矩阵。
-- Nginx 的 WSS 路由保留 `Upgrade`/`Connection` 请求头，并使用 HTTPS 证书。
-- 不直接把 Codex `app-server` 暴露到公网。
+   ```bash
+   sudo docker compose exec app \
+     node dist-server/server/manage-user.js create-host-root owner "Host owner"
+   ```
 
-### 12.3 通用部署顺序
+   生成密码只在可信终端交付并立即改密，不写入报告。
+4. 用 root 启动 `dist-server/server/host-root-server.js`，注入宿主 socket、
+   三个绝对根、`CWW_DATABASE_PATH`、`CODEX_RUNTIME_PATH` 和共享认证变量。
+   可将 [`docs/DEPLOYMENT_OPTIONS.md`](docs/DEPLOYMENT_OPTIONS.md) §4 的
+   systemd 单元复制为起点，放在 `/etc/systemd/system/`，把秘密放入权限
+   为 `600` 的 `/etc/codex-web/host-root.env`；不要把路径和凭据直接写进
+   命令行历史。启动前检查 `npm run build`，然后执行
+   `sudo systemctl daemon-reload && sudo systemctl enable --now codex-web-host-root`。
+   启动后确认 socket 为 `0660`、root 所有且 Web GID 可访问。
+5. 重建 app，host-root 登录后只做一个只读项目目录浏览和无副作用任务；
+   普通租户必须看不到宿主路径；停止 root 服务时 host 任务必须失败关闭。
+6. 禁用时先停止/屏蔽 root 服务，再清空 app 的路径变量并重建；按需要禁用
+   host-root 账号。保留宿主数据必须由用户另行确认。
 
-不同扩展的真实命令必须以其同版本 README 为准，不能复用其他私有环境中的主机名、令牌或脚本名。通用顺序如下：
+本仓库不提供自动 root systemd 安装器：服务名、MAC 策略、路径和 GID 属于
+目标主机安全策略，必须由管理员审核后落地。完整选项矩阵见
+[`docs/DEPLOYMENT_OPTIONS.md`](docs/DEPLOYMENT_OPTIONS.md)。
 
-1. 在服务端部署并迁移 Remote Worker 网关，配置独立的加密密钥和短期 Enrollment Token。
-2. 为 `/codex-web/...` 下的 WSS 路由配置 Nginx，执行 `nginx -t` 后重载。
-3. 在办公电脑安装扩展要求的 Node.js 与 Codex CLI，并以实际桌面用户执行 `codex login status`。
-4. 在批准的本机项目目录中测试 Codex；不要用管理员/root 身份运行日常任务。
-5. 通过扩展提供的安装器注册系统服务或用户登录任务。凭据应写入操作系统受限目录或凭据库。
-6. 从服务端确认机器在线、版本兼容、容量正确，再提交一个只读测试任务。
-7. 验证断网重连、任务取消、进程回收、文件校验、注销与凭据撤销。
-8. 交付时只报告机器显示名、版本、最后心跳和测试结果，不报告令牌。
+## 13. 可选：部署办公电脑上的 Remote Worker
 
-## 13. 备份与恢复
+Remote Worker 不需要 root bridge 进程来执行桌面任务，但当前 Web 的引导、
+执行器管理和项目路由要求登录保留的 host-root Web 账号；因此仍要先按第
+12 节处理账号冲突和权限确认。它只建立出站 WSS，不在办公电脑开放入站端口。
+
+1. 设置 HTTPS `PUBLIC_BASE_URL` 和随机、至少 32 字符的
+   `REMOTE_WORKER_ENROLLMENT_TOKEN`；Docker 构建会把 Windows/macOS 发布包
+   放入 `/app/worker-release`。
+2. host-root 登录网页，打开项目/执行器对话，选择 **＋新建远程 Worker**，
+   生成对应系统的一次性短期安装器链接。不要把链接贴到公开渠道。
+3. 在办公电脑以普通用户运行安装器，完成本机 Codex 登录并选择机器显示名；
+   不要以 Windows Administrator 或 Unix root 执行日常任务。
+4. 验收在线心跳、版本/容量、只读任务、取消任务、断网重连、文件大小和
+   SHA-256 校验。下线时先撤销/禁用执行器，再停止 Worker；全部机器退役后
+   才移除 Enrollment Token。
+
+如果没有 HTTPS、host-root 账号、Enrollment Token 或匹配发布包，保持该功能
+关闭。OS 安装细节见 [`remote-worker/README.md`](remote-worker/README.md)。
+
+## 14. 备份与恢复
 
 Compose 使用命名卷保存应用状态、租户目录和 Codex 运行时。实际卷名带 Compose 项目前缀，先解析，不要猜：
 
@@ -590,7 +674,7 @@ sudo docker compose ps
 
 恢复必须在隔离环境先演练。生产恢复时先停止栈、确认目标卷、保留现状快照，再把归档解压到空的新卷；不要向未知的非空卷直接覆盖。恢复后检查权限、健康接口、登录状态、对话和附件，再切换流量。
 
-## 14. 安全更新与回滚
+## 15. 安全更新与回滚
 
 更新前记录旧提交、备份数据并检查发布说明：
 
@@ -615,7 +699,7 @@ curl -fsS http://127.0.0.1:37821/codex-web/api/health
 
 升级后重复第 10 节验收。应用回滚时切回已记录的旧提交并重新构建；数据结构如果发生不可逆迁移，必须使用与旧版本匹配的备份恢复，不能只切 Git。任何时候都不要用 `down -v` 作为“重新安装”。
 
-## 15. 常见故障定位
+## 16. 常见故障定位
 
 | 现象 | 优先检查 | 不要做 |
 | --- | --- | --- |
@@ -628,7 +712,7 @@ curl -fsS http://127.0.0.1:37821/codex-web/api/health
 | 容器启动后立即退出 | `docker compose ps`、最近 200 行日志、`.env` 必填项 | 不要打印完整 `.env` |
 | Worker 任务无响应 | Supervisor 状态、租户配额、资源限制、Codex 登录 | 不要改成 root 运行 |
 
-## 16. AI 交付报告模板
+## 17. AI 交付报告模板
 
 交付报告应简短、可复核且不含秘密：
 
@@ -643,15 +727,18 @@ Codex Web 部署结果
 - TLS：<证书颁发者、到期日、续期演练；无域名则写不适用>
 - Codex 登录：<已登录/待人类授权；绝不附令牌>
 - 云端租户 Worker：<健康/异常>
-- Remote Worker 扩展：<未启用/已启用及版本/公开版缺少组件>
+- 选项决策：<语音、个人记忆、root bridge、Remote Worker、冷存储、共享认证、自发布：逐项写未启用/已启用>
+- Root bridge：<未启用/已启用；书面授权、socket ACL、root 服务状态；不附路径秘密>
+- Remote Worker：<未启用/已启用；机器显示名、版本、最后心跳；不附令牌>
+- 语音/个人记忆/冷存储：<未启用或验收摘要；写数据去向和恢复结果，不附 Key/密钥>
 - 持久化重启测试：<通过/失败>
 - 备份：<完成时间、受保护的位置、恢复演练结果；不附秘密内容>
 - 待办与风险：<逐项列出>
 ```
 
-## 17. 权威资料
+## 18. 权威资料
 
-- 本仓库：`README.md`、`compose.yaml`、`.env.example`、`docs/DEPLOYMENT.md`、`docs/ARCHITECTURE.md`
+- 本仓库：`README.md`、`compose.yaml`、`.env.example`、`docs/DEPLOYMENT.md`、`docs/DEPLOYMENT_OPTIONS.md`、`docs/ARCHITECTURE.md`、`docs/SECURITY.md`、`remote-worker/README.md`
 - OpenAI Codex 身份验证：https://developers.openai.com/codex/auth/
 - OpenAI Codex 远程连接：https://developers.openai.com/codex/app/remote/
 - Docker Engine on Ubuntu：https://docs.docker.com/engine/install/ubuntu/

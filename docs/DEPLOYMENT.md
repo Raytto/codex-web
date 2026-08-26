@@ -1,8 +1,30 @@
 # Deployment
 
+## Recommended rollout
+
+Use a layered rollout: complete the base Compose installation and its backup,
+health, login, task, and restart checks first. Then ask whether each optional
+feature is wanted and enable only the selected one. Empty optional environment
+variables are intentional and keep the corresponding code path inactive.
+
+The [deployment options guide](DEPLOYMENT_OPTIONS.md) is the canonical
+questionnaire and acceptance matrix. It covers voice, personal-memory
+extraction, the explicit-consent host/root bridge, Remote Worker, encrypted
+cold storage, shared Codex authentication, and the self-publish coordinator.
+The [AI cloud runbook](../AI_CLOUD_DEPLOYMENT_RUNBOOK.md) turns the same choices
+into an Ubuntu execution checklist.
+
 ## Local Docker deployment
 
 Follow the root README. Docker named volumes persist the SQLite database, tenant workspaces, Codex login/thread state, and the seeded Codex CLI runtime.
+
+Compose expects the external `codex-web-egress` network. Create it once before
+the first `up` (and do not remove it during routine updates):
+
+```bash
+sudo docker network inspect codex-web-egress >/dev/null 2>&1 \
+  || sudo docker network create codex-web-egress
+```
 
 Useful checks:
 
