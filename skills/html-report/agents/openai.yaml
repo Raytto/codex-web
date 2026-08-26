@@ -1,0 +1,6 @@
+interface:
+  display_name: "HTML Report"
+  short_description: "Generate a self-contained, mobile-readable UTF-8 HTML report"
+  default_prompt: "Use $html-report to create a self-contained HTML report from these findings."
+policy:
+  allow_implicit_invocation: true

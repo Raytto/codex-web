@@ -51,6 +51,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Scheduled prompts use a distinct clock identity, and relative postponements accumulate from the plan's current deadline
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
+- A managed `html-report` skill with its style guide, self-contained report template, and validator; new tenants receive it automatically with the managed skills
 - Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
 
 ## How the system fits together

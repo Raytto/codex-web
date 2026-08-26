@@ -8,6 +8,8 @@ Each conversation has an `uploads`, `outputs`, and temporary runtime area. Gener
 
 Finished Markdown and HTML deliverables remain private by default. An authenticated owner may enable a stable public reader URL. The public API exposes only a minimal file snapshot and an allowlist of same-message output images; it rejects remote, absolute, or traversing references, rewrites approved assets to scoped endpoints, records deduplicated access events in SQLite, and immediately stops serving content when sharing is disabled.
 
+The `html-report` skill is a managed platform asset, alongside the local spreadsheet skill. Its source lives under `skills/html-report/` and includes the instructions, style guide, static template, and validator. `ensureTenant` copies the complete directory into each new user's `CODEX_HOME/skills/`; existing tenants receive the same refresh on the next initialization. The skill does not grant extra filesystem or network access: it only guides the low-privilege worker to produce a static, self-contained HTML deliverable.
+
 Queued prompts and their attachments are stored by the server. The browser is only a view of that state. A queued prompt can be reordered, edited, deleted, or converted into a live steering instruction for the currently running Codex turn. Running and queued states are derived independently so an idle-but-queued conversation is not presented as actively executing.
 
 On graceful shutdown, dispatch stops first and the process waits for active Codex executions to finish; queued work remains durable. If the process disappears while a job is running, startup marks that job interrupted and appends a visible message/event. It does not automatically retry a possibly side-effecting turn.

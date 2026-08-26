@@ -37,6 +37,8 @@ docker compose up -d --build
 
 The container seeds a newer bundled Codex CLI into the persistent runtime volume on startup. Existing login and thread state remain in the tenant volume.
 
+Managed skills are copied from the repository's `skills/` directory when a tenant is initialized. The default set includes `local-spreadsheets` and `html-report`; the latter also installs its relative `references/`, `assets/`, and `scripts/` files, so a newly created user can follow and validate the report workflow without any extra volume or environment setting. Do not manually place these managed skills under `.system/`.
+
 After upgrading, verify that archived conversations remain listed under personal settings and that any job interrupted by an ungraceful previous stop has a visible interruption message instead of being retried.
 
 The public sign-in contract remains username plus password. Keep `APP_USERNAME` and

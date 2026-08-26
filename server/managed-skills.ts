@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const MANAGED_SKILLS = ["local-spreadsheets"] as const;
+const MANAGED_SKILLS = ["local-spreadsheets", "html-report"] as const;
 const syncedDestinations = new Set<string>();
 
 export function syncManagedSkills(codexHome: string, sourceRoot = path.join(process.cwd(), "skills")): void {

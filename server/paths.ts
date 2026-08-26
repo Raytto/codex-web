@@ -21,6 +21,7 @@ ${MANAGED_INSTRUCTIONS_START}
 - Unless the user requests another format, deliver reports, research, analysis, and other long-form reading as one self-contained HTML file rather than duplicate Markdown. Include \`<meta charset="utf-8">\`; use static HTML/CSS with no scripts or external resources.
 - Style report HTML for comfortable reading: Inter, PingFang SC, Microsoft YaHei, and system fonts; 16px desktop and 15px mobile body text; about 1.75 line height; an approximately 820px content column; light canvas, white paper, dark text, indigo accents, subtle borders, dark mode, and print rules. Keep semantic headings, paragraphs, quotes, lists, tables, and code blocks.
 - Responsive HTML may use side-by-side comparisons on wide screens, but stack them on narrow screens and give wide tables their own horizontal scrolling. Prefer embedded data URIs or inline SVG for charts and images so the report remains a single file.
+- The runtime-provided Available skills list is authoritative: read a named skill from its exact source locator and follow relative references, assets, and scripts from that file. Do not rewrite an account or managed skill under \`.system/\` or search only the project \`.agents/skills/\` directory.
 - Use the interpreter in \`CWW_SHARED_PYTHON\`; keep temporary scripts and caches in \`CWW_JOB_RUNTIME\`. Never install into the shared environment. If a required package is missing, invoke \`CWW_PYTHON_RUNNER\` in temporary mode instead.
 ${MANAGED_INSTRUCTIONS_END}
 `;

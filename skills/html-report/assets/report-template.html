@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Report title</title>
+  <style>
+    :root { color-scheme: light dark; --canvas:#fafbff; --paper:#fff; --text:#242630; --muted:#666b7a; --accent:#354381; --tint:#eef0f8; --line:#dfe2ec; --code:#20232d; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--canvas); color:var(--text); font:16px/1.76 Inter,"PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif; }
+    .report-shell { display:block; width:min(100% - 40px,820px); margin:32px auto 64px; }
+    main.report-content { min-width:0; padding:42px 48px; background:var(--paper); border:1px solid var(--line); border-radius:8px; counter-reset:section; }
+    h1 { margin:0 0 .7em; color:var(--accent); font-size:1.85em; line-height:1.25; scroll-margin-top:24px; }
+    h2 { margin:2em 0 .8em; padding-bottom:.35em; border-bottom:1px solid var(--line); font-size:1.42em; counter-increment:section; counter-reset:subsection; scroll-margin-top:24px; }
+    h2::before { content:counter(section, cjk-ideographic) "、"; color:var(--accent); }
+    h3 { margin:1.5em 0 .6em; font-size:1.18em; counter-increment:subsection; scroll-margin-top:24px; }
+    h3::before { content:counter(section) "." counter(subsection) " "; color:var(--accent); }
+    h1:target, h2:target, h3:target { border-radius:4px; background:var(--tint); box-shadow:0 0 0 6px var(--tint); }
+    p,ul,ol { margin:.8em 0; }
+    .lead { color:var(--muted); font-size:1.05em; }
+    .callout { margin:1.25em 0; padding:14px 16px; background:var(--tint); border-left:4px solid var(--accent); }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+    .panel { padding:16px; border:1px solid var(--line); border-radius:6px; }
+    .table-wrap { overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { padding:10px 12px; border:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { background:var(--tint); }
+    code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+    pre { overflow-x:auto; padding:16px; color:#f5f6fa; background:var(--code); border-radius:8px; }
+    a { color:var(--accent); text-underline-offset:2px; }
+    @media (max-width:760px) {
+      body { font-size:15px; }
+      .report-shell { display:block; width:100%; margin:0; }
+      main.report-content { width:100%; margin:0; padding:58px 18px 48px; border:0; border-radius:0; }
+      .grid { grid-template-columns:1fr; }
+    }
+    @media (prefers-color-scheme:dark) { :root { --canvas:#14161d; --paper:#1b1e27; --text:#e8eaf0; --muted:#aeb3c2; --accent:#aeb9ff; --tint:#282d42; --line:#383d4d; } }
+    @media print { :root { --canvas:#fff; --paper:#fff; --text:#111; --accent:#222; --tint:#f2f2f2; --line:#bbb; } body,.report-shell,main.report-content { background:#fff; } .report-shell { display:block; width:100%; margin:0; } main.report-content { width:100%; padding:0; border:0; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+  <div class="report-shell">
+    <main class="report-content">
+      <h1 id="report-title">Report title</h1>
+      <p class="lead">One sentence describing scope, method, and verification date.</p>
+      <section aria-labelledby="summary">
+        <h2 id="summary">Conclusion</h2>
+        <div class="callout"><strong>Key judgment:</strong> Put the most important actionable result first.</div>
+      </section>
+      <section aria-labelledby="analysis">
+        <h2 id="analysis">Analysis</h2>
+        <h3 id="evidence">Evidence and basis</h3>
+        <p>Develop the body around evidence and causal relationships.</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -727,7 +727,7 @@ test("the owner tenant has a dedicated Unix identity and workers reject cross-te
   assert.match(composeSource, /codex-runtime:\/opt\/codex-runtime/);
 });
 
-test("conversation workspaces stay concise while tenants receive the managed local spreadsheet skill", (context) => {
+test("conversation workspaces stay concise while tenants receive the managed report and spreadsheet skills", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-workspace-guidance-test-"));
   const conversationId = crypto.randomUUID();
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -752,6 +752,13 @@ test("conversation workspaces stay concise while tenants receive the managed loc
   const skillPath = path.join(tenant.codexHome, "skills", "local-spreadsheets", "SKILL.md");
   assert.equal(fs.existsSync(skillPath), true);
   assert.match(fs.readFileSync(skillPath, "utf8"), /openpyxl and pandas/);
+  const reportRoot = path.join(tenant.codexHome, "skills", "html-report");
+  assert.equal(fs.existsSync(path.join(reportRoot, "SKILL.md")), true);
+  assert.equal(fs.existsSync(path.join(reportRoot, "references", "style-guide.md")), true);
+  assert.equal(fs.existsSync(path.join(reportRoot, "assets", "report-template.html")), true);
+  assert.equal(fs.existsSync(path.join(reportRoot, "scripts", "validate_report.py")), true);
+  assert.match(fs.readFileSync(path.join(reportRoot, "SKILL.md"), "utf8"), /single self-contained .*HTML/);
+  assert.match(fs.readFileSync(path.join(reportRoot, "references", "style-guide.md"), "utf8"), /solid color fills/);
 });
 
 test("agent turn context keeps only current intent, attachments, and conditional safety", () => {
