@@ -4,6 +4,8 @@ Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。�
 
 > 本项目由社区独立开发，与 OpenAI 没有关联，也未获得 OpenAI 的背书或支持。
 
+阅读器支持从当前 Markdown 文档选中文本后直接询问 Reader Agent，引用会以可移除的引用卡片进入同一会话；公开版仍只使用账号密码登录，服务端模型与语音能力由部署者自行配置。
+
 ## 快速开始
 
 面向新云服务器的完整部署、登录、备份、更新与验收步骤，请参阅 [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)。公开版网页登录始终使用 `.env` 中的 `APP_USERNAME` 与 `APP_PASSWORD_HASH`；本仓库不提供手机号或短信登录。

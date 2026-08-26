@@ -45,6 +45,11 @@ On mobile Safari, also verify that selecting text in a Markdown reader survives 
 scroll and that the reader header keeps its back action, title, and file actions usable at narrow
 widths.
 
+For the reader Agent flow, open an authenticated Markdown file, select a passage, use the Reader
+Agent action, and confirm that the quoted passage appears as a removable reference and that the
+answer is stored in the file's owning conversation. HTML previews remain sandboxed; only the
+authenticated owner can send the reader question.
+
 The public sign-in contract remains username plus password. Keep `APP_USERNAME` and
 `APP_PASSWORD_HASH` in the private `.env`; do not add phone-number, SMS, or external credential
 proxy settings to a public deployment.

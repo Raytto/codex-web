@@ -1183,7 +1183,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const composerDraft = useComposerDraft ? db.getComposerDraft(conversation.id) : undefined;
     const attachmentCount = uploaded.length + (composerDraft?.files.length ?? 0);
     if (!prompt && !quoteExcerpt && attachmentCount === 0) return res.status(400).json({ error: "请输入内容、添加引用或上传文件。" });
-    const selection = conversationAgentSelection(conversation);
+    let selection: AgentSelection;
+    try {
+      const currentSelection = conversationAgentSelection(conversation);
+      const hasRequestSelection = typeof req.body?.model === "string" || typeof req.body?.reasoningEffort === "string";
+      selection = hasRequestSelection
+        ? resolveAgentSelection(
+            optionsForUser(session.user_id),
+            typeof req.body?.model === "string" ? req.body.model : currentSelection.model,
+            typeof req.body?.reasoningEffort === "string" ? req.body.reasoningEffort : currentSelection.reasoningEffort,
+          )
+        : currentSelection;
+    } catch (error) {
+      removeUnregisteredUploads(uploaded);
+      return res.status(400).json({ error: error instanceof Error ? error.message : "模型选项无效。" });
+    }
     const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0];
 
     if (useComposerDraft && editingPrompt) return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
@@ -1445,6 +1459,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
+    const conversation = db.getConversationForUser(file.conversation_id, session.user_id);
+    if (!conversation) return res.status(404).json({ error: "所属会话不存在。" });
     res.setHeader("Cache-Control", "private, no-store");
     return res.json({
       file: {
@@ -1456,6 +1472,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         kind: file.kind,
       },
       share: publicShareState(req, file.id),
+      conversation: {
+        id: conversation.id,
+        title: conversation.title,
+        status: conversation.status,
+        has_unread_result: conversation.has_unread_result,
+        has_pending_work: conversation.has_pending_work,
+      },
     });
   });
 

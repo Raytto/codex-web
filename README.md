@@ -12,6 +12,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Server-persistent queued prompts with reorder, edit, delete, and steer actions
 - Persistent attachments, cancellable/resumable uploads, generated-image capture, and compact server thumbnails
 - Authenticated Markdown reading, sandboxed HTML previews, explicit UTF-8 text responses, and direct original-file downloads
+- Reader Agent panel for asking about the current document, with browser-owned text selection and removable quoted references
 - Reader selection remains owned by the browser during mobile Safari viewport/loupe changes, while the preview header keeps navigation, title, and actions in stable columns
 - A consistent preview action for Markdown, HTML, images, PDF, plain text, and CSV deliverables
 - Opt-in fixed public links for finished Markdown/HTML reports, with safe same-delivery image rewriting and revocation

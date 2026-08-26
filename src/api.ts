@@ -8,13 +8,14 @@ export type WorkFile = {
   id: string; original_name: string; relative_path: string; mime_type: string; size: number; kind: "upload" | "output";
 };
 export type FileShareState = { enabled: boolean; publicUrl: string };
-export type FilePreviewMetadata = { file: WorkFile; share: FileShareState };
+export type FilePreviewConversation = Pick<Conversation, "id" | "title" | "status" | "has_unread_result" | "has_pending_work">;
+export type FilePreviewMetadata = { file: WorkFile; share: FileShareState; conversation: FilePreviewConversation };
 export type PublicFilePreview = {
   file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind">;
   content: string;
 };
 export type Message = {
-  id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; created_at: string; files: WorkFile[];
+  id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; attachment_references?: Array<{ name: string; fileId?: string | null }>; is_scheduled?: number; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
   id: string;
@@ -212,11 +213,13 @@ export const api = {
     `/conversations/${id}/draft/files/${fileId}`, { method: "DELETE" },
   ),
   deleteConversationDraft: (id: string) => request<void>(`/conversations/${id}/draft`, { method: "DELETE" }),
-  sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "", useComposerDraft = false) => {
+  sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "", useComposerDraft = false, voiceTranscriptionIds: string[] = [], selection?: AgentSelection) => {
     const body = new FormData();
     body.set("message", message);
     body.set("quoteExcerpt", quoteExcerpt);
     if (useComposerDraft) body.set("useComposerDraft", "true");
+    if (voiceTranscriptionIds.length > 0) body.set("voiceTranscriptionIds", JSON.stringify(voiceTranscriptionIds));
+    if (selection) { body.set("model", selection.model); body.set("reasoningEffort", selection.reasoningEffort); }
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body });
   },

@@ -7,7 +7,7 @@ import {
   Copy, CornerUpLeft, GripVertical, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Plus, Search, Settings2, Share2, Square, Sun,
   Play, RotateCcw, Trash2, TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type FileShareState, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
+import { api, BASE_PATH, fileThumbnailUrl, fileUrl, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type FilePreviewMetadata, type FileShareState, type Job, type JobEvent, type PendingPrompt, type ReasoningEffort, type Session, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -23,6 +23,7 @@ import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { formatContextUsage, formatRolloutBytes, shouldWarnAboutRollout } from "./rollout-capacity";
 import { recoverBrowserSession } from "./session-recovery";
 import { buildSubagentActivity, subagentStatusLabel } from "./subagent-activity";
+import { ReaderAskBubble, ReaderSelectionAction, useReaderSelection } from "./reader-ask";
 
 const SELECTED_CONVERSATION_KEY = "codex-web:selected-conversation";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
@@ -79,7 +80,7 @@ export default function App() {
   if (publicPreviewFileId) return <PublicFilePreviewPage fileId={publicPreviewFileId} />;
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
-  if (previewFileId) return <FilePreviewPage fileId={previewFileId} onSessionExpired={expireSession} />;
+  if (previewFileId) return <FilePreviewPage fileId={previewFileId} userInitials={(session.displayName || session.username || "你").slice(0, 2)} onSessionExpired={expireSession} />;
   return <Workspace session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
 }
 
@@ -117,7 +118,7 @@ function FileReaderContent({ file, content }: {
 }) {
   const readerKind = fileReaderKind(file);
   const math = useAsyncMarkdownMath(content);
-  if (readerKind === "markdown") return <div className="file-preview-scroll">
+  if (readerKind === "markdown") return <div className="file-reader-document file-preview-scroll">
     <article className="file-reader-markdown markdown">
       <ReactMarkdown
         remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
@@ -226,12 +227,19 @@ function FileShareMenu({ file, share, onChange }: { file: WorkFile; share: FileS
   </div>;
 }
 
-function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessionExpired: () => void }) {
+function FilePreviewPage({ fileId, userInitials, onSessionExpired }: { fileId: string; userInitials: string; onSessionExpired: () => void }) {
   const [file, setFile] = useState<WorkFile | null>(null);
+  const [conversation, setConversation] = useState<FilePreviewMetadata["conversation"] | null>(null);
   const [share, setShare] = useState<FileShareState | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [askOpen, setAskOpen] = useState(false);
+  const [askClosing, setAskClosing] = useState(false);
+  const [askQuote, setAskQuote] = useState("");
+  const readerBodyRef = useRef<HTMLElement>(null);
+  const askCloseTimerRef = useRef<number | null>(null);
+  const readerSelection = useReaderSelection(readerBodyRef);
   const readerKind = file ? fileReaderKind(file) : null;
 
   useEffect(() => {
@@ -241,7 +249,7 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
       try {
         const metadata = await api.filePreview(fileId, controller.signal);
         if (controller.signal.aborted) return;
-        setFile(metadata.file); setShare(metadata.share);
+        setFile(metadata.file); setShare(metadata.share); setConversation(metadata.conversation);
         if (!fileReaderKind(metadata.file)) { setError("这个文件不支持站内阅读，请下载后打开。"); return; }
         if (metadata.file.size > FILE_READER_MAX_BYTES) {
           setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 5 MB 的移动端在线阅读上限，请直接下载。`); return;
@@ -280,11 +288,24 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
     };
   }, [onSessionExpired]);
 
+  const openReaderAsk = useCallback((selectedText: string) => {
+    if (askCloseTimerRef.current !== null) window.clearTimeout(askCloseTimerRef.current);
+    setAskQuote(normalizeAskAgentSelection(selectedText).slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1));
+    setAskClosing(false); setAskOpen(true);
+  }, []);
+  const closeReaderAsk = useCallback(() => {
+    if (!askOpen || askClosing) return;
+    setAskClosing(true);
+    askCloseTimerRef.current = window.setTimeout(() => { askCloseTimerRef.current = null; setAskOpen(false); setAskClosing(false); }, 230);
+  }, [askClosing, askOpen]);
+  useEffect(() => () => { if (askCloseTimerRef.current !== null) window.clearTimeout(askCloseTimerRef.current); }, []);
+
   const download = file ? fileUrl(file, true) : "";
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <div className="file-preview-header-start">
         <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站"><ArrowLeft size={18} /><span>工作站</span></a>
+        {conversation && <button type="button" className={`file-reader-ask-launcher${askOpen ? " active" : ""}`} onClick={() => { if (askOpen) closeReaderAsk(); else setAskOpen(true); }} title={askOpen ? "收起询问 Agent" : "询问阅读器 Agent"} aria-label={askOpen ? "收起询问 Agent" : "询问阅读器 Agent"} aria-pressed={askOpen}><Bot size={17} /></button>}
       </div>
       <div className="file-preview-title"><strong>{file?.original_name || "正在读取文件…"}</strong></div>
       <div className="file-preview-actions">
@@ -292,10 +313,12 @@ function FilePreviewPage({ fileId, onSessionExpired }: { fileId: string; onSessi
         {file && <a className="file-preview-download" href={download} download={file.original_name} title="下载原文件" aria-label={`下载 ${file.original_name}`}><Download size={18} /><span>下载</span></a>}
       </div>
     </header>
-    <section className="file-preview-body">
+    <section ref={readerBodyRef} className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
       {!loading && !error && content !== null && file && <FileReaderContent file={file} content={content} />}
+      {readerSelection && <ReaderSelectionAction selection={readerSelection} onAsk={openReaderAsk} />}
+      {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file?.original_name} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
     </section>
   </main>;
 }
