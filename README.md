@@ -44,6 +44,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Optional Alibaba Cloud DashScope voice transcription
 - A five-minute recording-limit notice and a 650 ms long-press shortcut on an empty mobile composer
 - Bounded automatic retries for transient voice-transcription connection and upstream failures
+- Failed voice uploads keep the complete recording in browser IndexedDB for 24 hours, with an explicit retry/delete action; UUID receipts make a retry safe after a lost response
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
 - A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
 - Touch reordering for pending prompts, bounded session-restore retries, and resilient asynchronous math loading
@@ -227,6 +228,8 @@ State is stored in Docker named volumes. Closing the browser does not remove que
 Set `DASHSCOPE_API_KEY` and an HTTPS `PUBLIC_BASE_URL` in `.env` to enable the microphone button. The default model is `qwen3.5-omni-plus`; you can override it with `DASHSCOPE_ASR_MODEL`. Microphone access requires a secure browser context.
 
 Audio is uploaded to your server first and then sent to the DashScope endpoint configured by `DASHSCOPE_BASE_URL`. Leave the key empty to disable the feature completely.
+
+Before an upload starts, the browser stores the complete recording in a per-user, per-conversation IndexedDB draft. If the network disappears while the request is in flight, the composer keeps the recording and shows a retry action instead of discarding it. A retry reuses the same client recording UUID; the server records the audio hash/size and returns the original transcription when the first request already completed. Receipts and browser drafts are pruned after 24 hours; deleting the draft is always available locally.
 
 The optional spelling/topic context is bounded to about 500 tokens by default and shared across the draft, attachment names, the first 16 KiB of text attachments, recent messages, fixed technical terms, and up to two small images. Large unsent files are never copied wholesale into the transcription request. Tune the limits with `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`, `TRANSCRIPTION_CONTEXT_MAX_IMAGES`, and `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES`.
 

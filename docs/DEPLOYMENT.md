@@ -14,7 +14,7 @@ curl --fail http://127.0.0.1:37821/codex-web/api/health
 
 Back up all three named volumes before upgrades. Keep `.env` outside source control.
 
-Recent releases add SQLite columns for continuation targets and selections. Migrations are additive and run on startup, but the pre-upgrade volume backup remains the rollback boundary; do not start an older image against a database already migrated by a newer release unless that version is documented as backward compatible.
+Recent releases add SQLite columns for continuation targets and selections, plus the `voice_transcription_receipts` table used for idempotent voice retries. Migrations are additive and run on startup, but the pre-upgrade volume backup remains the rollback boundary; do not start an older image against a database already migrated by a newer release unless that version is documented as backward compatible.
 
 Docker grants the application up to 30 minutes after `SIGTERM` to drain active Codex work. New dispatch stops immediately, queued jobs stay persisted, and the container exits once active executions finish. Avoid overriding `stop_grace_period` with a shorter value unless you accept interrupted jobs.
 
@@ -27,6 +27,8 @@ Set `PUBLIC_BASE_URL` to the final HTTPS URL. Do not publish container port 3782
 Review `MAX_UPLOAD_FILE_BYTES`, `MAX_STORED_BYTES_PER_USER`, and `MINIMUM_FREE_DISK_BYTES` for the host volume before accepting uploads. The defaults allow a 2 GiB individual file, 20 GiB stored per user, and preserve 2 GiB of free space. Large uploads use 8 MiB resumable chunks and unfinished partials expire after 72 hours; all values are configurable in `.env`.
 
 For optional voice transcription, keep `DASHSCOPE_API_KEY` only in `.env`. The default context budget is 500 approximate tokens, two images, and 2 MiB per image. Adjust `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`, `TRANSCRIPTION_CONTEXT_MAX_IMAGES`, and `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES` only after considering request cost and data exposure.
+
+To verify the offline-retry path, start a recording, interrupt connectivity after the upload begins, and confirm the complete recording remains in the composer with retry and delete actions. Retrying the same recording must produce one transcription even if the first HTTP response was lost; a changed payload with the same client recording UUID must be rejected.
 
 ## Updating
 

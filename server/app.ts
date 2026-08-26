@@ -33,9 +33,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   fs.mkdirSync(config.dataRoot, { recursive: true });
   fs.mkdirSync(config.tenantRoot, { recursive: true });
   const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: config.displayName });
+  db.recoverVoiceTranscriptionReceipts();
   for (const user of db.listUsers()) ensureTenant(config.tenantRoot, user.id);
   migrateExistingOutputFiles(config, db);
   db.prunePublicShareAccessEvents(new Date(Date.now() - 180 * 24 * 60 * 60 * 1_000).toISOString());
+  db.pruneVoiceTranscriptionReceipts(new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString());
   const subscribers = new Map<string, Set<Response>>();
 
   function optionsForUser(userId: string): AgentOptions {
@@ -117,6 +119,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   const runner = new CodexRunner(config, db, publish);
   const transcription = new TranscriptionService(config);
+  const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const voiceEnabled = Boolean(config.dashscopeApiKey && config.publicBaseUrl.startsWith("https://"));
   const deletingConversations = new Set<string>();
   const imageThumbnails = new ImageThumbnailService();
@@ -1093,7 +1096,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         callback(null, `${crypto.randomUUID()}${AUDIO_MIME_EXTENSIONS[mime] ?? ""}`);
       },
     }),
-    limits: { files: 1, fileSize: 15 * 1024 * 1024, fields: 3, fieldSize: 10 * 1024 },
+    limits: { files: 1, fileSize: 15 * 1024 * 1024, fields: 4, fieldSize: 10 * 1024 },
     fileFilter(_req, file, callback) {
       const mime = file.mimetype.toLowerCase().split(";", 1)[0];
       callback(null, Boolean(AUDIO_MIME_EXTENSIONS[mime]));
@@ -1114,6 +1117,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!file) return res.status(400).json({ error: "没有收到可识别的录音，请重新录制。" });
     try {
       const session = res.locals.session as SessionRow;
+      const clientRecordingId = typeof req.body?.clientRecordingId === "string" ? req.body.clientRecordingId.trim() : "";
+      if (clientRecordingId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientRecordingId)) {
+        return res.status(400).json({ error: "语音录音 ID 无效，请重新录音。" });
+      }
+      const audioBuffer = fs.readFileSync(file.path);
+      const audioBytes = audioBuffer.byteLength;
+      const audioSha256 = crypto.createHash("sha256").update(audioBuffer).digest("hex");
       const conversationId = typeof req.body?.conversationId === "string" ? req.body.conversationId.trim() : "";
       const conversation = conversationId ? db.getConversationForUser(conversationId, session.user_id) : undefined;
       if (conversationId && !conversation) return res.status(404).json({ error: "会话不存在。" });
@@ -1140,13 +1150,42 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           } catch { return []; }
         });
       })() : [];
-      const text = await transcription.transcribe(file.filename, {
-        draftText: typeof req.body?.draftText === "string" ? req.body.draftText : "",
-        attachmentNames,
-        attachments,
-        recentMessages,
-      });
-      return res.json({ text });
+      const runTranscription = async (): Promise<{ text: string; transcriptionId: string }> => {
+        try {
+          const text = await transcription.transcribe(file.filename, {
+            draftText: typeof req.body?.draftText === "string" ? req.body.draftText : "",
+            attachmentNames,
+            attachments,
+            recentMessages,
+          });
+          const transcriptionId = newId();
+          if (clientRecordingId) db.updateVoiceTranscriptionReceipt({ userId: session.user_id, clientRecordingId, state: "succeeded", transcriptionId, transcriptionText: text });
+          return { text, transcriptionId };
+        } catch (error) {
+          if (clientRecordingId) db.updateVoiceTranscriptionReceipt({ userId: session.user_id, clientRecordingId, state: "failed", error: error instanceof Error ? error.message : "语音识别失败" });
+          throw error;
+        }
+      };
+      if (!clientRecordingId) return res.json(await runTranscription());
+      const existing = db.getVoiceTranscriptionReceipt(session.user_id, clientRecordingId);
+      if (existing && (existing.audio_bytes !== audioBytes || existing.audio_sha256 !== audioSha256)) return res.status(409).json({ error: "同一录音 ID 对应了不同音频内容。" });
+      if (existing?.state === "succeeded" && existing.transcription_id && existing.transcription_text !== null) {
+        return res.json({ text: existing.transcription_text, transcriptionId: existing.transcription_id });
+      }
+      if (existing?.state === "processing") {
+        const pending = voiceTranscriptionInFlight.get(`${session.user_id}:${clientRecordingId}`);
+        if (pending) return res.json(await pending);
+        return res.status(409).json({ error: "这段语音正在识别，请稍后重试。" });
+      }
+      const claimed = db.claimVoiceTranscriptionReceipt({ userId: session.user_id, clientRecordingId, audioSha256, audioBytes });
+      if (claimed.state === "succeeded" && claimed.transcription_id && claimed.transcription_text !== null) {
+        return res.json({ text: claimed.transcription_text, transcriptionId: claimed.transcription_id });
+      }
+      const key = `${session.user_id}:${clientRecordingId}`;
+      const pending = runTranscription();
+      voiceTranscriptionInFlight.set(key, pending);
+      try { return res.json(await pending); }
+      finally { voiceTranscriptionInFlight.delete(key); }
     } catch (error) {
       const status = error instanceof TranscriptionError ? error.status : 502;
       return res.status(status).json({ error: error instanceof Error ? error.message : "语音识别失败，请重试。" });

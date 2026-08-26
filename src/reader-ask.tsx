@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject, type SyntheticEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft, Bot, Clock, LoaderCircle, Minus, Zap } from "lucide-react";
 import { api, BASE_PATH, type AgentOptions, type AgentSelection, type ConversationActivity, type ConversationDetail, type ConversationMessagesPage, type Job } from "./api";
@@ -14,31 +14,32 @@ export type ReaderSelection = {
   below: boolean;
 };
 
-// The browser owns the native text selection.  In particular, WebKit can
-// temporarily publish a collapsed range while the user is releasing a text
-// handle.  The reader must only sample/clone that range; removing and adding a
-// range from JavaScript during that gesture clears the native highlight on
-// iOS and can also race the mouse compatibility events on Windows.
-const READER_SELECTION_IDLE_DELAY_MS = 180;
-const READER_SELECTION_GRACE_MS = 460;
-const READER_SELECTION_RELEASE_DELAYS_MS = [0, 32, 120, 280] as const;
-// iOS handle drags often expose only selectionchange (no touch/pointer end).
-// Waiting for a quiet interval keeps the action away from the handle while it
-// is moving, then still gives keyboard/handle selections an action eventually.
-const READER_SELECTION_HANDLE_IDLE_DELAY_MS = 900;
+// Safari owns the native selection and the Cut/Copy/Paste menu.  The reader
+// only observes selection changes and passive release boundaries, then samples
+// a clone of the current Range for the optional Agent action. It must not
+// capture touch/pointer starts, call preventDefault on a selection gesture, or
+// write a Range back to the browser.
+// Those small-looking interventions race WebKit's loupe and selection handles
+// on iOS (and the mouse compatibility events on Windows).
+const READER_SELECTION_MOUSE_DELAY_MS = 180;
+// Give WebKit enough time to finish the native loupe/edit-menu transaction
+// before React mounts the optional Agent button.
+const READER_SELECTION_TOUCH_DELAY_MS = 1_000;
+const READER_SELECTION_HANDLE_IDLE_DELAY_MS = 2_000;
+const READER_SELECTION_GRACE_MS = 2_000;
 
 export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): ReaderSelection | null {
   const [selection, setSelection] = useState<ReaderSelection | null>(null);
 
   useEffect(() => {
     let frame = 0;
-    let quietTimer = 0;
+    let publishTimer: number | null = null;
+    let clearTimer: number | null = null;
     let publishToken = 0;
-    let nativeSelectionGesture = false;
     let selectionSessionActive = false;
-    let releasePending = false;
     let lastTouchEndAt = 0;
-    const releaseTimers = new Set<number>();
+    let lastSelectionEndAt = 0;
+    let lastSelectionEndDelay = 0;
     const stableRangeRef = { current: null as Range | null };
     let stableRangeAt = 0;
     const elementFor = (node: Node | null): Element | null => node instanceof Element ? node : node?.parentElement ?? null;
@@ -47,10 +48,6 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): Read
       const start = elementFor(range.startContainer)?.closest(".file-reader-document");
       const end = elementFor(range.endContainer)?.closest(".file-reader-document");
       return Boolean(start && start === end && root.contains(start));
-    };
-    const cancelReleaseTimers = () => {
-      for (const timer of releaseTimers) window.clearTimeout(timer);
-      releaseTimers.clear();
     };
     const currentReaderRange = (root: HTMLElement | null): Range | null => {
       if (!root) return null;
@@ -63,43 +60,32 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): Read
         return null;
       }
     };
-    const rememberCurrentReaderRange = () => {
-      const range = currentReaderRange(rootRef.current);
-      if (!range) return null;
+    const rememberRange = (range: Range | null) => {
+      if (!range) return;
       try {
         stableRangeRef.current = range.cloneRange();
         stableRangeAt = Date.now();
-        selectionSessionActive = true;
       } catch {
-        return null;
+        // The document can be replaced while a file is loading.
       }
-      return range;
     };
-    const hasForeignNonCollapsedSelection = () => {
-      const root = rootRef.current;
-      const native = window.getSelection();
-      if (!root || !native || native.isCollapsed || native.rangeCount === 0) return false;
-      try { return !rangeIsReaderText(root, native.getRangeAt(0)); } catch { return true; }
-    };
-    const publish = (fallbackRange?: Range | null) => {
+    const publish = (fallbackRange: Range | null = null) => {
       const root = rootRef.current;
       const currentRange = currentReaderRange(root);
-      if (hasForeignNonCollapsedSelection()) {
+      const recentFallback = Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS ? stableRangeRef.current : null;
+      const range = currentRange ?? fallbackRange ?? recentFallback;
+      if (!root || !range || !rangeIsReaderText(root, range)) {
+        selectionSessionActive = false;
         stableRangeRef.current = null;
         stableRangeAt = 0;
-        selectionSessionActive = false;
-        return clear();
-      }
-      const recentFallback = Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS ? stableRangeRef.current : null;
-      const usableFallback = fallbackRange && Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS ? fallbackRange : null;
-      const range = currentRange ?? usableFallback ?? recentFallback;
-      if (!root || !range || !rangeIsReaderText(root, range)) {
-        if (!range || Date.now() - stableRangeAt > READER_SELECTION_GRACE_MS) selectionSessionActive = false;
         return clear();
       }
       const text = normalizeAskAgentSelection(range.toString());
-      if (!text) { selectionSessionActive = false; return clear(); }
-      try { stableRangeRef.current = range.cloneRange(); stableRangeAt = Date.now(); } catch { return clear(); }
+      if (!text) {
+        selectionSessionActive = false;
+        return clear();
+      }
+      rememberRange(range);
       const rootRect = root.getBoundingClientRect();
       const viewport: SelectionRect = {
         left: Math.max(0, rootRect.left),
@@ -117,240 +103,135 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): Read
       const top = below
         ? Math.min(rect.bottom + 8, viewport.bottom - 44)
         : Math.max(rect.top - 8, viewport.top + 44);
+      cancelClear();
       setSelection({ text: text.slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1), left, top, below });
+      // The release window has been consumed. A later handle adjustment must
+      // start a fresh quiet period instead of being mistaken for the original
+      // touch release.
+      lastSelectionEndAt = 0;
+      lastSelectionEndDelay = 0;
     };
-    const cancelQueuedPublishes = () => {
+    const cancelPublish = () => {
       publishToken += 1;
-      window.clearTimeout(quietTimer);
-      quietTimer = 0;
-      cancelReleaseTimers();
+      if (publishTimer !== null) window.clearTimeout(publishTimer);
+      publishTimer = null;
       window.cancelAnimationFrame(frame);
       frame = 0;
     };
-    const scheduleQuietPublish = (delay = READER_SELECTION_IDLE_DELAY_MS, allowGestureFallback = false) => {
-      window.clearTimeout(quietTimer);
-      cancelReleaseTimers();
+    const cancelClear = () => {
+      if (clearTimer !== null) window.clearTimeout(clearTimer);
+      clearTimer = null;
+    };
+    const schedulePublish = (delay: number) => {
+      cancelPublish();
       const token = ++publishToken;
-      quietTimer = window.setTimeout(() => {
-        quietTimer = 0;
+      publishTimer = window.setTimeout(() => {
+        publishTimer = null;
         if (token !== publishToken) return;
         frame = window.requestAnimationFrame(() => {
           frame = 0;
           if (token !== publishToken) return;
-          if (!selectionSessionActive && !nativeSelectionGesture && !releasePending) {
-            clear();
-            return;
-          }
-          // A handle drag on iOS may not emit a matching pointer/touch end.
-          // Once selectionchange has been quiet for a while, treat the native
-          // range as settled without ever writing back to window.getSelection().
-          if (releasePending || (nativeSelectionGesture && !allowGestureFallback)) return;
-          nativeSelectionGesture = false;
-          releasePending = false;
-          publish(rememberCurrentReaderRange());
+          if (selectionSessionActive) publish();
         });
       }, delay);
     };
-    const scheduleReleasePublish = () => {
-      window.clearTimeout(quietTimer);
-      cancelReleaseTimers();
-      const token = ++publishToken;
-      READER_SELECTION_RELEASE_DELAYS_MS.forEach((delay, index) => {
-        const timer = window.setTimeout(() => {
-          releaseTimers.delete(timer);
-          if (token !== publishToken) return;
-          const current = rememberCurrentReaderRange();
-          if (current) {
-            releasePending = false;
-            cancelReleaseTimers();
-            publish(current);
-            return;
-          }
-          // WebKit can report a collapsed range for a few macrotasks after the
-          // release. Keep sampling, but never remove/re-add the native range.
-          if (index < READER_SELECTION_RELEASE_DELAYS_MS.length - 1) return;
-          releasePending = false;
-          publish();
-        }, delay);
-        releaseTimers.add(timer);
-      });
-    };
-    const isReaderTextTarget = (target: EventTarget | null): boolean => {
-      const root = rootRef.current;
-      if (!root || !(target instanceof Node) || !root.contains(target)) return false;
-      const element = target instanceof Element ? target : target.parentElement;
-      return Boolean(element?.closest(".file-reader-document"));
-    };
-    const isReaderControlTarget = (target: EventTarget | null): boolean => {
-      if (!(target instanceof Node)) return false;
-      const element = target instanceof Element ? target : target.parentElement;
-      return Boolean(element?.closest("a,button,input,select,textarea,summary,option,[role=\"button\"],[contenteditable]"));
-    };
-    const isReaderSelectableTarget = (target: EventTarget | null): boolean => isReaderTextTarget(target) && !isReaderControlTarget(target);
-    const isSelectionActionTarget = (target: EventTarget | null): boolean => {
-      if (!(target instanceof Node)) return false;
-      const element = target instanceof Element ? target : target.parentElement;
-      return Boolean(element?.closest(".reader-selection-action"));
-    };
-    const invalidateSelection = () => {
-      nativeSelectionGesture = false;
-      selectionSessionActive = false;
-      releasePending = false;
-      stableRangeRef.current = null;
-      stableRangeAt = 0;
-      cancelQueuedPublishes();
-      clear();
-    };
-    const beginNativeGesture = (event: Event) => {
-      if (!isReaderSelectableTarget(event.target)) return;
-      // A synthetic mouse boundary commonly follows a touch release. It is
-      // part of the same native selection gesture, not a new selection.
-      if ((event.type === "mousedown" || ("pointerType" in event && (event as PointerEvent).pointerType === "mouse"))
-        && Date.now() - lastTouchEndAt < 520) return;
-      if (nativeSelectionGesture) return;
-      nativeSelectionGesture = true;
-      selectionSessionActive = true;
-      releasePending = false;
-      stableRangeRef.current = null;
-      stableRangeAt = 0;
-      cancelQueuedPublishes();
-      clear();
-    };
-    const handleSelectStart = (event: Event) => {
-      if (!isReaderSelectableTarget(event.target)) return;
-      // Safari/Windows touch implementations may emit a compatibility
-      // mousedown/selectstart immediately after touchend. Treat that pair as
-      // one native gesture so it cannot erase the saved reader Range.
-      if (stableRangeRef.current && Date.now() - lastTouchEndAt < 520) return;
-      // Pointer/touch listeners mark the active gesture before selectstart.
-      // A keyboard selection can emit selectstart without a pointer boundary;
-      // clear the previous React snapshot but let selectionchange publish it.
-      if (nativeSelectionGesture) return;
-      stableRangeRef.current = null;
-      stableRangeAt = 0;
-      selectionSessionActive = true;
-      releasePending = false;
-      cancelQueuedPublishes();
-      clear();
+    const scheduleClear = (delay: number) => {
+      cancelClear();
+      clearTimer = window.setTimeout(() => {
+        clearTimer = null;
+        if (!currentReaderRange(rootRef.current)) {
+          selectionSessionActive = false;
+          stableRangeRef.current = null;
+          stableRangeAt = 0;
+          clear();
+        }
+      }, delay);
     };
     const handleSelectionChange = () => {
-      const candidate = currentReaderRange(rootRef.current);
-      // An outside click can leave the old native Range visible for one more
-      // selectionchange task. Do not let that stale range re-arm the reader
-      // after invalidateSelection(); a new reader gesture/selectstart must
-      // open the session again.
-      if (candidate && !selectionSessionActive && !nativeSelectionGesture && !releasePending) return;
-      const current = rememberCurrentReaderRange();
+      const current = currentReaderRange(rootRef.current);
       if (current) {
+        cancelClear();
         selectionSessionActive = true;
-        // Do not mount a floating control while a native handle is still
-        // moving. It can cover the handle and steal the next touch/mouse hit.
+        rememberRange(current);
+        // A new handle position invalidates the old chip's geometry. Remove
+        // only the portal action (never the browser-owned Range) while the
+        // handle is moving; the settled publish below will mount a fresh one.
         clear();
-        if (releasePending) return;
-        scheduleQuietPublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS, true);
+        const releaseWindow = lastSelectionEndAt > 0
+          && Date.now() - lastSelectionEndAt <= lastSelectionEndDelay + READER_SELECTION_GRACE_MS;
+        // iOS handle drags can emit selectionchange without a matching
+        // touch/pointer end. The long quiet fallback is only a last resort;
+        // it is deliberately much later than the native menu gesture. If a
+        // release was just observed, keep its shorter, menu-safe timer.
+        if (!releaseWindow) schedulePublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS);
         return;
       }
-      if (hasForeignNonCollapsedSelection()) {
-        return invalidateSelection();
-      }
-      // A collapsed range is allowed to be a release-time transient. The
-      // short grace window keeps the quote/action available without touching
-      // the browser-owned selection.
-      if (nativeSelectionGesture) {
+      if (selectionSessionActive && stableRangeRef.current && Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS) {
+        // WebKit may expose a collapsed range for a short release-time window.
+        // Keep the snapshot briefly, but do not render or touch the native
+        // selection while that window is open.
+        const elapsedSinceRelease = lastSelectionEndAt > 0 ? Date.now() - lastSelectionEndAt : Infinity;
+        const releaseWindow = elapsedSinceRelease <= lastSelectionEndDelay + READER_SELECTION_GRACE_MS;
+        if (releaseWindow) {
+          if (publishTimer === null) schedulePublish(Math.max(60, lastSelectionEndDelay - elapsedSinceRelease));
+        } else cancelPublish();
+        scheduleClear(READER_SELECTION_GRACE_MS);
+      } else {
+        cancelPublish();
+        selectionSessionActive = false;
+        stableRangeRef.current = null;
+        stableRangeAt = 0;
+        cancelClear();
         clear();
-        scheduleQuietPublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS, true);
-        return;
       }
-      if (releasePending) return;
-      if (stableRangeRef.current && Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS) {
-        clear();
-        scheduleQuietPublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS);
-      }
-      else invalidateSelection();
     };
-    const handleRelease = (event?: Event) => {
-      if (event && isSelectionActionTarget(event.target)) return;
+    const handleSelectionEnd = (event: Event) => {
+      // These listeners are bubble/passive observers only. In particular, no
+      // touch/pointer start or move listener is installed, and this callback
+      // never calls preventDefault.
+      const pointerType = "pointerType" in event ? String((event as PointerEvent).pointerType || "") : "";
+      const touch = event.type === "touchend" || event.type === "touchcancel" || pointerType === "touch";
+      // iOS may follow one touchend with a compatibility pointerup/mouseup.
+      // Do not let that synthetic mouse boundary shorten the touch settle
+      // window that protects the native edit menu.
+      if (!touch && Date.now() - lastTouchEndAt < READER_SELECTION_TOUCH_DELAY_MS + 120) return;
       if (!selectionSessionActive) return;
-      if (releasePending) return;
-      const pointerType = "pointerType" in (event ?? {}) ? (event as PointerEvent).pointerType : "";
-      if (event?.type === "touchend" || event?.type === "touchcancel" || pointerType === "touch") lastTouchEndAt = Date.now();
-      nativeSelectionGesture = false;
-      releasePending = true;
-      scheduleReleasePublish();
-    };
-    const handlePointerCancel = (event?: Event) => {
-      // WebKit commonly cancels the pointer when it takes over a text handle;
-      // selectionchange/quiet settling remains the source of truth there. A
-      // touch cancel is deliberately slower than touchend so a browser that
-      // cancels the pointer while a handle is still moving cannot place the
-      // action over that handle.
-      if (event && isSelectionActionTarget(event.target)) return;
-      const pointerType = "pointerType" in (event ?? {}) ? (event as PointerEvent).pointerType : "";
-      if (pointerType === "touch" || event?.type === "touchcancel") {
-        lastTouchEndAt = Date.now();
-        if (!selectionSessionActive) return;
-        if (releasePending) return;
-        nativeSelectionGesture = false;
-        releasePending = false;
-        clear();
-        scheduleQuietPublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS, true);
-        return;
+      const endedAt = Date.now();
+      if (touch) lastTouchEndAt = endedAt;
+      lastSelectionEndAt = endedAt;
+      lastSelectionEndDelay = touch ? READER_SELECTION_TOUCH_DELAY_MS : READER_SELECTION_MOUSE_DELAY_MS;
+      if (currentReaderRange(rootRef.current)) {
+        cancelClear();
+        schedulePublish(lastSelectionEndDelay);
+      } else if (stableRangeRef.current && Date.now() - stableRangeAt <= READER_SELECTION_GRACE_MS) {
+        cancelClear();
+        schedulePublish(lastSelectionEndDelay);
       }
-      handleRelease(event);
     };
-    const handleTouchCancel = (event: Event) => handlePointerCancel(event);
-    const handlePointerDown = (event: Event) => {
-      if (isSelectionActionTarget(event.target)) return;
-      if (isReaderTextTarget(event.target)) {
-        if (isReaderControlTarget(event.target)) invalidateSelection();
-        else beginNativeGesture(event);
-        return;
-      }
-      invalidateSelection();
+    const handleViewportChange = () => {
+      // A selection-handle drag can auto-scroll the reader without emitting a
+      // touch/pointer end. Do not let that scroll event publish the Agent chip
+      // underneath the still-moving native handle.
+      if (selectionSessionActive) schedulePublish(READER_SELECTION_HANDLE_IDLE_DELAY_MS);
     };
-    const handleFocusIn = (event: FocusEvent) => {
-      if (isSelectionActionTarget(event.target) || (isReaderTextTarget(event.target) && !isReaderControlTarget(event.target))) return;
-      invalidateSelection();
-    };
-    const handleScroll = () => {
-      if (nativeSelectionGesture || releasePending) return;
-      scheduleQuietPublish(selectionSessionActive ? READER_SELECTION_HANDLE_IDLE_DELAY_MS : 0);
-    };
-    const handleResize = () => {
-      if (nativeSelectionGesture || releasePending) return;
-      scheduleQuietPublish(selectionSessionActive ? READER_SELECTION_HANDLE_IDLE_DELAY_MS : 0);
-    };
-    const passive = { passive: true } as const;
     const root = rootRef.current;
-    root?.addEventListener("selectstart", handleSelectStart, passive);
     document.addEventListener("selectionchange", handleSelectionChange);
-    document.addEventListener("pointerdown", handlePointerDown, { capture: true, passive: true });
-    document.addEventListener("touchstart", handlePointerDown, { capture: true, passive: true });
-    document.addEventListener("mousedown", handlePointerDown, { capture: true, passive: true });
-    document.addEventListener("focusin", handleFocusIn, true);
-    window.addEventListener("pointerup", handleRelease, passive);
-    window.addEventListener("pointercancel", handlePointerCancel, passive);
-    window.addEventListener("touchend", handleRelease, passive);
-    window.addEventListener("touchcancel", handleTouchCancel, passive);
-    window.addEventListener("mouseup", handleRelease, passive);
-    window.addEventListener("resize", handleResize);
-    root?.addEventListener("scroll", handleScroll, { capture: true, passive: true });
+    window.addEventListener("pointerup", handleSelectionEnd, { passive: true });
+    window.addEventListener("touchend", handleSelectionEnd, { passive: true });
+    window.addEventListener("mouseup", handleSelectionEnd, { passive: true });
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("scroll", handleViewportChange, { passive: true });
+    root?.addEventListener("scroll", handleViewportChange, { capture: true, passive: true });
     return () => {
-      cancelQueuedPublishes();
-      publishToken += 1;
-      root?.removeEventListener("selectstart", handleSelectStart, false);
+      cancelPublish();
+      cancelClear();
       document.removeEventListener("selectionchange", handleSelectionChange);
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("touchstart", handlePointerDown, true);
-      document.removeEventListener("mousedown", handlePointerDown, true);
-      document.removeEventListener("focusin", handleFocusIn, true);
-      window.removeEventListener("pointerup", handleRelease, false);
-      window.removeEventListener("pointercancel", handlePointerCancel, false);
-      window.removeEventListener("touchend", handleRelease, false);
-      window.removeEventListener("touchcancel", handleTouchCancel, false);
-      window.removeEventListener("mouseup", handleRelease, false);
-      window.removeEventListener("resize", handleResize);
-      root?.removeEventListener("scroll", handleScroll, true);
+      window.removeEventListener("pointerup", handleSelectionEnd);
+      window.removeEventListener("touchend", handleSelectionEnd);
+      window.removeEventListener("mouseup", handleSelectionEnd);
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("scroll", handleViewportChange);
+      root?.removeEventListener("scroll", handleViewportChange, true);
     };
   }, [rootRef]);
 
@@ -369,18 +250,11 @@ export function ReaderSelectionAction({ selection, onAsk }: { selection: ReaderS
     onAsk(selection.text);
   };
   if (usedText === selection.text) return null;
-  const handlePress = (event: SyntheticEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    useSelection();
-  };
   const action = <button
     type="button"
     className={`ask-agent-selection reader-selection-action ${selection.below ? "below" : "above"}`}
     style={{ left: selection.left, top: selection.top }}
-    onPointerDown={handlePress}
-    onTouchStart={handlePress}
-    onMouseDown={handlePress}
-    onClick={(event) => { if (event.detail === 0) useSelection(); }}
+    onClick={useSelection}
   ><Zap size={14} /><span>询问 Agent</span></button>;
   // Keep the floating control outside the reader's scrolling/selection DOM.
   // This prevents mounting the chip from becoming a WebKit selection boundary.
@@ -396,7 +270,8 @@ type ReaderPanelGeometry = { left: number; top: number; width: number; height: n
 type ReaderPanelDrag = ReaderPanelGeometry & { pointerId: number; startX: number; startY: number };
 type ReaderPanelResize = ReaderPanelGeometry & { pointerId: number; startX: number; startY: number; direction: "top-left" | "bottom-right" };
 
-export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerpt, quoteLabel, userInitials, open, closing, onClose }: {
+export function ReaderAskBubble({ accountId, conversationId, conversationTitle, quoteExcerpt, quoteLabel, userInitials, open, closing, onClose }: {
+  accountId?: string | null;
   conversationId: string;
   conversationTitle: string;
   quoteExcerpt: string;
@@ -440,7 +315,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
   }, []);
 
   const refreshConversation = useCallback(async () => {
-    const value = await api.conversation(conversationId, 20);
+    const value = await api.conversation(conversationId);
     if ("restoring" in value) { setError("历史正在恢复，请稍后再试。"); return null; }
     setDetail(value); syncActivity(value);
     return value;
@@ -474,7 +349,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
     if (loading) return;
     setLoading(true); setError("");
     try {
-      const [conversationValue, options] = await Promise.all([api.conversation(conversationId, 20), api.agentOptions({ conversationId })]);
+      const [conversationValue, options] = await Promise.all([api.conversation(conversationId), api.agentOptions({ conversationId })]);
       if ("restoring" in conversationValue) { setError("历史正在恢复，请稍后再试。"); return; }
       setDetail(conversationValue); syncActivity(conversationValue);
       setAgentOptions(options);
@@ -523,20 +398,20 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
     const previousTop = container?.scrollTop ?? 0;
     setHistoryLoading(true);
     try {
-      const older = await api.conversationMessages(conversationId, page.nextCursor, 20);
+      const older = await api.conversationMessages(conversationId, page.nextCursor);
       setDetail((current) => current ? mergeOlderMessages(current, older) : current);
       window.requestAnimationFrame(() => { if (container) container.scrollTop = previousTop + container.scrollHeight - previousHeight; });
     } catch (reason) { setError(reason instanceof Error ? reason.message : "更早消息加载失败。"); }
     finally { setHistoryLoading(false); }
   }
 
-  async function send() {
-    const message = input.trim();
-    if (!message || !quote.trim() || submitting || !selection) return;
+  async function send(messageOverride?: string, transcriptionIds = voiceIds) {
+    const message = (messageOverride ?? input).trim();
+    if (!message || submitting || !selection) return;
     setSubmitting(true); setError(""); setPendingQuestion(message); setInput(""); setStreamingContent("");
     window.requestAnimationFrame(() => { const container = historyRef.current; if (container) container.scrollTop = container.scrollHeight; });
     try {
-      const result = await api.sendMessage(conversationId, message, files, quote, false, voiceIds, selection);
+      const result = await api.sendMessage(conversationId, message, files, quote, false, transcriptionIds, selection);
       setFiles([]);
       setVoiceIds([]);
       if (result.job) connectJob(result.job);
@@ -648,7 +523,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
     onClose();
   }
 
-  const active = Boolean(detail?.activeJob || detail?.externalStatus === "running" || detail?.conversationStatus === "running");
+  const active = Boolean(detail?.activeJob || detail?.conversation.status === "running");
   const visibleMessages = detail?.messages ?? [];
 
   if (!open) return null;
@@ -675,6 +550,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
     </div>
     {error && <div className="reader-ask-error-banner" role="alert">{error}</div>}
     <ConversationComposer
+      accountId={accountId}
       conversationId={conversationId}
       value={input}
       quote={quote.trim() ? quote : undefined}
@@ -690,7 +566,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
       agentOptions={agentOptions}
       disabled={loading}
       submitting={submitting}
-      canSend={Boolean(input.trim() && quote.trim() && selection)}
+      canSend={Boolean(input.trim() && selection)}
       className="reader-ask-composer"
       controlsClassName={`reader-ask-bottom-row${readerVoiceState !== "idle" ? " is-voice-active" : ""}`}
       attachmentClassName="reader-ask-attach"
@@ -706,6 +582,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
       onSend={() => void send()}
       onStop={() => void stop()}
       onTranscript={(text, id) => { setInput((current) => current ? `${current}${/\s$/.test(current) ? "" : "\n"}${text}` : text); setVoiceIds((current) => [...current, id].slice(-20)); }}
+      onSendAfterTranscription={(text, ids) => void send(text, ids)}
       onVoiceStateChange={setReaderVoiceState}
     />
   </aside>;

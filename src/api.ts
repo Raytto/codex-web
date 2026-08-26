@@ -223,13 +223,14 @@ export const api = {
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body });
   },
-  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; draftText?: string; attachmentNames?: string[] } = {}) => {
+  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; draftText?: string; attachmentNames?: string[]; clientRecordingId?: string } = {}) => {
     const body = new FormData();
     body.set("audio", audio, fileName);
     body.set("conversationId", context.conversationId ?? "");
     body.set("draftText", context.draftText ?? "");
     body.set("attachmentNames", JSON.stringify(context.attachmentNames ?? []));
-    return request<{ text: string }>("/transcriptions", { method: "POST", body });
+    body.set("clientRecordingId", context.clientRecordingId ?? "");
+    return request<{ text: string; transcriptionId: string }>("/transcriptions", { method: "POST", body });
   },
   reorderPendingPrompts: (conversationId: string, ids: string[]) => request<{ pendingPrompts: PendingPrompt[] }>(
     `/conversations/${conversationId}/pending-prompts/order`,

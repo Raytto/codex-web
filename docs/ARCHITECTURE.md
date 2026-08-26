@@ -20,6 +20,6 @@ Durable waits store their target conversation and model/reasoning selection in S
 
 Conversation detail checks the current Codex rollout file size without loading the file. The UI warns at 500 MiB and points the user toward archiving the completed conversation and starting a fresh task.
 
-Optional voice transcription receives a bounded context envelope. The budget is shared across the current draft, attachment names, small heads of text attachments, recent messages, technical terms, and at most a few validated images. Temporary audio remains HMAC-signed and short-lived.
+Optional voice transcription receives a bounded context envelope. The budget is shared across the current draft, attachment names, small heads of text attachments, recent messages, technical terms, and at most a few validated images. Before upload, the browser stores the complete recording in an account/conversation-scoped IndexedDB draft for 24 hours. A client recording UUID and a server-side receipt keyed by that UUID plus audio size/hash make retries safe when the original response is lost; processing receipts recover to a retryable state after restart. Temporary audio remains HMAC-signed and short-lived.
 
 The public edition deliberately excludes host-root execution, Docker socket access, host filesystem mounts, private network routing, and multi-user provisioning.

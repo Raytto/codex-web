@@ -245,6 +245,21 @@ export type SessionRow = {
   role: UserRow["role"];
 };
 
+/** Durable client-side receipt used to make retried voice uploads idempotent. */
+export type VoiceTranscriptionReceiptRow = {
+  user_id: string;
+  client_recording_id: string;
+  audio_sha256: string;
+  audio_bytes: number;
+  state: "processing" | "succeeded" | "failed";
+  transcription_id: string | null;
+  transcription_text: string | null;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type JobEventRow = {
   seq: number;
   event_type: string;
@@ -488,6 +503,24 @@ export class AppDatabase {
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      -- voice-transcription-idempotency (2026-08-26): a client recording UUID
+      -- survives a lost response so the browser can safely retry the upload.
+      CREATE TABLE IF NOT EXISTS voice_transcription_receipts (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        client_recording_id TEXT NOT NULL,
+        audio_sha256 TEXT NOT NULL,
+        audio_bytes INTEGER NOT NULL CHECK(audio_bytes >= 0),
+        state TEXT NOT NULL CHECK(state IN ('processing','succeeded','failed')),
+        transcription_id TEXT,
+        transcription_text TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(user_id,client_recording_id)
+      );
+      CREATE INDEX IF NOT EXISTS voice_transcription_receipts_retention_idx
+        ON voice_transcription_receipts(state,updated_at);
       CREATE TABLE IF NOT EXISTS user_settings (
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         key TEXT NOT NULL,
@@ -1877,6 +1910,50 @@ export class AppDatabase {
 
   deleteSession(tokenHash: string): void {
     this.sqlite.prepare("DELETE FROM sessions WHERE token_hash=?").run(tokenHash);
+  }
+
+  getVoiceTranscriptionReceipt(userId: string, clientRecordingId: string): VoiceTranscriptionReceiptRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM voice_transcription_receipts WHERE user_id=? AND client_recording_id=?")
+      .get(userId, clientRecordingId) as VoiceTranscriptionReceiptRow | undefined;
+  }
+
+  claimVoiceTranscriptionReceipt(input: { userId: string; clientRecordingId: string; audioSha256: string; audioBytes: number; now?: string }): VoiceTranscriptionReceiptRow {
+    const now = input.now ?? new Date().toISOString();
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.getVoiceTranscriptionReceipt(input.userId, input.clientRecordingId);
+      if (!existing) {
+        this.sqlite.prepare(`INSERT INTO voice_transcription_receipts
+          (user_id,client_recording_id,audio_sha256,audio_bytes,state,transcription_id,attempts,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?, ?,?)`).run(input.userId, input.clientRecordingId, input.audioSha256, input.audioBytes, "processing", null, 0, now, now);
+      } else if (existing.audio_sha256 !== input.audioSha256 || existing.audio_bytes !== input.audioBytes) {
+        throw new Error("同一录音 ID 对应了不同音频内容");
+      } else if (existing.state === "failed") {
+        this.sqlite.prepare(`UPDATE voice_transcription_receipts
+          SET state='processing',attempts=attempts+1,last_error=NULL,updated_at=?
+          WHERE user_id=? AND client_recording_id=?`).run(now, input.userId, input.clientRecordingId);
+      }
+      this.sqlite.exec("COMMIT");
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+    return this.getVoiceTranscriptionReceipt(input.userId, input.clientRecordingId)!;
+  }
+
+  updateVoiceTranscriptionReceipt(input: { userId: string; clientRecordingId: string; state: "processing" | "succeeded" | "failed"; transcriptionId?: string | null; transcriptionText?: string | null; error?: string | null; now?: string }): void {
+    this.sqlite.prepare(`UPDATE voice_transcription_receipts
+      SET state=?,transcription_id=?,transcription_text=?,last_error=?,updated_at=?
+      WHERE user_id=? AND client_recording_id=?`).run(
+      input.state, input.transcriptionId ?? null, input.transcriptionText ?? null, input.error?.slice(0, 1_000) ?? null,
+      input.now ?? new Date().toISOString(), input.userId, input.clientRecordingId,
+    );
+  }
+
+  recoverVoiceTranscriptionReceipts(now = new Date().toISOString()): number {
+    return Number(this.sqlite.prepare(`UPDATE voice_transcription_receipts
+      SET state='failed',last_error='语音识别进程中断，请重试',updated_at=? WHERE state='processing'`).run(now).changes);
+  }
+
+  pruneVoiceTranscriptionReceipts(before: string): number {
+    return Number(this.sqlite.prepare("DELETE FROM voice_transcription_receipts WHERE updated_at<? AND state!='processing'").run(before).changes);
   }
 
   close(): void {

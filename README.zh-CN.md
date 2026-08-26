@@ -170,6 +170,8 @@ stateDiagram-v2
 
 在 `.env` 中设置你自己的 `DASHSCOPE_API_KEY` 和 HTTPS `PUBLIC_BASE_URL` 后，页面会显示麦克风按钮。默认使用 `qwen3.5-omni-plus`，可通过 `DASHSCOPE_ASR_MODEL` 修改。未设置 Key 时语音功能完全关闭。
 
+录音上传前，浏览器会按账号和会话把完整音频保存到 IndexedDB，保留 24 小时。若电梯等场景导致网络在发送中断，输入框会保留“语音未发送，音频已保留”的状态，可重试识别或删除，不会丢失原始音频。重试沿用同一个客户端录音 UUID；服务端记录音频大小和哈希，若第一次请求其实已经完成，会直接返回原转写结果而不会重复调用模型。浏览器草稿和服务端回执都会在 24 小时后清理。
+
 语音模型使用的额外拼写/话题上下文默认限制为约 500 token，由草稿、附件名、文本附件开头 16 KiB、最近对话、固定技术词和最多两张小图片共同分配；未发送的大文件不会整份进入转写请求。可通过 `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`、`TRANSCRIPTION_CONTEXT_MAX_IMAGES` 和 `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES` 调整。
 
 公网部署请配置 HTTPS；浏览器通常只允许在 HTTPS 或 localhost 页面调用麦克风。

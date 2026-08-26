@@ -3,7 +3,10 @@ const APP_VIEWPORT_HEIGHT = "--app-viewport-height";
 const KEYBOARD_HEIGHT_DELTA = 120;
 // WebKit can publish the final visual viewport only after the keyboard animation.
 const SETTLE_DELAYS_MS = [80, 240, 500] as const;
-const TEXT_SELECTION_RESET_GRACE_MS = 700;
+// Keep root-scroll recovery out of the browser's selection/loupe transaction.
+// iOS may finish presenting its native edit menu well after the first
+// selectionchange, especially inside an overflow reader.
+const TEXT_SELECTION_RESET_GRACE_MS = 2_000;
 
 export function isTextEntryElement(element: Element | null): boolean {
   return Boolean(element?.matches(

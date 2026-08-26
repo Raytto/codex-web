@@ -700,6 +700,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .voice-stop { color: #fff; background: #9a3f49; box-shadow: 0 4px 10px rgba(100, 26, 37, .18); }
 .voice-error { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 5px 6px; padding: 6px 8px; border-radius: 8px; color: #8e3540; background: #fff2f3; font-size: 11px; }
 .voice-error button { display: grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
+.voice-retry-card { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 7px; margin: 0 5px 6px; padding: 7px 7px 7px 9px; border: 1px solid #d9c993; border-radius: 9px; color: #66501d; background: #fff9e9; font-size: 11px; }
+.voice-retry-card > svg { color: #9b7414; }
+.voice-retry-copy { min-width: 0; display: grid; gap: 1px; }
+.voice-retry-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 750; }
+.voice-retry-copy small { overflow: hidden; color: #887545; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.voice-retry-card button { min-height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 7px; border: 1px solid #d6c486; border-radius: 7px; color: #6b5318; background: #fffdf5; cursor: pointer; font-size: 10px; font-weight: 700; }
+.voice-retry-card button:hover { background: #fff1c7; }
+.voice-retry-card button:last-child { width: 28px; padding: 0; border-color: transparent; background: transparent; }
+.voice-retry-card button:last-child:hover { background: #f5e9c4; }
+.voice-draft-restoring, .voice-draft-storage-error { display: flex; align-items: center; gap: 5px; margin: 0 5px 6px; color: #72778a; font-size: 10px; }
+.voice-draft-storage-error { color: #9a4b39; }
 .attach-button { min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid rgba(57, 70, 137, .09); border-radius: 9px; color: var(--indigo); background: var(--indigo-pale); cursor: pointer; font-size: 12px; font-weight: 650; }
 .attach-button:hover:not(:disabled) { background: #e2e6f3; }
 .attach-button:disabled { opacity: .5; cursor: not-allowed; }
@@ -752,6 +763,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .paste-notice svg { flex: 0 0 auto; }
 .voice-notice { width: fit-content; display: flex; align-items: center; gap: 6px; margin: 0 5px 4px; padding: 5px 8px; border-radius: 8px; color: #735514; background: #fff5d9; font-size: 11px; }
 .voice-notice svg { flex: 0 0 auto; }
+/* Keep native mobile selection in control of the browser; momentum layers can
+ * race Safari's loupe and selection handles inside the document reader. */
+.file-reader-markdown,
+.file-reader-markdown * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default !important; }
+.file-reader-markdown button,
+.file-reader-markdown input,
+.file-reader-markdown select,
+.file-reader-markdown textarea,
+.file-reader-markdown svg,
+.file-reader-markdown img,
+.file-reader-markdown video,
+.file-reader-markdown canvas { -webkit-user-select: none !important; user-select: none !important; -webkit-touch-callout: none !important; }
+.file-preview-scroll,
+.file-reader-html { -webkit-overflow-scrolling: auto; }
 .toast { position: absolute; top: 88px; left: 50%; z-index: 20; max-width: min(520px, 90%); display: flex; align-items: center; gap: 12px; transform: translateX(-50%); padding: 10px 13px; border: 1px solid #f0c7cd; border-radius: 10px; color: var(--danger); background: #fff6f7; box-shadow: 0 9px 25px rgba(80, 20, 30, .1); font-size: 12px; }
 .toast.info { border-color: #bed8c5; color: #28563a; background: #f1faf3; box-shadow: 0 9px 25px rgba(24, 91, 48, .1); }
 .toast button { border: 0; background: transparent; cursor: pointer; }
@@ -1047,6 +1072,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .voice-cancel { color: #b0b2ba; }
 :root[data-theme="dark"] .voice-cancel:hover { color: #ececf1; background: #383a42; }
 :root[data-theme="dark"] .voice-error { color: #ffadb5; background: #3a2226; }
+:root[data-theme="dark"] .voice-retry-card { border-color: #6e5d2b; color: #f0d98b; background: #332e1e; }
+:root[data-theme="dark"] .voice-retry-card > svg { color: #e0bc55; }
+:root[data-theme="dark"] .voice-retry-copy small { color: #c8b878; }
+:root[data-theme="dark"] .voice-retry-card button { border-color: #79652c; color: #f0d98b; background: #40371f; }
+:root[data-theme="dark"] .voice-retry-card button:hover { background: #514522; }
+:root[data-theme="dark"] .voice-draft-restoring { color: #b5b6bd; }
+:root[data-theme="dark"] .voice-draft-storage-error { color: #f0a18c; }
 :root[data-theme="dark"] .attach-button { border-color: #414552; color: #c8d0ff; background: #303342; }
 :root[data-theme="dark"] .attach-button:hover:not(:disabled) { background: #393d4e; }
 :root[data-theme="dark"] .setting-select { border-color: #454750; color: #c2c4cb; background: #24252a; }
