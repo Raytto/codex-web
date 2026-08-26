@@ -55,7 +55,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - A dedicated Unix identity for the Codex worker inside the container
 - A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
 - A managed `html-report` skill with its style guide, self-contained report template, and validator; new tenants receive it automatically with the managed skills
-- Optional Apps, connectors, Goals, and multi-agent features remain off unless the conversation explicitly asks for them
+- Optional Apps, connectors, and Goals remain off unless the conversation explicitly asks for them; multi-agent is available by default and follows the user's instruction when single-agent work is preferred
 - Project mode, project sidebar, cross-project conversation moves, and project-scoped Skills
 - Optional host/root bridge and Remote Worker gateway for explicitly trusted executors
 - Optional account management and shared Codex authentication policy (credentials stay in operator state)
