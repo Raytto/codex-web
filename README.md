@@ -1,5 +1,7 @@
 # Codex Web
 
+> Branch notice: the former `master` branch is no longer maintained and has been removed. Use the `main` branch for all clones, updates, and contributions.
+
 An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, durable timed or event-driven continuation, resumable interruption history, conversation archiving, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
