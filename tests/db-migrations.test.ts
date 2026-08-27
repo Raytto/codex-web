@@ -38,10 +38,13 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026082401, name: "voice-recording-storage" },
     { version: 2026082501, name: "login-throttle" },
     { version: 2026082601, name: "voice-transcription-idempotency" },
+    { version: 2026082602, name: "reader-sources-and-annotations" },
+    { version: 2026082603, name: "reader-storage-state-columns" },
+    { version: 2026082604, name: "reader-storage-archive-metadata" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
-  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, 25);
+  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, 28);
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some((column) => column.name === "finalization_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(remote_worker_credentials)").all() as Array<{ name: string }>).some((column) => column.name === "token_hash"));
   assert.ok((reopened.sqlite.prepare("PRAGMA index_list(conversations)").all() as Array<{ name: string }>).some((index) => index.name === "conversations_active_project_thread_idx"));
@@ -65,6 +68,10 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_transcriptions)").all() as Array<{ name: string }>).some((column) => column.name === "audio_relative_path"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_transcriptions)").all() as Array<{ name: string }>).some((column) => column.name === "audio_storage_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_transcriptions)").all() as Array<{ name: string }>).some((column) => column.name === "client_recording_id"));
+  assert.ok((reopened.sqlite.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as Array<{ name: string }>).some((table) => table.name === "reading_sources"));
+  assert.ok((reopened.sqlite.prepare("PRAGMA table_info(reading_source_versions)").all() as Array<{ name: string }>).some((column) => column.name === "storage_generation"));
+  assert.ok((reopened.sqlite.prepare("PRAGMA table_info(reading_source_versions)").all() as Array<{ name: string }>).some((column) => column.name === "storage_archive_sha256"));
+  assert.ok((reopened.sqlite.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as Array<{ name: string }>).some((table) => table.name === "reading_annotations"));
   assert.ok((reopened.sqlite.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as Array<{ name: string }>).some((table) => table.name === "voice_transcription_receipts"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_recording_storage_audit)").all() as Array<{ name: string }>).some((column) => column.name === "remote_path" || column.name === "to_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_lexicon_terms)").all() as Array<{ name: string }>).some((column) => column.name === "rank_index"));

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { ArrowLeft, Bot, Clock, LoaderCircle, Minus, Zap } from "lucide-react";
+import { ArrowLeft, Bot, Clock, Highlighter, LoaderCircle, Minus, StickyNote, Zap } from "lucide-react";
 import { api, BASE_PATH, type AgentOptions, type AgentSelection, type ConversationActivity, type ConversationDetail, type ConversationMessagesPage, type Job } from "./api";
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds, type SelectionRect } from "./ask-agent-selection";
 import { ConversationMessageList } from "./conversation/ConversationMessageList";
@@ -12,6 +12,12 @@ export type ReaderSelection = {
   left: number;
   top: number;
   below: boolean;
+  /** Stable reader coordinates used by highlights/notes; quote text remains
+   * the fallback when a publisher changes its markup. */
+  unitId?: string;
+  page?: number;
+  rects?: Array<{ left: number; top: number; width: number; height: number }>;
+  range?: Range;
 };
 
 // Safari owns the native selection and the Cut/Copy/Paste menu.  The reader
@@ -103,8 +109,18 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): Read
       const top = below
         ? Math.min(rect.bottom + 8, viewport.bottom - 44)
         : Math.max(rect.top - 8, viewport.top + 44);
+      const anchor = elementFor(range.startContainer)?.closest<HTMLElement>("[data-reader-unit], [data-reader-page]");
+      const unitElement = elementFor(range.startContainer)?.closest<HTMLElement>("[data-reader-unit]");
+      const pageElement = elementFor(range.startContainer)?.closest<HTMLElement>("[data-reader-page]");
+      const rects = Array.from(range.getClientRects()).slice(0, 32).map((item) => ({ left: item.left, top: item.top, width: item.width, height: item.height }));
       cancelClear();
-      setSelection({ text: text.slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1), left, top, below });
+      setSelection({
+        text: text.slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1), left, top, below,
+        unitId: unitElement?.dataset.readerUnit || anchor?.dataset.readerUnit,
+        page: pageElement?.dataset.readerPage ? Number(pageElement.dataset.readerPage) : undefined,
+        rects,
+        range: range.cloneRange(),
+      });
       // The release window has been consumed. A later handle adjustment must
       // start a fresh quiet period instead of being mistaken for the original
       // touch release.
@@ -238,24 +254,23 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>): Read
   return selection;
 }
 
-export function ReaderSelectionAction({ selection, onAsk }: { selection: ReaderSelection; onAsk: (text: string) => void }) {
+export function ReaderSelectionAction({ selection, onAsk, onHighlight, onNote }: { selection: ReaderSelection; onAsk: (text: string) => void; onHighlight?: (selection: ReaderSelection) => void; onNote?: (selection: ReaderSelection) => void }) {
   const [usedText, setUsedText] = useState<string | null>(null);
   const handledTextRef = useRef<string | null>(null);
   useEffect(() => setUsedText(null), [selection.text]);
   useEffect(() => { handledTextRef.current = null; }, [selection.text]);
-  const useSelection = () => {
+  const consumeSelection = (action: () => void) => {
     if (handledTextRef.current === selection.text) return;
     handledTextRef.current = selection.text;
     setUsedText(selection.text);
-    onAsk(selection.text);
+    action();
   };
   if (usedText === selection.text) return null;
-  const action = <button
-    type="button"
-    className={`ask-agent-selection reader-selection-action ${selection.below ? "below" : "above"}`}
-    style={{ left: selection.left, top: selection.top }}
-    onClick={useSelection}
-  ><Zap size={14} /><span>询问 Agent</span></button>;
+  const action = <div className={`reader-selection-actions ${selection.below ? "below" : "above"}`} style={{ left: selection.left, top: selection.top }}>
+    <button type="button" className="ask-agent-selection reader-selection-action" onClick={() => consumeSelection(() => onAsk(selection.text))}><Zap size={14} /><span>询问 Agent</span></button>
+    {onHighlight && <button type="button" className="reader-selection-tool" title="标记" aria-label="标记选中文字" onClick={() => consumeSelection(() => onHighlight(selection))}><Highlighter size={14} /></button>}
+    {onNote && <button type="button" className="reader-selection-tool" title="添加备注" aria-label="给选中文字添加备注" onClick={() => consumeSelection(() => onNote(selection))}><StickyNote size={14} /></button>}
+  </div>;
   // Keep the floating control outside the reader's scrolling/selection DOM.
   // This prevents mounting the chip from becoming a WebKit selection boundary.
   return typeof document === "undefined" ? action : createPortal(action, document.body);

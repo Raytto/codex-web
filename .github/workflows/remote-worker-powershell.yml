@@ -3,7 +3,7 @@ name: Remote Worker PowerShell gate
 on:
   pull_request:
   push:
-    branches: [main, master]
+    branches: [main]
 
 permissions:
   contents: read

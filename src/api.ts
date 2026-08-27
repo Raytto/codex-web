@@ -141,6 +141,18 @@ export type ManagedPublicShare = {
 };
 export type FilePreviewConversation = Pick<Conversation, "id" | "title" | "status" | "external_status" | "has_unread_result" | "has_pending_work">;
 export type FilePreviewMetadata = { file: WorkFile; share: FileShareState; conversation: FilePreviewConversation };
+export type ReaderFormat = "markdown" | "html" | "pdf" | "epub";
+export type ReaderCapability = "vertical-flow" | "pagination" | "text-selection" | "highlight" | "note" | "agent-ask" | "range-fetch" | "nearby-prefetch";
+export type ReaderManifest = {
+  source: { id: string; fileId: string; title: string; author: string | null; format: ReaderFormat };
+  version: { id: string; versionNo: number; derivedKind: "original" | "normalized" | "ocr"; status: "ready" | "processing" | "failed" | "cold" | "restoring"; parserVersion: string; sourceBytes: number; lastAccessedAt: string; error: string | null };
+  capabilities: ReaderCapability[];
+  units: Array<{ id: string; ordinal: number; kind: "spine" | "page"; href: string; title: string | null; media_type: string; byte_size: number }>;
+  endpoints: { bytes: string; manifest: string };
+};
+export type ReaderUnitResponse = { unit: { id: string; ordinal: number; href: string; title: string | null; mediaType: string }; content: string };
+export type ReaderProgress = { user_id: string; version_id: string; unit_id: string | null; position_json: string; updated_at: string };
+export type ReaderAnnotation = { id: string; user_id: string; version_id: string; unit_id: string | null; type: "highlight" | "note"; quote_text: string; note_text: string | null; color: string; locator_json: string; created_at: string; updated_at: string; deleted_at: string | null };
 export type PublicFilePreview = {
   file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind">;
   content: string;
@@ -404,7 +416,35 @@ export function isApiErrorStatus(reason: unknown, status: number): boolean {
   return reason instanceof ApiError && reason.status === status;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+function waitForReaderRetry(signal: AbortSignal | undefined, delayMs: number): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    };
+    const timer = window.setTimeout(finish, delayMs);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function isReaderRetryBody(value: unknown): value is { code?: string; restoring?: boolean; error?: string } {
+  return Boolean(value && typeof value === "object" && !("source" in value) && !("unit" in value));
+}
+
+type RequestOptions = { allowStatuses?: readonly number[] };
+
+async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase()) && csrfToken) headers.set("X-CSRF-Token", csrfToken);
@@ -419,7 +459,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   if (response.status === 204) return undefined as T;
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(body.error || `请求失败 (${response.status})`, response.status);
+  if (!response.ok && !options.allowStatuses?.includes(response.status)) throw new ApiError(body.error || `请求失败 (${response.status})`, response.status);
   return body as T;
 }
 
@@ -646,6 +686,64 @@ export const api = {
   filePreview: (id: string, signal?: AbortSignal) => request<FilePreviewMetadata>(
     `/files/${encodeURIComponent(id)}/preview`, { signal },
   ),
+  readerFileManifest: async (id: string, signal?: AbortSignal): Promise<ReaderManifest> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const body = await request<ReaderManifest | { code?: string; restoring?: boolean; error?: string }>(
+        `/reader/files/${encodeURIComponent(id)}/manifest`, { signal }, { allowStatuses: [202] },
+      );
+      if (body && typeof body === "object" && "source" in body && body.source?.format) return body as ReaderManifest;
+      if (isReaderRetryBody(body) && (body.restoring || body.code === "READER_RESTORE_IN_PROGRESS")) {
+        await waitForReaderRetry(signal, 1_000);
+        continue;
+      }
+      throw new ApiError("阅读资源清单无效。", 202);
+    }
+    throw new ApiError("阅读资源仍在恢复，请稍后重试。", 202);
+  },
+  readerManifest: async (versionId: string, signal?: AbortSignal): Promise<ReaderManifest> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const body = await request<ReaderManifest | { code?: string; restoring?: boolean; error?: string }>(
+        `/reader/versions/${encodeURIComponent(versionId)}/manifest`, { signal }, { allowStatuses: [202] },
+      );
+      if (body && typeof body === "object" && "source" in body && body.source?.format) return body as ReaderManifest;
+      if (isReaderRetryBody(body) && (body.restoring || body.code === "READER_RESTORE_IN_PROGRESS")) {
+        await waitForReaderRetry(signal, 1_000);
+        continue;
+      }
+      throw new ApiError("阅读资源清单无效。", 202);
+    }
+    throw new ApiError("阅读资源仍在恢复，请稍后重试。", 202);
+  },
+  readerUnit: async (versionId: string, unitId: string, signal?: AbortSignal): Promise<ReaderUnitResponse> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const body = await request<ReaderUnitResponse | { code?: string; restoring?: boolean; error?: string }>(
+        `/reader/versions/${encodeURIComponent(versionId)}/units/${encodeURIComponent(unitId)}`, { signal }, { allowStatuses: [202] },
+      );
+      if (body && typeof body === "object" && "unit" in body && "content" in body) return body as ReaderUnitResponse;
+      if (isReaderRetryBody(body) && (body.restoring || body.code === "READER_RESTORE_IN_PROGRESS")) {
+        await waitForReaderRetry(signal, 1_000);
+        continue;
+      }
+      throw new ApiError("阅读单元暂不可用。", 202);
+    }
+    throw new ApiError("阅读单元仍在处理中，请稍后重试。", 202);
+  },
+  readerProgress: (versionId: string, signal?: AbortSignal) => request<{ progress: ReaderProgress | null }>(
+    `/reader/versions/${encodeURIComponent(versionId)}/progress`, { signal },
+  ),
+  saveReaderProgress: (versionId: string, unitId: string | null, position: Record<string, unknown>) => request<{ progress: ReaderProgress }>(
+    `/reader/versions/${encodeURIComponent(versionId)}/progress`, { method: "PUT", body: JSON.stringify({ unitId, position }) },
+  ),
+  readerAnnotations: (versionId: string, signal?: AbortSignal) => request<{ annotations: ReaderAnnotation[] }>(
+    `/reader/versions/${encodeURIComponent(versionId)}/annotations`, { signal },
+  ),
+  createReaderAnnotation: (versionId: string, input: { unitId: string | null; type: "highlight" | "note"; quoteText: string; noteText?: string | null; color?: string; locator: Record<string, unknown> }) => request<{ annotation: ReaderAnnotation }>(
+    `/reader/versions/${encodeURIComponent(versionId)}/annotations`, { method: "POST", body: JSON.stringify(input) },
+  ),
+  updateReaderAnnotation: (id: string, input: { noteText?: string; color?: string }) => request<{ annotation: ReaderAnnotation }>(
+    `/reader/annotations/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) },
+  ),
+  deleteReaderAnnotation: (id: string) => request<void>(`/reader/annotations/${encodeURIComponent(id)}`, { method: "DELETE" }),
   enableFileShare: (id: string) => request<{ share: FileShareState }>(
     `/files/${encodeURIComponent(id)}/share`, { method: "POST" },
   ),

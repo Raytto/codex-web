@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,7 +7,7 @@ import {
   Copy, CornerUpLeft, GripVertical, KeyRound, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, MonitorUp, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RefreshCw, RotateCcw, Search, Settings2, Share2, Square, SquarePen, Sun,
   Trash2, X, Zap,
 } from "lucide-react";
-import { api, BASE_PATH, fileThumbnailUrl, fileUrl, isApiErrorStatus, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type ConversationPage, type DeploymentPhase, type DeploymentStatus, type Executor, type FileShareState, type Job, type JobEvent, type MaintenancePhase, type PendingPrompt, type Project, type ProjectDirectoryPage, type ReasoningEffort, type RemoteWorkerBootstrap, type Session, type SystemStatus, type WakePlan, type WorkFile } from "./api";
+import { api, BASE_PATH, fileThumbnailUrl, fileUrl, isApiErrorStatus, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type ConversationPage, type DeploymentPhase, type DeploymentStatus, type Executor, type FileShareState, type Job, type JobEvent, type MaintenancePhase, type PendingPrompt, type Project, type ProjectDirectoryPage, type ReaderAnnotation, type ReasoningEffort, type RemoteWorkerBootstrap, type Session, type SystemStatus, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, remoteMessageFileReferences, resolveMessageFileLink } from "./file-links";
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
@@ -36,15 +36,23 @@ import { canApplyDeferredInstanceReload } from "./reload-protection";
 import { AccountAuthDialog } from "./account-auth-dialog";
 import { DisplaySettingsDialog } from "./display-settings-dialog";
 import { ProjectSkillsDialog } from "./project-skills-dialog";
-import { markdownReaderOutline, prepareHtmlReaderDocument, type PreparedHtmlDocument } from "./file-reader-outline";
-import { readReaderPosition, restoreReaderScrollTop, writeReaderPosition } from "./reader-position";
 import { ReaderAskBubble, ReaderSelectionAction, useReaderSelection } from "./reader-ask";
+import { ReaderAnnotationPanel } from "./reader/ReaderAnnotations";
+import { applyReaderTextHighlights } from "./reader/annotation-dom";
+import type { ReaderSelection } from "./reader-ask";
+import { FileReaderLayout, preparedReaderDocument, useOutlineState } from "./reader/LegacyReader";
 import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
 import { useVoiceInput } from "./conversation/useVoiceInput";
 import { ConversationMessageList } from "./conversation/ConversationMessageList";
 import { ConversationComposerReference } from "./conversation/ConversationComposer";
 import { SettingMenu } from "./conversation/SettingMenu";
 import { formatConversationFullDateTime as formatFullDateTime, formatConversationMessageDateTime as formatMessageDateTime } from "./conversation/conversation-format";
+
+// Keep the PDF/EPUB reader out of the initial application graph. The module
+// (and its PDF.js dynamic dependency) is fetched only after a private preview
+// has resolved to one of those formats. HTML/Markdown continue to use the
+// lightweight legacy adapter without pulling the paginated reader code.
+const LazyReaderDocument = lazy(() => import("./reader/ReaderDocument").then(({ ReaderDocument }) => ({ default: ReaderDocument })));
 
 const SIDEBAR_WIDTH_KEY = "cww:sidebar-width";
 const SIDEBAR_WIDTH_DEFAULT = 280;
@@ -60,7 +68,7 @@ const COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX = 12;
 const READER_POSITION_SAVE_DELAY_MS = 2_000;
 const READER_POSITION_SAVE_INTERVAL_MS = 5_000;
 const READER_POSITION_RESTORE_ATTEMPTS = 10;
-const FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
+const FILE_READER_MAX_BYTES = 100 * 1024 * 1024;
 const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 const HOST_ROOT_ACCOUNT_ID = "00000000-0000-4000-8000-000000000010";
@@ -270,251 +278,14 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   </main>;
 }
 
-function readerNativeSelectionActive(container: HTMLElement): boolean {
-  const selection = document.getSelection();
-  if (!selection || selection.rangeCount === 0) return false;
-  // During an iOS release WebKit can briefly expose a collapsed Range while
-  // its native handles/menu are still being committed. Anchor/focus are still
-  // inside the reader in that interval, so treat both collapsed and expanded
-  // reader selections as browser-owned and avoid a React outline update.
-  return Boolean(selection.anchorNode
-    && selection.focusNode
-    && container.contains(selection.anchorNode)
-    && container.contains(selection.focusNode));
-}
-
-function updateReaderOutline(container: HTMLElement, headings: HTMLElement[], onActiveAnchorChange: (id: string) => void): void {
-  // Updating the active TOC item is a React state change. Leave the document
-  // completely quiet while WebKit owns a native selection/loupe transaction;
-  // the next ordinary scroll will refresh the outline after the gesture.
-  if (readerNativeSelectionActive(container)) return;
-  if (headings.length < 2) return;
-  // Author HTML can contain headings inside collapsed/removed controls. They
-  // must not win the active-section calculation just because their DOM
-  // position is still present while they are not rendered.
-  const visibleHeadings = headings.filter((heading) => heading.getClientRects().length > 0);
-  const candidates = visibleHeadings.length > 0 ? visibleHeadings : headings;
-  const top = container.getBoundingClientRect().top;
-  let current = candidates[0];
-  for (const heading of candidates) {
-    if (heading.getBoundingClientRect().top <= top + 96) current = heading;
-    else break;
-  }
-  onActiveAnchorChange(current.id);
-}
-
-function HtmlFileReader({ file, content, activeAnchor, navigationToken }: {
-  file: Pick<WorkFile, "original_name">;
-  content: string;
-  activeAnchor: string | null;
-  navigationToken: number;
-}) {
-  const scrollRoot = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!activeAnchor || navigationToken === 0 || !scrollRoot.current) return;
-    const root = scrollRoot.current;
-    const target = Array.from(root.querySelectorAll<HTMLElement>("[id]")).find((element) => element.id === activeAnchor);
-    if (!target) return;
-    const rootRect = root.getBoundingClientRect();
-    const targetRect = target.getBoundingClientRect();
-    root.scrollTo({ top: Math.max(0, root.scrollTop + targetRect.top - rootRect.top - 18), behavior: "smooth" });
-  // Scroll-driven active-anchor changes must not trigger another smooth scroll.
-  // This effect is intentionally keyed by the explicit TOC navigation token.
-  }, [content, navigationToken]);
-
-  return <div
-    ref={scrollRoot}
-    className="file-reader-html file-preview-scroll"
-    role="document"
-    aria-label={file.original_name || "HTML 文件预览"}
-    dangerouslySetInnerHTML={{ __html: content }}
-  />;
-}
-
-function FileReaderContent({ file, content, prepared, activeAnchor, navigationToken }: {
-  file: Pick<WorkFile, "original_name" | "mime_type">;
-  content: string;
-  prepared: PreparedHtmlDocument;
-  activeAnchor: string | null;
-  navigationToken: number;
-}) {
-  const readerKind = fileReaderKind(file);
-  const math = useAsyncMarkdownMath(content);
-  if (readerKind === "markdown") return <div className="file-preview-scroll">
-    <article className="file-reader-markdown markdown">
-      {(() => {
-        let headingCursor = 0;
-        return <ReactMarkdown
-          remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
-          rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
-          skipHtml
-          urlTransform={defaultUrlTransform}
-          components={{
-            h2: ({ children, ...props }) => {
-              const item = prepared.outline[headingCursor++];
-              return <h2 id={item?.id} {...props}>{children}</h2>;
-            },
-            a: ({ href, children }) => href?.startsWith("#")
-              ? <a href={href}>{children}</a>
-              : <a href={href} target="_blank" rel="noreferrer">{children}</a>,
-            img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
-            table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
-          }}
-        >{math.content}</ReactMarkdown>;
-      })()}
-    </article>
-  </div>;
-  if (readerKind === "html") return <HtmlFileReader file={file} content={prepared.content} activeAnchor={activeAnchor} navigationToken={navigationToken} />;
-  return null;
-}
-
-// Status polling updates the reader header every few seconds. Keep those
-// unrelated parent renders out of the document DOM so an active native Safari
-// selection never has to survive needless reader reconciliation.
-const FileReaderLayout = memo(function FileReaderLayout({ file, content, prepared, tocOpen, activeAnchor, onSelect, onActiveAnchorChange, navigationToken }: {
-  file: Pick<WorkFile, "id" | "original_name" | "mime_type">;
-  content: string;
-  prepared: PreparedHtmlDocument;
-  tocOpen: boolean;
-  activeAnchor: string | null;
-  onSelect: (id: string) => void;
-  onActiveAnchorChange: (id: string) => void;
-  navigationToken: number;
-}) {
-  const scrollRoot = useRef<HTMLDivElement>(null);
-  const readerKind = fileReaderKind(file);
-  const showOutline = prepared.outline.length >= 2;
-
-  useEffect(() => {
-    const documentRoot = scrollRoot.current;
-    if (!documentRoot || !file.id) return;
-    const container = documentRoot.querySelector<HTMLElement>(".file-preview-scroll");
-    if (!container) return;
-
-    let storage: Storage | null = null;
-    try { storage = window.localStorage; } catch { /* Storage can be disabled in private browsing. */ }
-    const saved = readReaderPosition(storage, file.id);
-    let restored = false;
-    let restoreAttempts = 0;
-    let restoreTimer: number | null = null;
-    let saveTimer: number | null = null;
-
-    const headings = Array.from(container.querySelectorAll<HTMLElement>("h2[id]"));
-    const syncActiveHeading = () => updateReaderOutline(container, headings, onActiveAnchorChange);
-    const restore = () => {
-      restoreTimer = null;
-      if (!saved) {
-        // The reader DOM is reused when navigating between files. Without an
-        // explicit reset, a new file inherits the previous file's bottom
-        // position even though it has never been opened before.
-        container.scrollTop = 0;
-        restored = true;
-        window.requestAnimationFrame(syncActiveHeading);
-        return;
-      }
-      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
-      // Images and KaTeX can expand the document after the first paint. Retry a
-      // few times while the saved position still cannot be represented.
-      if (saved.scrollTop > 0 && maxScrollTop === 0 && restoreAttempts < READER_POSITION_RESTORE_ATTEMPTS) {
-        restoreAttempts += 1;
-        restoreTimer = window.setTimeout(restore, 120);
-        return;
-      }
-      container.scrollTop = restoreReaderScrollTop(saved, container.scrollHeight, container.clientHeight);
-      restored = true;
-      window.requestAnimationFrame(syncActiveHeading);
-    };
-
-    const save = () => {
-      saveTimer = null;
-      if (!restored) return;
-      writeReaderPosition(storage, file.id, {
-        scrollTop: container.scrollTop,
-        scrollHeight: container.scrollHeight,
-        clientHeight: container.clientHeight,
-        updatedAt: Date.now(),
-      });
-    };
-    const scheduleSave = () => {
-      if (!restored) return;
-      if (saveTimer !== null) window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(save, READER_POSITION_SAVE_DELAY_MS);
-    };
-    const flushSave = () => {
-      if (saveTimer !== null) window.clearTimeout(saveTimer);
-      saveTimer = null;
-      save();
-    };
-    const handleVisibilityChange = () => { if (document.visibilityState === "hidden") flushSave(); };
-
-    container.addEventListener("scroll", scheduleSave, { passive: true });
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("pagehide", flushSave);
-    restoreTimer = window.setTimeout(restore, 0);
-    const interval = window.setInterval(save, READER_POSITION_SAVE_INTERVAL_MS);
-    return () => {
-      if (restoreTimer !== null) window.clearTimeout(restoreTimer);
-      if (saveTimer !== null) window.clearTimeout(saveTimer);
-      window.clearInterval(interval);
-      flushSave();
-      container.removeEventListener("scroll", scheduleSave);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("pagehide", flushSave);
-    };
-  }, [content, file.id, onActiveAnchorChange, prepared.content]);
-
-  useEffect(() => {
-    if (readerKind !== "markdown" || navigationToken === 0 || !activeAnchor || !scrollRoot.current) return;
-    const target = Array.from(scrollRoot.current.querySelectorAll<HTMLElement>("[id]"))
-      .find((element) => element.id === activeAnchor);
-    const container = target?.closest<HTMLElement>(".file-preview-scroll");
-    if (target && container) container.scrollTo({ top: Math.max(0, target.offsetTop - 18), behavior: "smooth" });
-  // Scroll-driven active-anchor changes must not trigger another smooth scroll.
-  // This effect is intentionally keyed by the explicit TOC navigation token.
-  }, [navigationToken, readerKind]);
-
-  useEffect(() => {
-    if (!scrollRoot.current || prepared.outline.length < 2) return;
-    const container = scrollRoot.current.querySelector<HTMLElement>(".file-preview-scroll");
-    if (!container) return;
-    const headings = Array.from(container.querySelectorAll<HTMLElement>("h2[id]"));
-    if (headings.length < 2) return;
-    let frame: number | null = null;
-    const updateCurrentHeading = () => {
-      if (frame !== null) return;
-      frame = window.requestAnimationFrame(() => {
-        frame = null;
-        updateReaderOutline(container, headings, onActiveAnchorChange);
-      });
-    };
-    container.addEventListener("scroll", updateCurrentHeading, { passive: true });
-    updateReaderOutline(container, headings, onActiveAnchorChange);
-    return () => {
-      if (frame !== null) window.cancelAnimationFrame(frame);
-      container.removeEventListener("scroll", updateCurrentHeading);
-    };
-  }, [onActiveAnchorChange, prepared.content]);
-
-  return <div className={`file-reader-layout${showOutline && tocOpen ? " outline-open" : ""}`}>
-    {showOutline && tocOpen && <aside id="file-reader-outline" className="file-reader-outline" aria-label="文章目录">
-      <h2>文章目录</h2>
-      <ol>{prepared.outline.map((item) => <li key={item.id}>
-        <a href={`#${encodeURIComponent(item.id)}`} aria-current={activeAnchor === item.id ? "location" : undefined} onClick={(event) => { event.preventDefault(); onSelect(item.id); }}>{item.label}</a>
-      </li>)}</ol>
-    </aside>}
-    <div ref={scrollRoot} className="file-reader-document">
-      <FileReaderContent file={file} content={content} prepared={prepared} activeAnchor={activeAnchor && readerKind === "html" ? activeAnchor : null} navigationToken={navigationToken} />
-    </div>
-  </div>;
-});
-
-function ReaderSelectionLayer({ rootRef, onAsk }: {
+function ReaderSelectionLayer({ rootRef, onAsk, onHighlight, onNote }: {
   rootRef: RefObject<HTMLElement | null>;
-  onAsk: (text: string) => void;
+  onAsk: (selection: ReaderSelection) => void;
+  onHighlight?: (selection: ReaderSelection) => void;
+  onNote?: (selection: ReaderSelection) => void;
 }) {
   const selection = useReaderSelection(rootRef);
-  return selection ? <ReaderSelectionAction selection={selection} onAsk={onAsk} /> : null;
+  return selection ? <ReaderSelectionAction selection={selection} onAsk={() => onAsk(selection)} onHighlight={onHighlight} onNote={onNote} /> : null;
 }
 
 function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<WorkFile, "id" | "original_name">; share: FileShareState; onChange: (share: FileShareState) => void; open: boolean; onClose: () => void }) {
@@ -589,7 +360,7 @@ function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<
 }
 
 function ReaderSettingsMenu({ file, share, download, themePreference, onThemePreferenceChange, onShareChange }: {
-  file: Pick<WorkFile, "id" | "original_name">;
+  file: Pick<WorkFile, "id" | "original_name" | "mime_type">;
   share: FileShareState | null;
   download: string | null;
   themePreference: ThemePreference;
@@ -598,6 +369,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
 }) {
   const [shareOpen, setShareOpen] = useState(false);
   const menu = useRef<HTMLDetailsElement>(null);
+  const shareable = fileReaderKind(file) === "html" || fileReaderKind(file) === "markdown";
 
   useEffect(() => {
     const closeOutside = (event: globalThis.PointerEvent) => {
@@ -612,9 +384,9 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
   return <details ref={menu} className="file-reader-settings-menu">
     <summary className="file-reader-settings-button" title="阅读器设置" aria-label="阅读器设置" aria-haspopup="menu"><Settings2 size={18} /></summary>
     <div className="file-reader-settings-popover" role="menu" aria-label="阅读器设置选项">
-      {share && <button className="file-reader-settings-item" type="button" role="menuitem" onClick={() => { if (menu.current) menu.current.open = false; setShareOpen(true); }}><Share2 size={15} /><span>分享</span></button>}
+      {shareable && share && <button className="file-reader-settings-item" type="button" role="menuitem" onClick={() => { if (menu.current) menu.current.open = false; setShareOpen(true); }}><Share2 size={15} /><span>分享</span></button>}
       {download && <a className="file-reader-settings-item" role="menuitem" href={download} download={file.original_name} onClick={() => { if (menu.current) menu.current.open = false; }}><Download size={15} /><span>下载</span></a>}
-      {(share || download) && <div className="file-reader-settings-divider" />}
+      {(shareable && share || download) && <div className="file-reader-settings-divider" />}
       <div className="file-reader-theme-label">颜色模式</div>
       <div className="file-reader-theme-options" role="group" aria-label="颜色模式">
         <button type="button" aria-label="使用浅色模式" aria-pressed={themePreference === "light"} className={themePreference === "light" ? "selected" : ""} onClick={() => onThemePreferenceChange("light")}><Sun size={14} /><span>浅色</span></button>
@@ -622,35 +394,8 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
         <button type="button" aria-label="外观跟随系统" aria-pressed={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => onThemePreferenceChange("system")}><Monitor size={14} /><span>系统</span></button>
       </div>
     </div>
-    {share && <FileShareDialog file={file} share={share} onChange={onShareChange} open={shareOpen} onClose={() => setShareOpen(false)} />}
+    {shareable && share && <FileShareDialog file={file} share={share} onChange={onShareChange} open={shareOpen} onClose={() => setShareOpen(false)} />}
   </details>;
-}
-
-function preparedReaderDocument(file: Pick<WorkFile, "mime_type" | "original_name"> | null, content: string | null, resolvedTheme: ResolvedTheme): PreparedHtmlDocument {
-  if (!file || content === null) return { content: content ?? "", outline: [] };
-  if (fileReaderKind(file) === "html") return prepareHtmlReaderDocument(content, resolvedTheme);
-  if (fileReaderKind(file) === "markdown") return { content, outline: markdownReaderOutline(content) };
-  return { content, outline: [] };
-}
-
-function useOutlineState(prepared: PreparedHtmlDocument) {
-  const hasOutline = prepared.outline.length >= 2;
-  const [open, setOpen] = useState(false);
-  const [activeAnchor, setActiveAnchor] = useState<string | null>(null);
-  const [navigationToken, setNavigationToken] = useState(0);
-  useEffect(() => {
-    setActiveAnchor(hasOutline ? prepared.outline[0]?.id ?? null : null);
-    setNavigationToken(0);
-    setOpen(hasOutline && (window.matchMedia?.("(min-width: 721px)").matches ?? true));
-  }, [hasOutline, prepared.content]);
-  const select = useCallback((id: string) => {
-    setActiveAnchor(id);
-    setNavigationToken((value) => value + 1);
-  }, []);
-  const updateFromScroll = useCallback((id: string) => {
-    setActiveAnchor((current) => current === id ? current : id);
-  }, []);
-  return { hasOutline, open, setOpen, activeAnchor, navigationToken, select, updateFromScroll };
 }
 
 function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme, themePreference, onThemePreferenceChange }: { fileId: string; userInitials: string; onSessionExpired: () => void; resolvedTheme: ResolvedTheme; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
@@ -659,21 +404,65 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const [conversationActivity, setConversationActivity] = useState<import("./api").ConversationActivity | null>(null);
   const [share, setShare] = useState<FileShareState | null>(null);
   const [content, setContent] = useState<string | null>(null);
+  const [readerManifest, setReaderManifest] = useState<import("./api").ReaderManifest | null>(null);
+  const [readerAnnotations, setReaderAnnotations] = useState<ReaderAnnotation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [askOpen, setAskOpen] = useState(false);
   const [askClosing, setAskClosing] = useState(false);
   const [askQuote, setAskQuote] = useState("");
+  const [askSelection, setAskSelection] = useState<ReaderSelection | null>(null);
   const readerBodyRef = useRef<HTMLElement>(null);
   const askCloseTimerRef = useRef<number | null>(null);
   const readerKind = file ? fileReaderKind(file) : null;
   const prepared = useMemo(() => preparedReaderDocument(file, content, resolvedTheme), [file, content, resolvedTheme]);
   const outline = useOutlineState(prepared);
 
-  function openReaderAsk(selectedText: string) {
+  function openReaderAsk(selection: ReaderSelection) {
     if (askCloseTimerRef.current !== null) window.clearTimeout(askCloseTimerRef.current);
-    setAskQuote(normalizeAskAgentSelection(selectedText).slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1));
+    setAskSelection(selection);
+    setAskQuote(normalizeAskAgentSelection(selection.text).slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1));
     setAskClosing(false); setAskOpen(true);
+  }
+
+  function applyReaderHighlight(selection: ReaderSelection): void {
+    if (!readerManifest) return;
+    void (async () => {
+      try {
+        const result = await api.createReaderAnnotation(readerManifest.version.id, {
+          unitId: selection.unitId ?? null, type: "highlight", quoteText: selection.text,
+          noteText: null, color: "yellow", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+        });
+        setReaderAnnotations((current) => [...current, result.annotation]);
+        const range = selection.range;
+        if (range && !range.collapsed) {
+          try {
+            const mark = document.createElement("mark");
+            mark.className = "reader-local-highlight";
+            mark.dataset.readerAnnotation = result.annotation.id;
+            range.surroundContents(mark);
+            window.getSelection()?.removeAllRanges();
+          } catch { /* Cross-block selections remain durable even if DOM wrapping is impossible. */ }
+        }
+      } catch (reason) { window.alert(reason instanceof Error ? reason.message : "保存标记失败。"); }
+    })();
+  }
+
+  function applyReaderNote(selection: ReaderSelection): void {
+    if (!readerManifest) return;
+    const note = window.prompt("给这段文字添加备注：", "");
+    if (note === null || !note.trim()) return;
+    void api.createReaderAnnotation(readerManifest.version.id, {
+      unitId: selection.unitId ?? null, type: "note", quoteText: selection.text,
+      noteText: note, color: "yellow", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+    }).then((result) => setReaderAnnotations((current) => [...current, result.annotation])).catch((reason) => window.alert(reason instanceof Error ? reason.message : "保存备注失败。"));
+  }
+
+  function deleteReaderAnnotation(annotation: ReaderAnnotation): void {
+    if (!window.confirm("删除这条标注？")) return;
+    void api.deleteReaderAnnotation(annotation.id).then(() => {
+      setReaderAnnotations((current) => current.filter((item) => item.id !== annotation.id));
+    }).catch((reason) => window.alert(reason instanceof Error ? reason.message : "删除标注失败。"));
   }
 
   function closeReaderAsk() {
@@ -688,7 +477,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true); setError(""); setContent(null);
+    setLoading(true); setError(""); setContent(null); setReaderManifest(null); setReaderAnnotations([]); setAskSelection(null);
     void (async () => {
       try {
         const metadata = await api.filePreview(fileId, controller.signal);
@@ -707,10 +496,19 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
         });
         if (!fileReaderKind(metadata.file)) { setError("这个文件不支持站内阅读，请下载后打开。"); return; }
         if (metadata.file.size > FILE_READER_MAX_BYTES) {
-          setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 5 MB 的移动端在线阅读上限，请直接下载。`); return;
+          setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 ${formatSize(FILE_READER_MAX_BYTES)} 的在线阅读上限，请直接下载。`); return;
         }
-        const text = await api.fileText(metadata.file, controller.signal);
-        if (!controller.signal.aborted) setContent(text);
+        const kind = fileReaderKind(metadata.file);
+        const manifest = await api.readerFileManifest(metadata.file.id, controller.signal);
+        if (controller.signal.aborted) return;
+        setReaderManifest(manifest);
+        const annotations = await api.readerAnnotations(manifest.version.id, controller.signal).catch(() => ({ annotations: [] as ReaderAnnotation[] }));
+        if (controller.signal.aborted) return;
+        setReaderAnnotations(annotations.annotations);
+        if (kind === "markdown" || kind === "html") {
+          const text = await api.fileText(metadata.file, controller.signal);
+          if (!controller.signal.aborted) setContent(text);
+        }
       } catch (reason) {
         if (controller.signal.aborted) return;
         const message = reason instanceof Error ? reason.message : "文件读取失败";
@@ -735,6 +533,16 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     const interval = window.setInterval(() => void refreshActivity(), 2_500);
     return () => { stopped = true; window.clearInterval(interval); };
   }, [conversation?.id]);
+
+  useEffect(() => {
+    if (!readerManifest || !content || (readerManifest.source.format !== "markdown" && readerManifest.source.format !== "html")) return;
+    const root = readerBodyRef.current;
+    if (!root) return;
+    // Wait one frame so ReactMarkdown/HTML innerHTML has committed before the
+    // quote-backed marks are re-applied.
+    const frame = window.requestAnimationFrame(() => applyReaderTextHighlights(root, readerAnnotations));
+    return () => window.cancelAnimationFrame(frame);
+  }, [content, readerAnnotations, readerManifest]);
 
   useEffect(() => {
     let checking = false;
@@ -776,9 +584,11 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     <section ref={readerBodyRef} className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
-      {!loading && !error && content !== null && file && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
-      <ReaderSelectionLayer rootRef={readerBodyRef} onAsk={openReaderAsk} />
-      {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file?.original_name} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
+      {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} /></Suspense>}
+      {!loading && !error && readerManifest && content !== null && file && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
+      {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} />}
+      <ReaderSelectionLayer rootRef={readerBodyRef} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onNote={applyReaderNote} />
+      {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file ? `${file.original_name}${askSelection?.page ? ` · 第 ${askSelection.page} 页` : ""}` : undefined} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
     </section>
   </main>;
 }
@@ -4694,7 +4504,9 @@ function triggerFileDownload(file: WorkFile) {
 
 function openFetchedFile(file: WorkFile) {
   const reader = fileReaderKind(file);
-  const target = reader === "html" ? filePreviewUrl(file) : reader === "markdown" || isBrowserPreviewable(file) ? fileUrl(file) : "";
+  const target = reader === "html" || reader === "pdf" || reader === "epub"
+    ? filePreviewUrl(file)
+    : reader === "markdown" || isBrowserPreviewable(file) ? fileUrl(file) : "";
   if (target) window.location.assign(target);
   else triggerFileDownload(file);
 }
@@ -4743,8 +4555,14 @@ function FileCard({ file }: { file: WorkFile }) {
   const previewable = isBrowserPreviewable(file);
   const previewHref = reader ? filePreviewUrl(file) : previewable ? fileUrl(file) : "";
   const body = <>{image && <img className="file-card-image" src={fileThumbnailUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
+  // PDF/EPUB must enter the bounded reader by default.  Opening their raw
+  // attachment would hand EPUB to a browser download handler and would make
+  // PDF use the browser's unrestricted viewer, bypassing our pagination,
+  // Range and annotation boundaries.  Markdown keeps its established raw
+  // primary link; its eye action still opens the vertical reader.
+  const opensReaderByDefault = reader === "html" || reader === "pdf" || reader === "epub";
   return <div className={`file-card ${image ? "image-file-card" : ""}`}>
-    {reader === "html"
+    {opensReaderByDefault
       ? <a href={filePreviewUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : reader === "markdown" || previewable
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>

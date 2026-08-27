@@ -11,7 +11,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ -d "$PROJECT_DIR/.git" ]] || die "Git repository is unavailable"
 [[ -z "$(git -C "$PROJECT_DIR" status --porcelain)" ]] || die "Repository has uncommitted changes"
 branch="$(git -C "$PROJECT_DIR" branch --show-current)"
-[[ "$branch" == "main" || "$branch" == "master" ]] || die "Deployment requests must come from main or master"
+[[ "$branch" == "main" ]] || die "Deployment requests must come from main"
 commit="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
 base="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^' 2>/dev/null || true)"
 mkdir -p "$REQUEST_ROOT"

@@ -39,6 +39,10 @@ import { formatVoiceLexiconTerms, VoiceLexiconService } from "./voice-lexicon.js
 import { persistVoiceRecording, removePersistedVoiceRecording, sha256File, type PersistedVoiceRecording } from "./voice-recording.js";
 import { VOICE_LEXICON_CODEX_MODEL } from "./codex-voice-review.js";
 import { bootstrapScript, type RemoteWorkerBootstrapPlatform } from "./remote-worker-bootstrap.js";
+import { ReaderIngestError } from "./reader-ingest.js";
+import { parseReaderRange, ReaderRangeError } from "./reader-range.js";
+import { ReaderService, ReaderUnavailableError } from "./reader-service.js";
+import type { ReadingAnnotationType } from "./reader-types.js";
 
 const COOKIE_NAME = "cww_session";
 // Keep unknown-user login work comparable without using any real account hash.
@@ -374,6 +378,24 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return resolveInside(storageRoot, file.relative_path);
   }
 
+  function resolveExistingFilePath(file: FileRow, userId: string): string {
+    // Reader probes must not recreate a conversation workspace that has been
+    // moved to cold storage.  The normal resolver remains intentionally
+    // creating for upload/task paths elsewhere in the application.
+    const workspace = path.resolve(config.tenantRoot, userId, "conversations", file.conversation_id);
+    const storageRoot = file.kind === "output" && isPersistedDeliverablePath(file.relative_path) ? config.dataRoot : workspace;
+    return resolveInside(storageRoot, file.relative_path);
+  }
+
+  const reader = new ReaderService({
+    db, config, resolveFilePath, resolveExistingFilePath,
+    ensureFileAvailable: (file, userId) => {
+      const conversation = db.getConversationForUser(file.conversation_id, userId);
+      if (!conversation) return "missing";
+      return activateConversation(conversation).state;
+    },
+  });
+
   function publicPreviewPath(fileId: string): string {
     return `${config.basePath}/files/${encodeURIComponent(fileId)}/preview/public`;
   }
@@ -446,6 +468,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   async function waitForBackgroundTasks(): Promise<void> {
     while (backgroundTasks.size > 0) await Promise.allSettled([...backgroundTasks]);
+    await reader.waitForBackgroundTasks();
   }
 
   function codexUpdateMaintenancePhase(): MaintenancePhase {
@@ -1570,6 +1593,265 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
+  function readerRequestError(res: Response, error: unknown): Response {
+    if (error instanceof ReaderUnavailableError) {
+      return res.status(202).setHeader("Retry-After", "2").json({ code: error.code, restoring: true, error: error.message });
+    }
+    if (error instanceof ReaderRangeError) {
+      if (error.code === "unsatisfiable") {
+        const total = Number.isSafeInteger(error.resourceSize) && (error.resourceSize ?? -1) >= 0 ? error.resourceSize : "*";
+        return res.status(416).setHeader("Content-Range", `bytes */${total}`).json({ code: "READER_RANGE_UNSATISFIABLE", error: error.message });
+      }
+      if (error.code === "too_large") return res.status(416).json({ code: "READER_RANGE_TOO_LARGE", error: error.message, maxBytes: config.readerRangeMaxBytes });
+      return res.status(400).json({ code: "READER_RANGE_INVALID", error: error.message });
+    }
+    if (error instanceof ReaderIngestError) {
+      const status = /大小上限|安全大小|在线阅读大小/i.test(error.message) ? 413 : 422;
+      return res.status(status).json({ code: status === 413 ? "READER_FILE_TOO_LARGE" : "READER_INGEST_FAILED", error: error.message });
+    }
+    if (error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT") {
+      return res.status(404).json({ code: "READER_FILE_NOT_FOUND", error: "阅读资源不存在。" });
+    }
+    return res.status(500).json({ code: "READER_INTERNAL_ERROR", error: "阅读资源处理失败。" });
+  }
+
+  function readerVersionForRequest(versionId: string, session: SessionRow) {
+    const version = db.getReadingVersion(versionId, session.user_id);
+    if (!version) return undefined;
+    // Keep progress/annotation APIs behind the same active conversation
+    // boundary as the file preview route.  A tombstoned conversation may
+    // still have rows during GC, but it must not accept new reader writes.
+    return db.getFileForUser(version.file_id, session.user_id) ? version : undefined;
+  }
+
+  api.get("/reader/files/:id/manifest", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    db.touchConversationActivity(file.conversation_id);
+    try {
+      const manifest = await reader.openFile(file, session.user_id);
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json(manifest);
+    } catch (error) { return readerRequestError(res, error); }
+  });
+
+  api.get("/reader/versions/:id/manifest", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    try {
+      const manifest = await reader.getManifest(String(req.params.id), session.user_id);
+      if (!manifest) return res.status(404).json({ error: "阅读版本不存在。" });
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json(manifest);
+    } catch (error) { return readerRequestError(res, error); }
+  });
+
+  api.get("/reader/versions/:versionId/units/:unitId", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const release = reader.reads.tryAcquire(session.user_id);
+    if (!release) return res.status(429).setHeader("Retry-After", "1").json({ code: "READER_CONCURRENCY_LIMIT", error: `同一账号最多同时读取 ${config.readerMaxConcurrentReads} 个资源。` });
+    try {
+      const result = await reader.readUnit(String(req.params.versionId), String(req.params.unitId), session.user_id);
+      if (!result) return res.status(404).json({ error: "阅读单元不存在或尚未解析完成。" });
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json({ unit: { id: result.unit.id, ordinal: result.unit.ordinal, href: result.unit.href, title: result.unit.title, mediaType: result.unit.media_type }, content: result.content });
+    } catch (error) { return readerRequestError(res, error); }
+    finally { release(); }
+  });
+
+  api.get("/reader/versions/:versionId/asset", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const assetPath = typeof req.query.path === "string" ? req.query.path : "";
+    if (!assetPath || assetPath.length > 2_000) return res.status(400).json({ error: "资源路径无效。" });
+    const release = reader.reads.tryAcquire(session.user_id);
+    if (!release) return res.status(429).setHeader("Retry-After", "1").json({ code: "READER_CONCURRENCY_LIMIT", error: `同一账号最多同时读取 ${config.readerMaxConcurrentReads} 个资源。` });
+    let handedOff = false;
+    try {
+      const asset = await reader.readAsset(String(req.params.versionId), assetPath, session.user_id);
+      if (!asset) return res.status(404).json({ error: "阅读资源不存在。" });
+      res.setHeader("Content-Type", asset.contentType);
+      res.setHeader("Content-Length", String(asset.size));
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      let released = false;
+      const done = () => { if (!released) { released = true; release(); } };
+      res.once("finish", done);
+      res.once("close", done);
+      res.once("error", done);
+      const response = res.sendFile(path.basename(asset.absolute), { root: path.dirname(asset.absolute), dotfiles: "deny" }, (error) => {
+        done();
+        if (error && !res.headersSent) readerRequestError(res, error);
+      });
+      handedOff = true;
+      return response;
+    } catch (error) { return readerRequestError(res, error); }
+    finally { if (!handedOff) release(); }
+  });
+
+  api.head("/reader/versions/:versionId/bytes", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    let source: ReturnType<ReaderService["sourceFile"]>;
+    try { source = reader.sourceFile(String(req.params.versionId), session.user_id); }
+    catch (error) { return readerRequestError(res, error); }
+    if (!source) return res.status(404).end();
+    const format = reader.format(source.file);
+    if (format !== "pdf" && format !== "epub") return res.status(415).end();
+    const release = reader.reads.tryAcquire(session.user_id);
+    if (!release) return res.status(429).setHeader("Retry-After", "1").end();
+    try {
+      // A successful metadata probe is still a reader call.  Touch before
+      // ending HEAD so retention cannot evict an actively inspected source.
+      db.touchReadingVersion(source.version.id, session.user_id);
+      const stat = fs.lstatSync(source.absolute);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("not_file");
+      if (stat.size !== source.file.size) return res.status(409).end();
+      // HEAD has no response body, so it remains a successful metadata probe
+      // even for a large PDF/EPUB. The 1 MiB ceiling applies to bytes actually
+      // transferred by GET; a caller can still use Range on HEAD to validate
+      // the exact bounded response it intends to request.
+      res.setHeader("Accept-Ranges", "bytes");
+      res.setHeader("Content-Type", fileResponseContentType(source.file.mime_type));
+      const range = parseReaderRange(typeof req.headers.range === "string" ? req.headers.range : undefined, stat.size, config.readerRangeMaxBytes);
+      if (range) {
+        res.status(206).setHeader("Content-Range", `bytes ${range.start}-${range.end}/${stat.size}`).setHeader("Content-Length", String(range.length));
+      } else {
+        res.setHeader("Content-Length", String(stat.size));
+      }
+      return res.end();
+    } catch (error) {
+      if (error instanceof ReaderRangeError || error instanceof ReaderIngestError) return readerRequestError(res, error);
+      const availability = reader.ensureOriginalFileAvailable(source.file, session.user_id);
+      if (availability === "restoring" || availability === "error") return readerRequestError(res, new ReaderUnavailableError());
+      return readerRequestError(res, error);
+    } finally { release(); }
+  });
+
+  api.get("/reader/versions/:versionId/bytes", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    let source: ReturnType<ReaderService["sourceFile"]>;
+    try { source = reader.sourceFile(String(req.params.versionId), session.user_id); }
+    catch (error) { return readerRequestError(res, error); }
+    if (!source) return res.status(404).json({ error: "阅读版本不存在。" });
+    const format = reader.format(source.file);
+    if (format !== "pdf" && format !== "epub") return res.status(415).json({ error: "该阅读版本不提供字节 Range 读取。" });
+    const release = reader.reads.tryAcquire(session.user_id);
+    if (!release) return res.status(429).setHeader("Retry-After", "1").json({ code: "READER_CONCURRENCY_LIMIT", error: `同一账号最多同时读取 ${config.readerMaxConcurrentReads} 个资源。` });
+    let closed = false;
+    const done = () => {
+      if (closed) return;
+      closed = true;
+      release();
+      try { db.touchReadingVersion(source.version.id, session.user_id); } catch { /* shutdown may close the DB after the stream ends */ }
+    };
+    res.once("finish", done); res.once("close", done); res.once("error", done);
+    try {
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(source.absolute);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new ReaderIngestError("原文件不是普通文件。");
+      }
+      catch (error) {
+        const availability = reader.ensureOriginalFileAvailable(source.file, session.user_id);
+        if (availability === "restoring" || availability === "error") throw new ReaderUnavailableError();
+        throw error;
+      }
+      if (stat.size !== source.file.size) { done(); return res.status(409).json({ error: "文件大小已变化，请重新打开阅读器。" }); }
+      const range = parseReaderRange(typeof req.headers.range === "string" ? req.headers.range : undefined, stat.size, config.readerRangeMaxBytes);
+      res.setHeader("Accept-Ranges", "bytes");
+      res.setHeader("Content-Type", fileResponseContentType(source.file.mime_type));
+      res.setHeader("Cache-Control", "private, no-store");
+      if (!range) {
+        if (stat.size > config.readerRangeMaxBytes) { res.setHeader("Content-Range", `bytes */${stat.size}`); done(); return res.status(416).json({ code: "READER_RANGE_REQUIRED", error: "大文件阅读必须使用 Range 请求。" }); }
+        res.setHeader("Content-Length", String(stat.size));
+        const stream = fs.createReadStream(source.absolute);
+        stream.once("error", (error) => { done(); if (!res.headersSent) readerRequestError(res, error); else res.destroy(error); });
+        return stream.pipe(res);
+      }
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${stat.size}`);
+      res.setHeader("Content-Length", String(range.length));
+      const stream = fs.createReadStream(source.absolute, { start: range.start, end: range.end });
+      stream.once("error", (error) => { done(); if (!res.headersSent) readerRequestError(res, error); else res.destroy(error); });
+      return stream.pipe(res);
+    } catch (error) { done(); return readerRequestError(res, error); }
+  });
+
+  api.get("/reader/versions/:versionId/progress", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const versionId = String(req.params.versionId);
+    if (!readerVersionForRequest(versionId, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    db.touchReadingVersion(versionId, session.user_id);
+    return res.json({ progress: db.getReadingProgress(versionId, session.user_id) ?? null });
+  });
+
+  api.put("/reader/versions/:versionId/progress", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const versionId = String(req.params.versionId);
+    if (!readerVersionForRequest(versionId, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    const unitId = req.body?.unitId == null ? null : String(req.body.unitId);
+    if (unitId && !db.getReadingUnit(versionId, unitId, session.user_id)) return res.status(400).json({ error: "阅读单元不存在。" });
+    const position = req.body?.position;
+    if (!position || typeof position !== "object" || Array.isArray(position)) return res.status(400).json({ error: "阅读位置无效。" });
+    const positionJson = JSON.stringify(position);
+    if (positionJson.length > 8_192) return res.status(400).json({ error: "阅读位置过大。" });
+    const progress = db.saveReadingProgress({ user_id: session.user_id, version_id: versionId, unit_id: unitId, position_json: positionJson });
+    db.touchReadingVersion(versionId, session.user_id);
+    return res.json({ progress });
+  });
+
+  api.get("/reader/versions/:versionId/annotations", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const versionId = String(req.params.versionId);
+    if (!readerVersionForRequest(versionId, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    db.touchReadingVersion(versionId, session.user_id);
+    return res.json({ annotations: db.listReadingAnnotations(versionId, session.user_id) });
+  });
+
+  api.post("/reader/versions/:versionId/annotations", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const versionId = String(req.params.versionId);
+    if (!readerVersionForRequest(versionId, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    const type = req.body?.type as ReadingAnnotationType;
+    const quoteText = typeof req.body?.quoteText === "string" ? req.body.quoteText.trim().slice(0, 20_000) : "";
+    const noteTextInvalid = req.body?.noteText != null && typeof req.body.noteText !== "string";
+    const noteText = req.body?.noteText == null ? null : typeof req.body.noteText === "string" ? req.body.noteText.trim().slice(0, 20_000) : null;
+    const color = typeof req.body?.color === "string" && /^[a-z-]{1,20}$/i.test(req.body.color) ? req.body.color : "yellow";
+    const locator = req.body?.locator;
+    if (!(["highlight", "note"] as string[]).includes(type) || !quoteText || noteTextInvalid || (type === "note" && !noteText) || !locator || typeof locator !== "object" || Array.isArray(locator)) return res.status(400).json({ error: "标注内容无效。" });
+    const locatorJson = JSON.stringify(locator);
+    if (locatorJson.length > 8_192) return res.status(400).json({ error: "标注定位信息过大。" });
+    const unitId = req.body?.unitId == null ? null : String(req.body.unitId);
+    if (unitId && !db.getReadingUnit(versionId, unitId, session.user_id)) return res.status(400).json({ error: "阅读单元不存在。" });
+    const annotation = db.createReadingAnnotation({ id: newId(), user_id: session.user_id, version_id: versionId, unit_id: unitId, type, quote_text: quoteText, note_text: noteText, color, locator_json: locatorJson });
+    db.touchReadingVersion(versionId, session.user_id);
+    return res.status(201).json({ annotation });
+  });
+
+  api.patch("/reader/annotations/:id", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const existing = db.getReadingAnnotation(String(req.params.id), session.user_id);
+    if (!existing) return res.status(404).json({ error: "标注不存在。" });
+    if (!readerVersionForRequest(existing.version_id, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    const patch: Record<string, unknown> = {};
+    if (typeof req.body?.noteText === "string") patch.note_text = req.body.noteText.trim().slice(0, 20_000);
+    if (typeof req.body?.color === "string" && /^[a-z-]{1,20}$/i.test(req.body.color)) patch.color = req.body.color;
+    const updated = db.updateReadingAnnotation(String(req.params.id), session.user_id, patch);
+    db.touchReadingVersion(existing.version_id, session.user_id);
+    return updated ? res.json({ annotation: updated }) : res.status(404).json({ error: "标注不存在。" });
+  });
+
+  api.delete("/reader/annotations/:id", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const existing = db.getReadingAnnotation(String(req.params.id), session.user_id);
+    if (!existing) return res.status(404).json({ error: "标注不存在。" });
+    if (!readerVersionForRequest(existing.version_id, session)) return res.status(404).json({ error: "阅读版本不存在。" });
+    const deleted = db.deleteReadingAnnotation(String(req.params.id), session.user_id);
+    if (deleted) db.touchReadingVersion(existing.version_id, session.user_id);
+    return deleted ? res.status(204).end() : res.status(404).json({ error: "标注不存在。" });
+  });
+
   api.options(["/uploads", "/uploads/:id"], (req, res) => resumableUploads.options(req, res));
   api.post("/uploads", (req, res) => resumableUploads.create(req, res, res.locals.session as SessionRow));
   api.head("/uploads/:id", (req, res) => resumableUploads.head(req, res, res.locals.session as SessionRow));
@@ -2557,6 +2839,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const hostRemoved = await runner.deleteCodexThread(conversation.user_id, conversation.id, conversation.codex_thread_id);
       if (hostRemoved === null) removeCodexThreadFiles(tenant.codexHome, conversation.codex_thread_id);
     }
+    await reader.removeConversationResources(conversation.id, conversation.user_id);
     removeWorkspace(tenant.conversations, conversation.id);
     if (!db.completeConversationDeletion(conversation.id) && db.getConversation(conversation.id)) {
       throw new Error("会话清理状态已经变化");
@@ -3449,6 +3732,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     app, db, runner, conversationTitles, personalMemory, voiceLexicon, config, pumpQueue, remoteWorkers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
+      reader.stop();
       personalMemory.stop();
       voiceLexicon.stop();
       resumableUploads.stop();

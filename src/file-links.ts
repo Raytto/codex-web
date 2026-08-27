@@ -7,7 +7,7 @@ export type ResolvedMessageLink =
   | { kind: "unavailable"; path?: string }
   | { kind: "regular"; href: string };
 
-export type FileReaderKind = "markdown" | "html";
+export type FileReaderKind = "markdown" | "html" | "pdf" | "epub";
 
 export type RemoteMessageFileReference = {
   sourcePath: string;
@@ -56,6 +56,7 @@ export function isBrowserPreviewable(file: WorkFile): boolean {
   const mimeType = file.mime_type.split(";", 1)[0].trim().toLowerCase();
   return mimeType.startsWith("image/")
     || mimeType === "application/pdf"
+    || mimeType === "application/epub+zip"
     || /^text\/(?:plain|csv)$/.test(mimeType);
 }
 
@@ -64,6 +65,8 @@ export function fileReaderKind(file: Pick<WorkFile, "original_name" | "mime_type
   const extension = file.original_name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
   if (mimeType === "text/markdown" || [".md", ".markdown"].includes(extension)) return "markdown";
   if (mimeType === "text/html" || [".html", ".htm"].includes(extension)) return "html";
+  if (mimeType === "application/pdf" || extension === ".pdf") return "pdf";
+  if (mimeType === "application/epub+zip" || extension === ".epub") return "epub";
   return null;
 }
 
@@ -113,7 +116,7 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
   const matched = exact ?? named;
   if (matched) {
     const readerKind = fileReaderKind(matched.file);
-    if (readerKind === "html") return { kind: "preview", href: filePreviewUrl(matched.file) };
+    if (readerKind === "html" || readerKind === "pdf" || readerKind === "epub") return { kind: "preview", href: filePreviewUrl(matched.file) };
     if (readerKind === "markdown") return { kind: "raw", href: fileUrl(matched.file) };
     return { kind: "download", href: fileUrl(matched.file, true) };
   }

@@ -124,7 +124,7 @@ function assertUuid(value: string, label: string): void {
   if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error(`Invalid ${label}`);
 }
 
-function sha256File(filePath: string): string {
+export function sha256File(filePath: string): string {
   const hash = crypto.createHash("sha256");
   const input = fs.openSync(filePath, "r");
   try {
@@ -140,7 +140,7 @@ function sha256File(filePath: string): string {
 
 function fileSha256(filePath: string): string { return sha256File(filePath); }
 
-function safeRelative(value: string): string {
+export function safeRelative(value: string): string {
   const normalized = value.replace(/\\/g, "/");
   if (!normalized || normalized.startsWith("/") || normalized.split("/").some((part) => !part || part === "." || part === "..")) {
     throw new Error("冷存储清单包含不安全路径");
@@ -148,11 +148,13 @@ function safeRelative(value: string): string {
   return normalized;
 }
 
-function openDb(databasePath: string): DatabaseSync {
+export function openColdStorageDb(databasePath: string): DatabaseSync {
   const sqlite = new DatabaseSync(databasePath);
   sqlite.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;");
   return sqlite;
 }
+
+const openDb = openColdStorageDb;
 
 function rowForConversation(sqlite: DatabaseSync, conversationId: string, userId?: string): StorageDbRow | undefined {
   const row = sqlite.prepare(`
@@ -428,7 +430,7 @@ function transition(sqlite: DatabaseSync, row: StorageDbRow, expected: Conversat
   return next;
 }
 
-function acquireOperationLock(roots: ColdStorageRoots, conversationId: string): string {
+export function acquireColdStorageLock(roots: ColdStorageRoots, conversationId: string): string {
   const lockRoot = path.join(path.dirname(roots.isolationRoot), "locks");
   fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
   const lock = path.join(lockRoot, conversationId);
@@ -438,11 +440,14 @@ function acquireOperationLock(roots: ColdStorageRoots, conversationId: string): 
   return lock;
 }
 
-function removeOperationLock(lock: string): void {
+export function removeColdStorageLock(lock: string): void {
   try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
-function runAliyun(roots: ColdStorageRoots, args: string[], timeout = 6 * 60 * 60_000): string {
+const acquireOperationLock = acquireColdStorageLock;
+const removeOperationLock = removeColdStorageLock;
+
+export function runAliyun(roots: ColdStorageRoots, args: string[], timeout = 6 * 60 * 60_000): string {
   return execFileSync(roots.aliyunpan, args, { encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024 });
 }
 
@@ -463,19 +468,19 @@ function ensureRemoteDirectory(roots: ColdStorageRoots, remotePath: string): voi
   if (!remoteTree(roots, remotePath).split(/\r?\n/).some((line) => line.trim() === remotePath)) throw new Error(`云端目录创建后不可见: ${remotePath}`);
 }
 
-function ensureRemotePath(roots: ColdStorageRoots, remotePath: string): void {
+export function ensureRemotePath(roots: ColdStorageRoots, remotePath: string): void {
   const parts = remotePath.split("/").filter(Boolean);
   let current = "";
   for (const part of parts) { current += `/${part}`; ensureRemoteDirectory(roots, current); }
 }
 
-function remoteObjectVisible(roots: ColdStorageRoots, remotePath: string): boolean {
+export function remoteObjectVisible(roots: ColdStorageRoots, remotePath: string): boolean {
   const parent = path.posix.dirname(remotePath);
   const name = path.posix.basename(remotePath);
   return remoteTree(roots, parent).split(/\r?\n/).some((line) => line.includes(`-> ${remotePath}`) || line.trim().endsWith(`/${name}`));
 }
 
-function stageForUpload(roots: ColdStorageRoots, source: string): string {
+export function stageForUpload(roots: ColdStorageRoots, source: string): string {
   fs.mkdirSync(roots.relayDir, { recursive: true, mode: 0o700 });
   const target = path.join(roots.relayDir, path.basename(source));
   if (fs.existsSync(target)) throw new Error(`阿里云盘中转目录已有同名文件: ${path.basename(source)}`);
@@ -489,7 +494,7 @@ function stageForUpload(roots: ColdStorageRoots, source: string): string {
   return target;
 }
 
-function prepareDownloadDirectory(directory: string): void {
+export function prepareDownloadDirectory(directory: string): void {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   try {
     const uid = Number(execFileSync("id", ["-u", "aliyunpan"], { encoding: "utf8" }).trim());
@@ -499,7 +504,7 @@ function prepareDownloadDirectory(directory: string): void {
   } catch (error) { throw new Error(`阿里云盘下载目录权限不可用: ${error instanceof Error ? error.message : "unknown"}`); }
 }
 
-function findDownloadedFile(root: string, name: string, fallbackRoots: string[] = []): string {
+export function findDownloadedFile(root: string, name: string, fallbackRoots: string[] = []): string {
   const matches: string[] = [];
   const visited = new Set<string>();
   const visit = (directory: string): void => {
@@ -521,14 +526,14 @@ function findDownloadedFile(root: string, name: string, fallbackRoots: string[] 
   return matches[0];
 }
 
-function packageArchive(roots: ColdStorageRoots, staging: string, archivePath: string): void {
+export function packageArchive(roots: ColdStorageRoots, staging: string, archivePath: string): void {
   const plain = `${archivePath}.plain`;
   execFileSync("tar", ["-cf", plain, "--sort=name", "-C", staging, "."], { stdio: "ignore", timeout: 6 * 60 * 60_000 });
   try { execFileSync(roots.age, ["-R", roots.ageRecipient, "-o", archivePath, plain], { stdio: "ignore", timeout: 6 * 60 * 60_000 }); }
   finally { try { fs.unlinkSync(plain); } catch {} }
 }
 
-function verifyAgeArchive(roots: ColdStorageRoots, archivePath: string): void {
+export function verifyAgeArchive(roots: ColdStorageRoots, archivePath: string): void {
   execFileSync(roots.age, ["-d", "-i", roots.ageIdentity, archivePath], { stdio: ["ignore", "ignore", "pipe"], timeout: 6 * 60 * 60_000 });
 }
 

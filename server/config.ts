@@ -1,6 +1,19 @@
 import path from "node:path";
 import os from "node:os";
 import dotenv from "dotenv";
+import {
+  READER_V1_MAX_CONCURRENT_READS,
+  READER_V1_MAX_FILE_BYTES,
+  READER_V1_MAX_RANGE_BYTES,
+  READER_V1_RETENTION_DAYS,
+} from "./reader-policy.js";
+
+export {
+  READER_V1_MAX_CONCURRENT_READS,
+  READER_V1_MAX_FILE_BYTES,
+  READER_V1_MAX_RANGE_BYTES,
+  READER_V1_RETENTION_DAYS,
+} from "./reader-policy.js";
 
 dotenv.config({ path: path.join(process.cwd(), ".env") });
 
@@ -28,6 +41,11 @@ export type AppConfig = {
   maxRunningJobsPerExecutor: number;
   maxUploadFileBytes: number;
   maxStoredBytesPerUser: number;
+  /** Online reader guardrails.  These are independent from attachment quota. */
+  readerMaxFileBytes: number;
+  readerMaxConcurrentReads: number;
+  readerRangeMaxBytes: number;
+  readerRetentionDays: number;
   minimumFreeDiskBytes: number;
   resumableUploadChunkBytes: number;
   resumableUploadExpiryHours: number;
@@ -99,6 +117,10 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxRunningJobsPerExecutor: boundedInteger(overrides.maxRunningJobsPerExecutor ?? process.env.MAX_RUNNING_JOBS_PER_EXECUTOR, 4, 1, 32),
     maxUploadFileBytes: boundedInteger(overrides.maxUploadFileBytes ?? process.env.MAX_UPLOAD_FILE_BYTES, 2 * 1024 * 1024 * 1024, 1 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
     maxStoredBytesPerUser: boundedInteger(overrides.maxStoredBytesPerUser ?? process.env.MAX_STORED_BYTES_PER_USER, 20 * 1024 * 1024 * 1024, 1, 1024 * 1024 * 1024 * 1024),
+    readerMaxFileBytes: boundedInteger(overrides.readerMaxFileBytes ?? process.env.READER_MAX_FILE_BYTES, READER_V1_MAX_FILE_BYTES, 1 * 1024 * 1024, READER_V1_MAX_FILE_BYTES),
+    readerMaxConcurrentReads: boundedInteger(overrides.readerMaxConcurrentReads ?? process.env.READER_MAX_CONCURRENT_READS, READER_V1_MAX_CONCURRENT_READS, 1, READER_V1_MAX_CONCURRENT_READS),
+    readerRangeMaxBytes: boundedInteger(overrides.readerRangeMaxBytes ?? process.env.READER_RANGE_MAX_BYTES, READER_V1_MAX_RANGE_BYTES, 64 * 1024, READER_V1_MAX_RANGE_BYTES),
+    readerRetentionDays: boundedInteger(overrides.readerRetentionDays ?? process.env.READER_RETENTION_DAYS, READER_V1_RETENTION_DAYS, 1, READER_V1_RETENTION_DAYS),
     minimumFreeDiskBytes: boundedInteger(overrides.minimumFreeDiskBytes ?? process.env.MINIMUM_FREE_DISK_BYTES, 2 * 1024 * 1024 * 1024, 1, Number.MAX_SAFE_INTEGER),
     resumableUploadChunkBytes: boundedInteger(overrides.resumableUploadChunkBytes ?? process.env.RESUMABLE_UPLOAD_CHUNK_BYTES, 8 * 1024 * 1024, 1 * 1024 * 1024, 32 * 1024 * 1024),
     resumableUploadExpiryHours: boundedInteger(overrides.resumableUploadExpiryHours ?? process.env.RESUMABLE_UPLOAD_EXPIRY_HOURS, 72, 1, 24 * 30),

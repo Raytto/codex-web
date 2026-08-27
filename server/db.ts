@@ -11,6 +11,7 @@ import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 import { isHostRootUser } from "./host-root-user.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import { containsPersonalContext, stripPersonalContext } from "./personal-context.js";
+import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, ReadingSourceRow, ReadingSourceVersionRow, ReadingUnitRow, ReaderFormat, ReaderVersionKind, ReaderVersionStatus } from "./reader-types.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
@@ -1715,6 +1716,136 @@ export class AppDatabase {
         );
         CREATE INDEX IF NOT EXISTS voice_transcription_receipts_retention_idx ON voice_transcription_receipts(state,updated_at);
       `);
+    });
+    this.applyMigration(2026082602, "reader-sources-and-annotations", () => {
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS reading_sources (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          format TEXT NOT NULL CHECK(format IN ('markdown','html','pdf','epub')),
+          title TEXT NOT NULL,
+          author TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id,file_id)
+        );
+        CREATE TABLE IF NOT EXISTS reading_source_versions (
+          id TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL REFERENCES reading_sources(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          version_no INTEGER NOT NULL CHECK(version_no > 0),
+          derived_kind TEXT NOT NULL CHECK(derived_kind IN ('original','normalized','ocr')),
+          source_sha256 TEXT,
+          source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+          parser_version TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('ready','processing','failed','cold','restoring')),
+          normalized_root TEXT,
+          manifest_json TEXT,
+          last_accessed_at TEXT NOT NULL,
+          storage_state TEXT NOT NULL DEFAULT 'local' CHECK(storage_state IN ('local','uploading','remote_verified','evicting','cold','restoring','error')),
+          storage_generation INTEGER NOT NULL DEFAULT 0 CHECK(storage_generation >= 0),
+          storage_revision INTEGER NOT NULL DEFAULT 0 CHECK(storage_revision >= 0),
+          storage_manifest_json TEXT,
+          storage_manifest_sha256 TEXT,
+          storage_archive_sha256 TEXT,
+          storage_archive_bytes INTEGER,
+          storage_plaintext_bytes INTEGER,
+          storage_uploaded_at TEXT,
+          storage_verified_at TEXT,
+          storage_restored_at TEXT,
+          remote_drive_id TEXT,
+          remote_path TEXT,
+          local_isolated_path TEXT,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(source_id,version_no)
+        );
+        CREATE TABLE IF NOT EXISTS reading_units (
+          id TEXT PRIMARY KEY,
+          version_id TEXT NOT NULL REFERENCES reading_source_versions(id) ON DELETE CASCADE,
+          ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+          kind TEXT NOT NULL CHECK(kind IN ('spine','page')),
+          href TEXT NOT NULL,
+          title TEXT,
+          media_type TEXT NOT NULL,
+          content_path TEXT,
+          byte_size INTEGER NOT NULL DEFAULT 0 CHECK(byte_size >= 0),
+          text_content TEXT,
+          metadata_json TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE(version_id,ordinal),
+          UNIQUE(version_id,href)
+        );
+        CREATE TABLE IF NOT EXISTS reading_progress (
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          version_id TEXT NOT NULL REFERENCES reading_source_versions(id) ON DELETE CASCADE,
+          unit_id TEXT REFERENCES reading_units(id) ON DELETE SET NULL,
+          position_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(user_id,version_id)
+        );
+        CREATE TABLE IF NOT EXISTS reading_annotations (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          version_id TEXT NOT NULL REFERENCES reading_source_versions(id) ON DELETE CASCADE,
+          unit_id TEXT REFERENCES reading_units(id) ON DELETE SET NULL,
+          type TEXT NOT NULL CHECK(type IN ('highlight','note')),
+          quote_text TEXT NOT NULL,
+          note_text TEXT,
+          color TEXT NOT NULL DEFAULT 'yellow',
+          locator_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          deleted_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS reading_sources_user_idx ON reading_sources(user_id,updated_at DESC);
+        CREATE INDEX IF NOT EXISTS reading_versions_access_idx ON reading_source_versions(user_id,last_accessed_at,status);
+        CREATE INDEX IF NOT EXISTS reading_units_version_idx ON reading_units(version_id,ordinal);
+        CREATE INDEX IF NOT EXISTS reading_annotations_version_idx ON reading_annotations(user_id,version_id,deleted_at,created_at);
+        CREATE TABLE IF NOT EXISTS reading_storage_audit (
+          id TEXT PRIMARY KEY,
+          version_id TEXT NOT NULL REFERENCES reading_source_versions(id) ON DELETE CASCADE,
+          generation INTEGER NOT NULL,
+          revision INTEGER NOT NULL,
+          from_state TEXT NOT NULL,
+          to_state TEXT NOT NULL,
+          action TEXT NOT NULL,
+          details_json TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS reading_storage_audit_version_idx ON reading_storage_audit(version_id,created_at);
+      `);
+    });
+    this.applyMigration(2026082603, "reader-storage-state-columns", () => {
+      const columns = this.columnNames("reading_source_versions");
+      if (!columns.has("storage_generation")) this.sqlite.exec("ALTER TABLE reading_source_versions ADD COLUMN storage_generation INTEGER NOT NULL DEFAULT 0");
+      if (!columns.has("storage_revision")) this.sqlite.exec("ALTER TABLE reading_source_versions ADD COLUMN storage_revision INTEGER NOT NULL DEFAULT 0");
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS reading_storage_audit (
+          id TEXT PRIMARY KEY,
+          version_id TEXT NOT NULL REFERENCES reading_source_versions(id) ON DELETE CASCADE,
+          generation INTEGER NOT NULL,
+          revision INTEGER NOT NULL,
+          from_state TEXT NOT NULL,
+          to_state TEXT NOT NULL,
+          action TEXT NOT NULL,
+          details_json TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS reading_storage_audit_version_idx ON reading_storage_audit(version_id,created_at);
+      `);
+    });
+    this.applyMigration(2026082604, "reader-storage-archive-metadata", () => {
+      const columns = this.columnNames("reading_source_versions");
+      const additions = [
+        ["storage_manifest_json", "TEXT"], ["storage_manifest_sha256", "TEXT"], ["storage_archive_sha256", "TEXT"],
+        ["storage_archive_bytes", "INTEGER"], ["storage_plaintext_bytes", "INTEGER"], ["storage_uploaded_at", "TEXT"],
+        ["storage_verified_at", "TEXT"], ["storage_restored_at", "TEXT"],
+      ] as const;
+      for (const [name, definition] of additions) if (!columns.has(name)) this.sqlite.exec(`ALTER TABLE reading_source_versions ADD COLUMN ${name} ${definition}`);
     });
     const titleAuditRecoveryAt = new Date().toISOString();
     this.sqlite.prepare(`
@@ -4249,6 +4380,199 @@ export class AppDatabase {
 
   listFilesForMessage(messageId: string): FileRow[] {
     return this.sqlite.prepare("SELECT * FROM files WHERE message_id=? ORDER BY created_at,id").all(messageId) as FileRow[];
+  }
+
+  getReadingSourceForFile(fileId: string, userId: string): ReadingSourceRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM reading_sources WHERE file_id=? AND user_id=?").get(fileId, userId) as ReadingSourceRow | undefined;
+  }
+
+  getReadingSource(id: string, userId: string): ReadingSourceRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM reading_sources WHERE id=? AND user_id=?").get(id, userId) as ReadingSourceRow | undefined;
+  }
+
+  createReadingSource(input: Omit<ReadingSourceRow, "created_at" | "updated_at">): ReadingSourceRow {
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO reading_sources(id,user_id,file_id,format,title,author,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(user_id,file_id) DO UPDATE SET title=excluded.title,author=excluded.author,updated_at=excluded.updated_at
+    `).run(input.id, input.user_id, input.file_id, input.format, input.title, input.author, now, now);
+    return this.getReadingSourceForFile(input.file_id, input.user_id)!;
+  }
+
+  updateReadingSourceMetadata(id: string, userId: string, title: string | null, author: string | null, format?: ReaderFormat): ReadingSourceRow | undefined {
+    const source = this.getReadingSource(id, userId);
+    if (!source) return undefined;
+    const nextTitle = title?.trim().slice(0, 500) || source.title;
+    const nextAuthor = author?.trim().slice(0, 500) || null;
+    const nextFormat = format ?? source.format;
+    this.sqlite.prepare("UPDATE reading_sources SET format=?,title=?,author=?,updated_at=? WHERE id=? AND user_id=?")
+      .run(nextFormat, nextTitle, nextAuthor, new Date().toISOString(), id, userId);
+    return this.getReadingSource(id, userId);
+  }
+
+  getReadingVersion(id: string, userId: string): ReadingSourceVersionRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT version.* FROM reading_source_versions version
+      JOIN reading_sources source ON source.id=version.source_id
+      WHERE version.id=? AND version.user_id=? AND source.user_id=?
+    `).get(id, userId, userId) as ReadingSourceVersionRow | undefined;
+  }
+
+  getReadingVersionForSource(sourceId: string, userId: string, derivedKind: ReaderVersionKind): ReadingSourceVersionRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT * FROM reading_source_versions
+      WHERE source_id=? AND user_id=? AND derived_kind=? ORDER BY version_no DESC LIMIT 1
+    `).get(sourceId, userId, derivedKind) as ReadingSourceVersionRow | undefined;
+  }
+
+  listReadingVersionsForConversation(conversationId: string, userId: string): ReadingSourceVersionRow[] {
+    return this.sqlite.prepare(`
+      SELECT version.* FROM reading_source_versions version
+      JOIN files file ON file.id=version.file_id
+      JOIN conversations conversation ON conversation.id=file.conversation_id
+      WHERE file.conversation_id=? AND conversation.user_id=? AND version.user_id=?
+      ORDER BY version.created_at,version.id
+    `).all(conversationId, userId, userId) as ReadingSourceVersionRow[];
+  }
+
+  nextReadingVersionNo(sourceId: string): number {
+    const row = this.sqlite.prepare("SELECT COALESCE(MAX(version_no),0)+1 AS value FROM reading_source_versions WHERE source_id=?").get(sourceId) as { value: number };
+    return Number(row.value) || 1;
+  }
+
+  createReadingVersion(input: Omit<ReadingSourceVersionRow, "created_at" | "updated_at">): ReadingSourceVersionRow {
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO reading_source_versions(
+        id,source_id,user_id,file_id,version_no,derived_kind,source_sha256,source_bytes,parser_version,status,
+        normalized_root,manifest_json,last_accessed_at,storage_state,storage_generation,storage_revision,storage_manifest_json,storage_manifest_sha256,storage_archive_sha256,storage_archive_bytes,storage_plaintext_bytes,storage_uploaded_at,storage_verified_at,storage_restored_at,remote_drive_id,remote_path,local_isolated_path,last_error,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      input.id, input.source_id, input.user_id, input.file_id, input.version_no, input.derived_kind,
+      input.source_sha256, input.source_bytes, input.parser_version, input.status, input.normalized_root,
+      input.manifest_json, input.last_accessed_at, input.storage_state, input.storage_generation, input.storage_revision, input.storage_manifest_json, input.storage_manifest_sha256, input.storage_archive_sha256, input.storage_archive_bytes, input.storage_plaintext_bytes, input.storage_uploaded_at, input.storage_verified_at, input.storage_restored_at, input.remote_drive_id, input.remote_path,
+      input.local_isolated_path, input.last_error, now, now,
+    );
+    return this.getReadingVersion(input.id, input.user_id)!;
+  }
+
+  updateReadingVersion(id: string, userId: string, patch: Partial<Pick<ReadingSourceVersionRow, "status" | "normalized_root" | "manifest_json" | "last_accessed_at" | "storage_state" | "remote_drive_id" | "remote_path" | "local_isolated_path" | "last_error" | "source_sha256" | "parser_version">>): ReadingSourceVersionRow | undefined {
+    const current = this.getReadingVersion(id, userId);
+    if (!current) return undefined;
+    const next = { ...current, ...patch, updated_at: new Date().toISOString() };
+    this.sqlite.prepare(`
+      UPDATE reading_source_versions SET status=?,normalized_root=?,manifest_json=?,last_accessed_at=?,storage_state=?,
+        remote_drive_id=?,remote_path=?,local_isolated_path=?,last_error=?,source_sha256=?,parser_version=?,updated_at=?
+      WHERE id=? AND user_id=?
+    `).run(
+      next.status, next.normalized_root, next.manifest_json, next.last_accessed_at, next.storage_state,
+      next.remote_drive_id, next.remote_path, next.local_isolated_path, next.last_error, next.source_sha256,
+      next.parser_version, next.updated_at, id, userId,
+    );
+    return this.getReadingVersion(id, userId);
+  }
+
+  touchReadingVersion(id: string, userId: string): ReadingSourceVersionRow | undefined {
+    const now = new Date().toISOString();
+    this.sqlite.prepare("UPDATE reading_source_versions SET last_accessed_at=?,updated_at=? WHERE id=? AND user_id=?").run(now, now, id, userId);
+    return this.getReadingVersion(id, userId);
+  }
+
+  replaceReadingUnits(versionId: string, userId: string, units: Array<Omit<ReadingUnitRow, "created_at">>): void {
+    const version = this.getReadingVersion(versionId, userId);
+    if (!version) throw new Error("Reading version does not exist");
+    const now = new Date().toISOString();
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      this.sqlite.prepare("DELETE FROM reading_units WHERE version_id=?").run(versionId);
+      const insert = this.sqlite.prepare(`
+        INSERT INTO reading_units(id,version_id,ordinal,kind,href,title,media_type,content_path,byte_size,text_content,metadata_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+      for (const unit of units) insert.run(
+        unit.id, versionId, unit.ordinal, unit.kind, unit.href, unit.title, unit.media_type, unit.content_path,
+        unit.byte_size, unit.text_content, unit.metadata_json, now,
+      );
+      this.sqlite.exec("COMMIT");
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listReadingUnits(versionId: string, userId: string): ReadingUnitRow[] {
+    return this.sqlite.prepare(`
+      SELECT unit.* FROM reading_units unit
+      JOIN reading_source_versions version ON version.id=unit.version_id
+      WHERE unit.version_id=? AND version.user_id=? ORDER BY unit.ordinal
+    `).all(versionId, userId) as ReadingUnitRow[];
+  }
+
+  getReadingUnit(versionId: string, unitId: string, userId: string): ReadingUnitRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT unit.* FROM reading_units unit
+      JOIN reading_source_versions version ON version.id=unit.version_id
+      WHERE unit.version_id=? AND unit.id=? AND version.user_id=?
+    `).get(versionId, unitId, userId) as ReadingUnitRow | undefined;
+  }
+
+  getReadingProgress(versionId: string, userId: string): ReadingProgressRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM reading_progress WHERE version_id=? AND user_id=?").get(versionId, userId) as ReadingProgressRow | undefined;
+  }
+
+  saveReadingProgress(input: Omit<ReadingProgressRow, "updated_at">): ReadingProgressRow {
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO reading_progress(user_id,version_id,unit_id,position_json,updated_at) VALUES(?,?,?,?,?)
+      ON CONFLICT(user_id,version_id) DO UPDATE SET unit_id=excluded.unit_id,position_json=excluded.position_json,updated_at=excluded.updated_at
+    `).run(input.user_id, input.version_id, input.unit_id, input.position_json, now);
+    return this.getReadingProgress(input.version_id, input.user_id)!;
+  }
+
+  listReadingAnnotations(versionId: string, userId: string): ReadingAnnotationRow[] {
+    return this.sqlite.prepare(`
+      SELECT * FROM reading_annotations WHERE version_id=? AND user_id=? AND deleted_at IS NULL ORDER BY created_at,id
+    `).all(versionId, userId) as ReadingAnnotationRow[];
+  }
+
+  getReadingAnnotation(id: string, userId: string): ReadingAnnotationRow | undefined {
+    return this.sqlite.prepare("SELECT * FROM reading_annotations WHERE id=? AND user_id=? AND deleted_at IS NULL").get(id, userId) as ReadingAnnotationRow | undefined;
+  }
+
+  createReadingAnnotation(input: Omit<ReadingAnnotationRow, "created_at" | "updated_at" | "deleted_at">): ReadingAnnotationRow {
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      INSERT INTO reading_annotations(id,user_id,version_id,unit_id,type,quote_text,note_text,color,locator_json,created_at,updated_at,deleted_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)
+    `).run(input.id, input.user_id, input.version_id, input.unit_id, input.type, input.quote_text, input.note_text, input.color, input.locator_json, now, now);
+    return this.sqlite.prepare("SELECT * FROM reading_annotations WHERE id=? AND user_id=?").get(input.id, input.user_id) as ReadingAnnotationRow;
+  }
+
+  updateReadingAnnotation(id: string, userId: string, patch: Partial<Pick<ReadingAnnotationRow, "note_text" | "color" | "locator_json" | "quote_text" | "unit_id" | "type">>): ReadingAnnotationRow | undefined {
+    const current = this.sqlite.prepare("SELECT * FROM reading_annotations WHERE id=? AND user_id=? AND deleted_at IS NULL").get(id, userId) as ReadingAnnotationRow | undefined;
+    if (!current) return undefined;
+    const next = { ...current, ...patch, updated_at: new Date().toISOString() };
+    this.sqlite.prepare(`UPDATE reading_annotations SET unit_id=?,type=?,quote_text=?,note_text=?,color=?,locator_json=?,updated_at=? WHERE id=? AND user_id=? AND deleted_at IS NULL`)
+      .run(next.unit_id, next.type, next.quote_text, next.note_text, next.color, next.locator_json, next.updated_at, id, userId);
+    return this.sqlite.prepare("SELECT * FROM reading_annotations WHERE id=? AND user_id=?").get(id, userId) as ReadingAnnotationRow | undefined;
+  }
+
+  deleteReadingAnnotation(id: string, userId: string): boolean {
+    return this.sqlite.prepare("UPDATE reading_annotations SET deleted_at=?,updated_at=? WHERE id=? AND user_id=? AND deleted_at IS NULL")
+      .run(new Date().toISOString(), new Date().toISOString(), id, userId).changes > 0;
+  }
+
+  listColdReadingVersions(before: string): ReadingSourceVersionRow[] {
+    return this.sqlite.prepare(`
+      SELECT version.* FROM reading_source_versions version
+      JOIN reading_sources source ON source.id=version.source_id AND source.user_id=version.user_id AND source.file_id=version.file_id
+      JOIN files file ON file.id=version.file_id
+      JOIN conversations conversation ON conversation.id=file.conversation_id AND conversation.user_id=version.user_id
+      WHERE version.storage_state='local' AND version.last_accessed_at<? AND version.status='ready'
+        AND conversation.deleted_at IS NULL AND conversation.deletion_state='active'
+      ORDER BY version.last_accessed_at,version.id
+    `).all(before) as ReadingSourceVersionRow[];
   }
 
   getPublicFileShare(fileId: string): PublicFileShareRow | undefined {
