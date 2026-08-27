@@ -1,49 +1,42 @@
-/* Loaded with the paginated PDF/EPUB reader chunk.  Keep these rules out of
- * the initial application stylesheet so ordinary PPA visits do not pay for a
- * reader they never open. */
+/* Loaded with the paginated PDF/EPUB reader chunk.  Keeping this file lazy
+ * means ordinary HTML/Markdown visits do not pay for pagination styles. */
 .reader-document-shell { width: 100%; height: 100%; min-height: 0; position: relative; overflow: hidden; background: var(--canvas); color: var(--ink); }
-.reader-inline-error { position: absolute; z-index: 3; top: 52px; left: 50%; transform: translateX(-50%); padding: 6px 10px; border-radius: 8px; color: #9b3f4a; background: var(--paper); box-shadow: 0 3px 14px rgba(20,20,30,.12); font-size: 11px; }
-.reader-pdf-reader, .reader-epub-reader { width: 100%; height: 100%; min-height: 0; display: flex; flex-direction: column; }
-.reader-paginator { flex: 0 0 auto; min-height: 38px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 4px 10px; border-bottom: 1px solid var(--line); color: var(--muted); background: color-mix(in srgb, var(--canvas) 92%, var(--paper)); font-size: 11px; }
-.reader-paginator button { width: 29px; height: 29px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; color: var(--indigo); background: transparent; cursor: pointer; }
-.reader-paginator button:hover:not(:disabled) { background: var(--indigo-pale); }
-.reader-paginator button:disabled { opacity: .35; cursor: default; }
-.reader-pdf-track { flex: 1 1 auto; min-height: 0; display: flex; align-items: flex-start; gap: 24px; overflow: auto; padding: 24px max(24px, calc((100% - 900px) / 2)); scroll-snap-type: x mandatory; overscroll-behavior: contain; scroll-padding-inline: max(24px, calc((100% - 900px) / 2)); background: #e9eaf0; }
-.reader-pdf-page-slot { flex: 0 0 auto; min-width: 0; scroll-snap-align: center; }
-.reader-pdf-page { position: relative; min-height: 600px; overflow: hidden; background: #fff; box-shadow: 0 7px 24px rgba(18, 22, 40, .18); }
+.reader-inline-error { position: absolute; z-index: 3; top: 12px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 24px); padding: 6px 10px; border-radius: 8px; color: #9b3f4a; background: var(--paper); box-shadow: 0 3px 14px rgba(20,20,30,.12); font-size: 11px; }
+.reader-pdf-reader, .reader-epub-reader { width: 100%; height: 100%; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.reader-pdf-track { flex: 1 1 auto; min-height: 0; display: flex; align-items: flex-start; gap: max(12px, 2vw); overflow: auto; padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); scroll-snap-type: x mandatory; scroll-snap-stop: normal; scroll-padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)); overscroll-behavior: contain; background: var(--canvas); scrollbar-width: none; }
+.reader-pdf-track::-webkit-scrollbar, .reader-epub-page-viewport::-webkit-scrollbar { display: none; }
+.reader-pdf-page-slot { flex: 0 0 auto; min-width: 0; scroll-snap-align: center; contain: layout paint; }
+.reader-pdf-page { position: relative; min-height: 600px; overflow: hidden; background: #fff; }
+.reader-pdf-page.is-inactive { content-visibility: auto; contain-intrinsic-size: 980px 760px; }
 .reader-pdf-page > canvas { display: block; }
-.reader-pdf-text-layer {
-  --min-font-size: 1;
-  --text-scale-factor: calc(var(--total-scale-factor, 1) * var(--min-font-size));
-  --min-font-size-inv: calc(1 / var(--min-font-size));
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  line-height: 1;
-  letter-spacing: normal;
-  word-spacing: normal;
-  text-size-adjust: none;
-  forced-color-adjust: none;
-  transform-origin: 0 0;
-  caret-color: CanvasText;
-  z-index: 0;
-}
-.reader-pdf-text-layer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0% 0%; user-select: text; }
-.reader-pdf-text-layer > :not(.markedContent), .reader-pdf-text-layer .markedContent span:not(.markedContent) {
-  z-index: 1;
-  --font-height: 0;
-  font-size: calc(var(--text-scale-factor) * var(--font-height));
-  --scale-x: 1;
-  --rotate: 0deg;
-  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
-}
+.reader-pdf-text-layer { --min-font-size: 1; --text-scale-factor: calc(var(--total-scale-factor, 1) * var(--min-font-size)); --min-font-size-inv: calc(1 / var(--min-font-size)); position: absolute; inset: 0; overflow: hidden; line-height: 1; letter-spacing: normal; word-spacing: normal; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; z-index: 0; }
+.reader-pdf-text-layer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0% 0%; -webkit-user-select: text; user-select: text; }
+.reader-pdf-text-layer > :not(.markedContent), .reader-pdf-text-layer .markedContent span:not(.markedContent) { z-index: 1; --font-height: 0; font-size: calc(var(--text-scale-factor) * var(--font-height)); --scale-x: 1; --rotate: 0deg; transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
 .reader-pdf-text-layer .markedContent { display: contents; }
 .reader-pdf-text-layer span::selection { color: transparent; background: rgba(74, 99, 196, .28); }
 .reader-page-placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: #9095a6; background: #f7f7fa; }
-.reader-epub-track { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 20px; }
-.reader-epub-unit { width: min(900px, 100%); height: 100%; margin: 0 auto; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: var(--paper); box-shadow: 0 10px 28px rgba(18,22,40,.08); }
-.reader-epub-page-viewport { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; overscroll-behavior-x: contain; }
-.reader-epub-content { box-sizing: border-box; min-width: 100%; height: 100%; overflow: visible; column-width: min(820px, calc(100vw - 100px)); column-gap: 44px; column-fill: auto; padding: 38px 44px 54px; color: var(--ink); font-size: 16px; line-height: 1.72; }
+.reader-epub-track { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 0; }
+.reader-epub-unit { width: 100%; height: 100%; margin: 0; overflow: hidden; border: 0; border-radius: 0; background: var(--paper); box-shadow: none; }
+.reader-epub-page-viewport { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scroll-snap-stop: normal; overscroll-behavior-x: contain; scrollbar-width: none; }
+.reader-epub-content { box-sizing: border-box; min-width: 100%; height: 100%; overflow: visible; column-width: min(820px, calc(100% - 56px)); column-gap: 44px; column-fill: auto; padding: max(26px, env(safe-area-inset-top)) max(28px, env(safe-area-inset-right)) max(54px, env(safe-area-inset-bottom)) max(28px, env(safe-area-inset-left)); color: var(--ink); font-size: 16px; line-height: 1.72; }
 .reader-epub-content > * { break-inside: avoid; }
+.reader-epub-content, .reader-epub-content * { -webkit-user-select: text; user-select: text; }
+.reader-epub-content ::selection { background: rgba(92, 116, 220, .28); }
 .reader-epub-content img { max-width: 100%; height: auto; }
 .reader-epub-content a { color: var(--indigo); }
+.reader-reader-controls { position: absolute; z-index: 8; left: max(12px, env(safe-area-inset-left)); bottom: max(12px, env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--paper) 88%, transparent); box-shadow: 0 5px 18px rgba(18,22,40,.14); backdrop-filter: blur(8px); }
+.reader-reader-controls button { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; color: var(--indigo); background: transparent; cursor: pointer; }
+.reader-reader-controls button:hover:not(:disabled), .reader-reader-controls button:focus-visible { background: var(--indigo-pale); outline: 0; }
+.reader-reader-controls button:disabled { opacity: .35; cursor: default; }
+.reader-reader-controls-divider { width: 1px; height: 18px; margin: 0 2px; background: var(--line); }
+.reader-page-indicator { position: absolute; z-index: 8; right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); pointer-events: none; padding: 5px 9px; border: 1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius: 999px; color: var(--muted); background: color-mix(in srgb, var(--paper) 88%, transparent); box-shadow: 0 5px 18px rgba(18,22,40,.12); backdrop-filter: blur(8px); font-size: 11px; font-variant-numeric: tabular-nums; }
+.reader-document-shell > .reader-annotations { right: max(12px, env(safe-area-inset-right)); bottom: calc(max(12px, env(safe-area-inset-bottom)) + 44px); }
+.reader-document-shell .reader-local-highlight { color: inherit; }
+
+@media (max-width: 720px) {
+  .reader-pdf-track { gap: 10px; padding-inline: max(7px, env(safe-area-inset-left)) max(7px, env(safe-area-inset-right)); scroll-padding-inline: max(7px, env(safe-area-inset-left)) max(7px, env(safe-area-inset-right)); }
+  .reader-epub-content { column-width: calc(100% - 32px); column-gap: 24px; padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right)); font-size: 15px; }
+  .reader-reader-controls { left: max(7px, env(safe-area-inset-left)); bottom: max(7px, env(safe-area-inset-bottom)); }
+  .reader-page-indicator { right: max(7px, env(safe-area-inset-right)); bottom: max(7px, env(safe-area-inset-bottom)); }
+  .reader-document-shell > .reader-annotations { right: max(7px, env(safe-area-inset-right)); bottom: calc(max(7px, env(safe-area-inset-bottom)) + 43px); width: min(250px, calc(100% - 14px)); max-height: 31%; }
+}

@@ -26,6 +26,32 @@ test("reader format adapters keep HTML/Markdown vertical and PDF/EPUB paginated"
   assert.ok(readerCapabilities("epub").includes("nearby-prefetch"));
 });
 
+test("paginated reader uses a full-bleed viewport, a bottom page indicator, and bounded swipe work", () => {
+  const readerSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.tsx"), "utf8");
+  const readerStyles = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.css"), "utf8");
+  const annotationSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "annotation-dom.ts"), "utf8");
+  const selectionSource = fs.readFileSync(path.join(process.cwd(), "src", "reader-ask.tsx"), "utf8");
+  assert.doesNotMatch(readerSource, /className="reader-paginator"/);
+  assert.match(readerSource, /<ReaderPageIndicator label=\{`\$\{activePage\} \/ \$\{pageCount\}`\}/);
+  assert.match(readerSource, /<ReaderPageIndicator label=\{`\$\{page\} \/ \$\{pageCount\}`\}/);
+  assert.match(readerStyles, /\.reader-epub-unit \{[^}]*border: 0;[^}]*border-radius: 0;[^}]*box-shadow: none/);
+  assert.match(readerStyles, /\.reader-page-indicator \{[^}]*position: absolute;[^}]*right:/);
+  assert.match(readerStyles, /scroll-snap-stop: normal/);
+  assert.match(readerStyles, /-webkit-user-select: text/);
+  assert.doesNotMatch(readerStyles, /\.reader-(?:pdf-track|epub-page-viewport) \{[^}]*touch-action:/);
+  assert.match(readerSource, /Math\.abs\(page - activePage\) <= 2/);
+  assert.match(readerSource, /scrollFrameRef/);
+  assert.match(readerSource, /contentRef/);
+  assert.match(readerSource, /\[0, -1, 1, -2, 2\]/);
+  assert.match(annotationSource, /export function markReaderRange/);
+  assert.match(annotationSource, /export function selectReaderAnnotation/);
+  assert.match(annotationSource, /annotation\.type\);/);
+  assert.match(readerSource, /mark\.reader-local-highlight\[data-reader-annotation\]/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderAnnotations.tsx"), "utf8"), /reader-annotation-ask/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8"), /type: "highlight", quoteText: selection\.text,[\s\S]*color: "orange"/);
+  assert.match(selectionSource, /reader-selection-preview/);
+});
+
 test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial PPA payload", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const readerSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.tsx"), "utf8");

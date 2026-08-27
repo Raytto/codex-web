@@ -559,6 +559,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .reader-selection-tool { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; color: #fff; background: transparent; cursor: pointer; }
 .reader-selection-tool:hover { background: #383a42; }
 .reader-selection-action { z-index: 84; }
+.reader-selection-preview { position: fixed; z-index: 69; inset: 0; pointer-events: none; }
+.reader-selection-preview i { position: fixed; display: block; border-radius: 2px; background: rgba(92, 116, 220, .28); }
 .file-preview-back { position: relative; }
 .file-reader-ask-launcher { position: relative; width: 34px; height: 34px; display: inline-grid; place-items: center; padding: 0; border: 0; border-radius: 9px; color: var(--indigo); background: transparent; cursor: pointer; }
 .file-reader-ask-launcher > svg { width: 17px; height: 17px; }
@@ -855,17 +857,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-preview-state.error a { margin-top: 5px; padding: 9px 13px; border-radius: 10px; color: #fff; background: var(--indigo); text-decoration: none; font-size: 13px; font-weight: 700; }
 .reader-document-loading, .reader-document-error { width: min(520px, calc(100% - 32px)); height: 100%; margin: auto; display: grid; place-content: center; justify-items: center; gap: 9px; color: var(--muted); text-align: center; }
 .reader-document-error { color: #a13d49; }
-.reader-local-highlight { padding: 1px 0; border-radius: 2px; background: rgba(245, 207, 77, .52); }
+.reader-local-highlight { padding: 1px 0; border-radius: 2px; color: inherit; background: rgba(244, 151, 47, .42); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+.reader-local-highlight[data-reader-annotation-color="yellow"] { background: rgba(245, 207, 77, .52); }
+.reader-local-highlight[data-reader-annotation-color="green"] { background: rgba(92, 190, 124, .34); }
+.reader-local-highlight[data-reader-annotation-color="blue"] { background: rgba(93, 143, 224, .34); }
+.reader-local-highlight[data-reader-annotation-color="pink"] { background: rgba(224, 114, 164, .34); }
+.reader-local-highlight[data-reader-annotation-type="note"] { box-shadow: inset 0 -2px 0 rgba(218, 119, 35, .72); }
 .reader-annotations { position: absolute; z-index: 4; right: 14px; bottom: 14px; width: min(270px, calc(100% - 28px)); max-height: 34%; overflow-y: auto; padding: 9px 10px; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--paper) 94%, transparent); box-shadow: 0 8px 24px rgba(18,22,40,.14); backdrop-filter: blur(8px); }
 .reader-annotations-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--indigo); font-size: 11px; }
 .reader-annotations-heading span { min-width: 18px; padding: 1px 5px; border-radius: 999px; color: var(--muted); background: var(--canvas); font-size: 9px; text-align: center; }
+.reader-annotations-heading small { margin-left: auto; color: var(--muted); font-size: 9px; font-weight: 500; }
 .reader-annotation-item { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--line); }
+.reader-annotation-item.active { margin-inline: -4px; padding-inline: 4px; border-radius: 6px; background: color-mix(in srgb, var(--indigo-pale) 72%, transparent); }
 .reader-annotation-meta { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .reader-annotation-item span { color: var(--muted); font-size: 9px; }
+.reader-annotation-jump { min-width: 0; display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; font: inherit; font-size: 9px; }
+.reader-annotation-swatch { width: 9px; height: 9px; flex: 0 0 9px; display: inline-block; border-radius: 2px; background: rgba(244, 151, 47, .76); }
+.reader-annotation-swatch.note { border-radius: 50%; box-shadow: inset 0 -2px 0 rgba(173, 89, 26, .8); }
+.reader-annotation-jump:hover, .reader-annotation-jump:focus-visible { color: var(--indigo); background: var(--indigo-pale); outline: 0; }
+.reader-annotation-quote { width: 100%; margin: 2px 0; padding: 0; border: 0; color: var(--ink); background: transparent; cursor: pointer; font: inherit; font-size: 10px; line-height: 1.4; text-align: left; }
+.reader-annotation-quote:hover, .reader-annotation-quote:focus-visible { color: var(--indigo); outline: 0; }
 .reader-annotation-meta button { display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; }
 .reader-annotation-meta button:hover, .reader-annotation-meta button:focus-visible { color: #a13d49; background: var(--indigo-pale); outline: 0; }
+.reader-annotation-meta .reader-annotation-jump { width: auto; height: 24px; display: inline-flex; place-items: initial; align-items: center; }
+.reader-annotation-meta .reader-annotation-jump:hover, .reader-annotation-meta .reader-annotation-jump:focus-visible { color: var(--indigo); background: var(--indigo-pale); outline: 0; }
+.reader-annotation-meta .reader-annotation-ask { width: auto; height: 24px; display: inline-flex; align-items: center; justify-content: center; padding-inline: 5px; color: var(--indigo); font-size: 9px; }
+.reader-annotation-meta .reader-annotation-ask:hover, .reader-annotation-meta .reader-annotation-ask:focus-visible { color: var(--indigo); outline: 0; }
 .reader-annotation-item p { margin: 2px 0; color: var(--ink); font-size: 10px; line-height: 1.4; }
-.reader-annotation-item small { display: block; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.reader-annotation-item small.reader-annotation-note { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; line-height: 1.4; }
 .activity-card { width: min(680px, 100%); padding: 15px 16px 14px; border: 1px solid #d5d9e8; border-radius: 5px 14px 14px 14px; background: #f7f8fc; box-shadow: 0 7px 22px rgba(15, 17, 32, .045); }
 .wake-plan-card { width: min(720px, calc(100% - 48px)); display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin: 4px auto 18px; padding: 13px 14px; border: 1px solid #e1c98d; border-radius: 14px; color: #55451f; background: #fffaf0; box-shadow: 0 7px 22px rgba(91, 65, 13, .06); }
 .wake-plan-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; color: #8a6319; background: #f7e7bb; }

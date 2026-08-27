@@ -271,9 +271,19 @@ export function ReaderSelectionAction({ selection, onAsk, onHighlight, onNote }:
     {onHighlight && <button type="button" className="reader-selection-tool" title="标记" aria-label="标记选中文字" onClick={() => consumeSelection(() => onHighlight(selection))}><Highlighter size={14} /></button>}
     {onNote && <button type="button" className="reader-selection-tool" title="添加备注" aria-label="给选中文字添加备注" onClick={() => consumeSelection(() => onNote(selection))}><StickyNote size={14} /></button>}
   </div>;
+  // The native Range belongs to Safari. Moving focus to this portal can make
+  // WebKit temporarily hide its blue selection, even though the cloned range
+  // is still valid for Agent/highlight actions. Paint a non-interactive
+  // viewport snapshot until the action is consumed so the selected text never
+  // appears to vanish when the chip mounts.
+  const previewRects = (selection.rects ?? []).filter((rect) => Number.isFinite(rect.left) && Number.isFinite(rect.top) && Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 0 && rect.height > 0);
+  const preview = previewRects.length > 0 && <div className="reader-selection-preview" aria-hidden="true">
+    {previewRects.map((rect, index) => <i key={`${rect.left}:${rect.top}:${index}`} style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }} />)}
+  </div>;
   // Keep the floating control outside the reader's scrolling/selection DOM.
   // This prevents mounting the chip from becoming a WebKit selection boundary.
-  return typeof document === "undefined" ? action : createPortal(action, document.body);
+  if (typeof document === "undefined") return <>{preview}{action}</>;
+  return <>{preview && createPortal(preview, document.body)}{createPortal(action, document.body)}</>;
 }
 
 function readerDefaultSelection(options: AgentOptions): AgentSelection {

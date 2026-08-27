@@ -51,29 +51,30 @@ function matchingContainer(root: HTMLElement, annotation: ReaderAnnotation): Rea
   return candidates[0] ?? null;
 }
 
-function markRange(range: Range, annotationId: string): boolean {
+function normalizedAnnotationColor(value: string | null | undefined): string {
+  const color = String(value || "orange").trim().toLowerCase();
+  return ["orange", "yellow", "green", "blue", "pink"].includes(color) ? color : "orange";
+}
+
+function markRange(range: Range, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight"): boolean {
   const mark = document.createElement("mark");
   mark.className = "reader-local-highlight";
   mark.dataset.readerAnnotation = annotationId;
+  mark.dataset.readerAnnotationColor = normalizedAnnotationColor(color);
+  mark.dataset.readerAnnotationType = type;
   try {
     range.surroundContents(mark);
     return true;
   } catch {
-    // A quote crossing two inline elements cannot be surrounded as one DOM
-    // node. Extracting the fragment still preserves the publisher's text and
-    // gives the user a continuous visual mark.
-    try {
-      const fragment = range.extractContents();
-      mark.appendChild(fragment);
-      range.insertNode(mark);
-      return true;
-    } catch {
-      return false;
-    }
+    // A range crossing block/inline boundaries is handled by
+    // markReaderRange/findAndMark one text node at a time. Never extract a
+    // whole publisher element here: doing so can change EPUB flow or PDF.js
+    // hit-testing while the user is reading.
+    return false;
   }
 }
 
-function findAndMark(container: ReaderTextContainer, quote: string, annotationId: string): boolean {
+function findAndMark(container: ReaderTextContainer, quote: string, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight"): boolean {
   const nodes = textNodes(container);
   if (nodes.length === 0) return false;
   const direct = nodes.find((node) => node.data.includes(quote));
@@ -82,7 +83,7 @@ function findAndMark(container: ReaderTextContainer, quote: string, annotationId
     const range = document.createRange();
     range.setStart(direct, start);
     range.setEnd(direct, start + quote.length);
-    return markRange(range, annotationId);
+    return markRange(range, annotationId, color, type);
   }
 
   // PDF.js and rich HTML commonly split a sentence over several spans. Build
@@ -127,9 +128,108 @@ function findAndMark(container: ReaderTextContainer, quote: string, annotationId
     const range = document.createRange();
     range.setStart(node, from);
     range.setEnd(node, to);
-    marked = markRange(range, annotationId) || marked;
+    marked = markRange(range, annotationId, color, type) || marked;
   }
   return marked;
+}
+
+function textNodesInRange(range: Range): Text[] {
+  const root = range.commonAncestorContainer;
+  if (root.nodeType === Node.TEXT_NODE) return [root as Text];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const result: Text[] = [];
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    const text = node as Text;
+    if (!text.data || text.parentElement?.closest("script,style,textarea,[data-reader-annotation],.reader-annotations")) continue;
+    try {
+      if (range.intersectsNode(text)) result.push(text);
+    } catch {
+      // A renderer may replace a text node between selection and persistence.
+    }
+  }
+  return result;
+}
+
+function textBoundaryOffset(range: Range, node: Text, container: Node, offset: number): number | null {
+  if (container === node) return Math.max(0, Math.min(node.data.length, offset));
+  const nodeRange = document.createRange();
+  nodeRange.selectNodeContents(node);
+  try {
+    const relation = nodeRange.comparePoint(container, offset);
+    if (relation < 0) return 0;
+    if (relation > 0) return node.data.length;
+    const prefix = document.createRange();
+    prefix.setStart(node, 0);
+    prefix.setEnd(container, offset);
+    return Math.max(0, Math.min(node.data.length, prefix.toString().length));
+  } catch {
+    // If a renderer replaced the boundary while an async annotation request
+    // was in flight, leave this slice untouched instead of guessing a range.
+    return null;
+  }
+}
+
+/** Apply a just-created annotation to the live selection without extracting
+ * whole block elements.  Safari commonly returns a range spanning several
+ * PDF.js/EPUB inline nodes; wrapping each text slice preserves their layout. */
+export function markReaderRange(range: Range, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight"): boolean {
+  if (range.collapsed) return false;
+  // A one-text-node range can be wrapped directly. For every broader range,
+  // deliberately use text slices even when `surroundContents` happens to
+  // succeed: putting a `<mark>` around complete PDF.js spans or EPUB blocks
+  // can alter their flow and hit-testing.
+  if (range.startContainer === range.endContainer && range.startContainer.nodeType === Node.TEXT_NODE) {
+    try {
+      if (markRange(range.cloneRange(), annotationId, color, type)) return true;
+    } catch {
+      // Fall through to the per-text-node path below.
+    }
+  }
+  const slices = textNodesInRange(range).map((node) => ({
+    node,
+    from: textBoundaryOffset(range, node, range.startContainer, range.startOffset),
+    to: textBoundaryOffset(range, node, range.endContainer, range.endOffset),
+  })).filter((slice): slice is { node: Text; from: number; to: number } => slice.from !== null && slice.to !== null && slice.to > slice.from);
+  let marked = false;
+  // Wrap from the end so DOM mutations cannot invalidate the text nodes and
+  // offsets belonging to earlier slices in the same selection.
+  for (let index = slices.length - 1; index >= 0; index -= 1) {
+    const { node, from, to } = slices[index];
+    const slice = document.createRange();
+    slice.setStart(node, from);
+    slice.setEnd(node, to);
+    marked = markRange(slice, annotationId, color, type) || marked;
+  }
+  return marked;
+}
+
+/** Re-select an annotation's mounted text and bring it into view.  The native
+ * Range is intentionally used here so the browser's own selection handles and
+ * the existing Agent action remain available after a user taps a highlight. */
+export function selectReaderAnnotation(root: HTMLElement, annotationId: string): boolean {
+  if (typeof document === "undefined" || typeof window === "undefined") return false;
+  const escaped = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(annotationId)
+    : annotationId.replace(/[^A-Za-z0-9_-]/g, "\\$&");
+  let marks: HTMLElement[];
+  try {
+    marks = Array.from(root.querySelectorAll<HTMLElement>(`mark.reader-local-highlight[data-reader-annotation="${escaped}"]`));
+  } catch {
+    return false;
+  }
+  if (marks.length === 0) return false;
+  const first = marks[0];
+  const last = marks[marks.length - 1];
+  const range = document.createRange();
+  range.setStart(first, 0);
+  range.setEnd(last, last.childNodes.length);
+  const selection = window.getSelection();
+  if (!selection) return false;
+  selection.removeAllRanges();
+  selection.addRange(range);
+  if (typeof first.scrollIntoView === "function") first.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  return true;
 }
 
 /** Re-apply quote-backed highlights after a document is rendered.
@@ -146,10 +246,9 @@ export function applyReaderTextHighlights(root: HTMLElement, annotations: Reader
     for (const mark of Array.from(container.querySelectorAll<HTMLElement>("mark.reader-local-highlight"))) mark.replaceWith(...Array.from(mark.childNodes));
   }
   for (const annotation of annotations) {
-    if (annotation.type !== "highlight") continue;
     const quote = annotation.quote_text.trim();
     if (!quote) continue;
     const container = matchingContainer(root, annotation);
-    if (container) findAndMark(container, quote, annotation.id);
+    if (container) findAndMark(container, quote, annotation.id, annotation.color, annotation.type);
   }
 }

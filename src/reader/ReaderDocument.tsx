@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, LoaderCircle, Minus, Plus } from "lucide-react";
 import { api, BASE_PATH, type ReaderAnnotation, type ReaderManifest, type ReaderUnitResponse } from "../api";
 import { ReaderAnnotationPanel } from "./ReaderAnnotations";
-import { applyReaderTextHighlights } from "./annotation-dom";
+import { applyReaderTextHighlights, selectReaderAnnotation } from "./annotation-dom";
 import { createReaderPdfRangeTransport, READER_PDF_RANGE_BYTES } from "./pdf-range-transport";
 import "./ReaderDocument.css";
 
@@ -10,15 +10,26 @@ type ReaderDocumentProps = {
   manifest: ReaderManifest;
   annotations?: ReaderAnnotation[];
   onDeleteAnnotation?: (annotation: ReaderAnnotation) => void;
+  onSelectAnnotation?: (annotation: ReaderAnnotation) => void;
+  onAskAnnotation?: (annotation: ReaderAnnotation) => void;
 };
 
 function endpoint(path: string): string { return path.startsWith("http") ? path : `${BASE_PATH}${path}`; }
 
+function ReaderPageIndicator({ label, ariaLabel }: { label: string; ariaLabel?: string }) {
+  return <div className="reader-page-indicator" aria-live="polite" aria-label={ariaLabel ?? label}>{label}</div>;
+}
+
 function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf: import("pdfjs-dist").PDFDocumentProxy; pageNumber: number; scale: number; maxWidth: number; active: boolean; onRendered?: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ width: 760, height: 980 });
+  const measuredRef = useRef(false);
+  const measuredScaleRef = useRef(scale);
+  const measuredMaxWidthRef = useRef(maxWidth);
+  const fallbackWidth = Math.max(180, Math.min(612, maxWidth)) * scale;
+  const [size, setSize] = useState(() => ({ width: fallbackWidth, height: fallbackWidth * 792 / 612 }));
   useEffect(() => {
+    if (measuredScaleRef.current !== scale || measuredMaxWidthRef.current !== maxWidth) measuredRef.current = false;
     if (!active) {
       // Drop the canvas/text layer when a page leaves the bounded render
       // window.  Keeping old canvases would make a long PDF consume memory
@@ -26,6 +37,10 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
       // meant to be live.
       if (canvasRef.current) { canvasRef.current.width = 0; canvasRef.current.height = 0; }
       textRef.current?.replaceChildren();
+      if (!measuredRef.current) {
+        const width = Math.max(180, Math.min(612, maxWidth)) * scale;
+        setSize((current) => current.width === width ? current : { width, height: width * 792 / 612 });
+      }
       return;
     }
     let cancelled = false;
@@ -54,6 +69,9 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
         const canvas = canvasRef.current;
         const textContainer = textRef.current;
         if (!canvas || !textContainer) { cleanupPage(); return; }
+        measuredRef.current = true;
+        measuredScaleRef.current = scale;
+        measuredMaxWidthRef.current = maxWidth;
         // pdfjs-dist's display TextLayer deliberately leaves the page scale
         // to the host stylesheet. Without this variable its generated
         // `calc(var(--total-scale-factor) * ...)` dimensions/font sizes are
@@ -95,7 +113,7 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
       else cleanupPage();
     };
   }, [active, maxWidth, onRendered, pageNumber, pdf, scale]);
-  return <article className="reader-pdf-page" data-reader-page={pageNumber} style={{ width: size.width, minHeight: size.height }} aria-label={`第 ${pageNumber} 页`}>
+  return <article className={`reader-pdf-page${active ? "" : " is-inactive"}`} data-reader-page={pageNumber} style={{ width: size.width, minHeight: size.height }} aria-label={`第 ${pageNumber} 页`} aria-hidden={!active}>
     <canvas ref={canvasRef} aria-hidden="true" />
     <div ref={textRef} className="reader-pdf-text-layer textLayer file-reader-document" data-reader-page={pageNumber} />
     {!active && <div className="reader-page-placeholder"><LoaderCircle className="spin" size={18} /></div>}
@@ -113,6 +131,12 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
   const progressReadyRef = useRef(false);
   const positionedVersionRef = useRef<string | null>(null);
   const [progressReady, setProgressReady] = useState(false);
+  const scrollFrameRef = useRef<number | null>(null);
+  const activePageRef = useRef(activePage);
+  useEffect(() => { activePageRef.current = activePage; }, [activePage]);
+  useEffect(() => () => {
+    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
   useEffect(() => {
     const track = trackRef.current;
     if (!track) return;
@@ -133,6 +157,7 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
   }, [pdf]);
   useEffect(() => {
     positionedVersionRef.current = null;
+    activePageRef.current = 1;
     setActivePage(1);
     setPageCount(0);
     setPdf(null);
@@ -232,38 +257,64 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
     const track = trackRef.current;
     if (!track || pageCount === 0) return;
     const center = track.scrollLeft + track.clientWidth / 2;
-    let nearest = 1; let distance = Infinity;
-    for (const element of Array.from(track.children)) {
-      const page = Number((element as HTMLElement).dataset.readerPage || 0);
-      if (!page) continue;
-      const middle = (element as HTMLElement).offsetLeft + (element as HTMLElement).offsetWidth / 2;
-      const nextDistance = Math.abs(middle - center);
-      if (nextDistance < distance) { distance = nextDistance; nearest = page; }
+    const children = track.children;
+    // Page slots stay in document order, so a binary search avoids walking
+    // every placeholder on each scroll frame in a thousand-page PDF.
+    let low = 0;
+    let high = children.length - 1;
+    while (low <= high) {
+      const middleIndex = (low + high) >> 1;
+      const element = children.item(middleIndex) as HTMLElement | null;
+      if (!element) break;
+      const middle = element.offsetLeft + element.offsetWidth / 2;
+      if (middle < center) low = middleIndex + 1;
+      else high = middleIndex - 1;
     }
-    setActivePage(nearest);
+    let nearest = 1;
+    let distance = Infinity;
+    for (const index of [Math.max(0, high), Math.min(children.length - 1, low)]) {
+      const element = children.item(index) as HTMLElement | null;
+      if (!element) continue;
+      const page = Number(element.dataset.readerPage || 0);
+      const nextDistance = Math.abs(element.offsetLeft + element.offsetWidth / 2 - center);
+      if (page && nextDistance < distance) { distance = nextDistance; nearest = page; }
+    }
+    if (nearest !== activePageRef.current) {
+      activePageRef.current = nearest;
+      setActivePage(nearest);
+    }
   }, [pageCount]);
+  const scheduleActivePageUpdate = useCallback(() => {
+    if (scrollFrameRef.current !== null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      updateActivePage();
+    });
+  }, [updateActivePage]);
   const jump = (delta: number) => {
     const next = Math.max(1, Math.min(pageCount, activePage + delta));
     const target = trackRef.current?.querySelector<HTMLElement>(`[data-reader-page="${next}"]`);
     target?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    activePageRef.current = next;
     setActivePage(next);
   };
   if (error) return <div className="reader-document-error">{error}</div>;
   if (!pdf) return <div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在按需加载 PDF…</div>;
   return <div className="reader-pdf-reader">
-    <div className="reader-paginator" role="toolbar" aria-label="PDF 分页控制">
-      <button type="button" disabled={activePage <= 1} onClick={() => jump(-1)} title="上一页"><ChevronLeft size={16} /></button>
-      <span>{activePage} / {pageCount}</span>
-      <button type="button" disabled={activePage >= pageCount} onClick={() => jump(1)} title="下一页"><ChevronRight size={16} /></button>
-      <button type="button" onClick={() => setScale((value) => Math.max(.6, value - .1))} title="缩小"><Minus size={15} /></button>
-      <button type="button" onClick={() => setScale((value) => Math.min(2, value + .1))} title="放大"><Plus size={15} /></button>
-    </div>
-    <div ref={trackRef} className="reader-pdf-track" onScroll={updateActivePage}>
+    <div ref={trackRef} className="reader-pdf-track" onScroll={scheduleActivePageUpdate}>
       {Array.from({ length: pageCount }, (_, index) => {
         const page = index + 1;
         return <div className="reader-pdf-page-slot" data-reader-page={page} key={page}><PdfPage pdf={pdf} pageNumber={page} scale={scale} maxWidth={pageMaxWidth} active={Math.abs(page - activePage) <= 2} onRendered={onPageRendered} /></div>;
       })}
     </div>
+    <div className="reader-reader-controls" role="toolbar" aria-label="PDF 阅读控制">
+      <button type="button" disabled={activePage <= 1} onClick={() => jump(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={16} /></button>
+      <button type="button" disabled={activePage >= pageCount} onClick={() => jump(1)} title="下一页" aria-label="下一页"><ChevronRight size={16} /></button>
+      <span className="reader-reader-controls-divider" aria-hidden="true" />
+      <button type="button" onClick={() => setScale((value) => Math.max(.6, value - .1))} title="缩小" aria-label="缩小"><Minus size={15} /></button>
+      <button type="button" onClick={() => setScale((value) => Math.min(2, value + .1))} title="放大" aria-label="放大"><Plus size={15} /></button>
+    </div>
+    <ReaderPageIndicator label={`${activePage} / ${pageCount}`} ariaLabel={`第 ${activePage} 页，共 ${pageCount} 页`} />
   </div>;
 }
 
@@ -277,6 +328,8 @@ function EpubUnit({ unit, content, active, initialScrollLeft = 0, onPageCount, o
   onRendered?: () => void;
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const scrollFrameRef = useRef<number | null>(null);
   const update = useCallback(() => {
     const node = viewportRef.current;
     if (!node) return;
@@ -285,6 +338,13 @@ function EpubUnit({ unit, content, active, initialScrollLeft = 0, onPageCount, o
     onPageCount?.(pageCount);
     onPosition?.(node.scrollLeft, pageCount, page);
   }, [onPageCount, onPosition]);
+  const scheduleUpdate = useCallback(() => {
+    if (scrollFrameRef.current !== null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      update();
+    });
+  }, [update]);
   useEffect(() => {
     if (!active) return;
     const node = viewportRef.current;
@@ -296,13 +356,19 @@ function EpubUnit({ unit, content, active, initialScrollLeft = 0, onPageCount, o
     update();
     let frame: number | null = null;
     if (content !== undefined) frame = window.requestAnimationFrame(() => onRendered?.());
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleUpdate);
     observer?.observe(node);
-    return () => { if (frame !== null) window.cancelAnimationFrame(frame); observer?.disconnect(); };
-  }, [active, content, initialScrollLeft, onRendered, unit.id, update]);
+    if (contentRef.current) observer?.observe(contentRef.current);
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    };
+  }, [active, content, initialScrollLeft, onRendered, scheduleUpdate, unit.id, update]);
   return <article className="reader-epub-unit" data-reader-unit={unit.id} aria-label={unit.title || `第 ${unit.ordinal + 1} 节`}>
-    <div ref={viewportRef} className="reader-epub-page-viewport" onScroll={update}>
-      {content === undefined ? <div className="reader-document-loading"><LoaderCircle className="spin" size={18} />正在加载附近内容…</div> : <div className="reader-epub-content file-reader-document" dangerouslySetInnerHTML={{ __html: content }} />}
+    <div ref={viewportRef} className="reader-epub-page-viewport" onScroll={scheduleUpdate}>
+      {content === undefined ? <div className="reader-document-loading"><LoaderCircle className="spin" size={18} />正在加载附近内容…</div> : <div ref={contentRef} className="reader-epub-content file-reader-document" dangerouslySetInnerHTML={{ __html: content }} />}
     </div>
   </article>;
 }
@@ -374,7 +440,11 @@ function EpubReader({ manifest, onUnitRendered }: { manifest: ReaderManifest; on
   useEffect(() => {
     if (manifest.version.status !== "ready") return;
     setError("");
-    const wanted = manifest.units.slice(Math.max(0, current - 2), Math.min(manifest.units.length, current + 3));
+    // Request the visible chapter first, then fan out to its four neighbours.
+    // A slow prefetch must never delay the chapter the user just opened.
+    const wanted = [0, -1, 1, -2, 2]
+      .map((offset) => manifest.units[current + offset])
+      .filter((candidate): candidate is ReaderManifest["units"][number] => Boolean(candidate));
     const generation = ++loadGenerationRef.current;
     const controller = new AbortController();
     // Prune immediately, rather than waiting for an asynchronous unit
@@ -406,22 +476,23 @@ function EpubReader({ manifest, onUnitRendered }: { manifest: ReaderManifest; on
   if (manifest.version.status === "failed") return <div className="reader-document-error">{manifest.version.error || "EPUB 解析失败。"}</div>;
   if (!unit) return <div className="reader-document-error">EPUB 没有可显示的章节。</div>;
   return <div className="reader-epub-reader">
-    <div className="reader-paginator" role="toolbar" aria-label="EPUB 章节控制">
-      <button type="button" disabled={current <= 0} onClick={() => { setCurrent((value) => Math.max(0, value - 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }}><ChevronLeft size={16} /></button>
-      <span>{current + 1} / {manifest.units.length} · {page} / {pageCount}{unit.title ? ` · ${unit.title}` : ""}</span>
-      <button type="button" disabled={current >= manifest.units.length - 1} onClick={() => { setCurrent((value) => Math.min(manifest.units.length - 1, value + 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }}><ChevronRight size={16} /></button>
-    </div>
     {error && <div className="reader-inline-error" role="alert">{error}</div>}
     <div className="reader-epub-track">
       <EpubUnit unit={unit} content={units[unit.id]?.content} active initialScrollLeft={initialScrollLeft} onPosition={handlePosition} onRendered={onUnitRendered} />
     </div>
+    <div className="reader-reader-controls" role="toolbar" aria-label="EPUB 章节控制">
+      <button type="button" disabled={current <= 0} onClick={() => { setCurrent((value) => Math.max(0, value - 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }} title="上一章" aria-label="上一章"><ChevronLeft size={16} /></button>
+      <button type="button" disabled={current >= manifest.units.length - 1} onClick={() => { setCurrent((value) => Math.min(manifest.units.length - 1, value + 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }} title="下一章" aria-label="下一章"><ChevronRight size={16} /></button>
+    </div>
+    <ReaderPageIndicator label={`${page} / ${pageCount}`} ariaLabel={`第 ${current + 1} 个章节，第 ${page} 页，共 ${pageCount} 页${unit.title ? `，${unit.title}` : ""}`} />
   </div>;
 }
 
-export function ReaderDocument({ manifest, annotations, onDeleteAnnotation }: ReaderDocumentProps) {
+export function ReaderDocument({ manifest, annotations, onDeleteAnnotation, onSelectAnnotation, onAskAnnotation }: ReaderDocumentProps) {
   const [liveManifest, setLiveManifest] = useState(manifest);
   const [loadedAnnotations, setLoadedAnnotations] = useState<ReaderAnnotation[]>([]);
   const [renderRevision, setRenderRevision] = useState(0);
+  const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
   const readerRootRef = useRef<HTMLDivElement>(null);
   const notifyRendered = useCallback(() => setRenderRevision((value) => value + 1), []);
   useEffect(() => setLiveManifest(manifest), [manifest]);
@@ -450,6 +521,39 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation }: Re
     return () => controller.abort();
   }, [annotations, liveManifest.version.id]);
   const visibleAnnotations = annotations ?? loadedAnnotations;
+  const focusAnnotation = useCallback((annotation: ReaderAnnotation) => {
+    setActiveAnnotationId(annotation.id);
+    const root = readerRootRef.current;
+    if (!root) { onSelectAnnotation?.(annotation); return; }
+    const focus = () => {
+      // Most marks are already mounted in the bounded reader window. Only
+      // delegate to the outer shell when this annotation is currently
+      // outside that window; this avoids replacing the same native Range
+      // twice and leaves room for future page/unit navigation there.
+      if (!selectReaderAnnotation(root, annotation.id)) onSelectAnnotation?.(annotation);
+    };
+    if (typeof window !== "undefined") window.requestAnimationFrame(focus);
+  }, [onSelectAnnotation]);
+  useEffect(() => {
+    const root = readerRootRef.current;
+    if (!root) return;
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const mark = target.closest<HTMLElement>("mark.reader-local-highlight[data-reader-annotation]");
+      if (!mark || !root.contains(mark)) return;
+      const annotationId = mark.dataset.readerAnnotation;
+      if (!annotationId) return;
+      const annotation = visibleAnnotations.find((item) => item.id === annotationId);
+      if (annotation) focusAnnotation(annotation);
+      else selectReaderAnnotation(root, annotationId);
+    };
+    root.addEventListener("click", handleClick);
+    return () => root.removeEventListener("click", handleClick);
+  }, [focusAnnotation, visibleAnnotations]);
+  useEffect(() => {
+    if (activeAnnotationId && !visibleAnnotations.some((annotation) => annotation.id === activeAnnotationId)) setActiveAnnotationId(null);
+  }, [activeAnnotationId, visibleAnnotations]);
   useEffect(() => {
     const root = readerRootRef.current;
     if (!root) return;
@@ -461,6 +565,6 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation }: Re
   }, [liveManifest.version.id, renderRevision, visibleAnnotations]);
   return <div ref={readerRootRef} className="reader-document-shell" data-reader-format={liveManifest.source.format}>
     {liveManifest.source.format === "pdf" ? <PdfReader manifest={liveManifest} onPageRendered={notifyRendered} /> : <EpubReader manifest={liveManifest} onUnitRendered={notifyRendered} />}
-    <ReaderAnnotationPanel annotations={visibleAnnotations} onDelete={onDeleteAnnotation} />
+    <ReaderAnnotationPanel annotations={visibleAnnotations} onDelete={onDeleteAnnotation} onSelect={focusAnnotation} onAsk={onAskAnnotation} activeAnnotationId={activeAnnotationId} />
   </div>;
 }

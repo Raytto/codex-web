@@ -38,7 +38,7 @@ import { DisplaySettingsDialog } from "./display-settings-dialog";
 import { ProjectSkillsDialog } from "./project-skills-dialog";
 import { ReaderAskBubble, ReaderSelectionAction, useReaderSelection } from "./reader-ask";
 import { ReaderAnnotationPanel } from "./reader/ReaderAnnotations";
-import { applyReaderTextHighlights } from "./reader/annotation-dom";
+import { applyReaderTextHighlights, markReaderRange, selectReaderAnnotation } from "./reader/annotation-dom";
 import type { ReaderSelection } from "./reader-ask";
 import { FileReaderLayout, preparedReaderDocument, useOutlineState } from "./reader/LegacyReader";
 import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
@@ -425,24 +425,50 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     setAskClosing(false); setAskOpen(true);
   }
 
+  function askReaderAnnotation(annotation: ReaderAnnotation) {
+    if (askCloseTimerRef.current !== null) window.clearTimeout(askCloseTimerRef.current);
+    // An annotation can be in a pruned/off-screen PDF page or EPUB unit. The
+    // quote is still a complete, durable Agent context even when its DOM mark
+    // is not currently mounted, so asking from the panel must not depend on a
+    // successful visual re-selection.
+    setAskSelection(null);
+    setAskQuote(normalizeAskAgentSelection(annotation.quote_text).slice(0, ASK_AGENT_SELECTION_MAX_CHARS + 1));
+    setAskClosing(false); setAskOpen(true);
+  }
+
+  function clearReaderSelectionIfUnchanged(selection: ReaderSelection): void {
+    const current = window.getSelection();
+    if (!current || current.rangeCount === 0) return;
+    // The annotation request is asynchronous. Do not clear a newer selection
+    // the user made while the save was in flight; compare the cloned range's
+    // boundary nodes/offsets before touching Safari's native selection.
+    if (selection.range) {
+      try {
+        const live = current.getRangeAt(0);
+        const saved = selection.range;
+        const sameRange = live.startContainer === saved.startContainer
+          && live.startOffset === saved.startOffset
+          && live.endContainer === saved.endContainer
+          && live.endOffset === saved.endOffset;
+        if (!sameRange) return;
+      } catch { return; }
+    } else if (normalizeAskAgentSelection(current.toString()) !== normalizeAskAgentSelection(selection.text)) return;
+    current.removeAllRanges();
+  }
+
   function applyReaderHighlight(selection: ReaderSelection): void {
     if (!readerManifest) return;
     void (async () => {
       try {
         const result = await api.createReaderAnnotation(readerManifest.version.id, {
           unitId: selection.unitId ?? null, type: "highlight", quoteText: selection.text,
-          noteText: null, color: "yellow", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+          noteText: null, color: "orange", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
         });
         setReaderAnnotations((current) => [...current, result.annotation]);
         const range = selection.range;
         if (range && !range.collapsed) {
-          try {
-            const mark = document.createElement("mark");
-            mark.className = "reader-local-highlight";
-            mark.dataset.readerAnnotation = result.annotation.id;
-            range.surroundContents(mark);
-            window.getSelection()?.removeAllRanges();
-          } catch { /* Cross-block selections remain durable even if DOM wrapping is impossible. */ }
+          markReaderRange(range, result.annotation.id, result.annotation.color, result.annotation.type);
+          clearReaderSelectionIfUnchanged(selection);
         }
       } catch (reason) { window.alert(reason instanceof Error ? reason.message : "保存标记失败。"); }
     })();
@@ -454,8 +480,19 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     if (note === null || !note.trim()) return;
     void api.createReaderAnnotation(readerManifest.version.id, {
       unitId: selection.unitId ?? null, type: "note", quoteText: selection.text,
-      noteText: note, color: "yellow", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
-    }).then((result) => setReaderAnnotations((current) => [...current, result.annotation])).catch((reason) => window.alert(reason instanceof Error ? reason.message : "保存备注失败。"));
+      noteText: note, color: "orange", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+    }).then((result) => {
+      setReaderAnnotations((current) => [...current, result.annotation]);
+      if (selection.range && !selection.range.collapsed) {
+        markReaderRange(selection.range, result.annotation.id, result.annotation.color, result.annotation.type);
+        clearReaderSelectionIfUnchanged(selection);
+      }
+    }).catch((reason) => window.alert(reason instanceof Error ? reason.message : "保存备注失败。"));
+  }
+
+  function focusReaderAnnotation(annotation: ReaderAnnotation): void {
+    const root = readerBodyRef.current;
+    if (root) selectReaderAnnotation(root, annotation.id);
   }
 
   function deleteReaderAnnotation(annotation: ReaderAnnotation): void {
@@ -584,9 +621,9 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     <section ref={readerBodyRef} className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
-      {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} /></Suspense>}
+      {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
       {!loading && !error && readerManifest && content !== null && file && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
-      {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} />}
+      {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} onSelect={focusReaderAnnotation} onAsk={askReaderAnnotation} />}
       <ReaderSelectionLayer rootRef={readerBodyRef} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onNote={applyReaderNote} />
       {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file ? `${file.original_name}${askSelection?.page ? ` · 第 ${askSelection.page} 页` : ""}` : undefined} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
     </section>
