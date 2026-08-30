@@ -5,7 +5,7 @@
 .reader-pdf-reader, .reader-epub-reader { width: 100%; height: 100%; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .reader-pdf-track { flex: 1 1 auto; min-height: 0; display: flex; align-items: flex-start; gap: max(12px, 2vw); overflow: auto; padding: max(8px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); scroll-snap-type: x mandatory; scroll-snap-stop: normal; scroll-padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right)); overscroll-behavior: contain; background: var(--canvas); scrollbar-width: none; }
 .reader-pdf-track::-webkit-scrollbar, .reader-epub-page-viewport::-webkit-scrollbar { display: none; }
-.reader-pdf-page-slot { flex: 0 0 auto; min-width: 0; scroll-snap-align: center; contain: layout paint; }
+.reader-pdf-page-slot { flex: 0 0 auto; width: 100%; min-width: 100%; display: flex; justify-content: center; scroll-snap-align: start; contain: layout paint; }
 .reader-pdf-page { position: relative; min-height: 600px; overflow: hidden; background: #fff; }
 .reader-pdf-page.is-inactive { content-visibility: auto; contain-intrinsic-size: 980px 760px; }
 .reader-pdf-page > canvas { display: block; }
@@ -18,8 +18,13 @@
 .reader-epub-track { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 0; }
 .reader-epub-unit { width: 100%; height: 100%; margin: 0; overflow: hidden; border: 0; border-radius: 0; background: var(--paper); box-shadow: none; }
 .reader-epub-page-viewport { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scroll-snap-stop: normal; overscroll-behavior-x: contain; scrollbar-width: none; }
-.reader-epub-content { box-sizing: border-box; min-width: 100%; height: 100%; overflow: visible; column-width: min(820px, calc(100% - 56px)); column-gap: 44px; column-fill: auto; padding: max(26px, env(safe-area-inset-top)) max(28px, env(safe-area-inset-right)) max(54px, env(safe-area-inset-bottom)) max(28px, env(safe-area-inset-left)); color: var(--ink); font-size: 16px; line-height: 1.72; }
-.reader-epub-content > * { break-inside: avoid; }
+.reader-epub-content { --reader-epub-scale: 1; box-sizing: border-box; min-width: 100%; height: 100%; overflow: visible; column-width: min(820px, calc(100vw - 56px)); column-gap: 44px; column-fill: auto; padding: max(26px, env(safe-area-inset-top)) max(28px, env(safe-area-inset-right)) max(54px, env(safe-area-inset-bottom)) max(28px, env(safe-area-inset-left)); color: var(--ink); font-size: calc(16px * var(--reader-epub-scale)); line-height: 1.72; }
+/* A normalized EPUB often wraps an entire chapter in one <header>/<section>.
+ * Keeping that outer wrapper unbreakable makes a long chapter overflow its
+ * fixed column and appear as one clipped page. Let flow containers split;
+ * keep only atomic reading units together. */
+.reader-epub-content > * { break-inside: auto; }
+.reader-epub-content :is(h1, h2, h3, h4, h5, h6, p, li, figure, table, blockquote, pre) { break-inside: avoid; }
 .reader-epub-content, .reader-epub-content * { -webkit-user-select: text; user-select: text; }
 .reader-epub-content ::selection { background: rgba(92, 116, 220, .28); }
 .reader-epub-content img { max-width: 100%; height: auto; }
@@ -28,6 +33,8 @@
 .reader-reader-controls button { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; color: var(--indigo); background: transparent; cursor: pointer; }
 .reader-reader-controls button:hover:not(:disabled), .reader-reader-controls button:focus-visible { background: var(--indigo-pale); outline: 0; }
 .reader-reader-controls button:disabled { opacity: .35; cursor: default; }
+.reader-epub-chapter-select { max-width: min(180px, 32vw); height: 30px; padding: 0 22px 0 8px; border: 0; border-radius: 8px; color: var(--ink-soft); background: transparent; font: inherit; font-size: 11px; }
+.reader-epub-chapter-select:focus-visible { outline: 2px solid var(--indigo); outline-offset: 1px; }
 .reader-reader-controls-divider { width: 1px; height: 18px; margin: 0 2px; background: var(--line); }
 .reader-page-indicator { position: absolute; z-index: 8; right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); pointer-events: none; padding: 5px 9px; border: 1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius: 999px; color: var(--muted); background: color-mix(in srgb, var(--paper) 88%, transparent); box-shadow: 0 5px 18px rgba(18,22,40,.12); backdrop-filter: blur(8px); font-size: 11px; font-variant-numeric: tabular-nums; }
 .reader-document-shell > .reader-annotations { right: max(12px, env(safe-area-inset-right)); bottom: calc(max(12px, env(safe-area-inset-bottom)) + 44px); }
@@ -35,7 +42,8 @@
 
 @media (max-width: 720px) {
   .reader-pdf-track { gap: 10px; padding-inline: max(7px, env(safe-area-inset-left)) max(7px, env(safe-area-inset-right)); scroll-padding-inline: max(7px, env(safe-area-inset-left)) max(7px, env(safe-area-inset-right)); }
-  .reader-epub-content { column-width: calc(100% - 32px); column-gap: 24px; padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right)); font-size: 15px; }
+  .reader-epub-content { column-width: calc(100vw - 32px); column-gap: 24px; padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right)); font-size: calc(15px * var(--reader-epub-scale)); }
+  .reader-epub-chapter-select { max-width: min(132px, 34vw); padding-inline: 5px 18px; font-size: 10px; }
   .reader-reader-controls { left: max(7px, env(safe-area-inset-left)); bottom: max(7px, env(safe-area-inset-bottom)); }
   .reader-page-indicator { right: max(7px, env(safe-area-inset-right)); bottom: max(7px, env(safe-area-inset-bottom)); }
   .reader-document-shell > .reader-annotations { right: max(7px, env(safe-area-inset-right)); bottom: calc(max(7px, env(safe-area-inset-bottom)) + 43px); width: min(250px, calc(100% - 14px)); max-height: 31%; }

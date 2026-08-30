@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { ChevronLeft, ChevronRight, LoaderCircle, Minus, Plus } from "lucide-react";
 import { api, BASE_PATH, type ReaderAnnotation, type ReaderManifest, type ReaderUnitResponse } from "../api";
-import { ReaderAnnotationPanel } from "./ReaderAnnotations";
+import { ReaderAnnotationPanel, type ReaderAnnotationAnchor } from "./ReaderAnnotations";
 import { applyReaderTextHighlights, selectReaderAnnotation } from "./annotation-dom";
 import { createReaderPdfRangeTransport, READER_PDF_RANGE_BYTES } from "./pdf-range-transport";
+import { ensurePdfJsCompatibility, shouldDisablePdfFontFace } from "./pdf-compat";
+import { readPdfTextContent } from "./pdf-text-content";
 import "./ReaderDocument.css";
 
 type ReaderDocumentProps = {
@@ -55,7 +57,8 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
     };
     void (async () => {
       try {
-        const module = await import("pdfjs-dist");
+        ensurePdfJsCompatibility();
+        const module = await import("pdfjs-dist/legacy/build/pdf.mjs");
         page = await pdf.getPage(pageNumber);
         if (cancelled) { cleanupPage(); return; }
         const base = page.getViewport({ scale: 1 });
@@ -86,7 +89,7 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
         const context = canvas.getContext("2d", { alpha: false });
         if (!context) { cleanupPage(); return; }
         renderTask = page.render({ canvasContext: context, canvas, viewport, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined });
-        const textContent = await page.getTextContent();
+        const textContent = await readPdfTextContent(page);
         if (cancelled) { renderTask.cancel(); await renderTask.promise.catch(() => undefined); cleanupPage(); return; }
         textContainer.replaceChildren();
         textLayer = new module.TextLayer({ textContentSource: textContent, container: textContainer, viewport });
@@ -115,7 +118,7 @@ function PdfPage({ pdf, pageNumber, scale, maxWidth, active, onRendered }: { pdf
   }, [active, maxWidth, onRendered, pageNumber, pdf, scale]);
   return <article className={`reader-pdf-page${active ? "" : " is-inactive"}`} data-reader-page={pageNumber} style={{ width: size.width, minHeight: size.height }} aria-label={`第 ${pageNumber} 页`} aria-hidden={!active}>
     <canvas ref={canvasRef} aria-hidden="true" />
-    <div ref={textRef} className="reader-pdf-text-layer textLayer file-reader-document" data-reader-page={pageNumber} />
+    <div ref={textRef} className="reader-pdf-text-layer textLayer file-reader-document reader-text-container" data-reader-page={pageNumber} />
     {!active && <div className="reader-page-placeholder"><LoaderCircle className="spin" size={18} /></div>}
   </article>;
 }
@@ -215,18 +218,30 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
     let cancelled = false;
     let task: import("pdfjs-dist").PDFDocumentLoadingTask | null = null;
     let transport: import("pdfjs-dist").PDFDataRangeTransport | null = null;
+    let pdfModule: typeof import("pdfjs-dist/legacy/build/pdf.mjs") | null = null;
+    let workerPort: Worker | null = null;
     let destroyStarted = false;
-    const destroyTask = () => {
+    const releaseWorker = () => {
+      const port = workerPort;
+      workerPort = null;
+      if (!port) return;
+      if (pdfModule?.GlobalWorkerOptions.workerPort === port) pdfModule.GlobalWorkerOptions.workerPort = null;
+      port.terminate();
+    };
+    const destroyTask = async () => {
       if (destroyStarted) return;
       destroyStarted = true;
       transport?.abort();
-      void task?.destroy().catch(() => undefined);
+      await task?.destroy().catch(() => undefined);
     };
     void (async () => {
       try {
-        const module = await import("pdfjs-dist");
+        ensurePdfJsCompatibility();
+        const module = await import("pdfjs-dist/legacy/build/pdf.mjs");
+        pdfModule = module;
         if (cancelled) return;
-        module.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
+        workerPort = new Worker(new URL("./pdf-worker.ts", import.meta.url), { type: "module" });
+        module.GlobalWorkerOptions.workerPort = workerPort;
         if (!Number.isSafeInteger(manifest.version.sourceBytes) || manifest.version.sourceBytes <= 0) throw new Error("PDF 文件大小无效。");
         transport = createReaderPdfRangeTransport(module.PDFDataRangeTransport, {
           url: endpoint(manifest.endpoints.bytes),
@@ -240,17 +255,33 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
           onError: (reason) => {
             if (cancelled) return;
             setError(reason instanceof Error ? reason.message : "PDF Range 读取失败。");
-            destroyTask();
+            void destroyTask().finally(releaseWorker);
           },
         });
         if (cancelled) { transport.abort(); return; }
-        task = module.getDocument({ range: transport, rangeChunkSize: READER_PDF_RANGE_BYTES, disableStream: true, disableAutoFetch: true });
+        task = module.getDocument({
+          range: transport,
+          rangeChunkSize: READER_PDF_RANGE_BYTES,
+          disableStream: true,
+          disableAutoFetch: true,
+          // Safari/WebKit may silently reject PDF.js's synthesized OpenType
+          // font while still painting the rest of the page.  Ask PDF.js to
+          // use its glyph-path renderer there so Chinese and other CID text
+          // remains visible on phones and WKWebViews.
+          disableFontFace: shouldDisablePdfFontFace(),
+        });
         const loaded = await task.promise;
         if (cancelled) { await loaded.cleanup(); return; }
         setPdf(loaded); setPageCount(loaded.numPages); setActivePage((value) => Math.max(1, Math.min(loaded.numPages, value)));
       } catch (reason) { if (!cancelled) setError(reason instanceof Error ? reason.message : "PDF 加载失败。"); }
     })();
-    return () => { cancelled = true; destroyTask(); };
+    return () => {
+      cancelled = true;
+      // Let PDF.js send its normal Terminate message before closing the
+      // externally-owned worker port. This avoids leaving a loading promise
+      // pending when a reader is switched quickly.
+      void destroyTask().finally(releaseWorker);
+    };
   }, [manifest.endpoints.bytes, manifest.source.title, manifest.version.id, manifest.version.sourceBytes]);
 
   const updateActivePage = useCallback(() => {
@@ -293,8 +324,19 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
   }, [updateActivePage]);
   const jump = (delta: number) => {
     const next = Math.max(1, Math.min(pageCount, activePage + delta));
-    const target = trackRef.current?.querySelector<HTMLElement>(`[data-reader-page="${next}"]`);
-    target?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    const track = trackRef.current;
+    const target = track?.querySelector<HTMLElement>(`[data-reader-page="${next}"]`);
+    // A PDF page may be narrower than a desktop viewport.  Centering the
+    // target in that case leaves part of the previous page (and its text
+    // selection) visible, so a page turn does not really take the source
+    // page off-screen.  Align the target's leading edge instead; this keeps
+    // the paging control deterministic while preserving the natural page
+    // size and horizontal swipe behavior.
+    if (track && target) {
+      const left = Math.max(0, target.offsetLeft);
+      if (typeof track.scrollTo === "function") track.scrollTo({ left, behavior: "smooth" });
+      else track.scrollLeft = left;
+    }
     activePageRef.current = next;
     setActivePage(next);
   };
@@ -318,11 +360,12 @@ function PdfReader({ manifest, onPageRendered }: { manifest: ReaderManifest; onP
   </div>;
 }
 
-function EpubUnit({ unit, content, active, initialScrollLeft = 0, onPageCount, onPosition, onRendered }: {
+function EpubUnit({ unit, content, active, initialScrollLeft = 0, fontScale = 1, onPageCount, onPosition, onRendered }: {
   unit: ReaderManifest["units"][number];
   content: string | undefined;
   active: boolean;
   initialScrollLeft?: number;
+  fontScale?: number;
   onPageCount?: (count: number) => void;
   onPosition?: (scrollLeft: number, pageCount: number, page: number) => void;
   onRendered?: () => void;
@@ -355,20 +398,40 @@ function EpubUnit({ unit, content, active, initialScrollLeft = 0, onPageCount, o
     node.scrollLeft = Math.max(0, initialScrollLeft);
     update();
     let frame: number | null = null;
-    if (content !== undefined) frame = window.requestAnimationFrame(() => onRendered?.());
+    let secondFrame: number | null = null;
+    if (content !== undefined) {
+      // Column geometry settles after the first style/layout pass. Measure
+      // again on the following frame so long chapters expose their complete
+      // horizontal extent and a saved page is not clamped to zero.
+      frame = window.requestAnimationFrame(() => {
+        node.scrollLeft = Math.max(0, initialScrollLeft);
+        update();
+        onRendered?.();
+        secondFrame = window.requestAnimationFrame(() => {
+          node.scrollLeft = Math.max(0, initialScrollLeft);
+          update();
+          // Notify after the second layout pass as well. Long chapters can
+          // settle their column geometry one frame after the first measure;
+          // replaying annotations only after that pass avoids a highlight
+          // being lost when the chapter DOM is still reflowing.
+          onRendered?.();
+        });
+      });
+    }
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleUpdate);
     observer?.observe(node);
     if (contentRef.current) observer?.observe(contentRef.current);
     return () => {
       if (frame !== null) window.cancelAnimationFrame(frame);
+      if (secondFrame !== null) window.cancelAnimationFrame(secondFrame);
       observer?.disconnect();
       if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
       scrollFrameRef.current = null;
     };
-  }, [active, content, initialScrollLeft, onRendered, scheduleUpdate, unit.id, update]);
+  }, [active, content, fontScale, initialScrollLeft, onRendered, scheduleUpdate, unit.id, update]);
   return <article className="reader-epub-unit" data-reader-unit={unit.id} aria-label={unit.title || `第 ${unit.ordinal + 1} 节`}>
     <div ref={viewportRef} className="reader-epub-page-viewport" onScroll={scheduleUpdate}>
-      {content === undefined ? <div className="reader-document-loading"><LoaderCircle className="spin" size={18} />正在加载附近内容…</div> : <div ref={contentRef} className="reader-epub-content file-reader-document" dangerouslySetInnerHTML={{ __html: content }} />}
+      {content === undefined ? <div className="reader-document-loading"><LoaderCircle className="spin" size={18} />正在加载附近内容…</div> : <div ref={contentRef} className="reader-epub-content file-reader-document reader-text-container" style={{ "--reader-epub-scale": fontScale ?? 1 } as CSSProperties} dangerouslySetInnerHTML={{ __html: content }} />}
     </div>
   </article>;
 }
@@ -386,6 +449,7 @@ function EpubReader({ manifest, onUnitRendered }: { manifest: ReaderManifest; on
   const [initialScrollLeft, setInitialScrollLeft] = useState(0);
   const [pageCount, setPageCount] = useState(1);
   const [page, setPage] = useState(1);
+  const [fontScale, setFontScale] = useState(1);
   const scrollPositionRef = useRef(0);
   const [error, setError] = useState("");
   const unit = manifest.units[current];
@@ -404,6 +468,7 @@ function EpubReader({ manifest, onUnitRendered }: { manifest: ReaderManifest; on
     scrollPositionRef.current = 0;
     setPage(1);
     setPageCount(1);
+    setFontScale(1);
     setError("");
   }, [manifest.version.id]);
   const handlePosition = useCallback((position: number, count: number, pageNumber: number) => {
@@ -478,11 +543,17 @@ function EpubReader({ manifest, onUnitRendered }: { manifest: ReaderManifest; on
   return <div className="reader-epub-reader">
     {error && <div className="reader-inline-error" role="alert">{error}</div>}
     <div className="reader-epub-track">
-      <EpubUnit unit={unit} content={units[unit.id]?.content} active initialScrollLeft={initialScrollLeft} onPosition={handlePosition} onRendered={onUnitRendered} />
+      <EpubUnit unit={unit} content={units[unit.id]?.content} active initialScrollLeft={initialScrollLeft} fontScale={fontScale} onPosition={handlePosition} onRendered={onUnitRendered} />
     </div>
     <div className="reader-reader-controls" role="toolbar" aria-label="EPUB 章节控制">
       <button type="button" disabled={current <= 0} onClick={() => { setCurrent((value) => Math.max(0, value - 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }} title="上一章" aria-label="上一章"><ChevronLeft size={16} /></button>
+      <select className="reader-epub-chapter-select" aria-label="选择章节" value={current} onChange={(event) => { const next = Math.max(0, Math.min(manifest.units.length - 1, Number(event.target.value))); setCurrent(next); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }}>
+        {manifest.units.map((candidate, index) => <option key={candidate.id} value={index}>{candidate.title || `第 ${index + 1} 节`}</option>)}
+      </select>
       <button type="button" disabled={current >= manifest.units.length - 1} onClick={() => { setCurrent((value) => Math.min(manifest.units.length - 1, value + 1)); scrollPositionRef.current = 0; setInitialScrollLeft(0); setPage(1); setPageCount(1); }} title="下一章" aria-label="下一章"><ChevronRight size={16} /></button>
+      <span className="reader-reader-controls-divider" aria-hidden="true" />
+      <button type="button" disabled={fontScale <= .8} onClick={() => setFontScale((value) => Math.max(.8, Number((value - .1).toFixed(2))))} title="缩小文字" aria-label="缩小文字"><Minus size={15} /></button>
+      <button type="button" disabled={fontScale >= 1.4} onClick={() => setFontScale((value) => Math.min(1.4, Number((value + .1).toFixed(2))))} title="放大文字" aria-label="放大文字"><Plus size={15} /></button>
     </div>
     <ReaderPageIndicator label={`${page} / ${pageCount}`} ariaLabel={`第 ${current + 1} 个章节，第 ${page} 页，共 ${pageCount} 页${unit.title ? `，${unit.title}` : ""}`} />
   </div>;
@@ -493,6 +564,7 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation, onSe
   const [loadedAnnotations, setLoadedAnnotations] = useState<ReaderAnnotation[]>([]);
   const [renderRevision, setRenderRevision] = useState(0);
   const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
+  const [activeAnnotationAnchor, setActiveAnnotationAnchor] = useState<ReaderAnnotationAnchor | null>(null);
   const readerRootRef = useRef<HTMLDivElement>(null);
   const notifyRendered = useCallback(() => setRenderRevision((value) => value + 1), []);
   useEffect(() => setLiveManifest(manifest), [manifest]);
@@ -521,8 +593,9 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation, onSe
     return () => controller.abort();
   }, [annotations, liveManifest.version.id]);
   const visibleAnnotations = annotations ?? loadedAnnotations;
-  const focusAnnotation = useCallback((annotation: ReaderAnnotation) => {
+  const focusAnnotation = useCallback((annotation: ReaderAnnotation, anchor?: ReaderAnnotationAnchor) => {
     setActiveAnnotationId(annotation.id);
+    setActiveAnnotationAnchor(anchor ?? null);
     const root = readerRootRef.current;
     if (!root) { onSelectAnnotation?.(annotation); return; }
     const focus = () => {
@@ -545,14 +618,24 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation, onSe
       const annotationId = mark.dataset.readerAnnotation;
       if (!annotationId) return;
       const annotation = visibleAnnotations.find((item) => item.id === annotationId);
-      if (annotation) focusAnnotation(annotation);
+      if (annotation?.type === "note") {
+        const rect = mark.getBoundingClientRect();
+        focusAnnotation(annotation, { left: (rect.left + rect.right) / 2, top: rect.bottom + 8 });
+      } else if (annotation) {
+        setActiveAnnotationId(null);
+        setActiveAnnotationAnchor(null);
+        selectReaderAnnotation(root, annotation.id);
+      }
       else selectReaderAnnotation(root, annotationId);
     };
     root.addEventListener("click", handleClick);
     return () => root.removeEventListener("click", handleClick);
   }, [focusAnnotation, visibleAnnotations]);
   useEffect(() => {
-    if (activeAnnotationId && !visibleAnnotations.some((annotation) => annotation.id === activeAnnotationId)) setActiveAnnotationId(null);
+    if (activeAnnotationId && !visibleAnnotations.some((annotation) => annotation.id === activeAnnotationId)) {
+      setActiveAnnotationId(null);
+      setActiveAnnotationAnchor(null);
+    }
   }, [activeAnnotationId, visibleAnnotations]);
   useEffect(() => {
     const root = readerRootRef.current;
@@ -560,11 +643,33 @@ export function ReaderDocument({ manifest, annotations, onDeleteAnnotation, onSe
     // Always run the replay pass, including when the list becomes empty.  The
     // pass first removes marks owned by this reader, so deleting the last
     // annotation cannot leave a stale highlight in a mounted PDF/EPUB unit.
-    const frame = window.requestAnimationFrame(() => applyReaderTextHighlights(root, visibleAnnotations));
-    return () => window.cancelAnimationFrame(frame);
+    // EPUB content is mounted after an asynchronous unit request and its
+    // multi-column layout can settle one or two turns after innerHTML is
+    // committed. A single frame can therefore race the first visit after a
+    // reopen: the annotation is present in the API response but its text
+    // node is not mounted yet. Replay across a short, bounded window (the
+    // same four-frame budget used by the legacy HTML reader) and once after
+    // the layout has had time to settle. This is deliberately bounded so a
+    // large EPUB cannot keep a timer or animation loop alive indefinitely.
+    let cancelled = false;
+    let frame: number | null = null;
+    let attempts = 0;
+    const replay = () => {
+      if (cancelled) return;
+      applyReaderTextHighlights(root, visibleAnnotations);
+      attempts += 1;
+      if (attempts < 4) frame = window.requestAnimationFrame(replay);
+    };
+    frame = window.requestAnimationFrame(replay);
+    const delayed = window.setTimeout(() => { if (!cancelled) applyReaderTextHighlights(root, visibleAnnotations); }, 180);
+    return () => {
+      cancelled = true;
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      window.clearTimeout(delayed);
+    };
   }, [liveManifest.version.id, renderRevision, visibleAnnotations]);
   return <div ref={readerRootRef} className="reader-document-shell" data-reader-format={liveManifest.source.format}>
     {liveManifest.source.format === "pdf" ? <PdfReader manifest={liveManifest} onPageRendered={notifyRendered} /> : <EpubReader manifest={liveManifest} onUnitRendered={notifyRendered} />}
-    <ReaderAnnotationPanel annotations={visibleAnnotations} onDelete={onDeleteAnnotation} onSelect={focusAnnotation} onAsk={onAskAnnotation} activeAnnotationId={activeAnnotationId} />
+    <ReaderAnnotationPanel annotations={visibleAnnotations} onDelete={onDeleteAnnotation} onSelect={focusAnnotation} onAsk={onAskAnnotation} activeAnnotationId={activeAnnotationId} anchor={activeAnnotationAnchor} onClose={() => { setActiveAnnotationId(null); setActiveAnnotationAnchor(null); }} />
   </div>;
 }

@@ -37,8 +37,9 @@ import { AccountAuthDialog } from "./account-auth-dialog";
 import { DisplaySettingsDialog } from "./display-settings-dialog";
 import { ProjectSkillsDialog } from "./project-skills-dialog";
 import { ReaderAskBubble, ReaderSelectionAction, useReaderSelection } from "./reader-ask";
-import { ReaderAnnotationPanel } from "./reader/ReaderAnnotations";
-import { applyReaderTextHighlights, markReaderRange, selectReaderAnnotation } from "./reader/annotation-dom";
+import { ReaderAnnotationPanel, ReaderNoteEditor, type ReaderAnnotationAnchor } from "./reader/ReaderAnnotations";
+import { applyReaderTextHighlights, markReaderRange, readerAnnotationIdForRange, readerAnnotationMatchesAnchor, selectReaderAnnotation } from "./reader/annotation-dom";
+import { captureReaderTextAnchor, readerTextAnchorsEqual } from "./reader/selection-anchor";
 import type { ReaderSelection } from "./reader-ask";
 import { FileReaderLayout, preparedReaderDocument, useOutlineState } from "./reader/LegacyReader";
 import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
@@ -73,6 +74,20 @@ const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 const HOST_ROOT_ACCOUNT_ID = "00000000-0000-4000-8000-000000000010";
 const NEW_REMOTE_WORKER_OPTION = "__new_remote_worker__";
+
+async function loadReaderAnnotationsWithRetry(versionId: string, signal: AbortSignal): Promise<{ annotations: ReaderAnnotation[] }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await api.readerAnnotations(versionId, signal);
+    } catch (reason) {
+      lastError = reason;
+      if (signal.aborted || attempt === 2) break;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 180 * (attempt + 1)));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("标注同步失败");
+}
 
 type DraftSaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
 type DraftUpload = { id: string; name: string; resumable: boolean; progress: number; status: "uploading" | "retrying" | "paused" | "error" };
@@ -278,14 +293,28 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
   </main>;
 }
 
-function ReaderSelectionLayer({ rootRef, onAsk, onHighlight, onNote }: {
+function ReaderSelectionLayer({ rootRef, scopeKey, annotations, onAsk, onHighlight, onRemoveHighlight, onNote }: {
   rootRef: RefObject<HTMLElement | null>;
+  scopeKey?: string;
+  annotations?: ReaderAnnotation[];
   onAsk: (selection: ReaderSelection) => void;
   onHighlight?: (selection: ReaderSelection) => void;
+  onRemoveHighlight?: (annotation: ReaderAnnotation, selection?: ReaderSelection) => void;
   onNote?: (selection: ReaderSelection) => void;
 }) {
-  const selection = useReaderSelection(rootRef);
-  return selection ? <ReaderSelectionAction selection={selection} onAsk={() => onAsk(selection)} onHighlight={onHighlight} onNote={onNote} /> : null;
+  const selection = useReaderSelection(rootRef, scopeKey);
+  const annotationId = selection?.range ? readerAnnotationIdForRange(selection.range) : null;
+  const selectedText = selection ? normalizeAskAgentSelection(selection.text) : "";
+  const anchor = selection?.anchor;
+  const existingHighlight = annotationId
+    ? annotations?.find((annotation) => annotation.id === annotationId && annotation.type === "highlight")
+    : anchor
+      ? annotations?.find((annotation) => annotation.type === "highlight" && readerAnnotationMatchesAnchor(annotation, anchor))
+      : annotations?.find((annotation) => annotation.type === "highlight" && normalizeAskAgentSelection(annotation.quote_text) === selectedText);
+  const toggleHighlight = existingHighlight && onRemoveHighlight
+    ? (current: ReaderSelection) => onRemoveHighlight(existingHighlight, current)
+    : onHighlight;
+  return selection ? <ReaderSelectionAction selection={selection} onAsk={() => onAsk(selection)} onHighlight={toggleHighlight} onNote={onNote} highlighted={Boolean(existingHighlight)} /> : null;
 }
 
 function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<WorkFile, "id" | "original_name">; share: FileShareState; onChange: (share: FileShareState) => void; open: boolean; onClose: () => void }) {
@@ -406,6 +435,10 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const [content, setContent] = useState<string | null>(null);
   const [readerManifest, setReaderManifest] = useState<import("./api").ReaderManifest | null>(null);
   const [readerAnnotations, setReaderAnnotations] = useState<ReaderAnnotation[]>([]);
+  const [readerAnnotationSyncError, setReaderAnnotationSyncError] = useState("");
+  const [activeReaderAnnotationId, setActiveReaderAnnotationId] = useState<string | null>(null);
+  const [activeReaderAnnotationAnchor, setActiveReaderAnnotationAnchor] = useState<ReaderAnnotationAnchor | null>(null);
+  const [readerNoteSelection, setReaderNoteSelection] = useState<ReaderSelection | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [askOpen, setAskOpen] = useState(false);
@@ -440,20 +473,40 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     const current = window.getSelection();
     if (!current || current.rangeCount === 0) return;
     // The annotation request is asynchronous. Do not clear a newer selection
-    // the user made while the save was in flight; compare the cloned range's
-    // boundary nodes/offsets before touching Safari's native selection.
-    if (selection.range) {
-      try {
-        const live = current.getRangeAt(0);
+    // the user made while the save was in flight. Boundary-node identity is
+    // insufficient here: applying a mark can split/replace those text nodes
+    // while preserving the same durable reader anchor.
+    try {
+      const live = current.getRangeAt(0);
+      const root = readerBodyRef.current;
+      if (selection.anchor && root) {
+        const liveAnchor = captureReaderTextAnchor(root, live);
+        if (!liveAnchor || !readerTextAnchorsEqual(liveAnchor, selection.anchor)) return;
+      } else if (selection.range) {
         const saved = selection.range;
         const sameRange = live.startContainer === saved.startContainer
           && live.startOffset === saved.startOffset
           && live.endContainer === saved.endContainer
           && live.endOffset === saved.endOffset;
         if (!sameRange) return;
-      } catch { return; }
-    } else if (normalizeAskAgentSelection(current.toString()) !== normalizeAskAgentSelection(selection.text)) return;
+      } else if (normalizeAskAgentSelection(live.toString()) !== normalizeAskAgentSelection(selection.text)) return;
+    } catch { return; }
     current.removeAllRanges();
+  }
+
+  function readerSelectionLocator(selection: ReaderSelection): Record<string, unknown> {
+    const anchor = selection.anchor;
+    return {
+      unitId: selection.unitId ?? anchor?.unitId ?? null,
+      page: selection.page ?? anchor?.page ?? null,
+      rects: selection.rects ?? [],
+      quote: selection.text,
+      ...(anchor ? {
+        startOffset: anchor.startOffset,
+        endOffset: anchor.endOffset,
+        textLength: anchor.textLength,
+      } : {}),
+    };
   }
 
   function applyReaderHighlight(selection: ReaderSelection): void {
@@ -461,8 +514,8 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     void (async () => {
       try {
         const result = await api.createReaderAnnotation(readerManifest.version.id, {
-          unitId: selection.unitId ?? null, type: "highlight", quoteText: selection.text,
-          noteText: null, color: "orange", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+          unitId: selection.unitId ?? selection.anchor?.unitId ?? null, type: "highlight", quoteText: selection.text,
+          noteText: null, color: "orange", locator: readerSelectionLocator(selection),
         });
         setReaderAnnotations((current) => [...current, result.annotation]);
         const range = selection.range;
@@ -475,22 +528,27 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   }
 
   function applyReaderNote(selection: ReaderSelection): void {
-    if (!readerManifest) return;
-    const note = window.prompt("给这段文字添加备注：", "");
-    if (note === null || !note.trim()) return;
+    if (readerManifest) setReaderNoteSelection(selection);
+  }
+
+  function saveReaderNote(selection: ReaderSelection, note: string): void {
+    if (!readerManifest || !note.trim()) return;
     void api.createReaderAnnotation(readerManifest.version.id, {
-      unitId: selection.unitId ?? null, type: "note", quoteText: selection.text,
-      noteText: note, color: "orange", locator: { unitId: selection.unitId ?? null, page: selection.page ?? null, rects: selection.rects ?? [], quote: selection.text },
+      unitId: selection.unitId ?? selection.anchor?.unitId ?? null, type: "note", quoteText: selection.text,
+      noteText: note, color: "orange", locator: readerSelectionLocator(selection),
     }).then((result) => {
       setReaderAnnotations((current) => [...current, result.annotation]);
       if (selection.range && !selection.range.collapsed) {
         markReaderRange(selection.range, result.annotation.id, result.annotation.color, result.annotation.type);
         clearReaderSelectionIfUnchanged(selection);
       }
+      setReaderNoteSelection(null);
     }).catch((reason) => window.alert(reason instanceof Error ? reason.message : "保存备注失败。"));
   }
 
-  function focusReaderAnnotation(annotation: ReaderAnnotation): void {
+  function focusReaderAnnotation(annotation: ReaderAnnotation, anchor?: ReaderAnnotationAnchor): void {
+    setActiveReaderAnnotationId(annotation.id);
+    setActiveReaderAnnotationAnchor(anchor ?? null);
     const root = readerBodyRef.current;
     if (root) selectReaderAnnotation(root, annotation.id);
   }
@@ -499,7 +557,18 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     if (!window.confirm("删除这条标注？")) return;
     void api.deleteReaderAnnotation(annotation.id).then(() => {
       setReaderAnnotations((current) => current.filter((item) => item.id !== annotation.id));
+      setActiveReaderAnnotationId((current) => current === annotation.id ? null : current);
+      setActiveReaderAnnotationAnchor((current) => current && activeReaderAnnotationId === annotation.id ? null : current);
     }).catch((reason) => window.alert(reason instanceof Error ? reason.message : "删除标注失败。"));
+  }
+
+  function removeReaderHighlight(annotation: ReaderAnnotation, selection?: ReaderSelection): void {
+    if (selection) clearReaderSelectionIfUnchanged(selection);
+    void api.deleteReaderAnnotation(annotation.id).then(() => {
+      setReaderAnnotations((current) => current.filter((item) => item.id !== annotation.id));
+      setActiveReaderAnnotationId((current) => current === annotation.id ? null : current);
+      setActiveReaderAnnotationAnchor((current) => current && activeReaderAnnotationId === annotation.id ? null : current);
+    }).catch((reason) => window.alert(reason instanceof Error ? reason.message : "取消标记失败。"));
   }
 
   function closeReaderAsk() {
@@ -514,7 +583,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true); setError(""); setContent(null); setReaderManifest(null); setReaderAnnotations([]); setAskSelection(null);
+    setLoading(true); setError(""); setReaderAnnotationSyncError(""); setContent(null); setReaderManifest(null); setReaderAnnotations([]); setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); setReaderNoteSelection(null); setAskSelection(null);
     void (async () => {
       try {
         const metadata = await api.filePreview(fileId, controller.signal);
@@ -539,7 +608,17 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
         const manifest = await api.readerFileManifest(metadata.file.id, controller.signal);
         if (controller.signal.aborted) return;
         setReaderManifest(manifest);
-        const annotations = await api.readerAnnotations(manifest.version.id, controller.signal).catch(() => ({ annotations: [] as ReaderAnnotation[] }));
+        let annotations: { annotations: ReaderAnnotation[] } = { annotations: [] };
+        try {
+          annotations = await loadReaderAnnotationsWithRetry(manifest.version.id, controller.signal);
+        } catch (reason) {
+          if (controller.signal.aborted) return;
+          if (reason instanceof Error && reason.message === "请先登录。") throw reason;
+          // Keep the document readable during a transient annotation request
+          // failure, but make the missing sync explicit instead of silently
+          // presenting an apparently empty annotation list.
+          setReaderAnnotationSyncError("标注暂时未同步，请稍后重新打开此文件重试。");
+        }
         if (controller.signal.aborted) return;
         setReaderAnnotations(annotations.annotations);
         if (kind === "markdown" || kind === "html") {
@@ -575,11 +654,53 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     if (!readerManifest || !content || (readerManifest.source.format !== "markdown" && readerManifest.source.format !== "html")) return;
     const root = readerBodyRef.current;
     if (!root) return;
-    // Wait one frame so ReactMarkdown/HTML innerHTML has committed before the
-    // quote-backed marks are re-applied.
-    const frame = window.requestAnimationFrame(() => applyReaderTextHighlights(root, readerAnnotations));
-    return () => window.cancelAnimationFrame(frame);
-  }, [content, readerAnnotations, readerManifest]);
+    // React commits the reader shell and the browser lays out the stitched
+    // HTML in separate turns. Replay once per frame for a short bounded
+    // window, plus one delayed pass, so annotations arriving with the
+    // manifest cannot lose a race with innerHTML/layout initialization.
+    let cancelled = false;
+    let frame: number | null = null;
+    let attempts = 0;
+    const replay = () => {
+      if (cancelled) return;
+      applyReaderTextHighlights(root, readerAnnotations);
+      attempts += 1;
+      if (attempts < 4) frame = window.requestAnimationFrame(replay);
+    };
+    frame = window.requestAnimationFrame(replay);
+    const delayed = window.setTimeout(() => { if (!cancelled) applyReaderTextHighlights(root, readerAnnotations); }, 180);
+    return () => { cancelled = true; if (frame !== null) window.cancelAnimationFrame(frame); window.clearTimeout(delayed); };
+  }, [content, prepared.content, readerAnnotations, readerManifest]);
+
+  useEffect(() => {
+    if (!readerManifest || (readerManifest.source.format !== "markdown" && readerManifest.source.format !== "html")) return;
+    const root = readerBodyRef.current;
+    if (!root) return;
+    const handleAnnotationClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const mark = target.closest<HTMLElement>("mark.reader-local-highlight[data-reader-annotation]");
+      if (!mark || !root.contains(mark)) return;
+      const annotation = readerAnnotations.find((item) => item.id === mark.dataset.readerAnnotation);
+      if (!annotation) return;
+      const rect = mark.getBoundingClientRect();
+      if (annotation.type === "note") focusReaderAnnotation(annotation, { left: (rect.left + rect.right) / 2, top: rect.bottom + 8 });
+      else {
+        setActiveReaderAnnotationId(null);
+        setActiveReaderAnnotationAnchor(null);
+        selectReaderAnnotation(root, annotation.id);
+      }
+    };
+    root.addEventListener("click", handleAnnotationClick);
+    return () => root.removeEventListener("click", handleAnnotationClick);
+  }, [readerAnnotations, readerManifest]);
+
+  useEffect(() => {
+    if (activeReaderAnnotationId && !readerAnnotations.some((annotation) => annotation.id === activeReaderAnnotationId)) {
+      setActiveReaderAnnotationId(null);
+      setActiveReaderAnnotationAnchor(null);
+    }
+  }, [activeReaderAnnotationId, readerAnnotations]);
 
   useEffect(() => {
     let checking = false;
@@ -621,10 +742,12 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     <section ref={readerBodyRef} className="file-preview-body">
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
+      {!loading && !error && readerAnnotationSyncError && <div className="reader-inline-error" role="alert">{readerAnnotationSyncError}</div>}
       {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
       {!loading && !error && readerManifest && content !== null && file && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
-      {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} onSelect={focusReaderAnnotation} onAsk={askReaderAnnotation} />}
-      <ReaderSelectionLayer rootRef={readerBodyRef} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onNote={applyReaderNote} />
+      {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} onSelect={focusReaderAnnotation} onAsk={askReaderAnnotation} activeAnnotationId={activeReaderAnnotationId} anchor={activeReaderAnnotationAnchor} onClose={() => { setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); }} />}
+      <ReaderSelectionLayer rootRef={readerBodyRef} scopeKey={readerManifest?.version.id ?? file?.id ?? ""} annotations={readerAnnotations} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onRemoveHighlight={removeReaderHighlight} onNote={applyReaderNote} />
+      {readerNoteSelection && <ReaderNoteEditor selection={readerNoteSelection} onClose={() => setReaderNoteSelection(null)} onSave={(note) => saveReaderNote(readerNoteSelection, note)} />}
       {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file ? `${file.original_name}${askSelection?.page ? ` · 第 ${askSelection.page} 页` : ""}` : undefined} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
     </section>
   </main>;
@@ -4405,7 +4528,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
         {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} onEdit={onEditWake} />}
         <div />
       </>}
-    />{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }}><Zap size={14} /><span>询问 Agent</span></button>}
+    />{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }} title="询问 Agent" aria-label="询问 Agent"><Bot size={14} /></button>}
   </section>;
 }
 

@@ -11,24 +11,56 @@ import type { WorkFile } from "../api";
 const READER_POSITION_SAVE_DELAY_MS = 2_000;
 const READER_POSITION_SAVE_INTERVAL_MS = 5_000;
 const READER_POSITION_RESTORE_ATTEMPTS = 10;
+const READER_OUTLINE_TOP_EPSILON_PX = 2;
+const READER_OUTLINE_ACTIVATION_OFFSET_PX = 96;
 
 function readerNativeSelectionActive(container: HTMLElement): boolean {
   const selection = document.getSelection();
-  if (!selection || selection.rangeCount === 0) return false;
+  // A collapsed caret/compatibility range is not a text-selection transaction
+  // and must not freeze the outline on a stale item after returning to the top.
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
   return Boolean(selection.anchorNode && selection.focusNode && container.contains(selection.anchorNode) && container.contains(selection.focusNode));
 }
 
-function updateReaderOutline(container: HTMLElement, headings: HTMLElement[], onActiveAnchorChange: (id: string) => void): void {
+function updateReaderOutline(container: HTMLElement, headings: HTMLElement[], onActiveAnchorChange: (id: string | null) => void): void {
   // Scroll-driven active-anchor changes must not trigger another smooth scroll.
   // Leave the document completely quiet while WebKit owns a native selection
   // transaction; the next ordinary scroll will refresh the outline.
   if (readerNativeSelectionActive(container) || headings.length < 2) return;
   const visibleHeadings = headings.filter((heading) => heading.getClientRects().length > 0);
-  const candidates = visibleHeadings.length > 0 ? visibleHeadings : headings;
+  const candidates = visibleHeadings.filter((heading) => {
+    const rect = heading.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && Number.isFinite(rect.top);
+  });
+  // A heading can sit well below the report title/lead at scroll origin. The
+  // old geometry-only loop could see a transient, not-yet-laid-out heading
+  // list and leave a later section active even though the reader was visibly
+  // at the beginning. Scroll origin is unambiguous: the first outline item
+  // is the only safe active choice.
+  const scrollTop = Number.isFinite(container.scrollTop) ? Math.max(0, container.scrollTop) : 0;
+  if (scrollTop <= READER_OUTLINE_TOP_EPSILON_PX) {
+    // Use the first *rendered* heading so a hidden/removed author heading can
+    // never become the active item merely because it appears first in DOM
+    // order.
+    onActiveAnchorChange(candidates[0]?.id ?? null);
+    return;
+  }
+  // If layout is not measurable yet, do not guess. A later restore/scroll
+  // pass will retry and an incorrect active item is worse than no highlight.
+  if (candidates.length === 0) {
+    onActiveAnchorChange(null);
+    return;
+  }
   const top = container.getBoundingClientRect().top;
-  let current = candidates[0];
-  for (const heading of candidates) { if (heading.getBoundingClientRect().top <= top + 96) current = heading; else break; }
-  onActiveAnchorChange(current.id);
+  let current: HTMLElement | null = null;
+  for (const heading of candidates) {
+    if (heading.getBoundingClientRect().top <= top + READER_OUTLINE_ACTIVATION_OFFSET_PX) current = heading;
+    else break;
+  }
+  // Before the first rendered heading enters the activation line, the reader
+  // is still in the first section. If that first heading is not measurable,
+  // the null branch above deliberately avoids selecting a later item.
+  onActiveAnchorChange((current ?? candidates[0])?.id ?? null);
 }
 
 function HtmlFileReader({ file, content, activeAnchor, navigationToken }: { file: Pick<WorkFile, "original_name">; content: string; activeAnchor: string | null; navigationToken: number }) {
@@ -41,12 +73,12 @@ function HtmlFileReader({ file, content, activeAnchor, navigationToken }: { file
     const rootRect = root.getBoundingClientRect(); const targetRect = target.getBoundingClientRect();
     root.scrollTo({ top: Math.max(0, root.scrollTop + targetRect.top - rootRect.top - 18), behavior: "smooth" });
   }, [content, navigationToken]);
-  return <div ref={scrollRoot} className="file-reader-html file-preview-scroll" role="document" aria-label={file.original_name || "HTML 文件预览"} dangerouslySetInnerHTML={{ __html: content }} />;
+  return <div ref={scrollRoot} className="file-reader-html file-preview-scroll reader-text-container" role="document" aria-label={file.original_name || "HTML 文件预览"} dangerouslySetInnerHTML={{ __html: content }} />;
 }
 
 function FileReaderContent({ file, content, prepared, activeAnchor, navigationToken }: { file: Pick<WorkFile, "original_name" | "mime_type">; content: string; prepared: PreparedHtmlDocument; activeAnchor: string | null; navigationToken: number }) {
   const readerKind = fileReaderKind(file); const math = useAsyncMarkdownMath(content);
-  if (readerKind === "markdown") return <div className="file-preview-scroll"><article className="file-reader-markdown markdown">{(() => { let headingCursor = 0; return <ReactMarkdown
+  if (readerKind === "markdown") return <div className="file-preview-scroll reader-text-container"><article className="file-reader-markdown markdown">{(() => { let headingCursor = 0; return <ReactMarkdown
     remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
     rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
     skipHtml urlTransform={defaultUrlTransform}
@@ -62,7 +94,7 @@ function FileReaderContent({ file, content, prepared, activeAnchor, navigationTo
 }
 
 export const FileReaderLayout = memo(function FileReaderLayout({ file, content, prepared, tocOpen, activeAnchor, onSelect, onActiveAnchorChange, navigationToken }: {
-  file: Pick<WorkFile, "id" | "original_name" | "mime_type">; content: string; prepared: PreparedHtmlDocument; tocOpen: boolean; activeAnchor: string | null; onSelect: (id: string) => void; onActiveAnchorChange: (id: string) => void; navigationToken: number;
+  file: Pick<WorkFile, "id" | "original_name" | "mime_type">; content: string; prepared: PreparedHtmlDocument; tocOpen: boolean; activeAnchor: string | null; onSelect: (id: string) => void; onActiveAnchorChange: (id: string | null) => void; navigationToken: number;
 }) {
   const scrollRoot = useRef<HTMLDivElement>(null); const readerKind = fileReaderKind(file); const showOutline = prepared.outline.length >= 2;
   useEffect(() => {
@@ -80,7 +112,28 @@ export const FileReaderLayout = memo(function FileReaderLayout({ file, content, 
     return () => { if (restoreTimer !== null) window.clearTimeout(restoreTimer); if (saveTimer !== null) window.clearTimeout(saveTimer); window.clearInterval(interval); flushSave(); container.removeEventListener("scroll", scheduleSave); document.removeEventListener("visibilitychange", handleVisibilityChange); window.removeEventListener("pagehide", flushSave); };
   }, [content, file.id, onActiveAnchorChange, prepared.content]);
   useEffect(() => { if (readerKind !== "markdown" || navigationToken === 0 || !activeAnchor || !scrollRoot.current) return; const target = Array.from(scrollRoot.current.querySelectorAll<HTMLElement>("[id]")).find((element) => element.id === activeAnchor); const container = target?.closest<HTMLElement>(".file-preview-scroll"); if (target && container) container.scrollTo({ top: Math.max(0, target.offsetTop - 18), behavior: "smooth" }); }, [navigationToken, readerKind]);
-  useEffect(() => { if (!scrollRoot.current || prepared.outline.length < 2) return; const container = scrollRoot.current.querySelector<HTMLElement>(".file-preview-scroll"); if (!container) return; const headings = Array.from(container.querySelectorAll<HTMLElement>("h2[id]")); if (headings.length < 2) return; let frame: number | null = null; const updateCurrentHeading = () => { if (frame !== null) return; frame = window.requestAnimationFrame(() => { frame = null; updateReaderOutline(container, headings, onActiveAnchorChange); }); }; container.addEventListener("scroll", updateCurrentHeading, { passive: true }); updateReaderOutline(container, headings, onActiveAnchorChange); return () => { if (frame !== null) window.cancelAnimationFrame(frame); container.removeEventListener("scroll", updateCurrentHeading); }; }, [onActiveAnchorChange, prepared.content]);
+  useEffect(() => {
+    if (!scrollRoot.current || prepared.outline.length < 2) return;
+    const container = scrollRoot.current.querySelector<HTMLElement>(".file-preview-scroll");
+    if (!container) return;
+    const headings = Array.from(container.querySelectorAll<HTMLElement>("h2[id]"));
+    if (headings.length < 2) return;
+    let frame: number | null = null;
+    const updateCurrentHeading = () => {
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        updateReaderOutline(container, headings, onActiveAnchorChange);
+      });
+    };
+    container.addEventListener("scroll", updateCurrentHeading, { passive: true });
+    // Initial synchronization is performed after scroll-position restoration;
+    // do not sample a transient layout here.
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      container.removeEventListener("scroll", updateCurrentHeading);
+    };
+  }, [onActiveAnchorChange, prepared.content]);
   return <div className={`file-reader-layout${showOutline && tocOpen ? " outline-open" : ""}`}>
     {showOutline && tocOpen && <aside id="file-reader-outline" className="file-reader-outline" aria-label="文章目录"><h2>文章目录</h2><ol>{prepared.outline.map((item) => <li key={item.id}><a href={`#${encodeURIComponent(item.id)}`} aria-current={activeAnchor === item.id ? "location" : undefined} onClick={(event) => { event.preventDefault(); onSelect(item.id); }}>{item.label}</a></li>)}</ol></aside>}
     <div ref={scrollRoot} className="file-reader-document"><FileReaderContent file={file} content={content} prepared={prepared} activeAnchor={activeAnchor && readerKind === "html" ? activeAnchor : null} navigationToken={navigationToken} /></div>
@@ -96,8 +149,8 @@ export function preparedReaderDocument(file: Pick<WorkFile, "mime_type" | "origi
 
 export function useOutlineState(prepared: PreparedHtmlDocument) {
   const hasOutline = prepared.outline.length >= 2; const [open, setOpen] = useState(false); const [activeAnchor, setActiveAnchor] = useState<string | null>(null); const [navigationToken, setNavigationToken] = useState(0);
-  useEffect(() => { setActiveAnchor(hasOutline ? prepared.outline[0]?.id ?? null : null); setNavigationToken(0); setOpen(hasOutline && (window.matchMedia?.("(min-width: 721px)").matches ?? true)); }, [hasOutline, prepared.content]);
+  useEffect(() => { setActiveAnchor(null); setNavigationToken(0); setOpen(hasOutline && (window.matchMedia?.("(min-width: 721px)").matches ?? true)); }, [hasOutline, prepared.content]);
   const select = useCallback((id: string) => { setActiveAnchor(id); setNavigationToken((value) => value + 1); }, []);
-  const updateFromScroll = useCallback((id: string) => { setActiveAnchor((current) => current === id ? current : id); }, []);
+  const updateFromScroll = useCallback((id: string | null) => { setActiveAnchor((current) => current === id ? current : id); }, []);
   return { hasOutline, open, setOpen, activeAnchor, navigationToken, select, updateFromScroll };
 }

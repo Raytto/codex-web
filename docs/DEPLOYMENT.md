@@ -80,6 +80,12 @@ On mobile Safari, also verify that selecting text in a Markdown reader survives 
 scroll and that the reader header keeps its back action, title, and file actions usable at narrow
 widths.
 
+For PDF and EPUB files, verify that the paginated reader opens only after the preview action,
+keeps rendering bounded to nearby pages, and preserves a selected passage or annotation after a
+page turn and a text-layer remount. On Safari/WebKit, confirm that the canvas glyphs and selectable
+text layer both remain visible; these checks exercise the compatibility paths that avoid browser
+font and stream-iterator quirks.
+
 For the reader Agent flow, open an authenticated Markdown file, select a passage, use the Reader
 Agent action, and confirm that the quoted passage appears as a removable reference and that the
 answer is stored in the file's owning conversation. HTML previews remain sandboxed; only the

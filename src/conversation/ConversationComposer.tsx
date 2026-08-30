@@ -19,6 +19,8 @@ export type ConversationComposerProps = {
   agentOptions: AgentOptions | null;
   disabled?: boolean;
   submitting?: boolean;
+  /** Render the one-row idle form used by the reader after a send. */
+  collapsed?: boolean;
   canSend: boolean;
   placeholder?: string;
   className?: string;
@@ -32,6 +34,7 @@ export type ConversationComposerProps = {
   maxFiles?: number;
   attachmentNames?: string[];
   onChange: (value: string) => void;
+  onFocus?: () => void;
   onQuoteRemove?: () => void;
   onFilesChange: (files: File[]) => void;
   onModelChange: (model: string) => void;
@@ -74,17 +77,17 @@ export function ConversationComposerReference({ reference, onRemove, className }
   </div>;
 }
 
-export function ConversationComposer({ conversationId, value, quote, reference, files, model, reasoningEffort, agentOptions, disabled, submitting, canSend, placeholder = "输入你想问的问题…", className, controlsClassName, attachmentClassName, sendClassName, voiceClassName, voicePanelClassName, voiceControlClassName, voiceMicClassName, maxFiles = 10, attachmentNames, onChange, onQuoteRemove, onFilesChange, onModelChange, onReasoningChange, onSend, onStop, onTranscript, onVoiceStateChange, onSendAfterTranscription }: ConversationComposerProps) {
+export function ConversationComposer({ conversationId, value, quote, reference, files, model, reasoningEffort, agentOptions, disabled, submitting, canSend, collapsed = false, placeholder = "输入你想问的问题…", className, controlsClassName, attachmentClassName, sendClassName, voiceClassName, voicePanelClassName, voiceControlClassName, voiceMicClassName, maxFiles = 10, attachmentNames, onChange, onFocus, onQuoteRemove, onFilesChange, onModelChange, onReasoningChange, onSend, onStop, onTranscript, onVoiceStateChange, onSendAfterTranscription }: ConversationComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [openMenu, setOpenMenu] = useState<"model" | "effort" | null>(null);
   const selectedModel = agentOptions?.models.find((candidate) => candidate.id === model);
   const effortOptions = agentOptions?.reasoningEfforts.filter((effort) => selectedModel?.reasoningEfforts.includes(effort.id)) ?? [];
   const addFiles = (newFiles: File[]) => onFilesChange([...files, ...newFiles].slice(-maxFiles));
   const composerReference = reference ?? (quote?.trim() ? { excerpt: quote } : undefined);
-  return <div className={`conversation-composer composer expanded ${className ?? ""}`}>
+  return <div className={`conversation-composer composer ${collapsed ? "compact" : "expanded"} ${className ?? ""}`}>
     {composerReference !== undefined && <ConversationComposerReference reference={composerReference} onRemove={onQuoteRemove} className={className?.includes("reader-ask") ? "reader-ask-reference" : undefined} />}
     {files.length > 0 && <div className={`pending-files ${className?.includes("reader-ask") ? "reader-ask-files" : ""}`}>{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" onClick={() => onFilesChange(files.filter((_, fileIndex) => fileIndex !== index))} aria-label={`移除附件 ${file.name}`} title="移除附件"><X size={13} /></button></span>)}</div>}
-    <textarea value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onSend(); } }} placeholder={placeholder} rows={2} disabled={disabled || submitting} />
+    <textarea value={value} onFocus={onFocus} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onSend(); } }} placeholder={placeholder} rows={2} disabled={disabled || submitting} />
     <div className={`composer-actions conversation-composer-actions ${controlsClassName ?? ""}`}>
       <div className={`composer-primary-actions ${controlsClassName?.includes("reader-ask") ? "reader-ask-controls" : ""}`}>
         <button type="button" className={`attach-button ${attachmentClassName ?? ""}`} onClick={() => fileInputRef.current?.click()} disabled={disabled || submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button>

@@ -15,6 +15,10 @@ import { parseReaderRange, ReaderRangeError, ReaderReadLimiter, READER_RANGE_MAX
 import { detectReaderFormat, readerCapabilities, ReaderService, ReaderUnavailableError } from "../server/reader-service.js";
 import { api } from "../src/api.js";
 import { createReaderPdfRangeTransport, READER_PDF_RANGE_BYTES } from "../src/reader/pdf-range-transport.js";
+import { readPdfTextContent } from "../src/reader/pdf-text-content.js";
+import { shouldDisablePdfFontFace } from "../src/reader/pdf-compat.js";
+import { normalizeReaderQuoteForSearch, readerAnnotationMatchesAnchor, readerHighlightSliceBounds } from "../src/reader/annotation-dom.js";
+import { normalizeReaderAnchorQuote, readerTextAnchorsEqual } from "../src/reader/selection-anchor.js";
 
 const uuid = () => crypto.randomUUID();
 
@@ -26,10 +30,119 @@ test("reader format adapters keep HTML/Markdown vertical and PDF/EPUB paginated"
   assert.ok(readerCapabilities("epub").includes("nearby-prefetch"));
 });
 
+test("PDF text aggregation uses the ReadableStream reader API for Safari compatibility", async () => {
+  const chunks = [
+    { items: [{ str: "第一段" }], styles: { fontA: { fontFamily: "serif" } }, lang: null },
+    { items: [{ str: "第二段" }], styles: { fontB: { fontFamily: "sans-serif" } }, lang: "zh-CN" },
+  ];
+  let released = false;
+  let index = 0;
+  const stream = {
+    getReader: () => ({
+      read: async () => index < chunks.length
+        ? { value: chunks[index++], done: false }
+        : { value: undefined, done: true },
+      cancel: async () => undefined,
+      releaseLock: () => { released = true; },
+    }),
+  } as unknown as ReadableStream;
+  const page = {
+    isPureXfa: false,
+    streamTextContent: () => stream,
+  } as unknown as import("pdfjs-dist").PDFPageProxy;
+
+  const result = await readPdfTextContent(page);
+
+  assert.deepEqual(result.items, chunks.flatMap((chunk) => chunk.items));
+  assert.deepEqual({ ...result.styles }, { fontA: { fontFamily: "serif" }, fontB: { fontFamily: "sans-serif" } });
+  assert.equal(result.lang, "zh-CN");
+  assert.equal(released, true);
+});
+
+test("PDF rendering uses glyph paths for WebKit fonts that can paint blank", () => {
+  assert.equal(shouldDisablePdfFontFace("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Version/18.5 Mobile/15E148 Safari/604.1", "iPhone", 5), true);
+  // iPadOS can advertise a desktop Mac platform while still being a touch
+  // device; it must take the same reliable path as an iPhone.
+  assert.equal(shouldDisablePdfFontFace("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/18.5 Safari/605.1.15", "MacIntel", 5), true);
+  assert.equal(shouldDisablePdfFontFace("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36", "Win32", 0), false);
+  assert.equal(shouldDisablePdfFontFace("Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140.0.0.0 Mobile Safari/537.36", "Linux armv8l", 5), false);
+});
+
+test("reader highlights never wrap indentation or newline-only DOM slices", () => {
+  assert.equal(readerHighlightSliceBounds("\n    ", 0, 5), null);
+  assert.deepEqual(readerHighlightSliceBounds("  可见文字  ", 0, 8), { from: 2, to: 6 });
+  assert.deepEqual(readerHighlightSliceBounds("前 文\n后 文", 2, 7), { from: 2, to: 7 });
+});
+
+test("reader quote replay normalizes layout whitespace without changing content", () => {
+  assert.equal(normalizeReaderQuoteForSearch("  第一行\n\n    第二行  "), "第一行 第二行");
+  assert.equal(normalizeReaderQuoteForSearch("\u00a0前\t后"), "前 后");
+  assert.equal(normalizeReaderAnchorQuote("  第一行\n\n    第二行  "), "第一行 第二行");
+});
+
+test("reader anchor equality ignores view geometry but rejects a different document position", () => {
+  const anchor = { text: "选中的文字", normalizedText: "选中的文字", startOffset: 4, endOffset: 9, textLength: 80, unitId: "unit-a", page: 2 };
+  assert.equal(readerTextAnchorsEqual(anchor, { ...anchor }), true);
+  assert.equal(readerTextAnchorsEqual(anchor, { ...anchor, startOffset: 5 }), false);
+  assert.equal(readerTextAnchorsEqual(anchor, { ...anchor, normalizedText: "另一段" }), false);
+});
+
+test("reader annotation identity prefers validated unit/page offsets over duplicate quote text", () => {
+  const annotation = {
+    id: uuid(), user_id: uuid(), version_id: uuid(), unit_id: "unit-a", type: "highlight" as const,
+    quote_text: "重复句子", note_text: null, color: "orange", deleted_at: null,
+    created_at: "", updated_at: "",
+    locator_json: JSON.stringify({ unitId: "wrong-unit", page: 3, startOffset: 12, endOffset: 16, textLength: 100 }),
+  };
+  const anchor = { unitId: "unit-a", page: 3, startOffset: 12, endOffset: 16, textLength: 100, normalizedText: "重复句子" };
+  assert.equal(readerAnnotationMatchesAnchor(annotation, anchor), true);
+  assert.equal(readerAnnotationMatchesAnchor(annotation, { ...anchor, startOffset: 0 }), false);
+  assert.equal(readerAnnotationMatchesAnchor(annotation, { ...anchor, page: 4 }), false);
+  assert.equal(readerAnnotationMatchesAnchor(annotation, { ...anchor, normalizedText: "另一段文字" }), false);
+  assert.equal(readerAnnotationMatchesAnchor({ ...annotation, locator_json: "{}" }, anchor), false);
+});
+
+test("reader selection actions use a durable text anchor and dismiss outside taps", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "src", "reader-ask.tsx"), "utf8");
+  const anchorSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "selection-anchor.ts"), "utf8");
+  const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
+  const selectionHook = source.split("export function ReaderSelectionAction", 1)[0] ?? source;
+  assert.match(source, /captureReaderTextAnchor/);
+  assert.match(source, /restoreReaderTextAnchor/);
+  assert.match(source, /publish = \(mode: "current" \| "refresh"\)/);
+  assert.match(source, /mode === "refresh"/);
+  assert.match(source, /restored && !restoringNative && settleTimer === null/);
+  assert.match(source, /clearSession\(true\)/);
+  assert.match(selectionHook, /const handleReaderClick = \(event: Event\)/);
+  assert.match(selectionHook, /document\.addEventListener\("click", handleReaderClick, true\)/);
+  assert.match(selectionHook, /document\.removeEventListener\("click", handleReaderClick, true\)/);
+  assert.match(selectionHook, /if \(!hadReaderSelection\) return/);
+  assert.match(selectionHook, /previousAnchor && current && !readerTextAnchorsEqual\(previousAnchor, current\.anchor\)/);
+  assert.match(selectionHook, /const liveAnchor = previousAnchor && liveRange \? captureReaderTextAnchor\(root, liveRange\) : null/);
+  assert.match(selectionHook, /const handleReaderClick[\s\S]*?if \(current \|\| nativeReaderSelection\(root\)\) clearSession\(true\)/);
+  assert.match(selectionHook, /pointerInsideNativeSelection/);
+  assert.match(selectionHook, /\.reader-ask-bubble, \.reader-note-editor, \.reader-annotations/);
+  assert.doesNotMatch(selectionHook, /stableGeometryRef|selectionSessionActive|READER_SELECTION_GRACE_MS|setInterval\(/);
+  assert.match(anchorSource, /startOffset/);
+  assert.match(anchorSource, /endOffset/);
+  assert.match(anchorSource, /offsetAtBoundary/);
+  assert.match(anchorSource, /restoreReaderTextAnchor/);
+  assert.match(source, /const result = await api\.sendMessage\([\s\S]*?setQuote\(""\)/);
+  assert.match(source, /setComposerCollapsed\(true\)/);
+  assert.match(source, /collapsed=\{composerCollapsed\}/);
+  assert.match(source, /className="reader-selection-tool reader-selection-action reader-selection-ask"[^>]*title="询问 Agent"[^>]*aria-label="询问 Agent"[^>]*>[\s\S]*?<Bot/);
+  assert.doesNotMatch(source, /reader-selection-action"[^>]*>[\s\S]*?<Zap[\s\S]*?询问 Agent/);
+  assert.match(styles, /\.reader-selection-tool \{[^}]*width: 30px;[^}]*height: 30px/);
+  assert.doesNotMatch(styles, /\.reader-selection-ask[^}]*color/);
+  assert.match(styles, /\.reader-ask-composer\.composer\.compact \{[^}]*grid-template-columns/);
+});
+
 test("paginated reader uses a full-bleed viewport, a bottom page indicator, and bounded swipe work", () => {
   const readerSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.tsx"), "utf8");
   const readerStyles = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.css"), "utf8");
   const annotationSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "annotation-dom.ts"), "utf8");
+  const anchorSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "selection-anchor.ts"), "utf8");
+  const legacyReaderSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "LegacyReader.tsx"), "utf8");
   const selectionSource = fs.readFileSync(path.join(process.cwd(), "src", "reader-ask.tsx"), "utf8");
   assert.doesNotMatch(readerSource, /className="reader-paginator"/);
   assert.match(readerSource, /<ReaderPageIndicator label=\{`\$\{activePage\} \/ \$\{pageCount\}`\}/);
@@ -38,16 +151,43 @@ test("paginated reader uses a full-bleed viewport, a bottom page indicator, and 
   assert.match(readerStyles, /\.reader-page-indicator \{[^}]*position: absolute;[^}]*right:/);
   assert.match(readerStyles, /scroll-snap-stop: normal/);
   assert.match(readerStyles, /-webkit-user-select: text/);
+  assert.match(readerStyles, /\.reader-epub-content > \* \{ break-inside: auto; \}/);
+  assert.match(readerStyles, /\.reader-epub-content :is\(h1, h2, h3, h4, h5, h6, p, li, figure, table, blockquote, pre\) \{ break-inside: avoid; \}/);
+  assert.match(readerStyles, /column-width: min\(820px, calc\(100vw - 56px\)\)/);
+  assert.match(readerStyles, /column-width: calc\(100vw - 32px\)/);
+  assert.match(readerSource, /className="reader-epub-chapter-select" aria-label="选择章节"/);
+  assert.match(readerSource, /title="缩小文字" aria-label="缩小文字"/);
+  assert.match(readerSource, /title="放大文字" aria-label="放大文字"/);
+  assert.match(readerSource, /fontScale/);
   assert.doesNotMatch(readerStyles, /\.reader-(?:pdf-track|epub-page-viewport) \{[^}]*touch-action:/);
   assert.match(readerSource, /Math\.abs\(page - activePage\) <= 2/);
   assert.match(readerSource, /scrollFrameRef/);
   assert.match(readerSource, /contentRef/);
+  assert.match(readerSource, /reader-pdf-text-layer textLayer file-reader-document reader-text-container/);
+  assert.match(readerSource, /reader-epub-content file-reader-document reader-text-container/);
+  assert.match(readerSource, /secondFrame = window\.requestAnimationFrame\([\s\S]*?onRendered\?\.\(\)/);
+  assert.match(readerSource, /EPUB content is mounted after an asynchronous unit request/);
+  assert.match(readerSource, /attempts < 4/);
+  assert.match(readerSource, /setTimeout\(\(\) => \{ if \(!cancelled\) applyReaderTextHighlights/);
   assert.match(readerSource, /\[0, -1, 1, -2, 2\]/);
   assert.match(annotationSource, /export function markReaderRange/);
   assert.match(annotationSource, /export function selectReaderAnnotation/);
-  assert.match(annotationSource, /annotation\.type\);/);
+  assert.match(annotationSource, /annotation\.type, readerAnnotationLocator\(annotation\)\);/);
+  assert.match(annotationSource, /startOffset/);
+  assert.match(annotationSource, /A unit\/page locator is an identity/);
+  assert.match(annotationSource, /same normalized anchor engine/);
+  assert.match(annotationSource, /readerAnnotationMatchesAnchor/);
+  assert.match(anchorSource, /READER_TEXT_CONTAINER_SELECTOR/);
+  assert.match(anchorSource, /Mark candidate ancestors, not descendants/);
+  assert.match(legacyReaderSource, /file-preview-scroll reader-text-container/);
+  const textNodesBlock = anchorSource.match(/export function readerTextNodes\([\s\S]*?\n\}\n/u)?.[0] ?? "";
+  const textNodesInRangeBlock = annotationSource.match(/function textNodesInRange\([\s\S]*?\n\}\n\nfunction textBoundaryOffset/u)?.[0] ?? "";
+  assert.ok(textNodesBlock && textNodesInRangeBlock);
+  assert.doesNotMatch(textNodesBlock, /data-reader-annotation/);
+  assert.doesNotMatch(textNodesInRangeBlock, /data-reader-annotation/);
   assert.match(readerSource, /mark\.reader-local-highlight\[data-reader-annotation\]/);
   assert.match(fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderAnnotations.tsx"), "utf8"), /reader-annotation-ask/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderAnnotations.tsx"), "utf8"), /if \(!selected\) return null/);
   assert.match(fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8"), /type: "highlight", quoteText: selection\.text,[\s\S]*color: "orange"/);
   assert.match(selectionSource, /reader-selection-preview/);
 });
@@ -60,8 +200,12 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   assert.match(appSource, /lazy\(\(\) => import\("\.\/reader\/ReaderDocument"\)/);
   assert.match(appSource, /source\.format === "pdf" \|\| readerManifest\.source\.format === "epub"[\s\S]*<LazyReaderDocument/);
   assert.doesNotMatch(readerSource, /^import .* from ["']pdfjs-dist["'];$/m);
-  assert.match(readerSource, /await import\("pdfjs-dist"\)/);
+  assert.match(readerSource, /await import\("pdfjs-dist\/legacy\/build\/pdf\.mjs"\)/);
+  assert.match(readerSource, /new Worker\(new URL\("\.\/pdf-worker\.ts", import\.meta\.url\)/);
   assert.match(readerSource, /const availableWidth = Number\.isFinite\(maxWidth\)/);
+  assert.match(readerSource, /readPdfTextContent\(page\)/);
+  assert.doesNotMatch(readerSource, /page\.getTextContent\(\)/);
+  assert.match(readerSource, /disableFontFace:\s*shouldDisablePdfFontFace\(\)/);
   assert.match(readerSource, /new ResizeObserver\(updatePageWidth\)/);
   assert.match(readerSource, /pageMaxWidth\} active=/);
   assert.match(readerSource, /import "\.\/ReaderDocument\.css"/);
@@ -78,7 +222,7 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   const readerScripts = assetNames.filter((name) => name.endsWith(".js") && sources.get(name)?.includes("正在按需加载 PDF") && sources.get(name)?.includes("正在后台解析 EPUB"));
   const readerStyles = assetNames.filter((name) => name.endsWith(".css") && sources.get(name)?.includes(".reader-pdf-track") && sources.get(name)?.includes(".reader-epub-track"));
   const pdfRuntimes = assetNames.filter((name) => name.endsWith(".js") && sources.get(name)?.includes("pdfjsLib") && sources.get(name)?.includes("PDFDataRangeTransport"));
-  const pdfWorkers = assetNames.filter((name) => /^pdf\.worker-.*\.mjs$/.test(name));
+  const pdfWorkers = assetNames.filter((name) => /^pdf-worker-.*\.js$/.test(name));
   assert.equal(readerScripts.length, 1, "the paginated reader should be one isolated lazy chunk");
   assert.equal(readerStyles.length, 1, "PDF/EPUB-only CSS should be one isolated lazy stylesheet");
   assert.equal(pdfRuntimes.length, 1, "PDF.js should remain one isolated lazy runtime");

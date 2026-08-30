@@ -1,59 +1,105 @@
 import type { ReaderAnnotation } from "../api";
+import { isReaderTextNode, normalizeReaderAnchorQuote, readerDocumentContainers, restoreReaderTextAnchor, type ReaderTextAnchor } from "./selection-anchor";
 
 type ReaderTextContainer = HTMLElement;
 
-function annotationLocator(annotation: ReaderAnnotation): { unitId?: string; page?: number } {
+export type ReaderAnnotationLocator = { unitId?: string; page?: number; startOffset?: number; endOffset?: number; textLength?: number };
+
+export function readerAnnotationLocator(annotation: ReaderAnnotation): ReaderAnnotationLocator {
   try {
-    const value = JSON.parse(annotation.locator_json) as { unitId?: unknown; page?: unknown };
+    const value = JSON.parse(annotation.locator_json) as { unitId?: unknown; page?: unknown; startOffset?: unknown; endOffset?: unknown; textLength?: unknown };
+    const relationalUnit = typeof annotation.unit_id === "string" && annotation.unit_id.length > 0 ? annotation.unit_id : undefined;
     return {
-      unitId: typeof value.unitId === "string" ? value.unitId : undefined,
+      // The relational unit is validated by the API and is therefore the
+      // authoritative identity when both representations are present. Keep
+      // the JSON value only for legacy rows that predate that column.
+      unitId: relationalUnit ?? (typeof value.unitId === "string" && value.unitId.length > 0 ? value.unitId : undefined),
       page: typeof value.page === "number" && Number.isFinite(value.page) ? Math.trunc(value.page) : undefined,
+      startOffset: typeof value.startOffset === "number" && Number.isFinite(value.startOffset) ? Math.trunc(value.startOffset) : undefined,
+      endOffset: typeof value.endOffset === "number" && Number.isFinite(value.endOffset) ? Math.trunc(value.endOffset) : undefined,
+      textLength: typeof value.textLength === "number" && Number.isFinite(value.textLength) ? Math.trunc(value.textLength) : undefined,
     };
   } catch {
-    return {};
+    return annotation.unit_id ? { unitId: annotation.unit_id } : {};
   }
+}
+
+/** Match a persisted annotation to a durable selection identity.
+ *
+ * Offset-bearing rows are compared by unit/page and document offsets. Legacy
+ * quote-only rows deliberately return false here; their visual mark (when
+ * mounted) is the stronger signal, and falling back to an equal quote would
+ * pick the wrong duplicate passage.
+ */
+export function readerAnnotationMatchesAnchor(annotation: ReaderAnnotation, anchor: Pick<ReaderTextAnchor, "unitId" | "page" | "startOffset" | "endOffset" | "textLength" | "normalizedText">): boolean {
+  const locator = readerAnnotationLocator(annotation);
+  if (locator.startOffset === undefined || locator.endOffset === undefined) return false;
+  if (anchor.unitId !== locator.unitId || anchor.page !== locator.page) return false;
+  if (locator.startOffset !== anchor.startOffset || locator.endOffset !== anchor.endOffset) return false;
+  if (locator.textLength !== undefined && locator.textLength > 0 && locator.textLength !== anchor.textLength) return false;
+  const expected = normalizeReaderAnchorQuote(annotation.quote_text);
+  const actual = normalizeReaderAnchorQuote(anchor.normalizedText);
+  if (!expected) return true;
+  if (!actual) return false;
+  return actual === expected || (annotation.quote_text.length >= 4_000 && actual.startsWith(expected));
 }
 
 function readerContainers(root: HTMLElement): ReaderTextContainer[] {
-  const candidates = root.matches(".file-reader-document")
-    ? [root]
-    : Array.from(root.querySelectorAll<HTMLElement>(".file-reader-document"));
-  // A PDF text layer and an EPUB unit can be nested in a reader shell. Keep
-  // the deepest containers so the same text node is never considered twice.
-  return candidates.filter((candidate) => !candidate.parentElement?.closest(".file-reader-document"));
-}
-
-function textNodes(container: ReaderTextContainer): Text[] {
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  const result: Text[] = [];
-  let node: Node | null;
-  while ((node = walker.nextNode())) {
-    const text = node as Text;
-    const parent = text.parentElement;
-    if (!parent || parent.closest("script,style,textarea,[data-reader-annotation],.reader-annotations")) continue;
-    if (text.data) result.push(text);
-  }
-  return result;
+  // Keep annotation replay on the same innermost document set used by the
+  // selection anchor. This prevents nested renderer shells from indexing the
+  // same text twice.
+  return readerDocumentContainers(root);
 }
 
 function matchingContainer(root: HTMLElement, annotation: ReaderAnnotation): ReaderTextContainer | null {
-  const locator = annotationLocator(annotation);
+  const locator = readerAnnotationLocator(annotation);
   const candidates = readerContainers(root);
-  if (locator.unitId) {
-    const escaped = typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(locator.unitId) : locator.unitId.replace(/[^A-Za-z0-9_-]/g, "\\$&");
-    const unit = candidates.find((candidate) => candidate.closest(`[data-reader-unit="${escaped}"]`));
-    if (unit) return unit;
-  }
-  if (locator.page !== undefined) {
-    const page = candidates.find((candidate) => Number(candidate.closest<HTMLElement>("[data-reader-page]")?.dataset.readerPage) === locator.page);
-    if (page) return page;
-  }
+  const hasIdentity = Boolean(locator.unitId) || locator.page !== undefined;
+  const identityMatch = candidates.find((candidate) => {
+    const unitId = candidate.dataset.readerUnit ?? candidate.closest<HTMLElement>("[data-reader-unit]")?.dataset.readerUnit;
+    const pageValue = candidate.dataset.readerPage ?? candidate.closest<HTMLElement>("[data-reader-page]")?.dataset.readerPage;
+    const page = pageValue === undefined ? undefined : Number(pageValue);
+    if (locator.unitId && unitId !== locator.unitId) return false;
+    if (locator.page !== undefined && page !== locator.page) return false;
+    return true;
+  });
+  if (identityMatch) return identityMatch;
+  // A unit/page locator is an identity, not a hint.  The requested source may
+  // be outside the bounded PDF/EPUB render window; waiting for that container
+  // to mount is safer than marking an identical quote in another chapter/page.
+  if (hasIdentity) return null;
   return candidates[0] ?? null;
 }
 
 function normalizedAnnotationColor(value: string | null | undefined): string {
   const color = String(value || "orange").trim().toLowerCase();
   return ["orange", "yellow", "green", "blue", "pink"].includes(color) ? color : "orange";
+}
+
+/** Return the visible-text portion of one selected text-node slice.
+ *
+ * HTML commonly keeps indentation/newlines in standalone text nodes between
+ * list items and block elements. Wrapping those nodes in a <mark> creates a
+ * real inline box, which can paint a vertical highlight and add an otherwise
+ * nonexistent line to the document. Keep annotation storage unchanged, but
+ * only paint characters that contain visible text. */
+export function readerHighlightSliceBounds(text: string, from = 0, to = text.length): { from: number; to: number } | null {
+  const boundedFrom = Math.max(0, Math.min(text.length, from));
+  const boundedTo = Math.max(boundedFrom, Math.min(text.length, to));
+  const value = text.slice(boundedFrom, boundedTo);
+  const leadingWhitespace = value.match(/^\s*/u)?.[0].length ?? 0;
+  const trailingWhitespace = value.match(/\s*$/u)?.[0].length ?? 0;
+  const visibleFrom = boundedFrom + leadingWhitespace;
+  const visibleTo = boundedTo - trailingWhitespace;
+  return visibleTo > visibleFrom ? { from: visibleFrom, to: visibleTo } : null;
+}
+
+/** Normalize only the layout whitespace used when locating a stored quote.
+ * The original quote is kept in the annotation payload, while this form lets
+ * replay survive HTML indentation, EPUB line wrapping, and PDF.js span
+ * boundaries changing between visits. */
+export function normalizeReaderQuoteForSearch(value: string): string {
+  return normalizeReaderAnchorQuote(value);
 }
 
 function markRange(range: Range, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight"): boolean {
@@ -74,74 +120,65 @@ function markRange(range: Range, annotationId: string, color = "orange", type: R
   }
 }
 
-function findAndMark(container: ReaderTextContainer, quote: string, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight"): boolean {
-  const nodes = textNodes(container);
-  if (nodes.length === 0) return false;
-  const direct = nodes.find((node) => node.data.includes(quote));
-  if (direct) {
-    const start = direct.data.indexOf(quote);
-    const range = document.createRange();
-    range.setStart(direct, start);
-    range.setEnd(direct, start + quote.length);
-    return markRange(range, annotationId, color, type);
-  }
-
-  // PDF.js and rich HTML commonly split a sentence over several spans. Build
-  // a temporary index so a quote can still be located across those text nodes.
-  const joined = nodes.map((node) => node.data).join("");
-  const startIndex = joined.indexOf(quote);
-  if (startIndex < 0) return false;
-  const endIndex = startIndex + quote.length;
-  let cursor = 0;
-  let startNode: Text | null = null;
-  let endNode: Text | null = null;
-  let startOffset = 0;
-  let endOffset = 0;
-  for (const node of nodes) {
-    const next = cursor + node.data.length;
-    if (!startNode && startIndex >= cursor && startIndex <= next) {
-      startNode = node;
-      startOffset = startIndex - cursor;
+function findAndMark(container: ReaderTextContainer, quote: string, annotationId: string, color = "orange", type: ReaderAnnotation["type"] = "highlight", locator?: ReaderAnnotationLocator): boolean {
+  // New annotations carry a document-text offset in addition to the quote.
+  // Prefer that identity so duplicate prose in one chapter cannot make replay
+  // mark the first matching sentence.  Quotes remain the compatibility
+  // fallback for annotations created before the offset locator existed.
+  const startOffsetLocator = locator?.startOffset;
+  const endOffsetLocator = locator?.endOffset;
+  const hasOffsetLocator = startOffsetLocator !== undefined && endOffsetLocator !== undefined;
+  if (hasOffsetLocator) {
+    const anchor: ReaderTextAnchor = {
+      text: quote,
+      normalizedText: "",
+      startOffset: startOffsetLocator,
+      endOffset: endOffsetLocator,
+      textLength: locator?.textLength ?? 0,
+      unitId: locator?.unitId,
+      page: locator?.page,
+    };
+    const offsetRange = restoreReaderTextAnchor(container, anchor);
+    if (offsetRange) {
+      const expected = normalizeReaderAnchorQuote(quote);
+      let actual = "";
+      try { actual = normalizeReaderAnchorQuote(offsetRange.toString()); } catch { return false; }
+      // The UI may intentionally truncate a very long quote. In that case a
+      // prefix check still guards against an offset accidentally pointing at a
+      // different paragraph after publisher markup changed.
+      const compatible = !expected || actual === expected || (quote.length >= 4_000 && actual.startsWith(expected));
+      if (compatible && markReaderRange(offsetRange, annotationId, color, type)) return true;
     }
-    if (endIndex >= cursor && endIndex <= next) {
-      endNode = node;
-      endOffset = endIndex - cursor;
-      break;
-    }
-    cursor = next;
+    // An explicit offset is an identity. Do not silently mark the first equal
+    // quote elsewhere in the same chapter if the source changed or the target
+    // is not mounted yet; the bounded replay pass can try again later.
+    return false;
   }
-  if (!startNode || !endNode) return false;
-  // Wrap only text slices in each participating node.  Extracting one range
-  // spanning several absolutely-positioned PDF.js spans would move those
-  // spans under a static <mark> and can change their hit-testing/layout. The
-  // per-node marks preserve the renderer's structure while still presenting
-  // one durable annotation ID.
-  const startPosition = nodes.indexOf(startNode);
-  const endPosition = nodes.indexOf(endNode);
-  if (startPosition < 0 || endPosition < startPosition) return false;
-  let marked = false;
-  for (let index = endPosition; index >= startPosition; index -= 1) {
-    const node = nodes[index];
-    const from = index === startPosition ? startOffset : 0;
-    const to = index === endPosition ? endOffset : node.data.length;
-    if (to <= from) continue;
-    const range = document.createRange();
-    range.setStart(node, from);
-    range.setEnd(node, to);
-    marked = markRange(range, annotationId, color, type) || marked;
-  }
-  return marked;
+  // Legacy annotations do not have offsets. Locate their quote through the
+  // same normalized anchor engine, then use the existing per-text-node marker
+  // so PDF.js spans and EPUB block structure are never extracted or moved.
+  const quoteRange = restoreReaderTextAnchor(container, {
+    text: quote,
+    normalizedText: normalizeReaderAnchorQuote(quote),
+    startOffset: 0,
+    endOffset: 0,
+    textLength: 0,
+  });
+  return quoteRange ? markReaderRange(quoteRange, annotationId, color, type) : false;
 }
 
 function textNodesInRange(range: Range): Text[] {
   const root = range.commonAncestorContainer;
-  if (root.nodeType === Node.TEXT_NODE) return [root as Text];
+  if (root.nodeType === Node.TEXT_NODE) {
+    const text = root as Text;
+    return text.data && isReaderTextNode(text) ? [text] : [];
+  }
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const result: Text[] = [];
   let node: Node | null;
   while ((node = walker.nextNode())) {
     const text = node as Text;
-    if (!text.data || text.parentElement?.closest("script,style,textarea,[data-reader-annotation],.reader-annotations")) continue;
+    if (!text.data || !isReaderTextNode(text)) continue;
     try {
       if (range.intersectsNode(text)) result.push(text);
     } catch {
@@ -154,8 +191,8 @@ function textNodesInRange(range: Range): Text[] {
 function textBoundaryOffset(range: Range, node: Text, container: Node, offset: number): number | null {
   if (container === node) return Math.max(0, Math.min(node.data.length, offset));
   const nodeRange = document.createRange();
-  nodeRange.selectNodeContents(node);
   try {
+    nodeRange.selectNodeContents(node);
     const relation = nodeRange.comparePoint(container, offset);
     if (relation < 0) return 0;
     if (relation > 0) return node.data.length;
@@ -181,7 +218,14 @@ export function markReaderRange(range: Range, annotationId: string, color = "ora
   // can alter their flow and hit-testing.
   if (range.startContainer === range.endContainer && range.startContainer.nodeType === Node.TEXT_NODE) {
     try {
-      if (markRange(range.cloneRange(), annotationId, color, type)) return true;
+      const node = range.startContainer as Text;
+      const bounds = readerHighlightSliceBounds(node.data, range.startOffset, range.endOffset);
+      if (bounds) {
+        const visibleRange = document.createRange();
+        visibleRange.setStart(node, bounds.from);
+        visibleRange.setEnd(node, bounds.to);
+        if (markRange(visibleRange, annotationId, color, type)) return true;
+      }
     } catch {
       // Fall through to the per-text-node path below.
     }
@@ -190,18 +234,46 @@ export function markReaderRange(range: Range, annotationId: string, color = "ora
     node,
     from: textBoundaryOffset(range, node, range.startContainer, range.startOffset),
     to: textBoundaryOffset(range, node, range.endContainer, range.endOffset),
-  })).filter((slice): slice is { node: Text; from: number; to: number } => slice.from !== null && slice.to !== null && slice.to > slice.from);
+  })).flatMap((slice): Array<{ node: Text; from: number; to: number }> => {
+    if (slice.from === null || slice.to === null) return [];
+    const bounds = readerHighlightSliceBounds(slice.node.data, slice.from, slice.to);
+    return bounds ? [{ node: slice.node, ...bounds }] : [];
+  });
   let marked = false;
   // Wrap from the end so DOM mutations cannot invalidate the text nodes and
   // offsets belonging to earlier slices in the same selection.
   for (let index = slices.length - 1; index >= 0; index -= 1) {
     const { node, from, to } = slices[index];
-    const slice = document.createRange();
-    slice.setStart(node, from);
-    slice.setEnd(node, to);
-    marked = markRange(slice, annotationId, color, type) || marked;
+    try {
+      const slice = document.createRange();
+      slice.setStart(node, from);
+      slice.setEnd(node, to);
+      marked = markRange(slice, annotationId, color, type) || marked;
+    } catch {
+      // The renderer may commit a new text layer between slices. Keep any
+      // slices already marked and let the next bounded replay pass retry.
+    }
   }
   return marked;
+}
+
+/** Return the annotation mark intersected by a live reader selection. */
+export function readerAnnotationIdForRange(range: Range): string | null {
+  const boundaryMarks = [range.startContainer, range.endContainer]
+    .map((node) => node instanceof Element ? node : node.parentElement)
+    .map((element) => element?.closest<HTMLElement>("mark.reader-local-highlight[data-reader-annotation]") ?? null)
+    .filter((mark): mark is HTMLElement => Boolean(mark));
+  if (boundaryMarks[0]?.dataset.readerAnnotation) return boundaryMarks[0].dataset.readerAnnotation;
+  const root = range.commonAncestorContainer instanceof Element
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  if (!root) return null;
+  for (const mark of Array.from(root.querySelectorAll<HTMLElement>("mark.reader-local-highlight[data-reader-annotation]"))) {
+    try {
+      if (range.intersectsNode(mark)) return mark.dataset.readerAnnotation ?? null;
+    } catch { /* The renderer may replace the mark during a page turn. */ }
+  }
+  return null;
 }
 
 /** Re-select an annotation's mounted text and bring it into view.  The native
@@ -209,26 +281,30 @@ export function markReaderRange(range: Range, annotationId: string, color = "ora
  * the existing Agent action remain available after a user taps a highlight. */
 export function selectReaderAnnotation(root: HTMLElement, annotationId: string): boolean {
   if (typeof document === "undefined" || typeof window === "undefined") return false;
-  const escaped = typeof CSS !== "undefined" && typeof CSS.escape === "function"
-    ? CSS.escape(annotationId)
-    : annotationId.replace(/[^A-Za-z0-9_-]/g, "\\$&");
-  let marks: HTMLElement[];
-  try {
-    marks = Array.from(root.querySelectorAll<HTMLElement>(`mark.reader-local-highlight[data-reader-annotation="${escaped}"]`));
-  } catch {
-    return false;
-  }
+  // Filter the data value after a fixed selector instead of interpolating an
+  // annotation ID into CSS. Besides avoiding escaping edge cases, this keeps
+  // malformed/legacy IDs from turning annotation focus into a selector error.
+  const marks = Array.from(root.querySelectorAll<HTMLElement>("mark.reader-local-highlight[data-reader-annotation]"))
+    .filter((mark) => mark.dataset.readerAnnotation === annotationId);
   if (marks.length === 0) return false;
   const first = marks[0];
   const last = marks[marks.length - 1];
   const range = document.createRange();
-  range.setStart(first, 0);
-  range.setEnd(last, last.childNodes.length);
+  try {
+    range.setStart(first, 0);
+    range.setEnd(last, last.childNodes.length);
+  } catch {
+    return false;
+  }
   const selection = window.getSelection();
   if (!selection) return false;
-  selection.removeAllRanges();
-  selection.addRange(range);
-  if (typeof first.scrollIntoView === "function") first.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  try {
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (typeof first.scrollIntoView === "function") first.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  } catch {
+    return false;
+  }
   return true;
 }
 
@@ -249,6 +325,6 @@ export function applyReaderTextHighlights(root: HTMLElement, annotations: Reader
     const quote = annotation.quote_text.trim();
     if (!quote) continue;
     const container = matchingContainer(root, annotation);
-    if (container) findAndMark(container, quote, annotation.id, annotation.color, annotation.type);
+    if (container) findAndMark(container, quote, annotation.id, annotation.color, annotation.type, readerAnnotationLocator(annotation));
   }
 }

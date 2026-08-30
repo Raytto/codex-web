@@ -50,13 +50,14 @@ export function ConversationMessage({ message, variant = "main", className: extr
   </article>;
 }
 
-export function ConversationMessageList({ messages, variant = "main", loading, loadingLabel = "正在加载会话上下文…", emptyLabel, pendingQuestion, pendingLabel, streamingContent, progressLabel, onScroll, className, style, containerRef, renderAssistant, renderUser, messageProps, userAvatar, assistantAvatar, beforeMessages, afterMessages }: {
+export function ConversationMessageList({ messages, variant = "main", loading, loadingLabel = "正在加载会话上下文…", emptyLabel, pendingQuestion, pendingQuote, pendingLabel, streamingContent, progressLabel, onScroll, className, style, containerRef, renderAssistant, renderUser, messageProps, userAvatar, assistantAvatar, beforeMessages, afterMessages }: {
   messages: Message[];
   variant?: ConversationMessageVariant;
   loading?: boolean;
   loadingLabel?: string;
   emptyLabel?: React.ReactNode;
   pendingQuestion?: string;
+  pendingQuote?: string;
   pendingLabel?: React.ReactNode;
   streamingContent?: string;
   progressLabel?: string;
@@ -78,7 +79,7 @@ export function ConversationMessageList({ messages, variant = "main", loading, l
     {!loading && messages.length === 0 && emptyLabel}
     {beforeMessages}
     {messages.map((message) => <ConversationMessage key={message.id} message={message} variant={variant} renderAssistant={renderAssistant} renderUser={renderUser} {...messageProps?.(message)} />)}
-    {pendingQuestion && <ConversationMessage message={{ id: "pending-question", role: "user", content: pendingQuestion, quote_excerpt: null, attachment_references: [], created_at: new Date().toISOString(), files: [] }} variant={variant} className="pending" avatar={userAvatar} statusLabel={pendingLabel} timeLabel={pendingLabel ? "" : undefined} />}
+    {pendingQuestion && <ConversationMessage message={{ id: "pending-question", role: "user", content: pendingQuestion, quote_excerpt: pendingQuote ?? null, attachment_references: [], created_at: new Date().toISOString(), files: [] }} variant={variant} className="pending" avatar={userAvatar} statusLabel={pendingLabel} timeLabel={pendingLabel ? "" : undefined} />}
     {streamingContent && <article className={`${reader ? "reader-ask-message " : ""}message assistant running streaming`}><div className="message-avatar">{assistantAvatar ?? <Zap size={15} />}</div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label"><LoaderCircle className="spin" size={12} />正在生成</span></div><ConversationMarkdown content={streamingContent} className={reader ? "reader-ask-markdown markdown" : "assistant-markdown markdown"} /></div></article>}
     {progressLabel && <div className={reader ? "reader-ask-progress" : "conversation-progress"}><LoaderCircle className="spin" size={14} /><span>{progressLabel}</span></div>}
     {afterMessages}
