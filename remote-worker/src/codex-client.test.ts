@@ -442,3 +442,86 @@ test("thread snapshots report rollout bytes from the app-server path", (context)
   assert.equal(snapshot?.rolloutBytes, 7);
   assert.equal(snapshot?.nameSource, "fallback");
 });
+
+for (const phase of ["initialize", "thread/resume", "turn/start", "active", "pre-aborted", "late-resume"] as const) {
+  test(`Remote Worker cancellation exits the child when stalled at ${phase}`, { timeout: 15_000 }, async (context) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-cancel-"));
+    const marker = path.join(root, "requests.jsonl");
+    const fake = path.join(root, "app-server.cjs.js");
+    fs.writeFileSync(fake, `
+      const fs = require('node:fs');
+      const readline = require('node:readline');
+      const phase = ${JSON.stringify(phase)};
+      const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+      const marker = ${JSON.stringify(marker)};
+      fs.appendFileSync(marker, JSON.stringify({pid:process.pid})+'\\n');
+      setInterval(()=>{},1000);
+      if (phase === 'active') {
+        process.on('SIGTERM',()=>{});
+        const child = require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+        fs.appendFileSync(marker,JSON.stringify({childPid:child.pid})+'\\n');
+      }
+      readline.createInterface({input:process.stdin}).on('line', line => {
+        const m = JSON.parse(line); fs.appendFileSync(marker,JSON.stringify({method:m.method})+'\\n');
+        if (m.method === phase || m.method === 'turn/interrupt') return;
+        if (m.method === 'initialize') send({id:m.id,result:{}});
+        if (m.method === 'thread/resume') {
+          const respond = () => send({id:m.id,result:{thread:{id:'root'}}});
+          if (phase === 'late-resume') setTimeout(respond, 100); else respond();
+        }
+        if (m.method === 'turn/start') send({id:m.id,result:{turn:{id:'turn'}}});
+      });
+    `);
+    const previous = process.env.CODEX_RUNTIME_PATH;
+    process.env.CODEX_RUNTIME_PATH = fake;
+    context.after(() => {
+      if (previous === undefined) delete process.env.CODEX_RUNTIME_PATH; else process.env.CODEX_RUNTIME_PATH = previous;
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+    const controller = new AbortController();
+    if (phase === "pre-aborted") controller.abort();
+    const execution = new CodexExecution({ cwd: root, threadId: "root", prompt: "test", imagePaths: [], model: "test", reasoningEffort: "low", optionalCapabilities: {} }, {
+      signal: controller.signal, onThreadStarted: () => {}, onProgress: () => {}, onContextUsage: () => {}, onQuotaUsage: () => {}, onChangedFile: () => {},
+    });
+    const rejected = assert.rejects(execution.result, { name: "AbortError" });
+    const target = phase === "active" ? "turn/start" : phase === "late-resume" ? "thread/resume" : phase;
+    if (phase !== "pre-aborted") {
+      const deadline = Date.now() + 4_000;
+      while (!fs.existsSync(marker) || !fs.readFileSync(marker, "utf8").includes(`"method":"${target}"`)) {
+        assert.ok(Date.now() < deadline, `fake app server did not reach ${target}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (phase === "active") await new Promise((resolve) => setTimeout(resolve, 30));
+      controller.abort();
+      execution.interrupt(); // The protocol calls both; cancellation stays idempotent.
+    }
+    await rejected;
+    const rows = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {pid?: number; childPid?: number; method?: string}) : [];
+    const pid = rows.find((row) => row.pid)?.pid;
+    if (pid) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    const childPid = rows.find((row) => row.childPid)?.childPid;
+    if (childPid) assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    if (phase !== "active" && phase !== "turn/start") assert.equal(rows.some((row) => row.method === "turn/start"), false);
+    if (phase === "active") assert.equal(rows.filter((row) => row.method === "turn/interrupt").length, 1);
+  });
+}
+
+test("Remote Worker bounds a stalled startup RPC without replaying the input", { timeout: 10_000 }, async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-startup-timeout-"));
+  const marker = path.join(root, "requests");
+  const fake = path.join(root, "app-server.js");
+  fs.writeFileSync(fake, `require('node:readline').createInterface({input:process.stdin}).on('line',line=>require('node:fs').appendFileSync(${JSON.stringify(marker)},line+'\\n'));`);
+  const previous = process.env.CODEX_RUNTIME_PATH;
+  process.env.CODEX_RUNTIME_PATH = fake;
+  context.after(() => { if (previous === undefined) delete process.env.CODEX_RUNTIME_PATH; else process.env.CODEX_RUNTIME_PATH = previous; fs.rmSync(root,{recursive:true,force:true}); });
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const execution = new CodexExecution({cwd:root,threadId:"root",prompt:"test",imagePaths:[],model:"test",reasoningEffort:"low",optionalCapabilities:{}}, {
+    signal: new AbortController().signal, onThreadStarted:()=>{},onProgress:()=>{},onContextUsage:()=>{},onQuotaUsage:()=>{},onChangedFile:()=>{},
+  });
+  const rejected = assert.rejects(execution.result, /initialize 超过 120 秒/);
+  const deadline = Date.now()+4_000;
+  while (!fs.existsSync(marker)) { assert.ok(Date.now()<deadline); await new Promise(resolve=>setImmediate(resolve)); }
+  context.mock.timers.tick(120_001);
+  await rejected;
+  assert.equal(fs.readFileSync(marker,"utf8").includes('turn/start'),false);
+});

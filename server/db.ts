@@ -12,6 +12,7 @@ import { isHostRootUser } from "./host-root-user.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import { containsPersonalContext, stripPersonalContext } from "./personal-context.js";
 import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, ReadingSourceRow, ReadingSourceVersionRow, ReadingUnitRow, ReaderFormat, ReaderVersionKind, ReaderVersionStatus } from "./reader-types.js";
+import { isModelCapacityContinuationPrompt } from "./internal-messages.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
@@ -20,6 +21,18 @@ export class StorageQuotaExceededError extends Error {
   readonly code = "USER_STORAGE_LIMIT";
   constructor() { super("User storage quota would be exceeded"); }
 }
+
+export type JobAttemptState = {
+  retries: number;
+  capacityStartedAt: number | null;
+  nextAttemptAt: string | null;
+  continuation: boolean;
+  acceptedTurnId: string | null;
+  contextRevision: number | null;
+  outputs: Array<[string, string]>;
+  images: Array<[string, string]>;
+  imageThreadId: string | null;
+};
 
 export type UserRow = {
   id: string;
@@ -241,6 +254,7 @@ export type MessageRow = {
   content: string;
   quote_excerpt?: string | null;
   is_scheduled?: number;
+  is_internal?: number;
   created_at: string;
 };
 
@@ -910,6 +924,7 @@ export class AppDatabase {
         content TEXT NOT NULL,
         quote_excerpt TEXT,
         is_scheduled INTEGER NOT NULL DEFAULT 0,
+        is_internal INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS pending_prompts (
@@ -1847,6 +1862,42 @@ export class AppDatabase {
       ] as const;
       for (const [name, definition] of additions) if (!columns.has(name)) this.sqlite.exec(`ALTER TABLE reading_source_versions ADD COLUMN ${name} ${definition}`);
     });
+    this.applyMigration(2026090701, "hide-capacity-continuation-messages", () => {
+      if (!this.columnNames("messages").has("is_internal")) {
+        this.sqlite.exec("ALTER TABLE messages ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0");
+      }
+      const importedUserMessages = this.sqlite.prepare(`
+        SELECT DISTINCT message.id,message.content
+        FROM messages message
+        JOIN remote_thread_items item ON item.message_id=message.id
+        WHERE message.role='user'
+          AND NOT EXISTS (SELECT 1 FROM jobs job WHERE job.message_id=message.id)
+      `).all() as Array<{ id: string; content: string }>;
+      const markInternal = this.sqlite.prepare("UPDATE messages SET is_internal=1 WHERE id=?");
+      for (const message of importedUserMessages) {
+        if (isModelCapacityContinuationPrompt(message.content)) markInternal.run(message.id);
+      }
+    });
+    this.applyMigration(2026090801, "durable-job-attempts", () => {
+      this.sqlite.exec(`CREATE TABLE job_attempt_state (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+        next_attempt_at TEXT,
+        state_json TEXT NOT NULL
+      ); CREATE INDEX job_attempt_due_idx ON job_attempt_state(next_attempt_at);
+      CREATE TRIGGER job_attempt_terminal_cleanup AFTER UPDATE OF status ON jobs
+      WHEN NEW.status IN ('completed','failed','cancelled','interrupted')
+      BEGIN DELETE FROM job_attempt_state WHERE job_id=NEW.id; END;`);
+    });
+    this.applyMigration(2026090802, "worker-enrollment-and-rotation", () => {
+      this.sqlite.exec(`CREATE TABLE remote_worker_enrollments (
+        token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL,
+        worker_id TEXT REFERENCES remote_workers(id) ON DELETE CASCADE
+      );
+      CREATE TABLE remote_worker_pending_credentials (
+        worker_id TEXT PRIMARY KEY REFERENCES remote_workers(id) ON DELETE CASCADE,
+        credential_id TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL
+      );`);
+    });
     const titleAuditRecoveryAt = new Date().toISOString();
     this.sqlite.prepare(`
       UPDATE conversation_title_audits
@@ -2415,7 +2466,7 @@ export class AppDatabase {
     }
     if (!this.getRemoteWorker(workerId)) throw new Error("Remote Worker does not exist");
     const now = new Date().toISOString();
-    this.sqlite.exec("BEGIN IMMEDIATE");
+    this.sqlite.exec("SAVEPOINT issue_device_credential");
     try {
       this.sqlite.prepare(`
         UPDATE remote_worker_credentials SET state='retired',revoked_at=?
@@ -2430,9 +2481,9 @@ export class AppDatabase {
         UPDATE remote_worker_credentials SET replaced_by=?
         WHERE worker_id=? AND state='retired' AND revoked_at=? AND replaced_by IS NULL
       `).run(credentialId, workerId, now);
-      this.sqlite.exec("COMMIT");
+      this.sqlite.exec("RELEASE issue_device_credential");
     } catch (error) {
-      this.sqlite.exec("ROLLBACK");
+      this.sqlite.exec("ROLLBACK TO issue_device_credential; RELEASE issue_device_credential");
       throw error;
     }
     return this.sqlite.prepare("SELECT * FROM remote_worker_credentials WHERE credential_id=?")
@@ -2454,6 +2505,67 @@ export class AppDatabase {
       WHERE worker_id=? AND credential_id=? AND state<>'revoked'
     `).run(new Date().toISOString(), workerId, credentialId);
     return result.changes === 1;
+  }
+
+  enrollRemoteWorker(input: Parameters<AppDatabase["registerRemoteWorker"]>[0], tokenHash: string): RemoteWorkerRow {
+    this.sqlite.exec("SAVEPOINT enroll_device");
+    try {
+      const grant = this.remoteWorkerEnrollment(tokenHash);
+      if (!grant || !(grant.worker_id === input.id || (grant.worker_id === null && !this.getRemoteWorker(input.id)))) {
+        throw new Error("设备注册凭据无效");
+      }
+      const worker = this.registerRemoteWorker(input);
+      this.issueRemoteWorkerCredential(input.id, crypto.randomUUID(), tokenHash);
+      this.sqlite.prepare("DELETE FROM remote_worker_enrollments WHERE token_hash=?").run(tokenHash);
+      this.sqlite.exec("RELEASE enroll_device");
+      return worker;
+    } catch (error) { this.sqlite.exec("ROLLBACK TO enroll_device; RELEASE enroll_device"); throw error; }
+  }
+
+  createRemoteWorkerEnrollment(tokenHash: string, expiresAt: string, workerId: string | null = null): void {
+    this.sqlite.prepare("DELETE FROM remote_worker_enrollments WHERE expires_at<=?").run(new Date().toISOString());
+    this.sqlite.prepare("INSERT INTO remote_worker_enrollments(token_hash,expires_at,worker_id) VALUES(?,?,?)")
+      .run(tokenHash, expiresAt, workerId);
+  }
+
+  remoteWorkerEnrollment(tokenHash: string): { worker_id: string | null } | undefined {
+    return this.sqlite.prepare("SELECT worker_id FROM remote_worker_enrollments WHERE token_hash=? AND expires_at>?")
+      .get(tokenHash, new Date().toISOString()) as { worker_id: string | null } | undefined;
+  }
+
+  activeRemoteWorkerCredential(tokenHash: string): RemoteWorkerCredentialRow | undefined {
+    return this.sqlite.prepare(`SELECT * FROM remote_worker_credentials WHERE token_hash=? AND state='active'
+      AND (expires_at IS NULL OR expires_at>?)`).get(tokenHash, new Date().toISOString()) as RemoteWorkerCredentialRow | undefined;
+  }
+
+  stageRemoteWorkerCredential(workerId: string, credentialId: string, tokenHash: string, expiresAt: string): void {
+    this.sqlite.prepare(`INSERT INTO remote_worker_pending_credentials(worker_id,credential_id,token_hash,expires_at) VALUES(?,?,?,?)
+      ON CONFLICT(worker_id) DO UPDATE SET credential_id=excluded.credential_id,token_hash=excluded.token_hash,expires_at=excluded.expires_at`)
+      .run(workerId, credentialId, tokenHash, expiresAt);
+  }
+
+  pendingRemoteWorkerCredential(workerId: string): { credential_id: string; token_hash: string; expires_at: string } | undefined {
+    return this.sqlite.prepare("SELECT credential_id,token_hash,expires_at FROM remote_worker_pending_credentials WHERE worker_id=? AND expires_at>?")
+      .get(workerId, new Date().toISOString()) as { credential_id: string; token_hash: string; expires_at: string } | undefined;
+  }
+
+  promoteRemoteWorkerCredential(workerId: string, credentialId: string): boolean {
+    const pending = this.pendingRemoteWorkerCredential(workerId);
+    if (!pending || pending.credential_id !== credentialId) return false;
+    this.sqlite.exec("SAVEPOINT promote_device_credential");
+    try {
+      this.issueRemoteWorkerCredential(workerId, credentialId, pending.token_hash);
+      this.sqlite.prepare("DELETE FROM remote_worker_pending_credentials WHERE worker_id=? AND credential_id=?").run(workerId, credentialId);
+      this.sqlite.exec("RELEASE promote_device_credential");
+    } catch (error) { this.sqlite.exec("ROLLBACK TO promote_device_credential; RELEASE promote_device_credential"); throw error; }
+    return true;
+  }
+
+  revokeRemoteWorkerDevice(workerId: string): void {
+    this.sqlite.prepare("DELETE FROM remote_worker_pending_credentials WHERE worker_id=?").run(workerId);
+    this.sqlite.prepare("DELETE FROM remote_worker_enrollments WHERE worker_id=?").run(workerId);
+    this.sqlite.prepare("UPDATE remote_worker_credentials SET state='revoked',revoked_at=? WHERE worker_id=? AND state<>'revoked'")
+      .run(new Date().toISOString(), workerId);
   }
 
   getRemoteWorkerUpdate(workerId: string): RemoteWorkerUpdateRow | undefined {
@@ -2867,6 +2979,16 @@ export class AppDatabase {
           JOIN jobs job ON job.message_id=item.message_id
           WHERE item.executor_id=? AND item.thread_id=? AND item.conversation_id=?
         `).all(executorId, thread.id, conversation.id) as Array<{ turn_id: string }>).map((row) => row.turn_id));
+      // Capacity continuation turns are generated inside an already-visible Codex Web
+      // Job. They remain in the Codex thread for recovery/audit, but must not be
+      // replayed as fresh user/assistant bubbles by the desktop observer.
+      for (const item of thread.messages) {
+        if (item.role !== "user") continue;
+        const parsed = parseResponseAnnotatedRequest(item.content);
+        if (isModelCapacityContinuationPrompt(stripPersonalContext(parsed?.content ?? item.content))) {
+          controlledTurns.add(item.turnId);
+        }
+      }
       const matchedExistingIds = new Set((this.sqlite.prepare("SELECT message_id FROM remote_thread_items WHERE conversation_id=? AND message_id IS NOT NULL")
         .all(conversation.id) as Array<{ message_id: string }>).map((row) => row.message_id));
       const activeJobMessage = activeJob?.message_id
@@ -2975,7 +3097,7 @@ export class AppDatabase {
       if (!unreadAnchorMessageId && thread.status === "idle" && previousExternalStatus === "running") {
         const latestUser = this.sqlite.prepare(`
           SELECT id,created_at FROM messages
-          WHERE conversation_id=? AND role='user'
+          WHERE conversation_id=? AND role='user' AND is_internal=0
           ORDER BY created_at DESC,id DESC LIMIT 1
         `).get(conversation.id) as { id: string; created_at: string } | undefined;
         if (latestUser) {
@@ -3388,18 +3510,18 @@ export class AppDatabase {
   }
 
   isFirstUserMessage(conversationId: string, messageId: string): boolean {
-    const first = this.sqlite.prepare("SELECT id FROM messages WHERE conversation_id=? AND role='user' ORDER BY created_at,id LIMIT 1")
+    const first = this.sqlite.prepare("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND is_internal=0 ORDER BY created_at,id LIMIT 1")
       .get(conversationId) as { id: string } | undefined;
     return first?.id === messageId;
   }
 
   getFirstUserMessage(conversationId: string): Pick<MessageRow, "id" | "content"> | undefined {
-    return this.sqlite.prepare("SELECT id,content FROM messages WHERE conversation_id=? AND role='user' ORDER BY created_at,id LIMIT 1")
+    return this.sqlite.prepare("SELECT id,content FROM messages WHERE conversation_id=? AND role='user' AND is_internal=0 ORDER BY created_at,id LIMIT 1")
       .get(conversationId) as Pick<MessageRow, "id" | "content"> | undefined;
   }
 
   listUserMessageContents(conversationId: string): string[] {
-    return (this.sqlite.prepare("SELECT content FROM messages WHERE conversation_id=? AND role='user' ORDER BY created_at,id")
+    return (this.sqlite.prepare("SELECT content FROM messages WHERE conversation_id=? AND role='user' AND is_internal=0 ORDER BY created_at,id")
       .all(conversationId) as Array<{ content: string }>).map((message) => message.content);
   }
 
@@ -4183,7 +4305,7 @@ export class AppDatabase {
   }
 
   listMessages(conversationId: string): Array<MessageRow & { files: FileRow[] }> {
-    const messages = this.sqlite.prepare("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,id").all(conversationId) as MessageRow[];
+    const messages = this.sqlite.prepare("SELECT * FROM messages WHERE conversation_id=? AND is_internal=0 ORDER BY created_at,id").all(conversationId) as MessageRow[];
     const files = this.sqlite.prepare("SELECT * FROM files WHERE conversation_id=? ORDER BY created_at,id").all(conversationId) as FileRow[];
     return messages.map((message) => ({
       ...message,
@@ -4199,12 +4321,12 @@ export class AppDatabase {
       if (!cursor || cursor.conversation_id !== conversationId) return undefined;
       newestFirst = this.sqlite.prepare(`
         SELECT * FROM messages
-        WHERE conversation_id=? AND (created_at<? OR (created_at=? AND id<?))
+        WHERE conversation_id=? AND is_internal=0 AND (created_at<? OR (created_at=? AND id<?))
         ORDER BY created_at DESC,id DESC LIMIT ?
       `).all(conversationId, cursor.created_at, cursor.created_at, cursor.id, pageSize + 1) as MessageRow[];
     } else {
       newestFirst = this.sqlite.prepare(`
-        SELECT * FROM messages WHERE conversation_id=?
+        SELECT * FROM messages WHERE conversation_id=? AND is_internal=0
         ORDER BY created_at DESC,id DESC LIMIT ?
       `).all(conversationId, pageSize + 1) as MessageRow[];
     }
@@ -5423,6 +5545,42 @@ export class AppDatabase {
     `).all() as TerminalJobRuntimeRow[];
   }
 
+  getJobAttemptState(jobId: string): JobAttemptState | undefined {
+    const row = this.sqlite.prepare("SELECT state_json FROM job_attempt_state WHERE job_id=?").get(jobId) as { state_json: string } | undefined;
+    return row ? JSON.parse(row.state_json) as JobAttemptState : undefined;
+  }
+
+  saveJobAttemptState(jobId: string, state: JobAttemptState): void {
+    this.sqlite.prepare(`INSERT INTO job_attempt_state(job_id,next_attempt_at,state_json) VALUES(?,?,?)
+      ON CONFLICT(job_id) DO UPDATE SET next_attempt_at=excluded.next_attempt_at,state_json=excluded.state_json`)
+      .run(jobId, state.nextAttemptAt, JSON.stringify(state));
+  }
+
+  deferJobForCapacity(jobId: string, state: JobAttemptState): boolean {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.getJob(jobId);
+      if (!job || job.status !== "running") { this.sqlite.exec("ROLLBACK"); return false; }
+      this.saveJobAttemptState(jobId, state);
+      this.updateJob(jobId, "queued");
+      this.updateConversation(job.conversation_id, { status: "idle" });
+      this.sqlite.exec("COMMIT");
+      return true;
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
+  nextCapacityRetryAt(): string | null {
+    const row = this.sqlite.prepare(`SELECT MIN(state.next_attempt_at) AS due FROM job_attempt_state state
+      JOIN jobs job ON job.id=state.job_id WHERE job.status='queued' AND state.next_attempt_at>?`)
+      .get(new Date().toISOString()) as { due: string | null };
+    return row.due;
+  }
+
+  hasCapacityWaitingJobs(): boolean {
+    return Boolean(this.sqlite.prepare(`SELECT 1 FROM job_attempt_state state JOIN jobs job ON job.id=state.job_id
+      WHERE job.status='queued' AND state.next_attempt_at IS NOT NULL LIMIT 1`).get());
+  }
+
   getNextQueuedJob(): JobRow | undefined {
     return this.sqlite.prepare("SELECT j.* FROM jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.status='queued' AND c.deleted_at IS NULL ORDER BY j.queue_seq LIMIT 1").get() as JobRow | undefined;
   }
@@ -5431,6 +5589,10 @@ export class AppDatabase {
     return this.sqlite.prepare(`
       SELECT queued.* FROM jobs queued JOIN conversations conversation ON conversation.id=queued.conversation_id
       WHERE queued.status='queued'
+        AND NOT EXISTS (SELECT 1 FROM job_attempt_state attempt WHERE attempt.job_id=queued.id
+          AND attempt.next_attempt_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        AND NOT EXISTS (SELECT 1 FROM jobs earlier WHERE earlier.conversation_id=queued.conversation_id
+          AND earlier.status='queued' AND earlier.queue_seq<queued.queue_seq)
         AND conversation.deleted_at IS NULL
         AND conversation.external_status<>'running'
         AND NOT EXISTS (
@@ -5445,7 +5607,11 @@ export class AppDatabase {
   listRunnableQueuedJobs(limit = 100): JobRow[] {
     return this.sqlite.prepare(`
       SELECT queued.* FROM jobs queued JOIN conversations conversation ON conversation.id=queued.conversation_id
-      WHERE queued.status='queued' AND conversation.deleted_at IS NULL AND conversation.external_status<>'running'
+      WHERE queued.status='queued'
+        AND NOT EXISTS (SELECT 1 FROM job_attempt_state attempt WHERE attempt.job_id=queued.id
+          AND attempt.next_attempt_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        AND NOT EXISTS (SELECT 1 FROM jobs earlier WHERE earlier.conversation_id=queued.conversation_id
+          AND earlier.status='queued' AND earlier.queue_seq<queued.queue_seq) AND conversation.deleted_at IS NULL AND conversation.external_status<>'running'
         AND NOT EXISTS (
           SELECT 1 FROM jobs running
           WHERE running.conversation_id=queued.conversation_id AND running.status='running'
@@ -5463,6 +5629,19 @@ export class AppDatabase {
       WHERE job.status='running' AND project.executor_id=?
     `).get(executorId) as { value: number };
     return Number(row.value);
+  }
+
+  listRunningCodexThreadIdsForExecutor(executorId: string): string[] {
+    return (this.sqlite.prepare(`SELECT DISTINCT c.codex_thread_id AS id FROM conversations c
+      JOIN projects p ON p.id=c.project_id WHERE p.executor_id=? AND c.deleted_at IS NULL
+      AND c.external_status='running' AND c.codex_thread_id IS NOT NULL LIMIT 200`).all(executorId) as Array<{id: string}>).map(row => row.id);
+  }
+
+  reconcileRemoteThreadLifecycle(executorId: string, threadId: string, status: "idle" | "running"): string[] {
+    return (this.sqlite.prepare(`UPDATE conversations SET external_status=? WHERE codex_thread_id=?
+      AND deleted_at IS NULL AND external_status<>? AND project_id IN (SELECT id FROM projects WHERE executor_id=?)
+      AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id AND jobs.status='running')
+      RETURNING id`).all(status, threadId, status, executorId) as Array<{id: string}>).map(row => row.id);
   }
 
   countRunningCodexThreadsForExecutor(executorId: string): number {

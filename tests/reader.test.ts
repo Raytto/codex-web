@@ -189,10 +189,10 @@ test("paginated reader uses a full-bleed viewport, a bottom page indicator, and 
   assert.match(fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderAnnotations.tsx"), "utf8"), /reader-annotation-ask/);
   assert.match(fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderAnnotations.tsx"), "utf8"), /if \(!selected\) return null/);
   assert.match(fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8"), /type: "highlight", quoteText: selection\.text,[\s\S]*color: "orange"/);
-  assert.match(selectionSource, /reader-selection-preview/);
+  assert.doesNotMatch(selectionSource, /reader-selection-preview/);
 });
 
-test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial PPA payload", () => {
+test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial Codex Web payload", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const readerSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.tsx"), "utf8");
   const readerStylesSource = fs.readFileSync(path.join(process.cwd(), "src", "reader", "ReaderDocument.css"), "utf8");
@@ -215,7 +215,7 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   const distRoot = path.join(process.cwd(), "dist");
   const assetsRoot = path.join(distRoot, "assets");
   const builtIndex = fs.readFileSync(path.join(distRoot, "index.html"), "utf8");
-  const entryName = builtIndex.match(/<script[^>]+src="\/assets\/([^"]+\.js)"/)?.[1];
+  const entryName = builtIndex.match(/<script[^>]+src="\/codex-web\/assets\/([^"]+\.js)"/)?.[1];
   assert.ok(entryName, "the production build should expose its JavaScript entry");
   const assetNames = fs.readdirSync(assetsRoot);
   const sources = new Map(assetNames.filter((name) => /\.(?:js|mjs|css)$/.test(name)).map((name) => [name, fs.readFileSync(path.join(assetsRoot, name), "utf8")]));
@@ -241,7 +241,7 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   assert.ok(!builtIndex.includes(readerStyles[0]));
   assert.ok(!builtIndex.includes(pdfRuntimes[0]));
   assert.ok(!builtIndex.includes(pdfWorkers[0]));
-  for (const stylesheet of Array.from(builtIndex.matchAll(/href="\/assets\/([^"]+\.css)"/g), (match) => match[1])) {
+  for (const stylesheet of Array.from(builtIndex.matchAll(/href="\/codex-web\/assets\/([^"]+\.css)"/g), (match) => match[1])) {
     assert.doesNotMatch(sources.get(stylesheet) ?? "", /\.reader-(?:pdf|epub|paginator|document-shell)/);
   }
   assert.ok(fs.statSync(path.join(assetsRoot, readerScripts[0])).size < 32 * 1024, "the lightweight reader shell should stay below 32 KiB minified");
@@ -461,7 +461,7 @@ test("reader cold candidates honor the 15-day inactivity window and only archive
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
-  const db = new AppDatabase(dataRoot, { username: "pp", passwordHash: "", displayName: "PP" });
+  const db = new AppDatabase(dataRoot, { username: "reader", passwordHash: "", displayName: "Reader" });
   try {
     const ready = addReaderFixture(db, root);
     const failed = addReaderFixture(db, root);
@@ -494,7 +494,7 @@ test("reader normalized resources round-trip through the encrypted cold-storage 
   context.after(() => { process.env.PATH = originalPath; });
   const ageRecipient = path.join(root, "recipient"); const ageIdentity = path.join(root, "identity");
   fs.writeFileSync(ageRecipient, "recipient"); fs.writeFileSync(ageIdentity, "identity");
-  const db = new AppDatabase(dataRoot, { username: "pp", passwordHash: "", displayName: "PP" });
+  const db = new AppDatabase(dataRoot, { username: "reader", passwordHash: "", displayName: "Reader" });
   try {
     const fixture = addReaderFixture(db, root);
     const resource = path.join(dataRoot, "reader-resources", LEGACY_USER_ID, fixture.version.id, "units", "0.html");
@@ -523,7 +523,7 @@ test("ReaderService reuses a ready native PDF version and exposes a bounded mani
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
-  const db = new AppDatabase(dataRoot, { username: "pp", passwordHash: "", displayName: "PP" });
+  const db = new AppDatabase(dataRoot, { username: "reader", passwordHash: "", displayName: "Reader" });
   try {
     const fixture = addReaderFixture(db, root, "pdf");
     const config = loadConfig({ projectRoot: root, dataRoot, tenantRoot, readerMaxConcurrentReads: 5 });
@@ -541,7 +541,7 @@ test("direct PDF version manifests respect conversation cold-storage activation"
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
-  const db = new AppDatabase(dataRoot, { username: "pp", passwordHash: "", displayName: "PP" });
+  const db = new AppDatabase(dataRoot, { username: "reader", passwordHash: "", displayName: "Reader" });
   try {
     const fixture = addReaderFixture(db, root, "pdf");
     fs.rmSync(path.dirname(path.join(tenantRoot, LEGACY_USER_ID, "conversations", fixture.file.conversation_id, fixture.file.relative_path)), { recursive: true, force: true });

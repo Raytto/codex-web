@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AppDatabase } from "../server/db.js";
+import { MODEL_CAPACITY_CONTINUATION_PROMPT } from "../server/internal-messages.js";
 
 test("new cross-layer schema changes are versioned and idempotent", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-schema-migrations-"));
@@ -41,10 +42,13 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026082602, name: "reader-sources-and-annotations" },
     { version: 2026082603, name: "reader-storage-state-columns" },
     { version: 2026082604, name: "reader-storage-archive-metadata" },
+    { version: 2026090701, name: "hide-capacity-continuation-messages" },
+    { version: 2026090801, name: "durable-job-attempts" },
+    { version: 2026090802, name: "worker-enrollment-and-rotation" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
-  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, 28);
+  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, 31);
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some((column) => column.name === "finalization_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(remote_worker_credentials)").all() as Array<{ name: string }>).some((column) => column.name === "token_hash"));
   assert.ok((reopened.sqlite.prepare("PRAGMA index_list(conversations)").all() as Array<{ name: string }>).some((index) => index.name === "conversations_active_project_thread_idx"));
@@ -77,6 +81,7 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(voice_lexicon_terms)").all() as Array<{ name: string }>).some((column) => column.name === "rank_index"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(conversation_title_audits)").all() as Array<{ name: string }>).some((column) => column.name === "request_sha256"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).some((column) => column.name === "is_scheduled"));
+  assert.ok((reopened.sqlite.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).some((column) => column.name === "is_internal"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(executor_codex_account_state)").all() as Array<{ name: string }>).some((column) => column.name === "active_account_id"));
   assert.equal((reopened.sqlite.prepare("PRAGMA index_list(wake_plans)").all() as Array<{ name: string }>).some((index) => index.name === "wake_plans_active_creator_idx"), false);
   reopened.close();
@@ -88,6 +93,36 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
   const migrated = new AppDatabase(root, undefined, false);
   assert.equal((migrated.sqlite.prepare("PRAGMA index_list(wake_plans)").all() as Array<{ name: string }>).some((index) => index.name === "wake_plans_active_creator_idx"), false);
   migrated.close();
+});
+
+test("capacity continuation migration hides legacy observer imports without deleting their audit row", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-internal-continuation-migration-"));
+  let db: AppDatabase | undefined = new AppDatabase(root);
+  context.after(() => {
+    db?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const project = db.createProject(crypto.randomUUID(), "00000000-0000-4000-8000-000000000001", "work", "E:\\work", "remote:worker-a");
+  const conversation = db.createConversation(crypto.randomUUID(), "容量续接", undefined, undefined, project.id);
+  db.updateConversation(conversation.id, { codexThreadId: "thread-capacity-migration" });
+  const messageId = crypto.randomUUID();
+  db.addMessage({
+    id: messageId, conversation_id: conversation.id, role: "user",
+    content: MODEL_CAPACITY_CONTINUATION_PROMPT, created_at: "2026-09-07T08:00:00.000Z",
+  });
+  db.sqlite.prepare(`
+    INSERT INTO remote_thread_items(executor_id,thread_id,turn_id,item_id,conversation_id,message_id,role,created_at)
+    VALUES('remote:worker-a','thread-capacity-migration','turn-capacity','user-capacity',?,?,'user','2026-09-07T08:00:00.000Z')
+  `).run(conversation.id, messageId);
+  db.sqlite.prepare("UPDATE messages SET is_internal=0 WHERE id=?").run(messageId);
+  db.sqlite.prepare("DELETE FROM schema_migrations WHERE version=2026090701").run();
+  db.close();
+  db = new AppDatabase(root);
+
+  assert.equal(db.getMessage(messageId)?.is_internal, 1);
+  assert.deepEqual(db.listMessages(conversation.id), []);
+  assert.deepEqual(db.listMessagesPage(conversation.id)?.messages, []);
+  assert.equal((db.sqlite.prepare("SELECT count(*) AS value FROM messages WHERE id=?").get(messageId) as { value: number }).value, 1);
 });
 
 test("terminal finalization migration clears published journals without hiding recoverable work", (context) => {

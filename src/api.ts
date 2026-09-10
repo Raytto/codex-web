@@ -1,4 +1,4 @@
-export const BASE_PATH = "";
+export const BASE_PATH = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
 
 export type MaintenancePhase = "idle" | "preparing" | "active";
 export type DeploymentPhase = "idle" | "queued" | "building" | "candidate_ready" | "waiting_for_jobs" | "promoting" | "health_check" | "deployed" | "superseded" | "conflict" | "deferred" | "failed";
@@ -75,6 +75,8 @@ export type Executor = {
     installedVersion: string;
     installedRef: string | null;
     installedCommit: string | null;
+    credentialState?: "active" | "pending" | "revoked" | "unregistered";
+    credentialRotationCapable?: boolean;
     updaterCapable: boolean;
     capacityConfigurable: boolean;
     targetVersion: string;
@@ -555,6 +557,9 @@ export const api = {
   ),
   upgradeRemoteWorker: (executorId: string) => request<{ accepted: boolean; executor: Executor }>(
     `/executors/${encodeURIComponent(executorId)}/worker/upgrade`, { method: "POST" },
+  ),
+  updateWorkerCredential: (executorId: string, action: "rotate" | "revoke") => request<{ executor: Executor }>(
+    `/executors/${encodeURIComponent(executorId)}/worker/credential/${action}`, { method: "POST" },
   ),
   createRemoteWorkerBootstrap: () => request<RemoteWorkerBootstrap>("/remote-worker-bootstrap", { method: "POST" }),
   updateChatFontSize: (chatFontSize: number) => request<{ chatFontSize: number }>("/user-settings/chat-font-size", {

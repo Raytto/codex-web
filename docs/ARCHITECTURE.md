@@ -27,3 +27,15 @@ Conversation detail checks the current Codex rollout file size without loading t
 Optional voice transcription receives a bounded context envelope. The budget is shared across the current draft, attachment names, small heads of text attachments, recent messages, technical terms, and at most a few validated images. Before upload, the browser stores the complete recording in an account/conversation-scoped IndexedDB draft for 24 hours. A client recording UUID and a server-side receipt keyed by that UUID plus audio size/hash make retries safe when the original response is lost; processing receipts recover to a retryable state after restart. Temporary audio remains HMAC-signed and short-lived.
 
 The repository includes optional host-root execution, project routing, Remote Worker, account-management, personal-context, and cold-storage modules. They are fail-closed: without explicit sockets, tokens, provider endpoints, or key files they remain inert. The default Compose profile still excludes Docker socket access, host filesystem mounts, private network routing, and pre-provisioned user data.
+
+## Durable attempt and device state
+
+`job_attempt_state` separates logical Job ownership from individual execution
+attempts and persists retry eligibility, accepted context and original artifact
+baselines. Device enrollment and pending rotation use separate hash-only tables;
+server-authorized runtime release and rollout lifecycle reconciliation travel
+on the authenticated outbound Worker channel. See the invariants in
+[durable retries and device credentials](JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
+Reader/chat selections retain native DOM identity and restored text anchors;
+Agent streams preserve literal commands as described in
+[content fidelity](AGENT_CONTENT_FIDELITY.md).

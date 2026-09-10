@@ -89,6 +89,13 @@ export class ProjectSyncMonitor {
     this.observer.close();
   }
 
+  reconcileLifecycles(states: Array<{ threadId: string; status: "idle" | "running" }>): void {
+    for (const state of states) {
+      if (state.status === "idle") this.runningThreads.delete(state.threadId);
+      else this.runningThreads.add(state.threadId);
+    }
+  }
+
   hasRunningThreads(): boolean {
     return this.runningThreads.size > 0;
   }

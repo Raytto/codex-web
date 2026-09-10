@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / ".deploy" / "codex-web-audit.py"
-SPEC = importlib.util.spec_from_file_location("chatgpt_work_audit", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("codex_web_audit", SCRIPT)
 assert SPEC and SPEC.loader
 audit = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(audit)

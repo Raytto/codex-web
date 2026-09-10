@@ -7,7 +7,7 @@ Runs on a trusted Windows computer and makes that computer's local Codex availab
 Requires Node.js 22.13 or later and a logged-in local Codex CLI.
 
 ```powershell
-.\scripts\install.ps1 -EnrollmentToken '<server token>' -MachineName 'worker-host' -ServerHttpUrl 'https://your-codex-web.example'
+.\scripts\install.ps1 -EnrollmentToken '<one-time device grant>' -MachineName 'worker-host' -ServerHttpUrl 'https://your-codex-web.example'
 ```
 
 Runtime state, credentials and logs are stored in `%LOCALAPPDATA%\CodexWebWorker`; they are never stored in Git. The scheduled task starts after the current Windows user logs on so it shares that user's Codex Home and ChatGPT App session history.
@@ -100,7 +100,12 @@ PowerShell 5.1 and PowerShell 7.
 
 Both WSS directions now have runtime schemas and independent byte/complexity limits. Offline outbound updates persist atomically in a 500-item/8-MiB outbox; ephemeral status is coalesced and thread items merge by stable IDs before reconnect replay. The outbox excludes the enrollment hello/token and quarantines invalid state. It is restart-recoverable but not an exactly-once transport, so stable job/request/thread/item IDs remain the idempotency boundary.
 
-The server contains a hash-only per-device credential lifecycle schema for a future rotation protocol. Worker 1.15 still authenticates the WSS hello with the existing shared enrollment token. Do not remove or rotate that shared value as if device credentials were already active; the later cutover requires one-time bootstrap, overlapping old/new credentials, acknowledgement, revocation controls and an observed compatibility window.
+Worker 1.19.3 authenticates using an independent device-bound credential. A
+one-time installation grant becomes that device's credential on first use;
+rotation saves a replacement before retiring the old hash. The server-wide
+enrollment setting is no longer a normal connection credential. Existing
+shared-token installations require the explicit, expiring migration in
+[the upgrade guide](../docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
 
 Worker 1.13.1 advertises optional persistent-wait automation. For each Codex Web-controlled turn, the server may supply a job-scoped token and the Worker injects the bundled `wait-cli.js` path into that turn's tool-shell environment. Codex can register a one-shot time wait or an event/deadline wait; an external supervisor reports through a single-plan HTTPS receipt. No inbound Worker port is added, and a wake always re-enters the server's normal conversation queue. See `docs/WAKE_AUTOMATION.md` in the repository root.
 
@@ -174,3 +179,14 @@ scheduled task's PowerShell wrapper: the Node process exits with the private
 restart code `75`, the wrapper waits three seconds, then launches it again in
 the same task instance. This avoids depending on a detached child process,
 which Windows Task Scheduler may terminate together with the old task job.
+
+## Worker 1.19.3 reliability
+
+Capacity attempts retain checkpointed runtime and original output/image
+baselines until the authenticated server releases the logical Job. Startup RPCs
+have 120-second bounds; cancellation interrupts or reaps only the current
+execution tree and handles cancellation before turn creation. Account-switch
+reconciliation uses rollout terminal events independently of native thread reads,
+clearing stale markers while preserving real active-turn locks. Lifecycle and
+credential protocol fields remain compatible with clients that omit optional
+metadata. See the [upgrade and verification guide](../docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md).

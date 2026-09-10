@@ -23,19 +23,25 @@ const remoteJobRecovery = runner.recoverRemoteJobs();
 void remoteJobRecovery.catch((error) => logger.error({ error }, "Remote job startup recovery failed"));
 
 const server = app.listen(config.port, config.host, () => {
-  logger.info({ host: config.host, port: config.port, basePath: config.basePath }, "ChatGPT Work started");
-  void runner.cleanupTerminalJobRuntimes().then((result) => {
-    if (result.removed > 0 || result.failed.length > 0) {
-      logger[result.failed.length > 0 ? "warn" : "info"](
-        { removed: result.removed, absent: result.absent, failed: result.failed },
-        "Terminal job runtime startup cleanup finished",
-      );
-    }
-  }).catch((error) => {
-    logger.error({ error }, "Terminal job runtime startup cleanup failed");
-  });
+  logger.info({ host: config.host, port: config.port, basePath: config.basePath }, "Codex Web started");
+  void cleanupTerminalRuntimes();
 });
 remoteWorkers.attach(server);
+
+// Child attempts do not own runtime cleanup. Retryable Jobs remain protected
+// by their queued state; terminal leftovers (including root-owned files) are retried.
+let runtimeCleanupBusy = false;
+async function cleanupTerminalRuntimes(): Promise<void> {
+  if (runtimeCleanupBusy) return;
+  runtimeCleanupBusy = true;
+  try {
+    const result = await runner.cleanupTerminalJobRuntimes();
+    if (result.removed || result.failed.length) logger.info(result, "Terminal Job runtime cleanup");
+  } catch (error) { logger.error({ error }, "Terminal Job runtime cleanup failed"); }
+  finally { runtimeCleanupBusy = false; }
+}
+const runtimeCleanupTimer = setInterval(() => void cleanupTerminalRuntimes(), 5 * 60_000);
+runtimeCleanupTimer.unref();
 
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 29 * 60_000;
 let stopping = false;
@@ -43,8 +49,9 @@ let stopping = false;
 async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
+  clearInterval(runtimeCleanupTimer);
   beginShutdown();
-  logger.info({ signal }, "ChatGPT Work stopping");
+  logger.info({ signal }, "Codex Web stopping");
   const deadline = Date.now() + SHUTDOWN_DRAIN_TIMEOUT_MS;
   while ((db.listRunningJobSummaries().length > 0 || runner.activeJobCount > 0) && Date.now() < deadline) {
     await new Promise<void>((resolve) => setTimeout(resolve, 250));

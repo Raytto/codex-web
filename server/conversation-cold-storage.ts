@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { HOST_ROOT_USER_ID } from "./host-root-user.js";
 import type { ConversationStorageState } from "./db.js";
+import { retryColdOperation } from "./cold-storage-maintenance.js";
 
 export const COLD_STORAGE_FORMAT = "conversation-cold-storage-v2";
 const LEGACY_COLD_STORAGE_FORMAT = "conversation-cold-storage-v1";
@@ -402,8 +403,7 @@ export function listColdCandidates(roots: ColdStorageRoots, inactiveDays = 15): 
     const cutoff = Date.now() - inactiveDays * DAY_MS;
     const rows = sqlite.prepare("SELECT c.id AS conversation_id,c.user_id,c.project_id,c.codex_thread_id,c.title,c.status,c.external_status,c.deleted_at,c.deletion_state,c.archived_at,c.last_active_at,p.executor_id,COALESCE(s.state,'local') AS storage_state,COALESCE(s.generation,0) AS generation,COALESCE(s.revision,0) AS revision,s.manifest_json,s.manifest_sha256,s.archive_sha256,s.archive_bytes,s.plaintext_bytes,s.remote_drive_id,s.remote_path,s.local_isolated_path,COALESCE(s.retry_count,0) AS retry_count,s.last_error FROM conversations c LEFT JOIN projects p ON p.id=c.project_id LEFT JOIN conversation_storage s ON s.conversation_id=c.id WHERE c.deleted_at IS NULL").all() as StorageDbRow[];
     return rows.map((row) => candidateFor(sqlite, roots, row, cutoff)).sort((left, right) => {
-      // The daily job archives at most one conversation. Explicitly archived
-      // conversations therefore take precedence over ordinary aged candidates.
+      // Explicitly archived conversations take precedence within each snapshot.
       const archivedOrder = Number(right.archived) - Number(left.archived);
       if (archivedOrder) return archivedOrder;
       const ageOrder = right.ageHours - left.ageHours;
@@ -457,15 +457,21 @@ function assertColdStorageConfigured(roots: ColdStorageRoots): void {
 }
 
 function remoteTree(roots: ColdStorageRoots, remotePath: string): string {
-  return runAliyun(roots, ["tree", "--driveId", roots.driveId, "-fp", remotePath]);
+  return retryColdOperation(() => {
+    const listing = runAliyun(roots, ["tree", "--driveId", roots.driveId, "-fp", remotePath]);
+    // The CLI sometimes exits zero after a failed API request. Never confuse
+    // an invalid listing with an empty directory and upload a duplicate.
+    if (!listing.split(/\r?\n/).some((line) => line.trim() === remotePath)) throw new Error(`云端目录读取失败: ${remotePath}`);
+    return listing;
+  });
 }
 
 function ensureRemoteDirectory(roots: ColdStorageRoots, remotePath: string): void {
-  let listing = "";
-  try { listing = remoteTree(roots, remotePath); } catch { /* create below */ }
-  if (listing.split(/\r?\n/).some((line) => line.trim() === remotePath)) return;
-  runAliyun(roots, ["mkdir", "--driveId", roots.driveId, remotePath], 120_000);
-  if (!remoteTree(roots, remotePath).split(/\r?\n/).some((line) => line.trim() === remotePath)) throw new Error(`云端目录创建后不可见: ${remotePath}`);
+  retryColdOperation(() => {
+    try { remoteTree(roots, remotePath); return; } catch { /* create below */ }
+    runAliyun(roots, ["mkdir", "--driveId", roots.driveId, remotePath], 120_000);
+    remoteTree(roots, remotePath);
+  });
 }
 
 export function ensureRemotePath(roots: ColdStorageRoots, remotePath: string): void {
@@ -478,6 +484,18 @@ export function remoteObjectVisible(roots: ColdStorageRoots, remotePath: string)
   const parent = path.posix.dirname(remotePath);
   const name = path.posix.basename(remotePath);
   return remoteTree(roots, parent).split(/\r?\n/).some((line) => line.includes(`-> ${remotePath}`) || line.trim().endsWith(`/${name}`));
+}
+
+export function uploadColdArchive(roots: ColdStorageRoots, stage: string, remoteDirectory: string): void {
+  const remotePath = path.posix.join(remoteDirectory, path.basename(stage));
+  retryColdOperation(() => {
+    // File names include the ciphertext hash. An upload may have committed
+    // before its process failed: check that exact object before each retry.
+    // Callers still download and verify its size/hash before local eviction.
+    if (remoteObjectVisible(roots, remotePath)) return;
+    runAliyun(roots, ["upload", "--driveId", roots.driveId, "--np", "--retry", "5", "--timeout", "120", stage, remoteDirectory]);
+    if (!remoteObjectVisible(roots, remotePath)) throw new Error("归档上传后云端精确对象不可见");
+  });
 }
 
 export function stageForUpload(roots: ColdStorageRoots, source: string): string {
@@ -618,7 +636,7 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     fs.renameSync(archiveLocal, remoteArchiveLocal);
     ensureRemotePath(roots, remoteDirectory);
     const stage = stageForUpload(roots, remoteArchiveLocal);
-    try { runAliyun(roots, ["upload", "--driveId", roots.driveId, "--np", "--retry", "5", "--timeout", "120", stage, remoteDirectory]); }
+    try { uploadColdArchive(roots, stage, remoteDirectory); }
     finally { try { fs.unlinkSync(stage); } catch {} }
     if (!remoteObjectVisible(roots, remotePath)) throw new Error("归档上传后云端精确对象不可见");
     prepareDownloadDirectory(roots.downloadDir);
@@ -936,7 +954,7 @@ export function archiveVoiceRecording(rootsInput: Partial<ColdStorageRoots>, tra
     const remoteDirectory = `${VOICE_RECORDING_REMOTE_ROOT}/${row.user_id}/${row.created_at.slice(0, 7)}`; const remotePath = `${remoteDirectory}/${transcriptionId}-${archiveSha256}.age`;
     const remoteArchiveLocal = path.join(work, path.basename(remotePath)); fs.copyFileSync(encrypted, remoteArchiveLocal);
     ensureRemotePath(roots, remoteDirectory); const stage = stageForUpload(roots, remoteArchiveLocal);
-    try { runAliyun(roots, ["upload", "--driveId", roots.driveId, "--np", "--retry", "5", "--timeout", "120", stage, remoteDirectory]); } finally { try { fs.unlinkSync(stage); } catch {} }
+    try { uploadColdArchive(roots, stage, remoteDirectory); } finally { try { fs.unlinkSync(stage); } catch {} }
     if (!remoteObjectVisible(roots, remotePath)) throw new Error("语音归档上传后云端精确对象不可见");
     prepareDownloadDirectory(roots.downloadDir); downloadWork = fs.mkdtempSync(path.join(roots.downloadDir, `voice-${transcriptionId}-`)); prepareDownloadDirectory(downloadWork);
     runAliyun(roots, ["download", "--driveId", roots.driveId, "--np", `--saveto=${downloadWork}`, remotePath], 6 * 60 * 60_000);

@@ -6,7 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   acquireColdStorageLock, defaultColdStorageRoots, findDownloadedFile, openColdStorageDb, packageArchive,
   prepareDownloadDirectory, remoteObjectVisible, removeColdStorageLock, runAliyun, safeRelative,
-  sha256File, stageForUpload, ensureRemotePath, verifyAgeArchive, type ColdStorageRoots,
+  sha256File, stageForUpload, ensureRemotePath, uploadColdArchive, verifyAgeArchive, type ColdStorageRoots,
 } from "./conversation-cold-storage.js";
 import { READER_V1_RETENTION_DAYS } from "./reader-policy.js";
 
@@ -359,7 +359,7 @@ export function archiveReaderVersion(input: Partial<ReaderColdRoots>, versionId:
     const remoteRoot = `/${roots.readerRemoteRoot.replace(/^\/+|\/+$/g, "")}`;
     const remoteDir = path.posix.join(remoteRoot, row.user_id, row.source_id);
     const remotePath = `${remoteDir}/generation-${generation}-${archiveSha}.tar.age`;
-    const remoteLocal = path.join(work, path.basename(remotePath)); fs.copyFileSync(encrypted, remoteLocal); ensureRemotePath(roots, remoteDir); const stage = stageForUpload(roots, remoteLocal); try { runAliyun(roots, ["upload", "--driveId", roots.driveId, "--np", "--retry", "5", "--timeout", "120", stage, remoteDir]); } finally { try { fs.unlinkSync(stage); } catch {} }
+    const remoteLocal = path.join(work, path.basename(remotePath)); fs.copyFileSync(encrypted, remoteLocal); ensureRemotePath(roots, remoteDir); const stage = stageForUpload(roots, remoteLocal); try { uploadColdArchive(roots, stage, remoteDir); } finally { try { fs.unlinkSync(stage); } catch {} }
     if (!remoteObjectVisible(roots, remotePath)) throw new Error("阅读资源归档上传后云端对象不可见");
     prepareDownloadDirectory(roots.downloadDir); downloadWork = fs.mkdtempSync(path.join(roots.downloadDir, `reader-${versionId}-`)); prepareDownloadDirectory(downloadWork); runAliyun(roots, ["download", "--driveId", roots.driveId, "--np", `--saveto=${downloadWork}`, remotePath]); const downloaded = findDownloadedFile(downloadWork, path.basename(remotePath), [path.dirname(roots.downloadDir)]); if (fs.statSync(downloaded).size !== archiveBytes || sha256File(downloaded) !== archiveSha) throw new Error("阅读资源云端回下载校验失败");
     row = rowFor(sqlite, versionId)!; row = transition(sqlite, row, ["uploading"], "remote_verified", "remote_verify", { storage_manifest_json: manifestText, storage_manifest_sha256: manifestSha, storage_archive_sha256: archiveSha, storage_archive_bytes: archiveBytes, storage_plaintext_bytes: manifest.plaintextBytes, remote_drive_id: roots.driveId, remote_path: remotePath, storage_uploaded_at: new Date().toISOString(), storage_verified_at: new Date().toISOString(), last_error: null }); row = transition(sqlite, row, ["remote_verified"], "evicting", "local_evict_begin");

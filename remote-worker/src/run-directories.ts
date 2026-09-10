@@ -33,6 +33,7 @@ export async function sweepRunDirectories(
     try {
       const stat = await fs.promises.lstat(target);
       if (!stat.isDirectory() || stat.isSymbolicLink() || now - stat.mtimeMs < protectionMs) continue;
+      if (fs.existsSync(path.join(target, "attempt-state.json"))) continue; // coordinator reconciles retained Jobs
       await fs.promises.rm(target, { recursive: true, force: true });
       removed.push(entry.name);
     } catch (error) {
@@ -48,4 +49,29 @@ function resolveRunDirectory(stateRoot: string, jobId: string): string {
   const target = path.resolve(runsRoot, jobId);
   if (path.dirname(target) !== runsRoot || path.basename(target) !== jobId) throw new Error("Run directory escaped the protected root");
   return target;
+}
+
+export type RunAttemptState = { changedFiles: string[]; imageThreadId: string | null; images: Array<[string, string]> };
+
+export function readRunAttempt(stateRoot: string, jobId: string): RunAttemptState | null {
+  const file = path.join(resolveRunDirectory(stateRoot, jobId), "attempt-state.json");
+  try { return JSON.parse(fs.readFileSync(file, "utf8")) as RunAttemptState; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+}
+
+export function saveRunAttempt(stateRoot: string, jobId: string, state: RunAttemptState): void {
+  const dir = resolveRunDirectory(stateRoot, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "attempt-state.json");
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(temporary, file);
+}
+
+export function retainedRunIds(stateRoot: string): string[] {
+  const root = path.join(stateRoot, "runs");
+  if (!fs.existsSync(root)) return [];
+  return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()
+    && isRunDirectoryId(entry.name) && fs.existsSync(path.join(root, entry.name, "attempt-state.json")))
+    .map((entry) => entry.name).slice(0, 64);
 }

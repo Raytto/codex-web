@@ -99,3 +99,30 @@ New deployments default to a 14-day Web session (`SESSION_TTL_HOURS=336`). Short
 for shared or higher-risk devices; changing it affects newly issued sessions.
 
 Also verify one empty-task reuse, one timed continuation with the intended same/new-conversation target and model selection, and a normal stop action. The health endpoint confirms the web process; these authenticated checks confirm the migrated queue and browser flow.
+
+## September 2026 upgrade checks
+
+Back up state before the new versioned SQLite migrations. Existing shared-token
+Workers need the explicit [credential migration](JOB_RETRY_AND_DEVICE_CREDENTIALS.md)
+and matching Worker 1.19.3 package; do not deploy a new gateway and assume old
+shared connections remain accepted. Verify independent reconnect, rotate/revoke,
+a harmless task and cancellation before closing the migration window.
+
+Check queued capacity recovery after restart, first-attempt file delivery, and
+literal copyable commands. New tasks prefer Astra/high only where the catalog
+supports them. Run the two `tests/browser/*-selection.mjs` fixtures with
+`PLAYWRIGHT_MODULE` pointing to an installed Playwright package and optionally
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE`; these fixtures use isolated loopback servers.
+Verify long reader quotes, native selection and all selection actions on target
+mobile Safari devices separately. Docker's test target includes `.github` so
+Worker CI-contract checks can run.
+
+For opted-in storage, use the finite-batch `maintain` command and review
+[cold-storage scheduling and restore acceptance](CONVERSATION_COLD_STORAGE.md).
+No private scheduler, runtime updater, service or credentials are installed.
+
+The base Compose file has no host bridge volume. After approving and configuring
+the root extension, set `CODEX_WEB_HOST_BRIDGE_DIR` and explicitly include
+`compose.host-root.yaml` with `docker compose -f compose.yaml -f compose.host-root.yaml`.
+The standard build, browser API URLs, Compose environment, health check and Nginx
+routes use `/codex-web`; the exact Worker connect route permits WSS upgrades.

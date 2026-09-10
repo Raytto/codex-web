@@ -4,6 +4,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { AgentOptions, CodexQuotaUsage, ContextUsage, ThreadSnapshot } from "./protocol.js";
 import { WORKER_VERSION } from "./version.js";
+import { rolloutLifecycle } from "./rollout-lifecycle.js";
 import { buildRemoteOptionalCapabilityConfig, remoteThreadInstructions } from "./agent-context.js";
 import { callWaitDynamicTool, WAIT_DYNAMIC_TOOL_NAME, WAIT_DYNAMIC_TOOL_SPEC, type WaitToolConfig } from "./wait-dynamic-tool.js";
 
@@ -46,6 +47,10 @@ export class CodexExecution {
   private readonly subagents = new Map<string, { path?: string; summary?: string }>();
   private terminal = false;
   private quotaRefreshInFlight = false;
+  private cancellationRequested = false;
+  private forceProcessTree = false;
+  private cancellationTimer?: NodeJS.Timeout;
+  private readonly onAbort = () => this.interrupt();
   private stderr = "";
   private resolveCompletion!: (value: string) => void;
   private rejectCompletion!: (error: Error) => void;
@@ -54,19 +59,20 @@ export class CodexExecution {
   constructor(private readonly options: { cwd: string; threadId: string | null; prompt: string; imagePaths: string[]; model: string; reasoningEffort: string; optionalCapabilities: Record<string, boolean>; automation?: { baseUrl: string; token: string; jobId: string; receiptDirectory: string; dynamicTool: boolean } }, private readonly callbacks: Callbacks) {
     this.result = new Promise<string>((resolve, reject) => { this.resolveCompletion = resolve; this.rejectCompletion = reject; }).finally(() => this.dispose());
     const launch = codexLaunch(["app-server", "--listen", "stdio://"]);
-    this.child = spawn(launch.command, launch.args, { cwd: options.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    this.child = spawn(launch.command, launch.args, { cwd: options.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     const lines = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     lines.on("line", (line) => this.handleLine(line));
     this.child.stderr.on("data", (chunk: Buffer) => { this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-8000); });
     this.child.on("error", (error) => this.fail(error));
     this.child.on("exit", (code, signal) => {
       lines.close();
-      if (!this.terminal) this.fail(new Error(this.stderr.trim() || `Codex app-server exited (${signal ?? code ?? "unknown"})`));
+      if (!this.terminal) this.fail(this.cancellationRequested ? this.cancelledError() : new Error(this.stderr.trim() || `Codex app-server exited (${signal ?? code ?? "unknown"})`));
       for (const pending of this.pending.values()) pending.reject(new Error("Codex app-server disconnected"));
       this.pending.clear();
     });
-    callbacks.signal.addEventListener("abort", () => this.interrupt(), { once: true });
-    void this.start();
+    callbacks.signal.addEventListener("abort", this.onAbort, { once: true });
+    if (callbacks.signal.aborted) this.interrupt();
+    else void this.start();
   }
 
   async steer(prompt: string, imagePaths: string[] = []): Promise<string> {
@@ -79,12 +85,27 @@ export class CodexExecution {
   }
 
   interrupt(): void {
-    if (this.threadId && this.turnId && !this.terminal) void this.request("turn/interrupt", { threadId: this.threadId, turnId: this.turnId }).catch(() => undefined);
+    if (this.terminal || this.cancellationRequested) return;
+    this.cancellationRequested = true;
+    this.forceProcessTree = true;
+    if (!this.threadId || !this.turnId) { this.fail(this.cancelledError()); return; }
+    void this.request("turn/interrupt", { threadId: this.threadId, turnId: this.turnId }).catch(() => undefined);
+    this.cancellationTimer = setTimeout(() => this.fail(this.cancelledError()), 5_000);
+  }
+
+  private cancelledError(): Error { const error = new Error("任务已停止"); error.name = "AbortError"; return error; }
+
+  private async startupRequest(method: string, params: JsonObject, label: string): Promise<unknown> {
+    this.callbacks.onProgress({ kind: "status", label });
+    const timer = setTimeout(() => { this.forceProcessTree = true; this.fail(new Error(`远端 Codex ${method} 超过 120 秒未响应，请重试`)); }, 120_000);
+    try { return await this.request(method, params); }
+    finally { clearTimeout(timer); }
   }
 
   private async start(): Promise<void> {
     try {
-      await this.request("initialize", { clientInfo: { name: "codex-web-remote-worker", title: "Codex Web Remote Worker", version: WORKER_VERSION }, capabilities: { experimentalApi: true, requestAttestation: false } });
+      await this.startupRequest("initialize", { clientInfo: { name: "codex-web-remote-worker", title: "Codex Web Remote Worker", version: WORKER_VERSION }, capabilities: { experimentalApi: true, requestAttestation: false } }, "正在初始化远端 Codex");
+      if (this.terminal || this.cancellationRequested) return;
       this.notify("initialized");
       void this.refreshQuotaUsage();
       const automationEnvironment = waitAutomationEnvironment(this.options.automation);
@@ -105,24 +126,28 @@ export class CodexExecution {
         },
       };
       const response = this.options.threadId
-        ? await this.request("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true })
-        : await this.request("thread/start", {
+        ? await this.startupRequest("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true }, "正在恢复远端会话")
+        : await this.startupRequest("thread/start", {
             ...common,
             developerInstructions: remoteThreadInstructions(),
             ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC] } : {}),
-          });
+          }, "正在创建远端会话");
+      if (this.terminal || this.cancellationRequested) return;
       const thread = (response as { thread?: { id?: string } }).thread;
       if (!thread?.id) throw new Error("Codex app-server did not return a thread id");
       this.threadId = thread.id;
       this.callbacks.onThreadStarted(thread.id);
       const input = makeUserInput(this.options.prompt, this.options.imagePaths);
-      const turn = await this.request("turn/start", { threadId: thread.id, input, model: this.options.model, effort: this.options.reasoningEffort, cwd: this.options.cwd, approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } }) as { turn?: { id?: string } };
+      const turn = await this.startupRequest("turn/start", { threadId: thread.id, input, model: this.options.model, effort: this.options.reasoningEffort, cwd: this.options.cwd, approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } }, "正在启动远端回合") as { turn?: { id?: string } };
+      if (this.terminal || this.cancellationRequested) return;
       if (!turn.turn?.id) throw new Error("Codex app-server did not start a turn");
       this.turnId = turn.turn.id;
+      this.callbacks.onProgress({ kind: "input_accepted", threadId: thread.id, turnId: turn.turn.id });
     } catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
   }
 
   private request(method: string, params: JsonObject): Promise<unknown> {
+    if (this.terminal || (this.cancellationRequested && method !== "turn/interrupt")) return Promise.reject(this.cancellationRequested ? this.cancelledError() : new Error("Codex execution has ended"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -132,6 +157,7 @@ export class CodexExecution {
 
   private notify(method: string): void { this.child.stdin.write(`${JSON.stringify({ method })}\n`); }
   private handleLine(line: string): void {
+    if (this.terminal) return;
     let message: { id?: number; result?: unknown; error?: { message?: string }; method?: string; params?: JsonObject };
     try { message = JSON.parse(line) as typeof message; } catch { return; }
     if (typeof message.id === "number" && typeof message.method === "string") {
@@ -174,7 +200,7 @@ export class CodexExecution {
       this.handleSubagentNotification(method, params);
       return;
     }
-    if (method === "turn/started") { const turn = params.turn as { id?: string } | undefined; if (turn?.id) this.turnId = turn.id; this.callbacks.onProgress({ kind: "status", label: "已开始分析" }); return; }
+    if (method === "turn/started") { const turn = params.turn as { id?: string } | undefined; if (turn?.id) { this.turnId = turn.id; this.callbacks.onProgress({ kind: "input_accepted", threadId: this.threadId, turnId: turn.id }); } this.callbacks.onProgress({ kind: "status", label: "已开始分析" }); return; }
     if (method === "thread/tokenUsage/updated") { const usage = normalizeContextUsage(params); if (usage) this.callbacks.onContextUsage(usage); return; }
     if (method === "error") { const error = params.error as { message?: string } | undefined; this.callbacks.onProgress({ kind: "error", label: error?.message || "上游处理发生错误" }); return; }
     if (method === "item/started" || method === "item/completed") {
@@ -249,7 +275,32 @@ export class CodexExecution {
       this.quotaRefreshInFlight = false;
     }
   }
-  private dispose(): void { if (this.child.stdin.writable) this.child.stdin.end(); if (!this.child.killed) this.child.kill("SIGTERM"); }
+  private async dispose(): Promise<void> {
+    this.callbacks.signal.removeEventListener("abort", this.onAbort);
+    if (this.cancellationTimer) clearTimeout(this.cancellationTimer);
+    for (const pending of this.pending.values()) pending.reject(new Error("Codex execution has ended"));
+    this.pending.clear();
+    if (this.child.exitCode !== null || this.child.signalCode !== null || !this.child.pid) return;
+    const exited = new Promise<void>((resolve) => this.child.once("exit", () => resolve()));
+    // Own only this execution's process tree. Never target the Worker or other
+    // desktop Codex sessions. Await exit before releasing the active run slot.
+    if (!this.forceProcessTree) {
+      if (this.child.stdin.writable) this.child.stdin.end();
+      this.child.kill("SIGTERM");
+      const timer = setTimeout(() => this.child.kill("SIGKILL"), 3_000);
+      try { await exited; } finally { clearTimeout(timer); }
+    } else if (process.platform === "win32") {
+      const killer = spawn("taskkill.exe", ["/PID", String(this.child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      killer.on("error", () => this.child.kill("SIGKILL"));
+      killer.on("exit", (code) => { if (code && this.child.exitCode === null && this.child.signalCode === null) this.child.kill("SIGKILL"); });
+      await exited;
+    } else {
+      const signalTree = (signal: NodeJS.Signals) => { try { process.kill(-this.child.pid!, signal); } catch { this.child.kill(signal); } };
+      signalTree("SIGTERM");
+      const timer = setTimeout(() => signalTree("SIGKILL"), 3_000);
+      try { await exited; } finally { clearTimeout(timer); }
+    }
+  }
 }
 
 export function normalizeContextUsage(params: JsonObject): ContextUsage | null {
@@ -687,7 +738,7 @@ export function normalizeThreadSnapshot(value: unknown): ThreadSnapshot | null {
     nameSource: explicitName ? "explicit" : preview ? "preview" : "fallback",
     createdAt,
     updatedAt,
-    status: running ? "running" : "idle",
+    status: (typeof thread.path === "string" ? rolloutLifecycle(thread.path) : null) ?? (running ? "running" : "idle"),
     rolloutBytes,
     messages: messages.slice(-1_000),
     activities: activities.slice(-2_000),

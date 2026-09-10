@@ -58,3 +58,10 @@ test("remote Worker accepts a bounded title-agent result and rejects oversized a
   assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "title_agent_result", requestId, ok: true, output: '{"title":"优化任务命名"}' })).ok, true);
   assert.deepEqual(parseRemoteWorkerMessage(JSON.stringify({ type: "title_agent_result", requestId, ok: true, output: "x".repeat(1001) })), { ok: false, reason: "invalid_schema" });
 });
+
+test("account lifecycle replies accept native v7 thread IDs and reject arbitrary paths", () => {
+  const message = { type: "codex_accounts_result", requestId: crypto.randomUUID(), ok: true,
+    threadStates: [{ threadId: "019fb964-b1fa-7c90-bbe7-fc16d4d165a3", status: "idle" }] };
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok, true);
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify({ ...message, threadStates: [{ threadId: "../../auth.json", status: "idle" }] })).ok, false);
+});

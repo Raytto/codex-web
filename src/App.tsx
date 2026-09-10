@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
+import { createContext, useContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -4105,7 +4105,7 @@ function WakePlanDetailsDialog({ conversation, onClose, onChanged }: { conversat
 }
 
 function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (project: Project) => void }) {
-  type RuntimeAction = "refresh" | "upgrade" | "worker";
+  type RuntimeAction = "refresh" | "upgrade" | "worker" | "credential";
   type RuntimeBusy = { action: RuntimeAction; executorId: string; requestId: number } | null;
   const [executors, setExecutors] = useState<Executor[]>([]);
   const [executorId, setExecutorId] = useState("");
@@ -4160,12 +4160,12 @@ function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
     return () => document.removeEventListener("keydown", close);
   }, [onClose]);
   useEffect(() => {
-    if (!workerUpdateActive) return;
+    if (!workerUpdateActive && selectedWorker?.credentialState !== "pending") return;
     const timer = window.setInterval(() => {
       void api.executors().then(({ executors: available }) => setExecutors(available)).catch(() => undefined);
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [workerUpdateActive]);
+  }, [workerUpdateActive, selectedWorker?.credentialState]);
   function chooseExecutor(nextExecutorId: string) {
     if (nextExecutorId === NEW_REMOTE_WORKER_OPTION) {
       setPage(null); setPathInput(""); setError(""); setBusy(true); setRuntimeBusy(null);
@@ -4225,6 +4225,19 @@ function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
       const result = await api.upgradeRemoteWorker(actionExecutorId);
       setExecutors((current) => current.map((executor) => executor.id === actionExecutorId ? result.executor : executor));
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Worker 升级请求失败"); }
+    finally { setRuntimeBusy((current) => current?.requestId === requestId ? null : current); }
+  }
+
+  async function updateWorkerCredential(action: "rotate" | "revoke") {
+    const actionExecutorId = executorId;
+    if (!actionExecutorId || selectedRuntimeBusy) return;
+    if (action === "revoke" && !window.confirm("吊销这台设备的连接凭据？设备将离线，重新接入需要管理员配置恢复凭据。其他设备不受影响。")) return;
+    const requestId = ++runtimeRequestRef.current;
+    setRuntimeBusy({ action: "credential", executorId: actionExecutorId, requestId }); setError("");
+    try {
+      const result = await api.updateWorkerCredential(actionExecutorId, action);
+      setExecutors((current) => current.map((executor) => executor.id === actionExecutorId ? result.executor : executor));
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "设备凭据更新失败"); }
     finally { setRuntimeBusy((current) => current?.requestId === requestId ? null : current); }
   }
 
@@ -4289,6 +4302,11 @@ function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
             : workerCurrent ? "已是最新版本" : "可升级到最新版本"
           }</small><small>{formatRemoteWorkerCapacity(selectedExecutor.capacity)} · 当前运行 {selectedExecutor.activeJobs} · 以 Worker 本机配置为准</small></div>
           <div className="worker-card-actions"><button type="button" disabled={!selectedWorker.updaterCapable || workerCurrent || workerUpdateActive || Boolean(selectedRuntimeBusy)} onClick={() => void upgradeWorker()}>{selectedRuntimeBusy?.action === "worker" || workerUpdateActive ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}升级 Worker</button></div>
+          <div><small>连接凭据：{selectedWorker.credentialState === "active" ? "每台设备独立" : selectedWorker.credentialState === "pending" ? "轮换已下发，等待设备保存确认" : selectedWorker.credentialState === "revoked" ? "已吊销或过期" : "尚未注册独立凭据"}</small></div>
+          <div className="worker-card-actions">
+            <button type="button" disabled={!selectedWorker.credentialRotationCapable || selectedWorker.credentialState !== "active" || Boolean(selectedRuntimeBusy)} onClick={() => void updateWorkerCredential("rotate")}>轮换连接凭据</button>
+            <button type="button" disabled={!selectedWorker.credentialState || ["revoked", "unregistered"].includes(selectedWorker.credentialState) || selectedExecutor.activeJobs > 0 || Boolean(selectedRuntimeBusy)} onClick={() => void updateWorkerCredential("revoke")}>吊销设备连接</button>
+          </div>
           {selectedWorker.update?.error && <small className="runtime-error">{selectedWorker.update.error}</small>}
         </div>}
         <label className="project-name-field">项目名称
@@ -4328,30 +4346,44 @@ function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
 
 type AskAgentSelection = { text: string; left: number; top: number; below: boolean };
 
-function AssistantMarkdown({ content, files, citationFiles, messageId, remoteFileFetchEnabled, onFetchRemoteFile }: {
-  content: string;
+type AssistantFileLinkContextValue = {
   files: WorkFile[];
-  citationFiles: WorkFile[];
   messageId: string;
   remoteFileFetchEnabled: boolean;
   onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>;
+};
+
+const AssistantFileLinkContext = createContext<AssistantFileLinkContextValue | null>(null);
+
+// A stable component type preserves native selection even when the toolbar or
+// live conversation data re-renders the message. Defining `a` inside the render
+// function would replace its entire subtree, including unavailable-file spans.
+function AssistantFileLink({ href, children }: { href?: string; children?: ReactNode }) {
+  const context = useContext(AssistantFileLinkContext)!;
+  const { files, messageId, remoteFileFetchEnabled, onFetchRemoteFile } = context;
+  const resolved = resolveMessageFileLink(href, files, remoteFileFetchEnabled);
+  if (resolved.kind === "preview" || resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+  if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
+  if (resolved.kind === "unavailable" && remoteFileFetchEnabled && resolved.path) return <RemoteFileInlineLink sourcePath={resolved.path} onFetch={() => onFetchRemoteFile(messageId, resolved.path!)}>{children}</RemoteFileInlineLink>;
+  if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
+  return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+}
+
+const assistantMarkdownComponents = { a: AssistantFileLink };
+
+function AssistantMarkdown({ content, files, citationFiles, messageId, remoteFileFetchEnabled, onFetchRemoteFile }: AssistantFileLinkContextValue & {
+  content: string;
+  citationFiles: WorkFile[];
 }) {
   const sanitized = useMemo(() => sanitizeAgentMarkdown(content, citationFiles), [citationFiles, content]);
   const math = useAsyncMarkdownMath(sanitized);
-  return <div className="markdown" data-agent-selectable="true" aria-busy={math.loading || undefined}><ReactMarkdown
+  const linkContext = useMemo(() => ({ files, messageId, remoteFileFetchEnabled, onFetchRemoteFile }), [files, messageId, remoteFileFetchEnabled, onFetchRemoteFile]);
+  return <AssistantFileLinkContext.Provider value={linkContext}><div className="markdown" data-agent-selectable="true" aria-busy={math.loading || undefined}><ReactMarkdown
     remarkPlugins={math.plugins ? [remarkGfm, math.plugins.remarkMath] : [remarkGfm]}
     rehypePlugins={math.plugins ? [[math.plugins.rehypeKatex, { throwOnError: false, strict: "ignore", trust: false }]] : []}
     urlTransform={(url) => isLocalMarkdownUrl(url) ? url : defaultUrlTransform(url)}
-    components={{ a: ({ href, children }) => {
-      const resolved = resolveMessageFileLink(href, files, remoteFileFetchEnabled);
-      if (resolved.kind === "preview") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-      if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-      if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
-      if (resolved.kind === "unavailable" && remoteFileFetchEnabled && resolved.path) return <RemoteFileInlineLink sourcePath={resolved.path} onFetch={() => onFetchRemoteFile(messageId, resolved.path!)}>{children}</RemoteFileInlineLink>;
-      if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
-      return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
-    } }}
-  >{math.content}</ReactMarkdown></div>;
+    components={assistantMarkdownComponents}
+  >{math.content}</ReactMarkdown></div></AssistantFileLinkContext.Provider>;
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {

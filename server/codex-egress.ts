@@ -1,6 +1,6 @@
 import http from "node:http";
 
-export const CODEX_EGRESS_FALLBACK_NOTICE = "BossLive 日本节点 10 秒内不可用，本次任务已切换到备用日本服务器。";
+export const CODEX_EGRESS_FALLBACK_NOTICE = "首选代理 10 秒内不可用，本次任务已切换到备用代理。";
 
 export type CodexEgressKind = "primary" | "backup" | "unchanged";
 

@@ -193,6 +193,7 @@ class AppServerTurnClient {
       }) as { turn?: { id?: string } };
       if (!turnResult?.turn?.id) throw new Error("Codex app server did not return a turn id");
       this.activeTurnId = turnResult.turn.id;
+      this.callbacks.onProgress({ kind: "input_accepted", threadId: thread.id, turnId: turnResult.turn.id });
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
     }
@@ -262,7 +263,10 @@ class AppServerTurnClient {
     }
     if (message.method === "turn/started") {
       const turn = params.turn as { id?: string } | undefined;
-      if (turn?.id) this.activeTurnId = turn.id;
+      if (turn?.id) {
+        this.activeTurnId = turn.id;
+        this.callbacks.onProgress({ kind: "input_accepted", threadId: this.threadId, turnId: turn.id });
+      }
       this.callbacks.onProgress({ kind: "status", label: "已开始分析" });
       return;
     }
@@ -281,10 +285,10 @@ class AppServerTurnClient {
       const error = params.error as { message?: string } | undefined;
       const detail = error?.message || "上游处理发生错误";
       this.callbacks.onProgress(isModelCapacityError(detail)
-        ? { kind: "error", label: redactBrand(detail) }
+        ? { kind: "error", label: detail }
         : isRetryableUpstreamError(detail)
         ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
-        : { kind: "error", label: redactBrand(detail) });
+        : { kind: "error", label: detail });
       return;
     }
     if (message.method === "item/agentMessage/delta") {
@@ -300,7 +304,7 @@ class AppServerTurnClient {
       this.callbacks.onProgress({
         kind: "assistant_stream",
         label: "正在生成回答",
-        detail: redactBrand(sanitizeAgentMarkdown(this.streamingAgentText)),
+        detail: sanitizeAgentMarkdown(this.streamingAgentText),
       });
       return;
     }
@@ -360,7 +364,7 @@ class AppServerTurnClient {
       }
       if (method === "item/completed" && item.type === "agentMessage"
         && (item.phase === "final_answer" || item.phase === undefined) && typeof item.text === "string") {
-        const summary = redactBrand(sanitizeAgentMarkdown(item.text)).trim().slice(0, 2_000);
+        const summary = sanitizeAgentMarkdown(item.text).trim().slice(0, 2_000);
         if (summary) this.subagents.set(threadId, { ...tracked, summary });
       }
       return;
@@ -372,7 +376,7 @@ class AppServerTurnClient {
       : turn?.status === "interrupted" ? "interrupted"
       : "failed";
     const errorSummary = status === "failed" && turn?.error?.message
-      ? redactBrand(sanitizeAgentMarkdown(turn.error.message)).trim().slice(0, 2_000)
+      ? sanitizeAgentMarkdown(turn.error.message).trim().slice(0, 2_000)
       : "";
     this.callbacks.onProgress({
       kind: "agent",
@@ -529,22 +533,22 @@ export function summarizeAppServerItem(item: JsonObject, completed: boolean): un
   if (subagent) return subagent;
   if (item.type === "reasoning") {
     const summary = [...asStringArray(item.summary), ...asStringArray(item.content)].join("\n\n").trim();
-    return summary ? { kind: "reasoning", label: "模型思路摘要", detail: redactBrand(sanitizeAgentMarkdown(summary)) } : null;
+    return summary ? { kind: "reasoning", label: "模型思路摘要", detail: sanitizeAgentMarkdown(summary) } : null;
   }
   if (item.type === "commandExecution") {
     const command = typeof item.command === "string" ? item.command : "";
     const status = typeof item.status === "string" ? item.status : completed ? "completed" : "inProgress";
-    return { kind: "command", label: status === "failed" ? "本机步骤执行失败，正在调整" : status === "inProgress" ? "正在执行本机处理步骤" : "本机处理步骤完成", detail: redactBrand(command) };
+    return { kind: "command", label: status === "failed" ? "本机步骤执行失败，正在调整" : status === "inProgress" ? "正在执行本机处理步骤" : "本机处理步骤完成", detail: command };
   }
   if (item.type === "fileChange") {
     const changes = Array.isArray(item.changes) ? item.changes as JsonObject[] : [];
     return { kind: "file", label: "已更新文件", files: changes.map((change) => String(change.path ?? change.file_path ?? "")).filter(Boolean) };
   }
   if (item.type === "webSearch") return { kind: "search", label: "正在搜索资料" };
-  if (item.type === "mcpToolCall") return { kind: "tool", label: `正在使用 ${redactBrand(String(item.server ?? "工具"))}`, detail: redactBrand(String(item.tool ?? "")) };
+  if (item.type === "mcpToolCall") return { kind: "tool", label: `正在使用 ${String(item.server ?? "工具")}`, detail: String(item.tool ?? "") };
   if (item.type === "plan") return { kind: "update", label: "任务计划已更新", detail: String(item.text ?? "") };
   if (item.type === "agentMessage" && completed) {
-    const detail = redactBrand(sanitizeAgentMarkdown(String(item.text ?? ""))).trim();
+    const detail = sanitizeAgentMarkdown(String(item.text ?? "")).trim();
     return detail ? { kind: "update", label: "阶段反馈", detail } : null;
   }
   return null;
@@ -580,7 +584,7 @@ function summarizeSubagentItem(item: JsonObject): unknown | null {
       : {};
     const status = normalizeSubagentStatus(rawState.status, item.status);
     const summary = typeof rawState.message === "string"
-      ? redactBrand(sanitizeAgentMarkdown(rawState.message)).trim().slice(0, 2_000)
+      ? sanitizeAgentMarkdown(rawState.message).trim().slice(0, 2_000)
       : "";
     return { id: id.slice(0, 200), status, ...(summary ? { summary } : {}) };
   });
@@ -598,8 +602,4 @@ function normalizeSubagentStatus(agentStatus: unknown, toolStatus: unknown): "pe
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-
-function redactBrand(value: string): string {
-  return value.replace(/chatgpt|codex/gi, "Codex Web");
 }

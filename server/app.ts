@@ -14,7 +14,7 @@ import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSel
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { parseCodexFileMentionRequest } from "../src/codex-file-mentions.js";
 import { AppDatabase, StorageQuotaExceededError, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type PersonalMemoryReviewAction, type ProjectRow, type SessionRow, type UserRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
-import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, type AgentOptions, type AgentSelection } from "./model-options.js";
+import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_PROMPT_VERSION, CONVERSATION_TITLE_REASONING_EFFORT, ConversationTitleService, extractTitleRequestText } from "./conversation-title.js";
@@ -149,7 +149,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function optionsForExecutor(userId: string, executorId?: string | null): AgentOptions {
     if (!isHostRootUser(userId) || !executorId) return optionsForUser(userId);
-    return db.getExecutorRuntime(executorId)?.agentOptions ?? optionsForUser(userId);
+    return withPreferredAgentDefaults(db.getExecutorRuntime(executorId)?.agentOptions ?? optionsForUser(userId));
   }
 
   function optionsForConversation(conversation: ConversationRow): AgentOptions {
@@ -366,6 +366,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   let lastPublishedSystemStatus = JSON.stringify(systemStatusPayload(HOST_ROOT_USER_ID));
   let queuePumpBusy = false;
   let maintenanceQueueWaiting = false;
+  let capacityQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
   let maintenanceQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
   let wakeSchedulerBusy = false;
   let wakeSchedulerTimer: ReturnType<typeof setInterval> | undefined;
@@ -677,6 +678,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   });
 
+  remoteWorkers.on("thread_lifecycle", (notice: { conversationId: string }) => {
+    const conversation = db.getConversationForUser(notice.conversationId, HOST_ROOT_USER_ID);
+    if (conversation) publishConversationChanged(conversation);
+    if (config.queueAutoStart) scheduleQueuePump();
+  });
+
   remoteWorkers.on("thread_activity", (notice: { executorId: string; projectId: string; thread: import("./remote-worker-protocol.js").RemoteThreadSnapshot }) => {
     try {
       const project = db.getActiveProjectForUser(notice.projectId, HOST_ROOT_USER_ID);
@@ -699,6 +706,19 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (!shuttingDown) trackBackground("maintenance_queue_pump", pumpQueue());
     }, 1_000);
     maintenanceQueueWakeTimer.unref();
+  }
+
+  function scheduleCapacityQueueWake(): void {
+    if (capacityQueueWakeTimer) clearTimeout(capacityQueueWakeTimer);
+    capacityQueueWakeTimer = undefined;
+    if (!config.queueAutoStart || shuttingDown) return;
+    const due = db.nextCapacityRetryAt();
+    if (!due) return;
+    capacityQueueWakeTimer = setTimeout(() => {
+      capacityQueueWakeTimer = undefined;
+      if (!shuttingDown) trackBackground("capacity_queue_pump", pumpQueue());
+    }, Math.max(1, Math.min(2_147_483_647, Date.parse(due) - Date.now())));
+    capacityQueueWakeTimer.unref();
   }
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
@@ -965,12 +985,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const executor = project ? remoteWorkers.executor(project.executor_id) : undefined;
       const waitingForRemote = Boolean(project && workerIdFromExecutor(project.executor_id) && executor?.status !== "online");
       const blocked = dispatchBlock(queued.conversation_id);
+      const retry = db.getJobAttemptState(queued.id);
       publish(queued.id, "status", {
         status: "queued",
         queuePosition,
         jobsAhead,
         label: maintenancePhase !== "idle"
           ? maintenanceQueueGuidance[maintenancePhase]
+          : retry?.nextAttemptAt && retry.nextAttemptAt > new Date().toISOString() ? `模型容量等待中，将于 ${new Date(retry.nextAttemptAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）自动继续`
           : waitingForRemote ? `等待 ${executor?.machineName ?? "远程电脑"} 上线`
           : blocked ? dispatchBlockLabel(blocked)
           : jobsAhead === 0 ? "任务即将开始" : `正在等待本会话前面的 ${jobsAhead} 个任务运行完毕`,
@@ -1052,6 +1074,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     } finally {
       queuePumpBusy = false;
       publishQueuePositions();
+      scheduleCapacityQueueWake();
     }
   }
 
@@ -2113,6 +2136,28 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       remoteWorkers.emit("status", executorId);
       return res.status(409).json({ error: message });
     }
+  });
+
+  api.post("/executors/:executorId/worker/credential/:action", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    if (!isHostRootUser(session.user_id)) return res.status(403).json({ error: "当前账号不能管理执行机器。" });
+    const workerId = workerIdFromExecutor(String(req.params.executorId));
+    if (!workerId || !db.getRemoteWorker(workerId)) return res.status(404).json({ error: "设备不存在" });
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      if (req.params.action === "rotate") {
+        const result = remoteWorkers.rotateDeviceCredential(workerId);
+        return res.status(202).json({ ...result, executor: remoteWorkers.executor(String(req.params.executorId)) });
+      }
+      if (req.params.action === "revoke") { remoteWorkers.revokeDeviceCredential(workerId); return res.json({ revoked: true, executor: remoteWorkers.executor(String(req.params.executorId)) }); }
+      if (req.params.action === "recover") {
+        const token = crypto.randomBytes(32).toString("base64url");
+        const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+        db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(token).digest("hex"), expiresAt, workerId);
+        return res.json({ workerId, enrollmentToken: token, expiresAt });
+      }
+      return res.status(400).json({ error: "无效凭据操作" });
+    } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "凭据操作失败" }); }
   });
 
   api.post("/executors/:executorId/worker/upgrade", (req, res) => {
@@ -3738,6 +3783,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       resumableUploads.stop();
       if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
       wakeSchedulerTimer = undefined;
+      if (capacityQueueWakeTimer) clearTimeout(capacityQueueWakeTimer);
+      capacityQueueWakeTimer = undefined;
       if (maintenanceQueueWakeTimer) clearTimeout(maintenanceQueueWakeTimer);
       maintenanceQueueWakeTimer = undefined;
       if (systemStatusTimer) clearInterval(systemStatusTimer);

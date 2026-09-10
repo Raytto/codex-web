@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import type { AppConfig } from "./config.js";
-import { AppDatabase, type FileRow, type JobFinalizationPayload } from "./db.js";
+import { AppDatabase, type FileRow, type JobFinalizationPayload, type JobAttemptState } from "./db.js";
 import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, normalizeStoredRelativePath, resolveGeneratedImage, resolveInside, snapshotDeliverables, snapshotGeneratedImages } from "./paths.js";
 import { cleanupJobRuntime, jobRuntimeRoot, prepareJobRuntime, resolvePythonRuntime, type JobRuntimeCleanupTarget } from "./python-runtime.js";
 import { assessTaskPolicy } from "./task-policy.js";
@@ -14,7 +14,7 @@ import { TenantWorkerClient } from "./tenant-worker-client.js";
 import type { TenantWorkerEvent, TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
 import type { AppServerTurnExecution } from "./app-server-turn.js";
 import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
-import { isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
+import { modelCapacityRetryDelayMs, isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
 import { isHostRootUser } from "./host-root-user.js";
 import { HostRootWorkerClient } from "./host-root-worker-client.js";
 import type { HostRootRunRequest } from "./host-root-protocol.js";
@@ -31,6 +31,9 @@ import { CODEX_EGRESS_FALLBACK_NOTICE, selectCodexEgress } from "./codex-egress.
 import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wake-automation.js";
 import { cleanupFinalizationDirectory, prepareFinalizationFiles, recoverPreparedFinalization, rollbackUncommittedFinalization, sweepFinalizationOrphans, type FinalizationFileSource } from "./job-finalization.js";
 import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
+import { MODEL_CAPACITY_CONTINUATION_PROMPT } from "./internal-messages.js";
+
+export { MODEL_CAPACITY_CONTINUATION_PROMPT, isModelCapacityContinuationPrompt } from "./internal-messages.js";
 
 type Publish = (jobId: string, eventType: string, payload: unknown) => void;
 
@@ -54,11 +57,6 @@ export function retryDelayLabel(delayMs: number): string {
   if (delayMs < 60_000) return `${delayMs / 1_000} 秒`;
   return `${delayMs / 60_000} 分钟`;
 }
-
-export const MODEL_CAPACITY_CONTINUATION_PROMPT = [
-  "继续刚才因模型容量不足而中断、尚未完成的任务。",
-  "先检查原会话中的最新进展、已经执行的命令、已有文件和现场状态，不要重复已经完成的步骤或外部操作；只完成剩余工作，并在完成后给出最终结果。",
-].join("\n\n");
 
 export function capacityRetryPrompt(originalPrompt: string, continuationRequired: boolean): string {
   return continuationRequired ? MODEL_CAPACITY_CONTINUATION_PROMPT : originalPrompt;
@@ -467,16 +465,15 @@ export class CodexRunner {
     let remoteOmittedArtifacts: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]> = [];
     let executionObserved = false;
     let capacityAttemptHadProgress = false;
-    let capacityAttemptReportedError = false;
-    let capacityContinuationRequired = false;
-    let lastRetryWasCapacity = false;
+    let attemptState: JobAttemptState | undefined = this.db.getJobAttemptState(jobId);
+    let capacityContinuationRequired = attemptState?.continuation ?? false;
     this.abortControllers.set(jobId, controller);
     try {
       const conversation = this.db.getConversation(conversationId);
       if (!conversation) throw new Error("会话不存在");
       const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
       const accountSkills = loadAccountSkillBundle(tenant.library);
-      const personalContextSnapshot = loadPersonalContextForTurn(
+      const personalContextSnapshot = attemptState?.contextRevision !== null && attemptState?.contextRevision !== undefined ? null : loadPersonalContextForTurn(
         tenant.library, conversation.codex_thread_id, conversation.personal_context_revision,
         this.db.getPersonalMemoryState(conversation.user_id).revision, prompt,
       );
@@ -486,8 +483,8 @@ export class CodexRunner {
       const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
       const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
       const localCodexHome = hostRoot ? this.config.hostRootCodexHome : tenant.codexHome;
-      const generatedImagesBeforeThreadId = conversation.codex_thread_id;
-      const generatedImagesBefore = !remoteWorkerId && generatedImagesBeforeThreadId
+      const generatedImagesBeforeThreadId = attemptState ? attemptState.imageThreadId : conversation.codex_thread_id;
+      const generatedImagesBefore = attemptState ? new Map(attemptState.images) : !remoteWorkerId && generatedImagesBeforeThreadId
         ? await snapshotGeneratedImages(localCodexHome, generatedImagesBeforeThreadId)
         : new Map<string, string>();
       const agentWorkspace = hostRoot ? this.hostWorkspace(conversation.user_id, conversationId) : workspace;
@@ -497,7 +494,11 @@ export class CodexRunner {
         token: createJobAutomationToken(this.config.sessionSecret, jobId, conversationId),
         receiptDirectory: path.join(agentWorkspace, ".automation", "wake-receipts"),
       } : undefined;
-      const before = await snapshotDeliverables(workspace);
+      const before = attemptState ? new Map(attemptState.outputs) : await snapshotDeliverables(workspace);
+      attemptState ??= { retries: 0, capacityStartedAt: null, nextAttemptAt: null, continuation: false,
+        acceptedTurnId: null, contextRevision: null, outputs: [...before], images: [...generatedImagesBefore], imageThreadId: generatedImagesBeforeThreadId };
+      attemptState.nextAttemptAt = null;
+      this.db.saveJobAttemptState(jobId, attemptState);
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
@@ -627,7 +628,19 @@ export class CodexRunner {
         onProgress: (payload: unknown) => {
           executionObserved = true;
           if (isMeaningfulExecutionProgress(payload)) capacityAttemptHadProgress = true;
-          if (isModelCapacityProgress(payload)) capacityAttemptReportedError = true;
+          if (payload && typeof payload === "object" && "kind" in payload && payload.kind === "input_accepted") {
+            const accepted = payload as { threadId?: string; turnId?: string };
+            if (attemptState && accepted.threadId === remoteThreadId && typeof accepted.turnId === "string") {
+              attemptState.acceptedTurnId = accepted.turnId;
+              attemptState.continuation = true;
+              if (personalContextSnapshot) {
+                attemptState.contextRevision = personalContextSnapshot.revision;
+                this.db.setConversationPersonalContextRevision(conversationId, personalContextSnapshot.revision);
+              }
+              this.db.saveJobAttemptState(jobId, attemptState);
+            }
+            return;
+          }
           if (containsPersonalContext(payload)) return;
           this.publish(jobId, "progress", payload);
         },
@@ -646,7 +659,6 @@ export class CodexRunner {
       }
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
         capacityAttemptHadProgress = false;
-        capacityAttemptReportedError = false;
         const continuationAttempt = capacityContinuationRequired;
         const attemptUserPrompt = capacityRetryPrompt(prompt, continuationAttempt);
         const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
@@ -659,21 +671,7 @@ export class CodexRunner {
         hostRequest.imageRelativePaths = continuationAttempt ? [] : selectedImagePaths
           .map((file) => file.relative_path);
         if (retryAttempt > 0) {
-          this.publish(jobId, "progress", {
-            kind: "retry",
-            label: lastRetryWasCapacity
-              ? continuationAttempt
-                ? `正在进行第 ${retryAttempt} 次容量续接`
-                : `正在进行第 ${retryAttempt} 次容量重试`
-              : `正在进行第 ${retryAttempt} 次连接重试`,
-            ...(continuationAttempt ? { detail: "正在原会话中继续未完成的任务，不会重发原始用户指令。" } : {}),
-          });
-          this.publish(jobId, "status", {
-            status: "running",
-            label: continuationAttempt
-              ? `正在进行第 ${retryAttempt} 次自动续接`
-              : `正在进行第 ${retryAttempt} 次自动重试`,
-          });
+          this.publish(jobId, "progress", { kind: "retry", label: `正在进行第 ${retryAttempt} 次连接重试` });
         }
         if (remoteWorkerId && project) {
           const result = options.resumeRemote
@@ -712,39 +710,13 @@ export class CodexRunner {
         finally { if (this.directExecutions.get(jobId) === execution) this.directExecutions.delete(jobId); }
       }, {
         signal: controller.signal,
-        // A no-progress capacity rejection safely retries the original prompt. Once an
-        // attempt has produced meaningful work, the next capacity retry starts a fresh turn
-        // in the same thread with an explicit continuation prompt instead of replaying the
-        // original user request. Transport retries retain the stricter whole-operation rule.
-        canRetry: (error) => isModelCapacityError(error) || !executionObserved,
-        onRetry: ({ attempt, maxAttempts, delayMs, message }) => {
-          const capacityError = isModelCapacityError(message);
-          lastRetryWasCapacity = capacityError;
-          if (capacityError) {
-            const continueExistingWork = capacityAttemptHadProgress || capacityContinuationRequired;
-            capacityContinuationRequired = continueExistingWork;
-            if (!capacityAttemptReportedError) this.publish(jobId, "progress", {
-              kind: "error",
-              label: redactBrandForDisplay(message),
-            });
-            this.publish(jobId, "progress", {
-              kind: "retry",
-              label: `容量不足，将在 ${retryDelayLabel(delayMs)} 后进行第 ${attempt} 次${continueExistingWork ? "续接" : "重试"}`,
-              detail: continueExistingWork
-                ? `本次已经产生执行进展；系统会在原会话中自动继续未完成的任务，不会重发原始用户指令，并持续尝试直到你主动停止。错误：${redactBrandForDisplay(message)}`
-                : `本次没有检测到新的命令、文件或阶段进展；系统会持续重试，直到你主动停止任务。错误：${redactBrandForDisplay(message)}`,
-            });
-          }
-          this.publish(jobId, "status", {
-            status: "retrying",
-            label: capacityError
-              ? `模型容量不足，${retryDelayLabel(delayMs)}后进行第 ${attempt} 次${capacityContinuationRequired ? "续接" : "重试"}`
-              : "上游连接短暂中断，正在自动重试",
-            retryAttempt: attempt,
-            ...(maxAttempts !== undefined ? { retryMaxAttempts: maxAttempts } : {}),
-            retryDelaySeconds: delayMs / 1000,
-            retryAt: new Date(Date.now() + delayMs).toISOString(),
-          });
+        // Capacity waits are persisted and release the worker. Only pre-execution
+        // transport failures may retry inside this invocation.
+        canRetry: (error) => !isModelCapacityError(error) && !executionObserved,
+        onRetry: ({ attempt, maxAttempts, delayMs }) => {
+          this.publish(jobId, "status", { status: "retrying", label: "上游连接短暂中断，正在自动重试",
+            retryAttempt: attempt, retryMaxAttempts: maxAttempts, retryDelaySeconds: delayMs / 1000,
+            retryAt: new Date(Date.now() + delayMs).toISOString() });
         },
       });
 
@@ -852,6 +824,21 @@ export class CodexRunner {
         console.warn("Finalization staging cleanup failed", error instanceof Error ? error.message : error);
       });
     } catch (error) {
+      if (!controller.signal.aborted && isModelCapacityError(error) && attemptState) {
+        const now = Date.now();
+        attemptState.capacityStartedAt ??= now;
+        const delayMs = modelCapacityRetryDelayMs(attemptState.retries, now - attemptState.capacityStartedAt);
+        attemptState.retries += 1;
+        attemptState.nextAttemptAt = new Date(now + delayMs).toISOString();
+        capacityContinuationRequired = attemptState.continuation || capacityAttemptHadProgress;
+        attemptState.continuation = capacityContinuationRequired;
+        if (this.db.deferJobForCapacity(jobId, attemptState)) {
+          this.remoteWorkers.release(jobId);
+          this.publish(jobId, "progress", { kind: "retry", label: `容量不足，已保存进度，将在 ${retryDelayLabel(delayMs)} 后继续`,
+            retryAttempt: attemptState.retries, retryAt: attemptState.nextAttemptAt });
+          return;
+        }
+      }
       const cancelled = controller.signal.aborted;
       const interrupted = !cancelled && error instanceof Error && (
         error.name === "TurnInterruptedError"
@@ -861,7 +848,7 @@ export class CodexRunner {
         ? "任务已停止"
         : interrupted
         ? "连接在本轮开始后中断。为避免重复执行命令或外部副作用，系统没有整轮重试；请确认现场状态后再继续。"
-        : error instanceof Error ? redactBrandForDisplay(error.message) : "Agent 任务失败";
+        : error instanceof Error ? error.message : "Agent 任务失败";
       try {
         this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message,
           interrupted ? `本轮已经开始执行，但随后连接中断。为避免重复产生副作用，系统没有自动重放。\n\n${message}` : undefined);
@@ -877,7 +864,7 @@ export class CodexRunner {
     } finally {
       this.abortControllers.delete(jobId);
       this.directExecutions.delete(jobId);
-      if (runtimeRoot) cleanupJobRuntime(runtimeRoot);
+      if (runtimeRoot && this.db.getJob(jobId)?.status !== "queued") cleanupJobRuntime(runtimeRoot);
       try { cleanupOwnedStagingDirectory(this.config.dataRoot, "remote-worker-staging", jobId); }
       catch { /* Staging cleanup must not mask the job result. */ }
     }
@@ -926,26 +913,22 @@ function parseFinalizationPayload(value: string | null): JobFinalizationPayload 
   } catch { return null; }
 }
 
-export function redactBrandForDisplay(value: string): string {
-  return value.replace(/chatgpt|codex/gi, "Codex Web");
-}
-
 export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (event.type === "error") return isModelCapacityError(event.message)
-    ? { kind: "error", label: redactBrandForDisplay(event.message) }
+    ? { kind: "error", label: event.message }
     : isRetryableUpstreamError(event.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
-    : { kind: "error", label: redactBrandForDisplay(event.message) };
+    : { kind: "error", label: event.message };
   if (event.type === "turn.started") return { kind: "status", label: "已开始分析" };
   if (event.type === "turn.completed") return { kind: "status", label: "工作已完成，正在整理结果" };
   if (event.type !== "item.started" && event.type !== "item.updated" && event.type !== "item.completed") return null;
   const item = event.item;
   if (item.type === "reasoning") {
-    const summary = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    const summary = sanitizeAgentMarkdown(item.text).trim();
     return summary ? { kind: "reasoning", label: "模型思路摘要", detail: summary } : null;
   }
   if (item.type === "command_execution") {
-    const detail = redactBrandForDisplay(item.command);
+    const detail = item.command;
     return {
       kind: "command",
       label: commandProgressLabel(item.command, item.status),
@@ -954,15 +937,15 @@ export function summarizeEvent(event: ThreadEvent): unknown | null {
   }
   if (item.type === "file_change") return { kind: "file", label: "已更新文件", files: item.changes.map((change) => change.path) };
   if (item.type === "web_search") return { kind: "search", label: "正在搜索资料", detail: item.query };
-  if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${redactBrandForDisplay(item.server)}`, detail: redactBrandForDisplay(item.tool) };
+  if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${item.server}`, detail: item.tool };
   if (item.type === "todo_list") return { kind: "todo", label: "任务计划已更新", items: item.items };
   if (item.type === "error") return isModelCapacityError(item.message)
-    ? { kind: "error", label: redactBrandForDisplay(item.message) }
+    ? { kind: "error", label: item.message }
     : isRetryableUpstreamError(item.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
-    : { kind: "error", label: redactBrandForDisplay(item.message) };
+    : { kind: "error", label: item.message };
   if (item.type === "agent_message" && event.type === "item.completed") {
-    const detail = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    const detail = sanitizeAgentMarkdown(item.text).trim();
     return detail ? { kind: "update", label: "阶段反馈", detail } : null;
   }
   return null;

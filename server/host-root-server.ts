@@ -19,6 +19,8 @@ import { validateCodexVoiceReviewRequest, type CodexVoiceReviewWorkerEvent } fro
 import { validateConversationTitleRequest, type ConversationTitleWorkerEvent } from "./conversation-title.js";
 import { CodexAccountManager } from "./codex-account-manager.js";
 import { defaultColdStorageRoots, restoreColdConversation } from "./conversation-cold-storage.js";
+import { countRunningJobsForExecutorInDatabase } from "./executor-job-status.js";
+import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 
 const socketPath = process.env.CODEX_WEB_HOST_SOCKET_PATH?.trim() || "";
 const hostTenantRoot = path.resolve(process.env.CODEX_WEB_HOST_TENANT_ROOT?.trim() || "");
@@ -512,7 +514,7 @@ function startWorker(socket: Socket, request: HostRootRunRequest): string {
     output.close();
     clearTimers(worker);
     workers.delete(request.jobId);
-    cleanupJobRuntime(worker.runtimeRoot);
+    // A child exit ends an attempt, not necessarily its logical Job.
     repairWorkspaceOwnership(workspace);
     if (!worker.terminal) {
       send(socket, { type: "event", jobId: request.jobId, event: { type: "failed", message: `CODEX_WEB 宿主任务异常退出（${signal ?? code ?? "unknown"}）`, cancelled: signal === "SIGTERM" || signal === "SIGKILL" } });
@@ -583,12 +585,13 @@ function assertCodexAccountSwitchAllowed(): void {
     throw new Error("CODEX_WEB 仍有任务执行，暂不能切换全局 Codex 账号。");
   }
   const database = process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite");
-  const query = spawnSync("sqlite3", [database, "SELECT count(1) FROM jobs WHERE status='running';"], {
-    encoding: "utf8",
-    timeout: 10_000,
-  });
-  if (query.status !== 0 || !/^\d+\s*$/.test(query.stdout)) throw new Error("无法确认任务状态，已拒绝切换全局 Codex 账号。");
-  if (Number(query.stdout.trim()) > 0) throw new Error("仍有任务执行，暂不能切换全局 Codex 账号；任务完成后可立即重试。");
+  let runningJobs: number;
+  try {
+    runningJobs = countRunningJobsForExecutorInDatabase(database, HOST_EXECUTOR_ID);
+  } catch {
+    throw new Error("无法确认 CODEX_WEB 服务器任务状态，已拒绝切换全局 Codex 账号。");
+  }
+  if (runningJobs > 0) throw new Error("CODEX_WEB 服务器仍有任务执行，暂不能切换全局 Codex 账号；任务完成后可立即重试。");
 }
 
 function validatePrompt(prompt: string): string {

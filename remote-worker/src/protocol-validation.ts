@@ -20,7 +20,7 @@ export function parseServerMessage(value: string): Validation<ServerMessage> {
 export function isPersistableWorkerMessage(value: unknown): value is WorkerMessage {
   if (!record(value) || !shortString(value.type, 80) || value.type === "hello" || !isBoundedJson(value)) return false;
   switch (value.type) {
-    case "heartbeat": return stringArray(value.activeJobs, 64, 200);
+    case "heartbeat": return stringArray(value.activeJobs, 64, 200) && (value.retainedJobs === undefined || stringArray(value.retainedJobs, 64, 200));
     case "quota_usage": return quota(value.usage) && optionalUuid(value.accountId);
     case "thread_activity": return uuid(value.projectId) && thread(value.thread);
     case "project_fs_result": return uuid(value.requestId) && shortString(value.directory, 4_096)
@@ -45,6 +45,7 @@ export function isPersistableWorkerMessage(value: unknown): value is WorkerMessa
       && (value.state === undefined || codexAccountsState(value.state))
       && (value.login === undefined || codexAccountLogin(value.login))
       && (value.restart === undefined || typeof value.restart === "boolean")
+      && (value.threadStates === undefined || recordArray(value.threadStates, 200, (item) => threadUuid(item.threadId) && ["idle", "running"].includes(String(item.status))))
       && optionalString(value.message, 2_000, 1);
     case "thread_sync_result": return uuid(value.requestId) && recordArray(value.threads, 50, thread)
       && (value.nextCursor === null || shortString(value.nextCursor, 500, 1));
@@ -57,7 +58,8 @@ function isServerMessage(value: unknown): value is ServerMessage {
   const allowed = SERVER_MESSAGE_KEYS[value.type];
   if (!allowed || !exactKeys(value, allowed)) return false;
   switch (value.type) {
-    case "authenticated": return uuid(value.workerId) && integer(value.heartbeatIntervalMs, 5_000, 60_000);
+    case "credential_replace": return uuid(value.workerId) && uuid(value.credentialId) && secret(value.token);
+    case "authenticated": return uuid(value.workerId) && integer(value.heartbeatIntervalMs, 5_000, 60_000) && (value.migrationOnly === undefined || typeof value.migrationOnly === "boolean");
     case "project_watch": return recordArray(value.projects, 200, (item) => exactKeys(item, ["id", "rootPath"]) && uuid(item.id) && shortString(item.rootPath, 4_096, 1));
     case "request_failed": return optionalUuid(value.requestId) && shortString(value.message, 2_000, 1);
     case "project_fs": return uuid(value.requestId) && ["list", "create", "validate", "initialize"].includes(String(value.action))
@@ -71,6 +73,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
         && exactKeys(value.turnContext, ["version", "userPrompt", "imageInput"])
         && value.turnContext.version === 1 && shortString(value.turnContext.userPrompt, 100_000, 1)
         && ["preload", "path_only", "none"].includes(String(value.turnContext.imageInput))));
+    case "run_release":
     case "cancel": return uuid(value.jobId);
     case "thread_rename": return uuid(value.requestId) && shortString(value.threadId, 200, 1) && shortString(value.name, 500, 1);
     case "thread_archive": return uuid(value.requestId) && shortString(value.threadId, 200, 1);
@@ -86,6 +89,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
     case "worker_config": return uuid(value.requestId) && integer(value.capacity, 0, 8);
     case "codex_accounts": {
       if (!uuid(value.requestId) || !["list", "login_start", "login_status", "login_cancel", "activate", "delete"].includes(String(value.action))) return false;
+      if (value.threadIds !== undefined && (value.action !== "list" || !Array.isArray(value.threadIds) || value.threadIds.length > 200 || !value.threadIds.every(threadUuid))) return false;
       if (value.action === "list") return value.label === undefined && value.loginId === undefined && value.accountId === undefined;
       if (value.action === "login_start") return optionalString(value.label, 60) && value.loginId === undefined && value.accountId === undefined;
       if (value.action === "login_status" || value.action === "login_cancel") return uuid(value.loginId) && value.label === undefined && value.accountId === undefined;
@@ -193,6 +197,7 @@ function integer(value: unknown, minimum: number, maximum: number): value is num
 function shortString(value: unknown, maximum: number, minimum = 0): value is string { return typeof value === "string" && value.length >= minimum && value.length <= maximum; }
 function optionalString(value: unknown, maximum: number, minimum = 0): boolean { return value === undefined || shortString(value, maximum, minimum); }
 function nullableString(value: unknown, maximum: number): boolean { return value === null || shortString(value, maximum, 1); }
+function threadUuid(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
 function uuid(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function optionalUuid(value: unknown): boolean { return value === undefined || uuid(value); }
 function secret(value: unknown): value is string { return shortString(value, 1_024, 16); }
@@ -203,7 +208,9 @@ function booleanRecord(value: unknown, maximumItems: number): boolean { return r
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean { return Object.keys(value).every((key) => allowed.includes(key)); }
 
 const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
-  authenticated: ["type", "workerId", "heartbeatIntervalMs"],
+  credential_replace: ["type", "workerId", "credentialId", "token"],
+  run_release: ["type", "jobId"],
+  authenticated: ["type", "workerId", "heartbeatIntervalMs", "migrationOnly"],
   project_watch: ["type", "projects"],
   request_failed: ["type", "requestId", "message"],
   project_fs: ["type", "requestId", "action", "path", "name", "content"],
@@ -220,6 +227,6 @@ const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
   worker_update: ["type", "requestId", "targetVersion", "targetRef"],
   worker_update_result_ack: ["type", "requestId"],
   worker_config: ["type", "requestId", "capacity"],
-  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId"],
+  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds"],
   heartbeat_ack: ["type", "at"],
 };

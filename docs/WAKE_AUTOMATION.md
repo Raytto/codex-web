@@ -45,3 +45,11 @@ observed, the next capacity attempt uses a continuation prompt in the existing C
 does not resend the original attachments.
 
 Set `PUBLIC_BASE_URL` when an external supervisor must call the event endpoint through a reverse proxy. The URL must include the configured base path when the deployment does not mount Codex Web at the origin root.
+
+## Capacity waits
+
+Capacity retry is a persisted Job-attempt state, separate from user-created wake
+plans. It releases running occupancy and preserves same-conversation ordering
+across restarts; cancellation stays terminal. See
+[durable retries](JOB_RETRY_AND_DEVICE_CREDENTIALS.md) for accepted-input and
+artifact-retention rules.

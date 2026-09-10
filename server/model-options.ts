@@ -51,9 +51,16 @@ const EFFORT_LABELS: Record<string, string> = {
   xhigh: "极高",
   max: "最大",
 };
-const DEFAULT_REASONING_EFFORT = "xhigh" as ModelReasoningEffort;
+const DEFAULT_MODEL = "gpt-6-astra";
+const DEFAULT_REASONING_EFFORT = "high" as ModelReasoningEffort;
 
 const FALLBACK_MODELS: AgentModelOption[] = [
+  {
+    id: DEFAULT_MODEL,
+    label: "GPT-6-Astra",
+    description: "旗舰 Agent 模型",
+    reasoningEfforts: ["low", "medium", "high", "xhigh"],
+  },
   {
     id: "gpt-5.6-sol",
     label: "GPT-5.6-Sol",
@@ -126,10 +133,29 @@ export function agentOptionsFromAppServer(value: unknown): AgentOptions | null {
   const models = candidates.sort((left, right) => left.priority - right.priority)
     .map(({ priority: _priority, isDefault: _isDefault, defaultEffort: _defaultEffort, ...model }) => model);
   const offeredEfforts = orderedEfforts(models.flatMap((model) => model.reasoningEfforts));
-  return {
+  return withPreferredAgentDefaults({
     models,
     reasoningEfforts: offeredEfforts.map((id) => ({ id, label: EFFORT_LABELS[id] ?? id })),
     defaults: { model: explicitDefault.id, reasoningEffort: defaultReasoning },
+  });
+}
+
+// Apply the web app's defaults to live and persisted executor catalogs alike.
+// Existing conversation and user selections are resolved separately.
+export function withPreferredAgentDefaults(options: AgentOptions): AgentOptions {
+  const model = options.models.find((candidate) => candidate.id === DEFAULT_MODEL)
+    ?? options.models.find((candidate) => candidate.id === options.defaults.model);
+  if (!model) return options;
+  return {
+    ...options,
+    defaults: {
+      model: model.id,
+      reasoningEffort: model.reasoningEfforts.includes(DEFAULT_REASONING_EFFORT)
+        ? DEFAULT_REASONING_EFFORT
+        : model.reasoningEfforts.includes(options.defaults.reasoningEffort)
+          ? options.defaults.reasoningEffort
+          : model.reasoningEfforts.at(-1)!,
+    },
   };
 }
 
@@ -156,6 +182,7 @@ function catalogModels(config: AppConfig, codexHome = config.codexHome): AgentMo
 }
 
 function strongestModel(models: AgentModelOption[]): string {
+  if (models.some((model) => model.id === DEFAULT_MODEL)) return DEFAULT_MODEL;
   const versionOf = (id: string) => {
     const match = /^gpt-(\d+)\.(\d+)/i.exec(id);
     return match ? { major: Number(match[1]), minor: Number(match[2]) } : { major: 0, minor: 0 };

@@ -95,3 +95,22 @@ test("Worker validates bounded Remote steer attachments and transfer scope", () 
   }));
   assert.equal(parsed.ok, true);
 });
+
+test("credential delivery is validated and credential acknowledgements never enter the durable outbox", () => {
+  const workerId = "10000000-0000-4000-8000-000000000001";
+  const credentialId = "10000000-0000-4000-8000-000000000002";
+  assert.equal(parseServerMessage(JSON.stringify({ type: "credential_replace", workerId, credentialId, token: "x".repeat(43) })).ok, true);
+  assert.equal(parseServerMessage(JSON.stringify({ type: "credential_replace", workerId: "invalid", credentialId, token: "secret" })).ok, false);
+  assert.equal(isPersistableWorkerMessage({ type: "credential_saved", credentialId }), false);
+});
+
+
+test("account lifecycle checks are bounded UUID-only list extensions", () => {
+  const requestId = "00000000-0000-4000-8000-000000000001";
+  const threadId = "019fb964-b1fa-7c90-bbe7-fc16d4d165a3";
+  const base = { type: "codex_accounts", requestId, action: "list", threadIds: [threadId] };
+  assert.equal(parseServerMessage(JSON.stringify(base)).ok, true);
+  assert.equal(parseServerMessage(JSON.stringify({ ...base, threadIds: ["../../auth.json"] })).ok, false);
+  assert.equal(parseServerMessage(JSON.stringify({ ...base, action: "activate", accountId: requestId })).ok, false);
+  assert.equal(parseServerMessage(JSON.stringify({ ...base, threadIds: Array(201).fill(requestId) })).ok, false);
+});

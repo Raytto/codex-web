@@ -1,0 +1,6 @@
+# Explicit opt-in after configuring and reviewing the host-root extension.
+# docker compose -f compose.yaml -f compose.host-root.yaml up -d
+services:
+  app:
+    volumes:
+      - ${CODEX_WEB_HOST_BRIDGE_DIR:?Configure the reviewed host socket directory}:/run/codex-web-host:ro

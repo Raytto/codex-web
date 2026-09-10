@@ -95,6 +95,7 @@ const artifact = z.object({
 }).strict();
 
 const remoteWorkerMessage = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("credential_saved"), credentialId: uuid }).strict(),
   z.object({
     type: z.literal("hello"),
     protocolVersion: z.number().int().min(1).max(100),
@@ -107,6 +108,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
     workerCommit: text(64, 1).nullable().optional(),
     capabilities: z.object({
       workerUpdate: z.boolean().optional(),
+      deviceCredentials: z.boolean().optional(),
       waitAutomation: z.boolean().optional(),
       capacityConfig: z.boolean().optional(),
       dynamicWaitTool: z.boolean().optional(),
@@ -114,6 +116,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
       accountSkills: z.boolean().optional(),
       titleAgent: z.boolean().optional(),
       codexAccounts: z.boolean().optional(),
+      threadLifecycle: z.boolean().optional(),
     }).strict().optional(),
     codexVersion: text(80, 1),
     capacity: z.number().int().min(0).max(8),
@@ -121,7 +124,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   // Protocol v4/v5 workers historically reported opaque job identifiers here.
   // Keep them bounded strings during the compatibility window; authorization and
   // reconciliation still match them only against server-owned pending job IDs.
-  z.object({ type: z.literal("heartbeat"), activeJobs: z.array(id).max(64) }).strict(),
+  z.object({ type: z.literal("heartbeat"), activeJobs: z.array(id).max(64), retainedJobs: z.array(uuid).max(64).optional() }).strict(),
   z.object({ type: z.literal("quota_usage"), usage: z.object({ remainingPercent: finite.min(0).max(100), resetAt: iso.nullable().optional() }).strict(), accountId: uuid.optional() }).strict(),
   z.object({ type: z.literal("thread_activity"), projectId: uuid, thread: threadSnapshot }).strict(),
   z.object({
@@ -159,6 +162,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
       createdAt: iso, expiresAt: iso,
     }).strict().optional(),
     restart: z.boolean().optional(), message: text(2_000, 1).optional(),
+    threadStates: z.array(z.object({ threadId: uuid, status: z.enum(["idle", "running"]) }).strict()).max(200).optional(),
   }).strict(),
   z.object({ type: z.literal("thread_sync_result"), requestId: uuid, threads: z.array(threadSnapshot).max(50), nextCursor: text(500, 1).nullable() }).strict(),
 ]);

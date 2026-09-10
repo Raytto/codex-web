@@ -9,7 +9,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 37821
-      BASE_PATH: ""
+      BASE_PATH: /codex-web
       CONTAINERIZED: "true"
       DATA_ROOT: /app/data
       TENANT_ROOT: /app/tenants
@@ -35,7 +35,6 @@ services:
       - ${CODEX_WEB_SHARED_AUTH_ROOT:-./.state/shared-codex-auth}:/app/shared-codex-auth
       - ${CODEX_WEB_MARKETPLACE_ROOT:-./.state/codex-marketplaces}:/opt/codex-marketplaces:ro
       - ${CODEX_WEB_RUNTIME_ROOT:-./.state/codex-runtime}:/opt/codex-runtime
-      - ${CODEX_WEB_HOST_BRIDGE_DIR:-./.state/host-bridge}:/run/codex-web-host:ro
       - ${CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-./.state/deploy-status}:/app/deploy-status:ro
     networks:
       - egress
@@ -60,7 +59,7 @@ services:
     # Give SIGTERM shutdown enough time to drain in-flight local and remote jobs.
     stop_grace_period: 30m
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/codex-web/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 20s
       timeout: 5s
       retries: 5

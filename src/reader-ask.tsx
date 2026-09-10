@@ -499,19 +499,13 @@ export function ReaderSelectionAction({ selection, onAsk, onHighlight, onNote, h
     {onHighlight && <button type="button" className={`reader-selection-tool${highlighted ? " active" : ""}`} title={highlighted ? "取消标记" : "标记"} aria-label={highlighted ? "取消标记选中文字" : "标记选中文字"} onClick={() => consumeSelection(() => onHighlight(selection))}>{highlighted ? <X size={14} /> : <Highlighter size={14} />}</button>}
     {onNote && <button type="button" className="reader-selection-tool" title="添加备注" aria-label="给选中文字添加备注" onClick={() => consumeSelection(() => onNote(selection))}><StickyNote size={14} /></button>}
   </div>;
-  // The native Range belongs to Safari. Moving focus to this portal can make
-  // WebKit temporarily hide its blue selection, even though the cloned range
-  // is still valid for Agent/highlight actions. Paint a non-interactive
-  // viewport snapshot until the action is consumed so the selected text never
-  // appears to vanish when the chip mounts.
-  const previewRects = (selection.rects ?? []).filter((rect) => Number.isFinite(rect.left) && Number.isFinite(rect.top) && Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 0 && rect.height > 0);
-  const preview = previewRects.length > 0 && <div className="reader-selection-preview" aria-hidden="true">
-    {previewRects.map((rect, index) => <i key={`${rect.left}:${rect.top}:${index}`} style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }} />)}
-  </div>;
   // Keep the floating control outside the reader's scrolling/selection DOM.
   // This prevents mounting the chip from becoming a WebKit selection boundary.
-  if (typeof document === "undefined") return <>{preview}{action}</>;
-  return <>{preview && createPortal(preview, document.body)}{createPortal(action, document.body)}</>;
+  // The native selection owns its paint; a rectangle overlay would also tint
+  // the selected glyphs when this delayed toolbar mounts. Text-layer remounts
+  // are handled by the hook's anchor-based native Range restoration instead.
+  if (typeof document === "undefined") return action;
+  return createPortal(action, document.body);
 }
 
 function readerDefaultSelection(options: AgentOptions): AgentSelection {

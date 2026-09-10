@@ -14,7 +14,7 @@ import { PROTOCOL_VERSION, type RunRequest, type ServerMessage, type WorkerEvent
 import { RuntimeManager } from "./runtime-manager.js";
 import { WORKER_VERSION } from "./version.js";
 import { hasCapacity, isValidCapacity, normalizeCapacity } from "./capacity.js";
-import { cleanupCurrentRunDirectory, sweepRunDirectories } from "./run-directories.js";
+import { cleanupCurrentRunDirectory, sweepRunDirectories, readRunAttempt, saveRunAttempt, retainedRunIds } from "./run-directories.js";
 import { DurableOutbox } from "./durable-outbox.js";
 import { isPersistableWorkerMessage, MAX_PROTOCOL_ERRORS, parseServerMessage, SERVER_MESSAGE_MAX_BYTES, WORKER_MESSAGE_MAX_BYTES } from "./protocol-validation.js";
 import { collectChangedFiles, type OmittedArtifact } from "./changed-files.js";
@@ -22,6 +22,7 @@ import { collectGeneratedImages, snapshotGeneratedImages } from "./generated-ima
 import { buildRemoteSteerPrompt, buildRemoteTurnPrompt } from "./agent-context.js";
 import { syncAccountSkills } from "./account-skills.js";
 import { runConversationTitleAgent } from "./conversation-title-agent.js";
+import { localThreadLifecycles } from "./rollout-lifecycle.js";
 import { RemoteCodexAccountManager } from "./codex-accounts.js";
 
 type Config = { serverWsUrl: string; serverHttpUrl: string; enrollmentToken: string; machineName: string; workerId: string; capacity: number; stateRoot?: string; codexRuntimePath?: string; sourceRoot?: string; workerUpdateTaskName?: string };
@@ -84,7 +85,7 @@ function connect(): void {
     type: "hello", protocolVersion: PROTOCOL_VERSION, workerId: config.workerId, machineName: config.machineName,
     enrollmentToken: config.enrollmentToken, platform: `${process.platform}-${process.arch}`,
     workerVersion: WORKER_VERSION, workerRelease: workerRelease().ref, workerCommit: workerRelease().commit,
-    capabilities: { workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true },
+    capabilities: { deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true },
     codexVersion: runtimeManager.snapshot().installedVersion, capacity: config.capacity,
   }));
   socket.on("message", (data, isBinary) => {
@@ -115,23 +116,37 @@ function connect(): void {
 }
 
 async function handle(message: ServerMessage): Promise<void> {
+  if (message.type === "credential_replace") {
+    if (!authenticated || message.workerId !== config.workerId) return;
+    // Preserve installer-owned fields (nodePath, etc). Never put secrets in the outbox.
+    const stored = JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, ""));
+    writeJsonAtomically(configPath, { ...stored, enrollmentToken: message.token });
+    config.enrollmentToken = message.token;
+    sendNow({ type: "credential_saved", credentialId: message.credentialId });
+    return;
+  }
   if (message.type === "authenticated") {
     authenticated = true;
     reconnectDelay = 1_000;
     if (message.workerId !== config.workerId) throw new Error("server returned a different worker id");
+    if (message.migrationOnly) { sendNow({ type: "heartbeat", activeJobs: [...activeRuns.keys()] }); return; }
     flushOutbox();
     const release = workerRelease();
     writeJsonAtomically(workerOnlinePath, { version: release.version, ref: release.ref, commit: release.commit, authenticatedAt: new Date().toISOString() });
     sendPendingWorkerUpdateResult();
-    send({ type: "heartbeat", activeJobs: [...activeRuns.keys()] });
+    send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
     send({ type: "runtime_status", ...runtimeManager.snapshot() });
     void refreshRuntime(true, undefined, false);
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = setInterval(() => {
       sendPendingWorkerUpdateResult();
-      send({ type: "heartbeat", activeJobs: [...activeRuns.keys()] });
+      send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
     }, Math.max(5_000, message.heartbeatIntervalMs));
     log("authenticated and online");
+    return;
+  }
+  if (message.type === "run_release") {
+    if (authenticated && !activeRuns.has(message.jobId)) await cleanupCurrentRunDirectory(stateRoot, message.jobId);
     return;
   }
   if (message.type === "heartbeat_ack") return;
@@ -158,7 +173,7 @@ async function handle(message: ServerMessage): Promise<void> {
       updateConfigCapacity(configPath, message.capacity);
       config.capacity = message.capacity;
       send({ type: "worker_config_result", requestId: message.requestId, ok: true, capacity: config.capacity });
-      send({ type: "heartbeat", activeJobs: [...activeRuns.keys()] });
+      send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
     } catch (error) {
       send({ type: "worker_config_result", requestId: message.requestId, ok: false, message: error instanceof Error ? error.message : "并发容量保存失败" });
     }
@@ -178,6 +193,10 @@ async function handle(message: ServerMessage): Promise<void> {
       const response: Extract<WorkerMessage, { type: "codex_accounts_result" }> = {
         type: "codex_accounts_result", requestId: message.requestId, ok: true,
       };
+      if (message.action === "list" && message.threadIds && activeRuns.size === 0 && activeTitleAgents.size === 0) {
+        response.threadStates = localThreadLifecycles(codexHome, message.threadIds);
+        projectSyncMonitor?.reconcileLifecycles(response.threadStates);
+      }
       if (state !== undefined) response.state = state;
       if (login !== undefined) response.login = login;
       if (restart) response.restart = true;
@@ -311,10 +330,11 @@ async function startRun(request: RunRequest): Promise<void> {
   if (workerUpdateStarting) { sendEvent(request.jobId, { type: "failed", message: "Worker 已进入升级准备阶段，请等待节点重连" }); return; }
   if (!hasCapacity(activeRuns.size, config.capacity)) { sendEvent(request.jobId, { type: "failed", message: "远程电脑并发容量已满" }); return; }
   const controller = new AbortController();
-  const run: ActiveRun = { request, controller, changedFiles: new Set() };
+  const previousAttempt = readRunAttempt(stateRoot, request.jobId);
+  const run: ActiveRun = { request, controller, changedFiles: new Set(previousAttempt?.changedFiles) };
   let deferredFailure: Extract<WorkerEvent, { type: "failed" }> | undefined;
   activeRuns.set(request.jobId, run);
-  send({ type: "heartbeat", activeJobs: [...activeRuns.keys()] });
+  send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
   try {
     if (request.accountSkills) syncAccountSkills(codexHome, request.accountSkills);
     const projectRoot = resolveDirectory(request.projectRoot);
@@ -335,11 +355,14 @@ async function startRun(request: RunRequest): Promise<void> {
       localAttachments.push({ name: attachment.name, path: destination, mimeType: attachment.mimeType });
     }
     const turnInput = buildRemoteTurnPrompt(request, localAttachments);
-    const generatedImagesBeforeThreadId = request.codexThreadId;
-    const generatedImagesBefore = generatedImagesBeforeThreadId
+    const generatedImagesBeforeThreadId = previousAttempt ? previousAttempt.imageThreadId : request.codexThreadId;
+    const generatedImagesBefore = previousAttempt ? new Map(previousAttempt.images) : generatedImagesBeforeThreadId
       ? await snapshotGeneratedImages(codexHome, generatedImagesBeforeThreadId)
       : new Map<string, string>();
-    let generatedImageThreadId = generatedImagesBeforeThreadId;
+    const persistAttempt = () => saveRunAttempt(stateRoot, request.jobId, { changedFiles: [...run.changedFiles],
+      imageThreadId: generatedImagesBeforeThreadId, images: [...generatedImagesBefore] });
+    persistAttempt();
+    let generatedImageThreadId = request.codexThreadId;
     run.execution = new CodexExecution({
       cwd: projectRoot, threadId: request.codexThreadId, prompt: turnInput.prompt,
       imagePaths: turnInput.imagePaths, model: request.selection.model, reasoningEffort: request.selection.reasoningEffort,
@@ -354,7 +377,7 @@ async function startRun(request: RunRequest): Promise<void> {
       onContextUsage: (usage) => sendEvent(request.jobId, { type: "context_usage", usage }),
       onQuotaUsage: (usage) => sendEvent(request.jobId, { type: "quota_usage", usage }),
       onProgress: (payload) => sendEvent(request.jobId, { type: "progress", payload }),
-      onChangedFile: (filePath) => run.changedFiles.add(filePath),
+      onChangedFile: (filePath) => { run.changedFiles.add(filePath); persistAttempt(); },
     });
     const finalResponse = await run.execution.result;
     const changed = await uploadChangedFiles(run, projectRoot);
@@ -373,10 +396,10 @@ async function startRun(request: RunRequest): Promise<void> {
     const cancelled = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
     deferredFailure = { type: "failed", message: cancelled ? "任务已停止" : error instanceof Error ? error.message : "远程任务失败", cancelled };
   } finally {
-    try { await cleanupCurrentRunDirectory(stateRoot, request.jobId); }
+    try { if (!deferredFailure || deferredFailure.cancelled || !/model (?:is )?at capacity/i.test(deferredFailure.message)) await cleanupCurrentRunDirectory(stateRoot, request.jobId); }
     catch (error) { log(`run directory cleanup failed (${request.jobId}): ${error instanceof Error ? error.message : String(error)}`); }
     activeRuns.delete(request.jobId);
-    send({ type: "heartbeat", activeJobs: [...activeRuns.keys()] });
+    send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
     // Report failure only after the same Job ID can be accepted again. The
     // server may intentionally redispatch capacity failures after a delay.
     if (deferredFailure) sendEvent(request.jobId, deferredFailure);
@@ -598,7 +621,7 @@ function readJson<T>(filePath: string): T | null {
 
 function writeJsonAtomically(filePath: string, value: unknown): void {
   const temporary = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   try { fs.renameSync(temporary, filePath); }
   catch (error) { fs.rmSync(temporary, { force: true }); throw error; }
 }

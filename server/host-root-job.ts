@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import { startAppServerTurn, type AppServerTurnExecution } from "./app-server-turn.js";
 import type { HostRootJobInput } from "./host-root-protocol.js";
 import type { TenantWorkerEvent } from "./tenant-worker-protocol.js";
-import { cleanupJobRuntime } from "./python-runtime.js";
 import { acquireSharedCodexAuth, sharedCodexAuthPolicyFromEnv, type SharedCodexAuthLease } from "./shared-codex-auth.js";
 import { materializeHostLinkedFiles } from "./host-linked-files.js";
 
@@ -137,7 +136,7 @@ input.on("line", (line) => {
         process.stderr.write(`Shared Codex auth commit failed: ${error instanceof Error ? error.message : String(error)}\n`);
       });
       activeExecution = null;
-      cleanupJobRuntime(message.request.runtimeRoot);
+      // Runtime belongs to the logical Job; the coordinator cleans it after terminal finalization.
       send(terminalEvent!);
       input.close();
     }

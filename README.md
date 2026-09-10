@@ -288,3 +288,13 @@ before exposing an instance to the internet.
 ## License
 
 [MIT](LICENSE)
+
+## Reliability updates (September 2026)
+
+- Capacity retries persist across restarts, release execution slots, retain process files and early outputs, and resume accepted input without repeating it. Internal continuation prompts stay out of chat.
+- Agent-generated commands and paths keep their original text. Chat file selections survive toolbar updates; reader selections retain their brightness in both themes and long quotes fit the composer.
+- Optional Remote Worker 1.19.3 adds independent device credentials, rotation/revocation, bounded startup cancellation and stale account-lock reconciliation on the selected executor.
+- Optional cold-storage maintenance processes every eligible item in a finite batch, isolates failures and retains verified encryption and the seven-day local grace period.
+- New task defaults prefer `gpt-6-astra` with `high` reasoning when supported by the executor catalog. Saved selections remain intact; unsupported choices use catalog fallback.
+
+Read [retry and device upgrade instructions](docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md), [cold-storage operations](docs/CONVERSATION_COLD_STORAGE.md), and [content fidelity](docs/AGENT_CONTENT_FIDELITY.md). Username/password Web login, `/codex-web`, and the default non-root tenant profile remain the public deployment contract.

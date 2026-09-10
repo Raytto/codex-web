@@ -325,3 +325,23 @@ Disable/rollback: <exact reversible action>
 This record makes a later “why is this running?” question answerable without
 publishing passwords, API keys, tokens, cookies, private keys, provider IDs, or
 Codex login files.
+
+## Upgrade notes for configured extensions
+
+Remote Worker now requires independent device credentials. The server enrollment
+setting remains an opt-in/bootstrap prerequisite; generate one-time install
+grants through the Web UI rather than copying it to devices. Follow the
+[explicit migration window](JOB_RETRY_AND_DEVICE_CREDENTIALS.md) for existing
+shared-token installations. Revoke each device before removing the extension;
+blanking the enrollment setting alone does not invalidate issued credentials.
+
+Cold-storage operators may schedule the new finite-batch `maintain` command
+every 15 minutes after an isolated restore rehearsal. It drains all eligible
+candidates and continues after per-item or per-stage failures. No scheduler is
+installed automatically; see [operations](CONVERSATION_COLD_STORAGE.md).
+
+The base Compose file has no host bridge volume. After approving and configuring
+the root extension, set `CODEX_WEB_HOST_BRIDGE_DIR` and explicitly include
+`compose.host-root.yaml` with `docker compose -f compose.yaml -f compose.host-root.yaml`.
+The standard build, browser API URLs, Compose environment, health check and Nginx
+routes use `/codex-web`; the exact Worker connect route permits WSS upgrades.

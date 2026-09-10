@@ -22,3 +22,17 @@
 - Cold-storage code is inert without all provider/`age` settings and an operator-managed provider CLI/scheduler. Do not treat an environment variable as proof that an encrypted archive was uploaded or can be restored; require a dry-run, hash check, and isolated restore rehearsal.
 
 Please report vulnerabilities privately through GitHub's security advisory feature instead of opening a public issue.
+
+## Independent Worker credentials
+
+Normal Worker connections require a device-bound hash credential, not the
+server-wide enrollment setting. Installation grants cannot take over existing
+IDs; rotation requires saved-state acknowledgement or a verified reconnect.
+Revocation affects one device and forbids fallback to shared authentication.
+Administrative credential APIs require the reserved host-root session and CSRF
+protection. Tokens stay in protected device configuration and one-time TLS
+messages, never the outbox or status API. Existing installations must follow the
+explicit, expiring [migration procedure](JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
+Clearing the bootstrap setting alone does not revoke issued device credentials.
+Cold-storage [maintenance](CONVERSATION_COLD_STORAGE.md) keeps upload verification
+and local grace periods even when processing all eligible candidates.

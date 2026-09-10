@@ -2,43 +2,39 @@ import type { ThreadEvent } from "@openai/codex-sdk";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.js";
 
-export function redactBrandForDisplay(value: string): string {
-  return value.replace(/chatgpt|codex/gi, "Codex Web");
-}
-
 export function summarizeEvent(event: ThreadEvent): unknown | null {
   if (event.type === "turn.started") return { kind: "status", label: "已开始分析" };
   if (event.type === "error") return isModelCapacityError(event.message)
-    ? { kind: "error", label: redactBrandForDisplay(event.message) }
+    ? { kind: "error", label: event.message }
     : isRetryableUpstreamError(event.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
-    : { kind: "error", label: redactBrandForDisplay(event.message) };
+    : { kind: "error", label: event.message };
   if (event.type === "turn.completed") return { kind: "status", label: "工作已完成，正在整理结果" };
   if (event.type !== "item.started" && event.type !== "item.updated" && event.type !== "item.completed") return null;
   const item = event.item;
   if (item.type === "reasoning") {
-    const summary = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    const summary = sanitizeAgentMarkdown(item.text).trim();
     return summary ? { kind: "reasoning", label: "模型思路摘要", detail: summary } : null;
   }
   if (item.type === "command_execution") {
-    const detail = redactBrandForDisplay(item.command);
+    const detail = item.command;
     return { kind: "command", label: commandProgressLabel(item.command, item.status), detail };
   }
   if (item.type === "file_change") return { kind: "file", label: "已更新文件", files: item.changes.map((change) => change.path) };
   if (item.type === "web_search") return { kind: "search", label: "正在搜索资料", detail: item.query };
-  if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${redactBrandForDisplay(item.server)}`, detail: redactBrandForDisplay(item.tool) };
+  if (item.type === "mcp_tool_call") return { kind: "tool", label: `正在使用 ${item.server}`, detail: item.tool };
   if (item.type === "todo_list") return { kind: "todo", label: "任务计划已更新", items: item.items };
   if (item.type === "error") return isModelCapacityError(item.message)
-    ? { kind: "error", label: redactBrandForDisplay(item.message) }
+    ? { kind: "error", label: item.message }
     : isRetryableUpstreamError(item.message)
     ? { kind: "status", status: "retrying", label: "上游连接短暂中断，正在自动重试" }
-    : { kind: "error", label: redactBrandForDisplay(item.message) };
+    : { kind: "error", label: item.message };
   if (item.type === "agent_message" && event.type === "item.updated") {
-    const detail = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    const detail = sanitizeAgentMarkdown(item.text).trim();
     return detail ? { kind: "assistant_stream", label: "正在生成回答", detail } : null;
   }
   if (item.type === "agent_message" && event.type === "item.completed") {
-    const detail = redactBrandForDisplay(sanitizeAgentMarkdown(item.text)).trim();
+    const detail = sanitizeAgentMarkdown(item.text).trim();
     return detail ? { kind: "update", label: "阶段反馈", detail } : null;
   }
   return null;

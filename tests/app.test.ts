@@ -21,9 +21,9 @@ import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles, projectDisplayName } from "../server/app.js";
 import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
 import { assertProductionConfig, loadConfig, loadProductionConfig } from "../server/config.js";
-import { capacityRetryPrompt, extractLeakedAutoTitleAnswer, isMeaningfulExecutionProgress, isModelCapacityProgress, MODEL_CAPACITY_CONTINUATION_PROMPT, redactBrandForDisplay, retryDelayLabel, summarizeEvent } from "../server/codex-runner.js";
+import { capacityRetryPrompt, extractLeakedAutoTitleAnswer, isMeaningfulExecutionProgress, isModelCapacityContinuationPrompt, isModelCapacityProgress, MODEL_CAPACITY_CONTINUATION_PROMPT, retryDelayLabel, summarizeEvent } from "../server/codex-runner.js";
 import { AppDatabase, LEGACY_USER_ID, type FileRow } from "../server/db.js";
-import { agentOptionsFromAppServer, loadAgentOptions, repairAgentSelection, resolveAgentSelection } from "../server/model-options.js";
+import { agentOptionsFromAppServer, loadAgentOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults } from "../server/model-options.js";
 import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, ensureWorkspace, isDeliverablePath, isPersistedDeliverablePath, LEGACY_LIBRARY_AGENTS, normalizeStoredRelativePath, normalizeUploadFileName, persistDeliverable, resolveGeneratedImage, resolveInside, safeUploadName, snapshotGeneratedImages } from "../server/paths.js";
 import { buildShellEnvironment, cleanupJobRuntime, jobRuntimeRoot, prepareJobRuntime } from "../server/python-runtime.js";
 import { assessTaskPolicy } from "../server/task-policy.js";
@@ -273,7 +273,6 @@ test("user-visible branding uses Codex Web without explicit upstream names", () 
   // upstream ChatGPT brand leak is prohibited in the public shell.
   assert.doesNotMatch(`${index}\n${appSource.replace(/Codex/g, "任务引擎")}`, /chatgpt/i);
   assert.doesNotMatch(appSource, /localStorage\.setItem\([^)]*codex-web:/);
-  assert.equal(redactBrandForDisplay("Codex / CHATGPT / agent"), "Codex Web / Codex Web / agent");
 });
 
 test("the site favicon is a bundled PNG referenced through the configured base path", () => {
@@ -373,7 +372,7 @@ test("the tus browser client is loaded only when a resumable upload starts", () 
 
   const distRoot = path.join(process.cwd(), "dist");
   const builtIndex = fs.readFileSync(path.join(distRoot, "index.html"), "utf8");
-  const entryPath = builtIndex.match(/<script[^>]+src="([^"]+\.js)"/)?.[1].replace(/^\/+/, "");
+  const entryPath = builtIndex.match(/<script[^>]+src="([^"]+\.js)"/)?.[1].replace(/^\/codex-web\//, "");
   assert.ok(entryPath, "the production build should expose its JavaScript entry");
   const assetsRoot = path.join(distRoot, "assets");
   const tusChunks = fs.readdirSync(assetsRoot).filter((name) => {
@@ -420,7 +419,7 @@ test("each Codex job pins the primary proxy or the backup after one ten-second p
     probe: async () => { throw new Error("airport unavailable"); },
   });
   assert.deepEqual(selectedBackup, { kind: "backup", proxyUrl: backup });
-  assert.match(CODEX_EGRESS_FALLBACK_NOTICE, /BossLive 日本节点 10 秒内不可用/);
+  assert.match(CODEX_EGRESS_FALLBACK_NOTICE, /首选代理 10 秒内不可用/);
 
   assert.deepEqual(resolveCodexEgressChoice("primary", primary, backup), selectedPrimary);
   assert.deepEqual(resolveCodexEgressChoice("backup", primary, backup), selectedBackup);
@@ -1712,6 +1711,8 @@ test("transient upstream failures stay bounded while model capacity retries unti
   assert.equal(isConnectionInterruptionError("websocket closed by server before response.completed"), true);
   assert.equal(capacityRetryPrompt("原始用户指令", false), "原始用户指令");
   assert.equal(capacityRetryPrompt("原始用户指令", true), MODEL_CAPACITY_CONTINUATION_PROMPT);
+  assert.equal(isModelCapacityContinuationPrompt(`\n${MODEL_CAPACITY_CONTINUATION_PROMPT}\n`), true);
+  assert.equal(isModelCapacityContinuationPrompt(`${MODEL_CAPACITY_CONTINUATION_PROMPT}\n用户补充`), false);
   assert.match(MODEL_CAPACITY_CONTINUATION_PROMPT, /继续刚才.*未完成的任务/);
   assert.match(MODEL_CAPACITY_CONTINUATION_PROMPT, /不要重复已经完成的步骤或外部操作/);
 
@@ -1777,8 +1778,8 @@ test("transient upstream failures stay bounded while model capacity retries unti
   assert.deepEqual(retryPrompts, ["原始用户指令", MODEL_CAPACITY_CONTINUATION_PROMPT]);
 
   const runnerSource = fs.readFileSync(path.join(process.cwd(), "server", "codex-runner.ts"), "utf8");
-  assert.match(runnerSource, /canRetry: \(error\) => isModelCapacityError\(error\) \|\| !executionObserved/);
-  assert.match(runnerSource, /capacityContinuationRequired = continueExistingWork/);
+  assert.match(runnerSource, /canRetry: \(error\) => !isModelCapacityError\(error\) && !executionObserved/);
+  assert.match(runnerSource, /deferJobForCapacity/);
 
   let permanentCalls = 0;
   await assert.rejects(() => runWithTransientRetries(async () => {
@@ -2589,7 +2590,7 @@ test("password reset atomically revokes existing user sessions", (context) => {
   assert.equal(db.getSession("old-session"), undefined);
 });
 
-test("agent options use the live image-capable catalog and default to Sol with extra-high reasoning", (context) => {
+test("agent options use the live image-capable catalog and prefer high reasoning", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-model-options-test-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.writeFileSync(path.join(root, "models_cache.json"), JSON.stringify({
@@ -2618,10 +2619,10 @@ test("agent options use the live image-capable catalog and default to Sol with e
   assert.deepEqual(options.models.map((model) => model.id), ["gpt-5.5", "gpt-5.6-sol"]);
   assert.deepEqual(options.models[1].reasoningEfforts, ["low", "medium", "high", "xhigh", "max"]);
   assert.deepEqual(options.reasoningEfforts.at(-1), { id: "max", label: "最大" });
-  assert.deepEqual(options.defaults, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.deepEqual(options.defaults, { model: "gpt-5.6-sol", reasoningEffort: "high" });
   assert.deepEqual(resolveAgentSelection(options, "gpt-5.5", "high"), { model: "gpt-5.5", reasoningEffort: "high" });
   assert.deepEqual(resolveAgentSelection(options, "gpt-5.6-sol", "max"), { model: "gpt-5.6-sol", reasoningEffort: "max" });
-  assert.deepEqual(repairAgentSelection(options, "retired-model", "high"), { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.deepEqual(repairAgentSelection(options, "retired-model", "high"), { model: "gpt-5.6-sol", reasoningEffort: "high" });
   assert.deepEqual(repairAgentSelection(options, "gpt-5.5", "medium"), { model: "gpt-5.5", reasoningEffort: "xhigh" });
   assert.throws(() => resolveAgentSelection(options, "hidden-model", "high"), /当前不可用/);
   assert.throws(() => resolveAgentSelection(options, "gpt-5.6-sol", "ultra"), /不受该模型支持/);
@@ -2629,7 +2630,7 @@ test("agent options use the live image-capable catalog and default to Sol with e
     slug: "gpt-5.7-sol", display_name: "GPT-5.7-Sol", priority: 0, visibility: "list",
     input_modalities: ["text", "image"], supported_reasoning_levels: [{ effort: "high" }, { effort: "xhigh" }],
   }, ...JSON.parse(fs.readFileSync(path.join(root, "models_cache.json"), "utf8")).models] }), "utf8");
-  assert.deepEqual(loadAgentOptions(loadConfig({ codexHome: root })).defaults, { model: "gpt-5.7-sol", reasoningEffort: "xhigh" });
+  assert.deepEqual(loadAgentOptions(loadConfig({ codexHome: root })).defaults, { model: "gpt-5.7-sol", reasoningEffort: "high" });
 });
 
 test("legacy databases gain durable selections and preserve existing titles", (context) => {
@@ -3390,6 +3391,44 @@ test("remote activity observation does not replay Codex Web controlled turns as 
     "测试一下连接情况", "连接正常。", "再检查一次", "第二次也正常。",
   ]);
   assert.deepEqual(db.listRemoteThreadActivities(conversation.id).map((activity) => activity.label), ["桌面检查完成"]);
+
+  const capacityContinuation = db.importRemoteThread(LEGACY_USER_ID, project.id, project.executor_id, {
+    ...controlledSnapshot,
+    updatedAt: controlledSnapshot.updatedAt + 30,
+    status: "running",
+    messages: [
+      ...controlledSnapshot.messages,
+      {
+        turnId: "turn-capacity", itemId: "user-capacity", role: "user",
+        content: MODEL_CAPACITY_CONTINUATION_PROMPT, createdAt: "2026-09-07T08:00:00.000Z",
+      },
+      {
+        turnId: "turn-capacity", itemId: "agent-capacity", role: "assistant",
+        content: "正在检查此前进展。", createdAt: "2026-09-07T08:00:01.000Z",
+      },
+    ],
+    activities: [
+      ...controlledSnapshot.activities,
+      {
+        turnId: "turn-capacity", itemId: "command-capacity", kind: "command",
+        label: "检查已有文件", createdAt: "2026-09-07T08:00:02.000Z",
+      },
+    ],
+  }, selection);
+  assert.equal(capacityContinuation.importedMessages, 0);
+  assert.equal(capacityContinuation.importedActivities, 0);
+  assert.deepEqual(db.listMessages(conversation.id).map((message) => message.content), [
+    "测试一下连接情况", "连接正常。", "再检查一次", "第二次也正常。",
+  ]);
+  assert.deepEqual(db.listRemoteThreadActivities(conversation.id).map((activity) => activity.label), ["桌面检查完成"]);
+  const capacityMappings = db.sqlite.prepare(`
+    SELECT item_id,message_id FROM remote_thread_items
+    WHERE thread_id='thread-controlled' AND turn_id='turn-capacity' ORDER BY item_id
+  `).all() as Array<{ item_id: string; message_id: string | null }>;
+  assert.deepEqual(capacityMappings.map((item) => ({ ...item })), [
+    { item_id: "agent-capacity", message_id: null },
+    { item_id: "user-capacity", message_id: null },
+  ]);
 });
 
 test("thread_started atomically claims an observer placeholder for a controlled Remote job", (context) => {
@@ -4357,9 +4396,9 @@ test("single-user login and CSRF protection", async (context) => {
     .send({ chatFontSize: "large" }).expect(400);
 
   const options = await agent.get("/api/agent-options").expect(200);
-  assert.equal(options.body.defaults.model, "gpt-5.6-sol");
-  assert.equal(options.body.defaults.reasoningEffort, "xhigh");
-  assert.deepEqual(options.body.selection, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.equal(options.body.defaults.model, "gpt-6-astra");
+  assert.equal(options.body.defaults.reasoningEffort, "high");
+  assert.deepEqual(options.body.selection, { model: "gpt-6-astra", reasoningEffort: "high" });
   const projects = await agent.get("/api/projects").expect(200);
   assert.equal(projects.body.canManageProjects, true);
   assert.equal(projects.body.projects.length, 1);
@@ -4390,7 +4429,7 @@ test("single-user login and CSRF protection", async (context) => {
   assert.equal(created.body.conversation.title_source, "default");
   assert.equal(created.body.conversation.pinned_at, null);
   assert.equal(created.body.conversation.has_unread_result, 0);
-  assert.deepEqual(created.body.agentSelection, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.deepEqual(created.body.agentSelection, { model: "gpt-6-astra", reasoningEffort: "high" });
   await agent.put(`/api/conversations/${created.body.conversation.id}/agent-selection`)
     .set("X-CSRF-Token", login.body.csrfToken)
     .send({ model: "gpt-5.6-luna", reasoningEffort: "low" }).expect(200);
@@ -4437,7 +4476,7 @@ test("single-user login and CSRF protection", async (context) => {
     supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "xhigh" }],
   }] }), "utf8");
   const repaired = await agent.get(`/api/conversations/${created.body.conversation.id}`).expect(200);
-  assert.deepEqual(repaired.body.agentSelection, { model: "gpt-5.6-sol", reasoningEffort: "xhigh" });
+  assert.deepEqual(repaired.body.agentSelection, { model: "gpt-5.6-sol", reasoningEffort: "high" });
   assert.equal(instance.db.getConversation(created.body.conversation.id)?.agent_model, "gpt-5.6-sol");
   await agent.get("/api/conversations").expect(200);
 
@@ -4595,6 +4634,7 @@ test("owner can fetch any readable remote file into the normal deliverable downl
   assert.ok(address && typeof address === "object");
   const origin = `http://127.0.0.1:${address.port}`;
   const workerId = crypto.randomUUID();
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
   let fetchRequests = 0;
   const fetchPaths: Array<{ projectRoot: string; path: string }> = [];
@@ -4688,6 +4728,7 @@ test("remote Worker output uploads keep large JSON files on the raw 100 MiB path
   assert.ok(address && typeof address === "object");
   const origin = `http://127.0.0.1:${address.port}`;
   const workerId = crypto.randomUUID();
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
   const authenticated = new Promise<void>((resolve, reject) => {
     socket.once("error", reject);
@@ -4782,6 +4823,7 @@ test("remote Worker behavior updates import automatically without duplicating me
   const remoteAccountA = crypto.randomUUID();
   const remoteAccountB = crypto.randomUUID();
   let currentRemoteAccount = remoteAccountA;
+  let lifecycleReplies: Array<{ threadId: string; status: "idle" | "running" }> = [];
   const remoteAccountState = () => ({
     activeAccountId: currentRemoteAccount,
     accounts: [
@@ -4792,6 +4834,7 @@ test("remote Worker behavior updates import automatically without duplicating me
   const ppThreadId = crypto.randomUUID();
   const ppConversation = instance.db.createConversation(crypto.randomUUID(), "Codex-created thread", undefined, HOST_ROOT_USER_ID, project.id);
   instance.db.updateConversation(ppConversation.id, { codexThreadId: ppThreadId });
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
   context.after(async () => {
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.terminate();
@@ -4807,7 +4850,7 @@ test("remote Worker behavior updates import automatically without duplicating me
     socket.once("open", () => socket.send(JSON.stringify({
       type: "hello", protocolVersion: REMOTE_WORKER_PROTOCOL_VERSION, workerId, machineName: "LIVE-PC",
       enrollmentToken, platform: "win32-x64", workerVersion: "1.7.0", codexVersion: "test", capacity: 1,
-      capabilities: { codexAccounts: true },
+      capabilities: { codexAccounts: true, threadLifecycle: true },
     })));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as {
@@ -4819,7 +4862,7 @@ test("remote Worker behavior updates import automatically without duplicating me
       };
       if (message.type === "codex_accounts" && message.requestId) {
         if (message.action === "activate" && message.accountId) currentRemoteAccount = message.accountId;
-        socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, state: remoteAccountState(), restart: false }));
+        socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, state: remoteAccountState(), restart: false, threadStates: lifecycleReplies }));
         return;
       }
       if (message.type === "thread_rename" && message.requestId) {
@@ -4929,8 +4972,17 @@ test("remote Worker behavior updates import automatically without duplicating me
 
   const accounts = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
   assert.equal(accounts.body.activeAccountId, remoteAccountA);
+  instance.db.sqlite.prepare("UPDATE conversations SET external_status='running' WHERE id=?").run(imported.id);
+  await agent.post(`/api/codex-accounts/${remoteAccountB}/activate`)
+    .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(409);
+  assert.equal(instance.db.getConversation(imported.id)?.external_status, "running", "unknown lifecycle stays protected");
+  lifecycleReplies = [{ threadId, status: "idle" }, { threadId: ppThreadId, status: "running" }];
   await agent.post(`/api/codex-accounts/${remoteAccountB}/activate`)
     .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(200);
+  assert.equal(instance.db.getConversation(imported.id)?.external_status, "idle");
+  assert.equal(instance.db.getConversation(ppConversation.id)?.external_status, "idle", "unrequested lifecycle replies are ignored");
+  assert.deepEqual(instance.db.listMessages(imported.id).map(message => message.content), ["检查项目", "检查完成，测试通过。"]);
+  lifecycleReplies = [];
   const afterSwitch = await agent.get(`/api/conversations/${ppConversation.id}`).expect(200);
   assert.equal(afterSwitch.body.packageQuota, null);
   socket.send(JSON.stringify({ type: "quota_usage", usage: { remainingPercent: 27 }, accountId: remoteAccountB }));
@@ -4959,6 +5011,7 @@ test("remote Worker capacity can be changed to unlimited through the managed pro
   const address = server.address();
   assert.ok(address && typeof address === "object");
   const workerId = crypto.randomUUID();
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/remote-workers/connect`);
   context.after(async () => {
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.terminate();
@@ -5026,6 +5079,7 @@ test("remote Worker update waits for an idle heartbeat and succeeds only after v
   const sockets: WebSocket[] = [];
 
   const connectWorker = (version: string, release: string | null, commit: string | null) => new Promise<WebSocket>((resolve, reject) => {
+    if (!instance.db.activeRemoteWorkerCredential(crypto.createHash("sha256").update(enrollmentToken).digest("hex"))) instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
     const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
     sockets.push(socket);
     socket.once("error", reject);
@@ -5139,6 +5193,7 @@ test("production automatically queues an outdated capable Worker after deploymen
   assert.ok(address && typeof address === "object");
   const origin = `http://127.0.0.1:${address.port}`;
   const workerId = crypto.randomUUID();
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
   context.after(async () => {
     instance.remoteWorkers.close();
@@ -5200,6 +5255,7 @@ test("versioned Remote Worker release downloads require the enrollment credentia
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
     remoteWorkerEnrollmentToken: enrollmentToken, remoteWorkerReleaseRoot: releaseRoot,
   });
+  instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
   const now = new Date().toISOString();
   instance.db.createUser({
     id: HOST_ROOT_USER_ID, username: "owner", display_name: "CODEX_WEB", password_hash: bcrypt.hashSync("fixture", 8),
@@ -5236,11 +5292,12 @@ test("versioned Remote Worker release downloads require the enrollment credentia
   assert.match(script.text, /remote-worker-bootstrap\/exchange/);
   const exchangeToken = windowsLink.split("/").at(-1)!;
   const exchanged = await request(instance.app).post("/api/remote-worker-bootstrap/exchange").send({ token: exchangeToken, platform: "win32-x64" }).expect(200);
-  assert.equal(exchanged.body.enrollmentToken, enrollmentToken);
+  assert.notEqual(exchanged.body.enrollmentToken, enrollmentToken);
+  assert.ok(instance.remoteWorkers.authorizeReleaseDownload(`Bearer ${exchanged.body.enrollmentToken}`));
   await request(instance.app).post("/api/remote-worker-bootstrap/exchange").send({ token: exchangeToken, platform: "win32-x64" }).expect(410);
 });
 
-test("a replacement remote worker fails an observed job that it did not resume", async (context) => {
+test("remote worker heartbeats preserve terminal errors while replacement connections reconcile lost jobs", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-reconcile-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
   const instance = createApp({
@@ -5258,6 +5315,7 @@ test("a replacement remote worker fails an observed job that it did not resume",
   const workerId = crypto.randomUUID();
   const sockets: WebSocket[] = [];
   const connectWorker = (machineName: string): Promise<WebSocket> => new Promise((resolve, reject) => {
+    if (!instance.db.activeRemoteWorkerCredential(crypto.createHash("sha256").update(enrollmentToken).digest("hex"))) instance.db.createRemoteWorkerEnrollment(crypto.createHash("sha256").update(enrollmentToken).digest("hex"), new Date(Date.now() + 60_000).toISOString());
     const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/api/remote-workers/connect`);
     sockets.push(socket);
     socket.once("error", reject);
@@ -5282,6 +5340,41 @@ test("a replacement remote worker fails an observed job that it did not resume",
   });
 
   const first = await connectWorker("worker-host");
+  first.send(JSON.stringify({ type: "heartbeat", activeJobs: [] }));
+  for (let attempt = 0; attempt < 30 && !instance.remoteWorkers.canRun(`remote:${workerId}`); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  const capacityJobId = crypto.randomUUID();
+  let resolveCapacityDispatch!: () => void;
+  const capacityDispatched = new Promise<void>((resolve) => { resolveCapacityDispatch = resolve; });
+  first.on("message", (raw) => {
+    const message = JSON.parse(raw.toString()) as { type: string; request?: { jobId: string } };
+    if (message.type === "run" && message.request?.jobId === capacityJobId) resolveCapacityDispatch();
+  });
+  const capacityResult = instance.remoteWorkers.run(workerId, {
+    jobId: capacityJobId, conversationId: crypto.randomUUID(), projectRoot: "E:\\projects\\work", codexThreadId: null,
+    prompt: "retry model capacity", selection: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    optionalCapabilities: DEFAULT_OPTIONAL_AGENT_CAPABILITIES,
+  }, [], { onThreadStarted: () => undefined, onProgress: () => undefined });
+  await capacityDispatched;
+  first.send(JSON.stringify({ type: "heartbeat", activeJobs: [capacityJobId] }));
+  first.send(JSON.stringify({
+    type: "event", jobId: capacityJobId,
+    event: { type: "progress", payload: { kind: "error", label: "Selected model is at capacity. Please try a different model." } },
+  }));
+  first.send(JSON.stringify({ type: "heartbeat", activeJobs: [] }));
+  const prematureResult = await Promise.race([
+    capacityResult.then(() => "resolved", (error: Error) => `rejected:${error.message}`),
+    new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 30)),
+  ]);
+  assert.equal(prematureResult, "pending", "a normal heartbeat must not masquerade as a reconnect");
+  first.send(JSON.stringify({
+    type: "event", jobId: capacityJobId,
+    event: { type: "failed", message: "Selected model is at capacity. Please try a different model." },
+  }));
+  await assert.rejects(capacityResult, /Selected model is at capacity/);
+
   const jobId = crypto.randomUUID();
   let resolveProgress!: () => void;
   const progressSeen = new Promise<void>((resolve) => { resolveProgress = resolve; });
@@ -6352,8 +6445,8 @@ test("sidebar distinguishes running work from queued work with animated and stat
 });
 
 test("account identity uses the signed-in display name for the label and avatar", () => {
-  assert.deepEqual(resolveAccountIdentity({ username: "member", displayName: "WH" }), { displayName: "WH", initials: "WH" });
-  assert.deepEqual(resolveAccountIdentity({ username: "wenhao", displayName: "Wen Hao" }), { displayName: "Wen Hao", initials: "WH" });
+  assert.deepEqual(resolveAccountIdentity({ username: "member", displayName: "MM" }), { displayName: "MM", initials: "MM" });
+  assert.deepEqual(resolveAccountIdentity({ username: "alex", displayName: "Alex Smith" }), { displayName: "Alex Smith", initials: "AS" });
   assert.deepEqual(resolveAccountIdentity({ username: "friend", displayName: "文豪" }), { displayName: "文豪", initials: "文豪" });
 });
 

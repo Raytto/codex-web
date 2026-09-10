@@ -120,7 +120,9 @@ export type RemoteWorkerUpdateResult = {
 export type RemoteCodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 
 export type ServerToRemoteWorker =
-  | { type: "authenticated"; workerId: string; heartbeatIntervalMs: number }
+  | { type: "credential_replace"; workerId: string; credentialId: string; token: string }
+  | { type: "run_release"; jobId: string }
+  | { type: "authenticated"; workerId: string; heartbeatIntervalMs: number; migrationOnly?: boolean }
   | { type: "project_watch"; projects: Array<{ id: string; rootPath: string }> }
   | { type: "request_failed"; requestId?: string; message: string }
   | { type: "project_fs"; requestId: string; action: "list" | "create" | "validate" | "initialize"; path: string; name?: string; content?: string }
@@ -137,12 +139,13 @@ export type ServerToRemoteWorker =
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
   | { type: "worker_update_result_ack"; requestId: string }
   | { type: "worker_config"; requestId: string; capacity: number }
-  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete"; label?: string; loginId?: string; accountId?: string }
+  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete"; label?: string; loginId?: string; accountId?: string; threadIds?: string[] }
   | { type: "heartbeat_ack"; at: string };
 
 export type RemoteWorkerToServer =
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; codexAccounts?: boolean }; codexVersion: string; capacity: number }
-  | { type: "heartbeat"; activeJobs: string[] }
+  | { type: "credential_saved"; credentialId: string }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
+  | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: RemoteThreadSnapshot }
   | ({ type: "project_fs_result"; requestId: string } & RemoteProjectFsResult)
@@ -157,5 +160,5 @@ export type RemoteWorkerToServer =
   | { type: "worker_update_ack"; requestId: string; accepted: boolean; message?: string }
   | ({ type: "worker_update_result" } & RemoteWorkerUpdateResult)
   | { type: "worker_config_result"; requestId: string; ok: boolean; capacity?: number; message?: string }
-  | { type: "codex_accounts_result"; requestId: string; ok: boolean; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string }
+  | { type: "codex_accounts_result"; requestId: string; ok: boolean; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }
   | ({ type: "thread_sync_result"; requestId: string } & RemoteThreadSyncPage);

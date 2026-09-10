@@ -45,7 +45,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; accountSwitching: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -54,7 +54,7 @@ type PendingRuntime = { workerId: string; resolve(value: ExecutorRuntimeStatus):
 type PendingUpgrade = { workerId: string; resolve(value: ExecutorRuntimeStatus): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingWorkerConfig = { workerId: string; capacity: number; resolve(value: ExecutorView): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingTitleAgent = { workerId: string; resolve(output: string): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
-type PendingCodexAccounts = { workerId: string; action: string; resolve(value: { state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean }): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
+type PendingCodexAccounts = { workerId: string; action: string; resolve(value: { state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingFileFetch = {
   workerId: string;
   transferToken: string;
@@ -130,6 +130,8 @@ export type ExecutorView = {
     installedVersion: string;
     installedRef: string | null;
     installedCommit: string | null;
+    credentialState?: "active" | "pending" | "revoked" | "unregistered";
+    credentialRotationCapable?: boolean;
     updaterCapable: boolean;
     capacityConfigurable: boolean;
     targetVersion: string;
@@ -242,7 +244,9 @@ export class RemoteWorkerGateway extends EventEmitter {
     const release = this.targetRelease;
     const archive = release?.platforms?.[platform];
     if (!release || !archive || !this.config.remoteWorkerEnrollmentToken) throw new Error("当前 Worker 发布包不可用");
-    return { enrollmentToken: this.config.remoteWorkerEnrollmentToken, archive, version: release.version };
+    const enrollmentToken = crypto.randomBytes(32).toString("base64url");
+    this.db.createRemoteWorkerEnrollment(credentialHash(enrollmentToken), new Date(Date.now() + REMOTE_WORKER_BOOTSTRAP_TTL_MS).toISOString());
+    return { enrollmentToken, archive, version: release.version };
   }
 
   bootstrapGrantValid(token: string, platform: RemoteWorkerBootstrapPlatform): boolean {
@@ -256,8 +260,9 @@ export class RemoteWorkerGateway extends EventEmitter {
 
   authorizeReleaseDownload(authorization: string | undefined): boolean {
     const match = /^Bearer ([^\s]+)$/.exec(String(authorization ?? ""));
-    return Boolean(match && this.config.remoteWorkerEnrollmentToken
-      && safeEqual(this.config.remoteWorkerEnrollmentToken, match[1]));
+    return Boolean(match && (this.db.listRemoteWorkers().some((worker) => this.allowedLegacyMigration(worker.id, match[1]))
+      || this.db.activeRemoteWorkerCredential(credentialHash(match[1]))
+      || this.db.remoteWorkerEnrollment(credentialHash(match[1]))));
   }
 
   listExecutors(): ExecutorView[] {
@@ -294,7 +299,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     const workerId = workerIdFromExecutor(executorId);
     const connection = workerId ? this.connections.get(workerId) : undefined;
     const worker = workerId ? this.db.getRemoteWorker(workerId) : undefined;
-    if (!workerId || !connection || !worker || worker.protocol_version < 5) return;
+    if (!workerId || !connection || connection.migrationOnly || !worker || worker.protocol_version < 5) return;
     this.send(connection.socket, {
       type: "project_watch",
       projects: this.db.listActiveProjectsForExecutor(executorId).map((project) => ({ id: project.id, rootPath: project.root_path })),
@@ -305,7 +310,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return true;
     const connection = this.connections.get(workerId);
-    if (!connection || connection.socket.readyState !== WebSocket.OPEN || !connection.heartbeatSeen || connection.accountSwitching) return false;
+    if (!connection || connection.socket.readyState !== WebSocket.OPEN || !connection.heartbeatSeen || connection.accountSwitching || connection.migrationOnly) return false;
     const update = this.db.getRemoteWorkerUpdate(workerId);
     if (update && ["queued", "dispatching", "updating"].includes(update.state)) return false;
     const active = this.activeJobCount(workerId, connection);
@@ -355,7 +360,15 @@ export class RemoteWorkerGateway extends EventEmitter {
   }
 
   listCodexAccounts(executorId: string): Promise<RemoteCodexAccountsState> {
-    return this.codexAccountsRequest(executorId, "list", {}).then((result) => {
+    const workerId = workerIdFromExecutor(executorId);
+    const threadIds = workerId && this.connection(workerId).threadLifecycle ? this.db.listRunningCodexThreadIdsForExecutor(executorId) : undefined;
+    return this.codexAccountsRequest(executorId, "list", threadIds ? { threadIds } : {}).then((result) => {
+      const requested = new Set(threadIds);
+      for (const state of result.threadStates ?? []) {
+        if (!requested.has(state.threadId)) continue;
+        const changed = this.db.reconcileRemoteThreadLifecycle(executorId, state.threadId, state.status);
+        for (const id of changed) this.emit("thread_lifecycle", { conversationId: id });
+      }
       if (!result.state) throw new Error("远程 Worker 未返回 Codex 账号列表");
       return result.state;
     });
@@ -382,9 +395,10 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  activateCodexAccount(executorId: string, accountId: string): Promise<RemoteCodexAccountsState> {
+  async activateCodexAccount(executorId: string, accountId: string): Promise<RemoteCodexAccountsState> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
+    if (this.connection(workerId).threadLifecycle && this.db.countRunningCodexThreadsForExecutor(executorId) > 0) await this.listCodexAccounts(executorId);
     const connection = this.connection(workerId);
     if (connection.activeJobs.size > 0 || this.activeJobCount(workerId, connection) > 0
       || this.db.countRunningJobsForExecutor(executorId) > 0 || this.db.countRunningCodexThreadsForExecutor(executorId) > 0) {
@@ -409,7 +423,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete", fields: { label?: string; loginId?: string; accountId?: string }): Promise<{ state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean }> {
+  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[] }): Promise<{ state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
     const connection = this.connection(workerId);
@@ -440,6 +454,27 @@ export class RemoteWorkerGateway extends EventEmitter {
     this.emit("status", workerId);
     this.maybeDispatchWorkerUpdate(workerId);
     return { accepted: true, executor: this.workerView(worker) };
+  }
+
+  rotateDeviceCredential(workerId: string): { credentialId: string; expiresAt: string } {
+    const connection = this.connection(workerId);
+    if (!connection.deviceCredentials) throw new Error("请先升级设备 Worker");
+    if (this.db.pendingRemoteWorkerCredential(workerId)) throw new Error("设备凭据轮换仍待确认，请等待重连或使用恢复流程");
+    const credentialId = crypto.randomUUID();
+    const token = crypto.randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    this.db.stageRemoteWorkerCredential(workerId, credentialId, credentialHash(token), expiresAt);
+    this.send(connection.socket, { type: "credential_replace", workerId, credentialId, token });
+    return { credentialId, expiresAt };
+  }
+
+  revokeDeviceCredential(workerId: string): void {
+    this.db.revokeRemoteWorkerDevice(workerId);
+    const connection = this.connections.get(workerId);
+    this.connections.delete(workerId);
+    this.db.markRemoteWorkerOffline(workerId);
+    this.armJobDisconnectTimers(workerId);
+    connection?.socket.close(4003, "device credential revoked");
   }
 
   setCapacity(executorId: string, capacity: number): Promise<ExecutorView> {
@@ -866,8 +901,38 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
+  private allowedLegacyMigration(workerId: string, token: string): boolean {
+    // Pair only after the application promotion has cleared its maintenance gate.
+    // A candidate that fails health checks must not rotate production device secrets.
+    if (fs.existsSync(path.join(this.config.dataRoot, ".codex-update-maintenance"))) return false;
+    if (!this.config.remoteWorkerEnrollmentToken || !safeEqual(this.config.remoteWorkerEnrollmentToken, token)
+      || !this.db.getRemoteWorker(workerId) || this.db.listRemoteWorkerCredentials(workerId).length > 0) return false;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(this.config.dataRoot, "worker-credential-migration.json"), "utf8")) as {
+        version?: number; createdAt?: string; expiresAt?: string; workerIds?: string[];
+      };
+      const created = Date.parse(manifest.createdAt ?? ""), expires = Date.parse(manifest.expiresAt ?? "");
+      return manifest.version === 1 && Number.isFinite(created) && Number.isFinite(expires)
+        && created <= Date.now() && expires > Date.now() && expires - created <= 24 * 60 * 60_000
+        && Array.isArray(manifest.workerIds) && manifest.workerIds.includes(workerId);
+    } catch { return false; }
+  }
+
   private authenticate(socket: WebSocket, hello: Extract<RemoteWorkerToServer, { type: "hello" }>): string {
-    if (!this.config.remoteWorkerEnrollmentToken || !safeEqual(this.config.remoteWorkerEnrollmentToken, hello.enrollmentToken)) throw new Error("远程 Worker 凭据无效");
+    const tokenHash = credentialHash(hello.enrollmentToken);
+    const pendingCredential = this.db.pendingRemoteWorkerCredential(hello.workerId);
+    if (pendingCredential && safeEqual(pendingCredential.token_hash, tokenHash)) {
+      this.db.promoteRemoteWorkerCredential(hello.workerId, pendingCredential.credential_id);
+    }
+    const credential = this.db.activeRemoteWorkerCredential(tokenHash);
+    const enrollment = this.db.remoteWorkerEnrollment(tokenHash);
+    // Enrollment can create a new device, or recover one explicitly bound by
+    // the administrator. It can never claim an arbitrary existing device ID.
+    const canEnroll = enrollment && (enrollment.worker_id === hello.workerId
+      || (enrollment.worker_id === null && !this.db.getRemoteWorker(hello.workerId)));
+    const migrationOnly = !(credential?.worker_id === hello.workerId) && !canEnroll
+      && this.allowedLegacyMigration(hello.workerId, hello.enrollmentToken);
+    if (!(credential?.worker_id === hello.workerId) && !canEnroll && !migrationOnly) throw new Error("远程 Worker 凭据无效");
     if (![4, REMOTE_WORKER_PROTOCOL_VERSION].includes(hello.protocolVersion)) throw new Error("远程 Worker 协议版本不兼容");
     if (!/^[0-9a-f-]{36}$/i.test(hello.workerId)) throw new Error("远程 Worker ID 无效");
     const machineName = hello.machineName.trim();
@@ -877,7 +942,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       this.armJobDisconnectTimers(hello.workerId);
       previous.socket.close(4000, "replaced by new connection");
     }
-    const worker = this.db.registerRemoteWorker({
+    const workerInput = {
       id: hello.workerId,
       machine_name: machineName,
       platform: hello.platform.slice(0, 40),
@@ -888,7 +953,9 @@ export class RemoteWorkerGateway extends EventEmitter {
       worker_update_capable: hello.capabilities?.workerUpdate ? 1 : 0,
       codex_version: hello.codexVersion.slice(0, 80),
       capacity: normalizeRemoteWorkerCapacity(hello.capacity),
-    });
+    };
+    const worker = canEnroll ? this.db.enrollRemoteWorker(workerInput, tokenHash) : this.db.registerRemoteWorker(workerInput);
+    if (credential) this.db.markRemoteWorkerCredentialUsed(hello.workerId, credential.credential_id);
     this.connections.set(hello.workerId, {
       socket,
       workerId: hello.workerId,
@@ -903,9 +970,19 @@ export class RemoteWorkerGateway extends EventEmitter {
       accountSkills: Boolean(hello.capabilities?.accountSkills),
       titleAgent: Boolean(hello.capabilities?.titleAgent),
       codexAccounts: Boolean(hello.capabilities?.codexAccounts),
+      threadLifecycle: Boolean(hello.capabilities?.threadLifecycle),
       accountSwitching: false,
+      deviceCredentials: Boolean(hello.capabilities?.deviceCredentials),
+      migrationOnly,
     });
-    this.send(socket, { type: "authenticated", workerId: hello.workerId, heartbeatIntervalMs: 15_000 });
+    this.send(socket, { type: "authenticated", workerId: hello.workerId, heartbeatIntervalMs: 15_000,
+      ...(migrationOnly && hello.capabilities?.deviceCredentials ? { migrationOnly: true } : {}) });
+    if (migrationOnly && hello.capabilities?.deviceCredentials) {
+      const credentialId = crypto.randomUUID();
+      const token = crypto.randomBytes(32).toString("base64url");
+      this.db.stageRemoteWorkerCredential(hello.workerId, credentialId, credentialHash(token), new Date(Date.now() + 10 * 60_000).toISOString());
+      this.send(socket, { type: "credential_replace", workerId: hello.workerId, credentialId, token });
+    }
     this.refreshProjectWatches(remoteExecutorId(hello.workerId));
     this.reconcileWorkerUpdateOnConnect(hello.workerId);
     this.maybeQueueAutomaticWorkerUpdate(hello.workerId);
@@ -914,6 +991,18 @@ export class RemoteWorkerGateway extends EventEmitter {
   }
 
   private handleMessage(workerId: string, message: RemoteWorkerToServer): void {
+    const currentConnection = this.connections.get(workerId);
+    if (message.type === "credential_saved") {
+      if (this.db.promoteRemoteWorkerCredential(workerId, message.credentialId) && currentConnection?.migrationOnly) {
+        currentConnection.migrationOnly = false;
+        this.db.markRemoteWorkerCredentialUsed(workerId, message.credentialId);
+        this.send(currentConnection.socket, { type: "authenticated", workerId, heartbeatIntervalMs: 15_000 });
+        this.refreshProjectWatches(remoteExecutorId(workerId));
+      }
+      this.emit("status", workerId);
+      return;
+    }
+    if (currentConnection?.migrationOnly && !["heartbeat", "worker_update_ack", "worker_update_result"].includes(message.type)) return;
     if (message.type === "quota_usage") {
       if (!message.usage || typeof message.usage.remainingPercent !== "number" || !Number.isFinite(message.usage.remainingPercent)) return;
       const executorId = remoteExecutorId(workerId);
@@ -935,12 +1024,26 @@ export class RemoteWorkerGateway extends EventEmitter {
     }
     if (message.type === "heartbeat") {
       const connection = this.connections.get(workerId);
+      const firstHeartbeat = Boolean(connection && !connection.heartbeatSeen);
       if (connection) {
         connection.lastHeartbeat = Date.now();
         connection.activeJobs = new Set(message.activeJobs);
         connection.heartbeatSeen = true;
       }
-      this.reconcileWorkerJobs(workerId, message.activeJobs);
+      // A missing Job only proves it was lost when a newly established Worker
+      // connection reports its first process-local active set. During a normal
+      // connection the Worker removes a failed run before sending the terminal
+      // event, so reconciling every heartbeat would mask the real error as a
+      // reconnect failure and bypass the runner's retry policy.
+      if (firstHeartbeat) this.reconcileWorkerJobs(workerId, message.activeJobs);
+      for (const jobId of message.retainedJobs ?? []) {
+        const job = this.db.getJob(jobId);
+        const conversation = job ? this.db.getConversation(job.conversation_id) : undefined;
+        const project = conversation?.project_id ? this.db.getProject(conversation.project_id) : undefined;
+        if (connection && (!job || !["queued", "running"].includes(job.status) || project?.executor_id !== remoteExecutorId(workerId))) {
+          this.send(connection.socket, { type: "run_release", jobId });
+        }
+      }
       this.db.updateRemoteWorkerPresence(workerId, "online", message.activeJobs.length);
       if (connection) this.send(connection.socket, { type: "heartbeat_ack", at: new Date().toISOString() });
       this.maybeQueueAutomaticWorkerUpdate(workerId);
@@ -1003,7 +1106,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       clearTimeout(pending.timer);
       this.pendingCodexAccounts.delete(message.requestId);
       if (!message.ok) pending.reject(new Error(message.message || "远程 Codex 账号操作失败"));
-      else pending.resolve({ state: message.state, login: message.login, restart: message.restart });
+      else pending.resolve({ state: message.state, login: message.login, restart: message.restart, threadStates: message.threadStates });
       return;
     }
     if (message.type === "title_agent_result") {
@@ -1216,6 +1319,7 @@ export class RemoteWorkerGateway extends EventEmitter {
   private connection(workerId: string): Connection {
     const connection = this.connections.get(workerId);
     if (!connection || connection.socket.readyState !== WebSocket.OPEN) throw new Error("远程电脑当前离线");
+    if (connection.migrationOnly) throw new Error("设备正在迁移独立凭据，暂不能执行任务");
     return connection;
   }
 
@@ -1260,6 +1364,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     const connection = this.connections.get(worker.id);
     const active = Math.max(worker.active_jobs, this.activeJobCount(worker.id, connection));
     const update = this.db.getRemoteWorkerUpdate(worker.id);
+    const credentials = this.db.listRemoteWorkerCredentials(worker.id);
     return {
       id: remoteExecutorId(worker.id), machineName: worker.machine_name, kind: "remote_worker",
       status: this.connections.has(worker.id) && worker.status !== "disabled" ? "online" : worker.status,
@@ -1273,6 +1378,10 @@ export class RemoteWorkerGateway extends EventEmitter {
       retryCapability: { transparentBeforeStart: true, replayAfterStart: false, idempotencyReceipts: false },
       codexAccountManagementCapable: Boolean(connection?.codexAccounts),
       worker: {
+        credentialState: this.db.pendingRemoteWorkerCredential(worker.id) ? "pending"
+          : credentials.some((item) => item.state === "active" && (!item.expires_at || item.expires_at > new Date().toISOString())) ? "active"
+          : credentials.length ? "revoked" : "unregistered",
+        credentialRotationCapable: Boolean(connection?.deviceCredentials),
         installedVersion: worker.worker_version,
         installedRef: worker.worker_release,
         installedCommit: worker.worker_commit,
@@ -1413,3 +1522,5 @@ function isTransferScopeId(value: string): boolean {
 function safeTransferName(value: string, fallback: string): string {
   return path.basename(value).replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_").slice(0, 180) || fallback;
 }
+
+function credentialHash(token: string): string { return crypto.createHash("sha256").update(token).digest("hex"); }

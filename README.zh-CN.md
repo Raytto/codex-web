@@ -183,3 +183,13 @@ stateDiagram-v2
 公网部署请配置 HTTPS；浏览器通常只允许在 HTTPS 或 localhost 页面调用麦克风。
 
 更多信息请参阅 [部署说明](docs/DEPLOYMENT.md)、[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)、[架构说明](docs/ARCHITECTURE.md) 与 [安全说明](docs/SECURITY.md)。
+
+## 2026 年 9 月可靠性更新
+
+- 容量等待持久化，服务重启后继续，等待时释放执行名额；过程文件和首轮产物跨尝试保留，已接收输入不重复发送，内部续接提示不再作为聊天消息展示。
+- Agent 的命令、路径与 URL 保留原文；聊天文件名选区不受工具栏刷新影响，阅读器浅深主题选区亮度稳定，长引用不再挤压发送按钮。
+- 可选 Remote Worker 1.19.3 增加每设备独立凭据、轮换/吊销、启动阶段超时与取消，以及只针对所选执行器的历史账号锁状态校正。
+- 可选冷存储按有限快照处理本轮全部合格候选，单项/阶段失败不阻断后续工作；继续要求密文回下载校验和 7 天本地隔离宽限。
+- 新任务在执行器目录支持时优先使用 `gpt-6-astra` / `high`；已有选择保留，不支持的选项按目录回退。
+
+升级前阅读[重试与设备凭据说明](docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md)、[冷存储维护](docs/CONVERSATION_COLD_STORAGE.md)和[Agent 内容保真](docs/AGENT_CONTENT_FIDELITY.md)。公开版继续使用用户名/密码登录、`/codex-web` 路径和默认低权限租户；扩展须自行配置后启用。
