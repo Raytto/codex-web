@@ -1,3 +1,5 @@
+import { mountParaRoutes } from "./para-routes.js";
+import { parseDeploymentSteps, type DeploymentStepStatus, type DeploymentBlocker } from "./deployment-progress.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -16,7 +18,7 @@ import { parseCodexFileMentionRequest } from "../src/codex-file-mentions.js";
 import { AppDatabase, StorageQuotaExceededError, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type PersonalMemoryReviewAction, type ProjectRow, type SessionRow, type UserRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
-import { AUDIO_MIME_EXTENSIONS, TranscriptionError, TranscriptionService } from "./transcription.js";
+import { AUDIO_MIME_EXTENSIONS, TRANSCRIPTION_PROMPT_VERSION, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_PROMPT_VERSION, CONVERSATION_TITLE_REASONING_EFFORT, ConversationTitleService, extractTitleRequestText } from "./conversation-title.js";
 import { HOST_ROOT_USER_ID, isHostRootUser } from "./host-root-user.js";
 import { DEFAULT_PROJECT_AGENTS_TEMPLATE, PROJECT_AGENTS_TEMPLATE_SETTING } from "./project-instructions.js";
@@ -318,6 +320,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       lastRun: db.getLatestVoiceLexiconRun(userId),
       selectedTerms: activeTerms.slice(0, config.voiceLexiconMaxTerms).map(serializeTerm),
       candidateTerms: candidateTerms.map(serializeTerm),
+      suppressedTerms: terms.filter((term) => term.status === "suppressed").map(serializeTerm),
     };
   };
   const voiceLexicon = new VoiceLexiconService(
@@ -349,6 +352,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     errorCode?: number | null;
     errorSummary?: string | null;
     phaseHistory?: Array<{ phase: DeploymentPhase; at: string }>;
+    stepHistory?: DeploymentStepStatus[];
+    runningJobCount?: number;
+    blockers?: DeploymentBlocker[];
   };
   const deploymentPhases = new Set<DeploymentPhase>([
     "idle", "queued", "building", "candidate_ready", "waiting_for_jobs", "promoting", "health_check",
@@ -503,6 +509,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         finishedAt: typeof candidate.finishedAt === "string" ? candidate.finishedAt : null,
         errorCode: typeof candidate.errorCode === "number" ? candidate.errorCode : null,
         errorSummary: typeof candidate.errorSummary === "string" ? candidate.errorSummary.slice(0, 300) : null,
+        stepHistory: parseDeploymentSteps(candidate.stepHistory),
         phaseHistory: Array.isArray(candidate.phaseHistory) ? candidate.phaseHistory.slice(-32).flatMap((entry) => {
           if (!entry || typeof entry !== "object") return [];
           const value = entry as Record<string, unknown>;
@@ -527,7 +534,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function systemStatusPayload(userId?: string): { instanceId: string; maintenance: boolean; maintenancePhase: MaintenancePhase; message: string | null; maintenanceWait: MaintenanceWaitStatus | null; deployment: DeploymentStatus | null } {
     const maintenancePhase = codexUpdateMaintenancePhase();
-    const running = maintenancePhase === "preparing" ? db.listRunningJobSummaries() : [];
+    const deployment = deploymentStatus();
+    const awaitingDrain = maintenancePhase === "preparing" || Boolean(deployment && ["queued", "building", "candidate_ready", "waiting_for_jobs"].includes(deployment.phase));
+    const running = awaitingDrain ? db.listRunningJobSummaries() : [];
+    if (deployment && awaitingDrain) {
+      deployment.runningJobCount = running.length;
+      deployment.blockers = isHostRootUser(userId ?? "") ? running.slice(0, 10).map((job) => ({
+        jobId: job.id, title: job.title, executor: job.executor_label, startedAt: job.started_at,
+      })) : [];
+    }
     const lastActivityAt = running.reduce<string | null>((latest, job) => !latest || job.updated_at > latest ? job.updated_at : latest, null);
     const stalled = Boolean(lastActivityAt && Date.now() - Date.parse(lastActivityAt) >= 5 * 60_000);
     const taskTitle = isHostRootUser(userId ?? "") && running.length === 1 ? running[0].title : null;
@@ -545,7 +560,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         ? `Codex Web 正在准备维护，${waitingDescription}。${stalled ? "最后进度已超过 5 分钟，任务可能停滞。" : "新的任务已安全排队。"}`
         : maintenancePhase === "active" ? "Codex Web 正在维护，已提交的任务会安全排队并在维护结束后继续。" : null,
       maintenanceWait,
-      deployment: deploymentStatus(),
+      deployment,
     };
   }
 
@@ -877,10 +892,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function recordUserCancelledJob(job: JobRow): void {
     if (db.getJob(job.id)?.status !== "cancelled" || !db.getConversation(job.conversation_id)) return;
+    if (!db.jobHasExecutionHistory(job.id)) return;
+    db.captureJobRecovery(job.id, "cancelled", "用户主动停止任务");
+    if (db.hasJobEvent(job.id, "cancellation_summary")) return;
     db.addMessage({
       id: newId(), conversation_id: job.conversation_id, role: "assistant",
       content: buildUserCancellationSummary(db.listEvents(job.id)), created_at: new Date().toISOString(),
     });
+    db.appendEvent(job.id, "cancellation_summary", { recorded: true });
   }
 
   async function stopConversationJobs(conversationId: string, recordCancellation = true): Promise<void> {
@@ -890,7 +909,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (conversation) publishConversationChanged(conversation);
     }
     const activeJobs = db.listActiveJobsForConversation(conversationId);
-    const runningJobs = activeJobs.filter((job) => job.status === "running");
     for (const job of activeJobs) {
       if (job.status === "queued" && db.cancelQueuedJob(job.id)) {
         publish(job.id, "done", { status: "cancelled", message: "任务已停止" });
@@ -911,7 +929,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (Date.now() >= deadline) throw new Error("相关任务未能在限定时间内停止，请稍后重试。");
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    if (recordCancellation) for (const job of runningJobs) recordUserCancelledJob(job);
+    if (recordCancellation) for (const job of activeJobs) recordUserCancelledJob(job);
   }
 
   type DispatchBlock = "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
@@ -1616,6 +1634,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
+  mountParaRoutes(api, { db, config, resolveFile: resolveExistingFilePath,
+    restore: (id) => { const c = db.getConversation(id); if (c) activateConversation(c); },
+    selection: (user, executor) => userAgentSelection(user, optionsForExecutor(user, executor)),
+    executorOnline: (executor) => executorView(executor)?.status === "online",
+    maximumBytes: maximumStoredBytesForUser,
+  });
+
   function readerRequestError(res: Response, error: unknown): Response {
     if (error instanceof ReaderUnavailableError) {
       return res.status(202).setHeader("Retry-After", "2").json({ code: error.code, restoring: true, error: error.message });
@@ -1932,6 +1957,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "Codex 账号读取失败。" }); }
   });
 
+  api.post("/codex-accounts/refresh-usage", async (req, res) => {
+    const session = codexAccountAdminSession(res);
+    if (!session) return;
+    const executorId = codexAccountExecutor(req, res); if (!executorId) return;
+    try { return res.json(await runner.listCodexAccounts(session.user_id, executorId, true)); }
+    catch { return res.status(400).json({ error: "账号用量刷新失败，请稍后重试。" }); }
+  });
+
   api.post("/codex-accounts/logins", codexAccountLoginLimiter, async (req, res) => {
     const session = codexAccountAdminSession(res);
     if (!session) return;
@@ -1955,6 +1988,16 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const executorId = codexAccountExecutor(req, res); if (!executorId) return;
     try { return res.json({ login: await runner.cancelCodexAccountLogin(session.user_id, String(req.params.loginId), executorId) }); }
     catch (error) { return res.status(404).json({ error: error instanceof Error ? error.message : "登录验证不存在。" }); }
+  });
+
+  api.post("/codex-accounts/:accountId/reset-credit", async (req, res) => {
+    const session = codexAccountAdminSession(res); if (!session) return;
+    const executorId = codexAccountExecutor(req, res); if (!executorId) return;
+    const accountId = String(req.params.accountId), attemptId = req.body?.attemptId;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(accountId) || typeof attemptId !== "string" || !uuid.test(attemptId)) return res.status(400).json({ error: "账号或重置请求标识无效。" });
+    try { return res.json(await runner.consumeResetCredit(session.user_id, accountId, attemptId, executorId)); }
+    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "重置未确认，请重试核对同一次操作。" }); }
   });
 
   api.post("/codex-accounts/:accountId/activate", async (req, res) => {
@@ -1991,6 +2034,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.get("/voice-lexicon", (_req, res) => {
     const session = res.locals.session as SessionRow;
     res.setHeader("Cache-Control", "private, no-store, no-cache, must-revalidate");
+    return res.json(voiceLexiconManagementPayload(session.user_id));
+  });
+
+  api.patch("/voice-lexicon/terms/:termId", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    if (typeof req.body?.disabled !== "boolean") {
+      return res.status(400).json({ error: "请指定是否禁用关键词。" });
+    }
+    if (!db.setVoiceLexiconTermDisabled(session.user_id, req.params.termId, req.body.disabled)) {
+      return res.status(404).json({ error: "关键词不存在。" });
+    }
+    res.setHeader("Cache-Control", "private, no-store");
     return res.json(voiceLexiconManagementPayload(session.user_id));
   });
 
@@ -2576,6 +2631,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.status(activated.state === "local" ? 200 : 202).json({ state: activated.state, restoring: activated.state === "restoring", conversation: activated.conversation });
   });
 
+  api.get("/conversations/:id/rollout-size", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    const rolloutBytes = await runner.conversationRolloutBytes(conversation.id).catch(() => conversation.rollout_bytes);
+    if (rolloutBytes !== conversation.rollout_bytes) db.setConversationRolloutBytes(conversation.id, rolloutBytes);
+    return res.json({ rolloutBytes });
+  });
+
   api.get("/conversations/:id", async (req, res) => {
     const session = res.locals.session as SessionRow;
     let conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -3034,7 +3098,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         callback(null, `${crypto.randomUUID()}${AUDIO_MIME_EXTENSIONS[mime] ?? ""}`);
       },
     }),
-    limits: { files: 1, fileSize: 15 * 1024 * 1024, fields: 6, fieldSize: 10 * 1024 },
+    limits: { files: 1, fileSize: 30 * 1024 * 1024, fields: 6, fieldSize: 10 * 1024 },
     fileFilter(_req, file, callback) {
       const mime = file.mimetype.toLowerCase().split(";", 1)[0];
       callback(null, Boolean(AUDIO_MIME_EXTENSIONS[mime]));
@@ -3115,7 +3179,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           db.createVoiceTranscription({
             id: transcriptionId, userId: session.user_id, clientRecordingId: clientRecordingId || null,
             conversationId: conversation?.id ?? null, projectId: conversation?.project_id ?? null, rawText: text, model: config.dashscopeModel,
-            promptVersion: "transcription-context-v3", selectedTermIds: selectedLexicon.ids, audio: persistedAudio,
+            promptVersion: TRANSCRIPTION_PROMPT_VERSION, selectedTermIds: selectedLexicon.ids, audio: persistedAudio,
           });
           if (clientRecordingId) db.updateVoiceTranscriptionReceipt({ userId: session.user_id, clientRecordingId, state: "succeeded", transcriptionId });
           return { text, transcriptionId };
@@ -3495,6 +3559,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const job = db.getJobForUser(String(req.params.id), session.user_id);
     if (!job) return res.status(404).json({ error: "任务不存在。" });
     if (job.status === "queued" && db.cancelQueuedJob(job.id)) {
+      recordUserCancelledJob(job);
       publish(job.id, "done", { status: "cancelled", message: "任务已停止" });
       publishQueuePositions();
       if (config.queueAutoStart) scheduleQueuePump();

@@ -28,6 +28,7 @@ export function isPersistableWorkerMessage(value: unknown): value is WorkerMessa
       && recordArray(value.directories, 500, (item) => shortString(item.name, 255, 1) && shortString(item.path, 4_096, 1));
     case "request_failed": return optionalUuid(value.requestId) && shortString(value.message, 2_000, 1);
     case "event": return uuid(value.jobId) && workerEvent(value.event);
+    case "thread_rollout_size_result": return uuid(value.requestId) && (value.bytes === null || integer(value.bytes, 0, Number.MAX_SAFE_INTEGER));
     case "thread_rename_result":
     case "file_fetch_result": return uuid(value.requestId) && typeof value.ok === "boolean" && optionalString(value.message, 2_000, 1);
     case "title_agent_result": return uuid(value.requestId) && typeof value.ok === "boolean"
@@ -42,6 +43,7 @@ export function isPersistableWorkerMessage(value: unknown): value is WorkerMessa
     case "worker_config_result": return uuid(value.requestId) && typeof value.ok === "boolean"
       && (value.capacity === undefined || integer(value.capacity, 0, 8)) && optionalString(value.message, 2_000, 1);
     case "codex_accounts_result": return uuid(value.requestId) && typeof value.ok === "boolean"
+      && (value.resetResult === undefined || resetConsumption(value.resetResult))
       && (value.state === undefined || codexAccountsState(value.state))
       && (value.login === undefined || codexAccountLogin(value.login))
       && (value.restart === undefined || typeof value.restart === "boolean")
@@ -60,6 +62,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
   switch (value.type) {
     case "credential_replace": return uuid(value.workerId) && uuid(value.credentialId) && secret(value.token);
     case "authenticated": return uuid(value.workerId) && integer(value.heartbeatIntervalMs, 5_000, 60_000) && (value.migrationOnly === undefined || typeof value.migrationOnly === "boolean");
+    case "thread_rollout_size": return uuid(value.requestId) && threadUuid(value.threadId);
     case "project_watch": return recordArray(value.projects, 200, (item) => exactKeys(item, ["id", "rootPath"]) && uuid(item.id) && shortString(item.rootPath, 4_096, 1));
     case "request_failed": return optionalUuid(value.requestId) && shortString(value.message, 2_000, 1);
     case "project_fs": return uuid(value.requestId) && ["list", "create", "validate", "initialize"].includes(String(value.action))
@@ -88,7 +91,9 @@ function isServerMessage(value: unknown): value is ServerMessage {
     case "worker_update_result_ack": return uuid(value.requestId);
     case "worker_config": return uuid(value.requestId) && integer(value.capacity, 0, 8);
     case "codex_accounts": {
-      if (!uuid(value.requestId) || !["list", "login_start", "login_status", "login_cancel", "activate", "delete"].includes(String(value.action))) return false;
+      if (!uuid(value.requestId) || !["list", "login_start", "login_status", "login_cancel", "activate", "delete", "reset_credit"].includes(String(value.action))) return false;
+      if (value.action === "reset_credit" ? !uuid(value.attemptId) : value.attemptId !== undefined) return false;
+      if (value.refreshUsage !== undefined && (value.action !== "list" || typeof value.refreshUsage !== "boolean")) return false;
       if (value.threadIds !== undefined && (value.action !== "list" || !Array.isArray(value.threadIds) || value.threadIds.length > 200 || !value.threadIds.every(threadUuid))) return false;
       if (value.action === "list") return value.label === undefined && value.loginId === undefined && value.accountId === undefined;
       if (value.action === "login_start") return optionalString(value.label, 60) && value.loginId === undefined && value.accountId === undefined;
@@ -160,11 +165,21 @@ function runtimeStatus(value: unknown): boolean {
     && shortString(value.agentOptions.defaults.model, 100, 1) && shortString(value.agentOptions.defaults.reasoningEffort, 32, 1);
 }
 
+function resetConsumption(value: unknown): boolean {
+  return record(value) && exactKeys(value, ["attemptId", "outcome", "resetCredits", "quota", "refreshed"])
+    && uuid(value.attemptId) && ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"].includes(String(value.outcome))
+    && resetCredits(value.resetCredits) && typeof value.refreshed === "boolean"
+    && (value.quota === null || (record(value.quota) && exactKeys(value.quota, ["remainingPercent", "resetAt"])
+      && typeof value.quota.remainingPercent === "number" && Number.isFinite(value.quota.remainingPercent)
+      && value.quota.remainingPercent >= 0 && value.quota.remainingPercent <= 100 && nullableString(value.quota.resetAt, 80)));
+}
+
 function codexAccount(value: unknown): boolean {
   return record(value) && uuid(value.id) && shortString(value.label, 60, 1)
     && (value.email === null || shortString(value.email, 254, 3)) && shortString(value.accountHint, 40, 1)
     && typeof value.active === "boolean" && shortString(value.createdAt, 80, 1)
-    && (value.lastUsedAt === null || shortString(value.lastUsedAt, 80, 1));
+    && (value.lastUsedAt === null || shortString(value.lastUsedAt, 80, 1))
+    && (value.resetCredits === undefined || value.resetCredits === null || resetCredits(value.resetCredits));
 }
 function codexAccountsState(value: unknown): boolean {
   return record(value) && uuid(value.activeAccountId) && recordArray(value.accounts, 20, codexAccount);
@@ -201,7 +216,18 @@ function threadUuid(value: unknown): value is string { return typeof value === "
 function uuid(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function optionalUuid(value: unknown): boolean { return value === undefined || uuid(value); }
 function secret(value: unknown): value is string { return shortString(value, 1_024, 16); }
-function quota(value: unknown): boolean { return record(value) && finite(value.remainingPercent) && value.remainingPercent >= 0 && value.remainingPercent <= 100; }
+function resetCredits(value: unknown): boolean {
+  return record(value) && exactKeys(value, ["availableCount", "earliestExpiresAt", "expiryStatus", "state", "updatedAt", "checkedAt"])
+    && (value.availableCount === null || integer(value.availableCount, 0, Number.MAX_SAFE_INTEGER))
+    && nullableString(value.earliestExpiresAt, 80) && nullableString(value.updatedAt, 80) && shortString(value.checkedAt, 80, 1)
+    && ["complete", "partial", "unknown"].includes(String(value.expiryStatus))
+    && ["ok", "unavailable", "auth_required", "error"].includes(String(value.state));
+}
+function quota(value: unknown): boolean {
+  return record(value) && (value.remainingPercent === null || (finite(value.remainingPercent) && value.remainingPercent >= 0 && value.remainingPercent <= 100))
+    && (value.resetAt === undefined || nullableString(value.resetAt, 80))
+    && (value.resetCredits === undefined || resetCredits(value.resetCredits));
+}
 function stringArray(value: unknown, maximumItems: number, maximumLength: number): value is string[] { return Array.isArray(value) && value.length <= maximumItems && value.every((item) => shortString(item, maximumLength, 1)); }
 function recordArray(value: unknown, maximumItems: number, validate: (item: Record<string, unknown>) => boolean): boolean { return Array.isArray(value) && value.length <= maximumItems && value.every((item) => record(item) && validate(item)); }
 function booleanRecord(value: unknown, maximumItems: number): boolean { return record(value) && Object.keys(value).length <= maximumItems && Object.entries(value).every(([key, item]) => key.length <= 100 && typeof item === "boolean"); }
@@ -213,6 +239,7 @@ const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
   authenticated: ["type", "workerId", "heartbeatIntervalMs", "migrationOnly"],
   project_watch: ["type", "projects"],
   request_failed: ["type", "requestId", "message"],
+  thread_rollout_size: ["type", "requestId", "threadId"],
   project_fs: ["type", "requestId", "action", "path", "name", "content"],
   run: ["type", "request"],
   steer: ["type", "jobId", "requestId", "prompt", "attachments", "transferToken", "turnContext"],
@@ -227,6 +254,6 @@ const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
   worker_update: ["type", "requestId", "targetVersion", "targetRef"],
   worker_update_result_ack: ["type", "requestId"],
   worker_config: ["type", "requestId", "capacity"],
-  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds"],
+  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds", "refreshUsage", "attemptId"],
   heartbeat_ack: ["type", "at"],
 };

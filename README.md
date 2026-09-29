@@ -45,7 +45,7 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 - Copy an assistant reply from its compact message action without selecting the whole bubble
 - Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
 - Optional Alibaba Cloud DashScope voice transcription
-- A five-minute recording-limit notice and a 650 ms long-press shortcut on an empty mobile composer
+- A ten-minute recording-limit notice and a 650 ms long-press shortcut on an empty mobile composer
 - Bounded automatic retries for transient voice-transcription connection and upstream failures
 - Failed voice uploads keep the complete recording in browser IndexedDB for 24 hours, with an explicit retry/delete action; UUID receipts make a retry safe after a lost response
 - Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
@@ -253,7 +253,7 @@ state root and are never committed.
 
 ## Optional voice transcription
 
-Set `DASHSCOPE_API_KEY` and an HTTPS `PUBLIC_BASE_URL` in `.env` to enable the microphone button. The default model is `qwen3.5-omni-plus`; you can override it with `DASHSCOPE_ASR_MODEL`. Microphone access requires a secure browser context.
+Set your own `DASHSCOPE_API_KEY`, HTTPS `DASHSCOPE_BASE_URL` and HTTPS `PUBLIC_BASE_URL` in `.env` to enable voice transcription. Choose a compatible model with `DASHSCOPE_ASR_MODEL`; empty credentials or endpoint keep voice disabled. Microphone access requires a secure browser context.
 
 Audio is uploaded to your server first and then sent to the DashScope endpoint configured by `DASHSCOPE_BASE_URL`. Leave the key empty to disable the feature completely.
 
@@ -298,3 +298,14 @@ before exposing an instance to the internet.
 - New task defaults prefer `gpt-6-astra` with `high` reasoning when supported by the executor catalog. Saved selections remain intact; unsupported choices use catalog fallback.
 
 Read [retry and device upgrade instructions](docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md), [cold-storage operations](docs/CONVERSATION_COLD_STORAGE.md), and [content fidelity](docs/AGENT_CONTENT_FIDELITY.md). Username/password Web login, `/codex-web`, and the default non-root tenant profile remain the public deployment contract.
+
+
+## Reader, project and recovery updates (September 30, 2026)
+
+- Empty, account-owned [PARA boards](docs/features/PARA_BOARD.md) organize ideas, projects, areas and durable resources. Collect messages/files, link conversations, and prepare a draft with a versioned project brief and explicitly selected material. Unified sidebar search covers boards, projects and conversations while preserving manual selection and normal pagination.
+- PDF/EPUB offer paged or continuous reading, page/chapter navigation and progress restoration. HTML/Markdown native selections survive the first drag, long gestures and React refreshes. Browser tabs use the article or conversation title followed by Codex Web.
+- [Durable task handoffs](docs/TASK_RECOVERY.md) preserve interrupted goals and bounded evidence across cancellation, capacity waits and restarts. Consecutive tasks wait for the prior Codex writer to exit; hidden answer streaming cannot displace visible progress.
+- Configured account administrators can inspect and explicitly redeem [reset credits](docs/CODEX_RESET_CREDITS.md). Worker 1.19.7 adds validated account refresh and bounded rollout-size queries; no account, credentials or device data is bundled.
+- Voice waits for Safari's final audio chunk, supports ten-minute recordings (30 MiB request ceiling), rejects incomplete streamed transcripts, and retains explicit keyword suppression. The configured provider remains an operator choice.
+
+The default Compose remains a low-privilege tenant deployment with username/password login at `/codex-web`. PARA starts with no data and can be disabled using `CWW_PARA_ENABLED=false`; integrations still require their own explicit configuration. See the [upgrade checklist](docs/DEPLOYMENT.md#september-30-2026-upgrade-checks).

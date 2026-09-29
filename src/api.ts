@@ -14,6 +14,9 @@ export type DeploymentStatus = {
   errorCode?: number | null;
   errorSummary?: string | null;
   phaseHistory?: Array<{ phase: DeploymentPhase; at: string }>;
+  stepHistory?: import("../server/deployment-progress").DeploymentStepStatus[];
+  runningJobCount?: number;
+  blockers?: import("../server/deployment-progress").DeploymentBlocker[];
 };
 export type Session = { authenticated: boolean; accountId?: string; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; projectMode?: boolean; maintenance?: boolean; maintenancePhase?: MaintenancePhase };
 export type SystemStatus = {
@@ -35,6 +38,7 @@ export type CodexAccount = {
   quotaRemainingPercent?: number | null;
   quotaResetAt?: string | null;
   quotaUpdatedAt?: string | null;
+  resetCredits?: import("../remote-worker/src/codex-reset-credits.js").CodexResetCredits | null;
 };
 export type CodexAccountLogin = {
   id: string;
@@ -327,6 +331,7 @@ export type VoiceLexiconManagement = {
   lastRun: VoiceLexiconRunSummary | null;
   selectedTerms: VoiceLexiconTerm[];
   candidateTerms: VoiceLexiconTerm[];
+  suppressedTerms: VoiceLexiconTerm[];
 };
 export type SubagentStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
 export type SubagentEventState = {
@@ -446,7 +451,7 @@ function isReaderRetryBody(value: unknown): value is { code?: string; restoring?
 
 type RequestOptions = { allowStatuses?: readonly number[] };
 
-async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
+export async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase()) && csrfToken) headers.set("X-CSRF-Token", csrfToken);
@@ -470,6 +475,8 @@ export const api = {
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   systemStatus: () => request<SystemStatus>("/system/status"),
+  consumeCodexResetCredit: (executorId: string, accountId: string, attemptId: string) => request<import("../remote-worker/src/codex-reset-consumer.js").ResetConsumption>(`/codex-accounts/${encodeURIComponent(accountId)}/reset-credit`, { method: "POST", body: JSON.stringify({ executorId, attemptId }) }),
+  refreshCodexAccountUsage: (executorId: string) => request<CodexAccountsState>("/codex-accounts/refresh-usage", { method: "POST", body: JSON.stringify({ executorId }) }),
   codexAccounts: (executorId: string) => request<CodexAccountsState>(`/codex-accounts?executorId=${encodeURIComponent(executorId)}`),
   beginCodexAccountLogin: (executorId: string, label: string) => request<{ login: CodexAccountLogin }>("/codex-accounts/logins", { method: "POST", body: JSON.stringify({ executorId, label }) }),
   codexAccountLoginStatus: (executorId: string, loginId: string) => request<{ login: CodexAccountLogin }>(`/codex-accounts/logins/${encodeURIComponent(loginId)}?executorId=${encodeURIComponent(executorId)}`),
@@ -478,6 +485,10 @@ export const api = {
   deleteCodexAccount: (executorId: string, accountId: string) => request<CodexAccountsState>(`/codex-accounts/${encodeURIComponent(accountId)}?executorId=${encodeURIComponent(executorId)}`, { method: "DELETE" }),
   personalMemory: () => request<PersonalMemoryManagement>("/personal-memory"),
   voiceLexicon: () => request<VoiceLexiconManagement>("/voice-lexicon"),
+  setVoiceKeywordDisabled: (termId: string, disabled: boolean) => request<VoiceLexiconManagement>(
+    `/voice-lexicon/terms/${encodeURIComponent(termId)}`,
+    { method: "PATCH", body: JSON.stringify({ disabled }) },
+  ),
   reviewPersonalMemory: (entryId: string, action: PersonalMemoryReviewAction, statement?: string) => request<PersonalMemoryManagement>(
     `/personal-memory/entries/${encodeURIComponent(entryId)}/review`,
     { method: "POST", body: JSON.stringify({ action, statement }) },
@@ -566,6 +577,7 @@ export const api = {
     method: "PUT", body: JSON.stringify({ chatFontSize }),
   }),
   createConversation: (projectId?: string, reuseEmpty = true) => request<{ conversation: Conversation; agentSelection: AgentSelection; reused: boolean }>("/conversations", { method: "POST", body: JSON.stringify({ projectId, reuseEmpty }) }),
+  conversationRolloutSize: (id: string) => request<{ rolloutBytes: number | null }>(`/conversations/${id}/rollout-size`),
   conversation: (id: string, limit?: number) => request<ConversationDetail | ConversationRestorePending>(`/conversations/${id}${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
   conversationActivity: (id: string) => request<ConversationActivity>(`/conversations/${id}/activity`),
   conversationMessages: (id: string, before: string, limit?: number) => request<ConversationMessagesPage>(

@@ -1,5 +1,7 @@
+import { normalizeResetCredits } from "../remote-worker/src/codex-reset-credits.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { isModelCapacityError, isRetryableUpstreamError } from "./retry-policy.js";
 import { buildOptionalCapabilityConfig, type OptionalAgentCapabilities } from "./optional-capabilities.js";
@@ -24,7 +26,8 @@ export type ContextTokenUsage = {
 };
 
 export type CodexQuotaUsage = {
-  remainingPercent: number;
+  remainingPercent: number | null;
+  resetCredits?: import("../remote-worker/src/codex-reset-credits.js").CodexResetCredits;
   resetAt?: string | null;
 };
 
@@ -86,6 +89,8 @@ class AppServerTurnClient {
   private quotaRefreshInFlight = false;
   private authReadyNotified = false;
   private stderr = "";
+  private readonly childExited: Promise<void>;
+  private readonly onAbort = () => this.interrupt();
   private readonly completion: Promise<string>;
   private resolveCompletion!: (value: string) => void;
   private rejectCompletion!: (error: Error) => void;
@@ -100,6 +105,11 @@ class AppServerTurnClient {
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.childExited = new Promise<void>((resolve) => {
+      this.child.once("exit", () => resolve());
+      // A failed spawn has no process whose exit we can await.
+      this.child.once("error", () => { if (!this.child.pid) resolve(); });
+    });
     const output = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     output.on("line", (line) => this.handleLine(line));
     this.child.stderr.on("data", (chunk: Buffer) => {
@@ -112,7 +122,7 @@ class AppServerTurnClient {
       for (const request of this.pending.values()) request.reject(new Error("Codex app server disconnected"));
       this.pending.clear();
     });
-    callbacks.signal.addEventListener("abort", () => this.interrupt(), { once: true });
+    callbacks.signal.addEventListener("abort", this.onAbort, { once: true });
   }
 
   run(): Promise<string> {
@@ -136,6 +146,12 @@ class AppServerTurnClient {
     if (this.terminal) return;
     const threadId = this.threadId;
     const turnId = this.activeTurnId;
+    if (!turnId) {
+      const error = new Error("任务已停止");
+      error.name = "AbortError";
+      this.fail(error);
+      return;
+    }
     if (threadId && turnId && this.child.stdin.writable) {
       void this.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
     }
@@ -143,6 +159,7 @@ class AppServerTurnClient {
 
   private async start(): Promise<void> {
     try {
+      this.callbacks.signal.throwIfAborted();
       await this.request("initialize", {
         clientInfo: { name: "codex-web", title: "Codex Web", version: "1.0.0" },
         capabilities: { experimentalApi: true, requestAttestation: false },
@@ -171,7 +188,7 @@ class AppServerTurnClient {
         },
       };
       const threadResult = this.options.threadId
-        ? await this.request("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true })
+        ? await this.resumeThread({ threadId: this.options.threadId, ...common, excludeTurns: true })
         : await this.request("thread/start", {
             ...common,
             ...(this.options.threadInstructions ? { developerInstructions: this.options.threadInstructions } : {}),
@@ -181,6 +198,8 @@ class AppServerTurnClient {
       if (!thread?.id) throw new Error("Codex app server did not return a thread id");
       this.threadId = thread.id;
       this.callbacks.onThreadStarted(thread.id);
+      this.callbacks.signal.throwIfAborted();
+      if (this.terminal) return;
       const turnResult = await this.request("turn/start", {
         threadId: thread.id,
         input: makeUserInput(this.options.prompt, this.options.imagePaths),
@@ -196,6 +215,24 @@ class AppServerTurnClient {
       this.callbacks.onProgress({ kind: "input_accepted", threadId: thread.id, turnId: turnResult.turn.id });
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async resumeThread(params: JsonObject): Promise<unknown> {
+    // Retry only rejected acquisition, before turn/start or user input delivery.
+    // Never replay a turn that may already have performed external actions.
+    const waits = [250, 500, 1_000, 2_000, 4_000, 4_000];
+    for (let attempt = 0; ; attempt++) {
+      this.callbacks.signal.throwIfAborted();
+      if (this.terminal) throw new Error("Codex app server is unavailable");
+      try {
+        return await this.request("thread/resume", params);
+      } catch (error) {
+        if (!(error instanceof Error) || !/^thread \S+ already has an active writer$/i.test(error.message.trim())
+          || attempt >= waits.length) throw error;
+        if (attempt === 0) this.callbacks.onProgress({ kind: "status", label: "正在等待上一条任务释放会话" });
+        await delay(waits[attempt], undefined, { signal: this.callbacks.signal });
+      }
     }
   }
 
@@ -417,9 +454,24 @@ class AppServerTurnClient {
     catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
   }
 
-  private dispose(): void {
+  private async dispose(): Promise<void> {
+    this.callbacks.signal.removeEventListener("abort", this.onAbort);
     if (this.child.stdin.writable) this.child.stdin.end();
-    if (!this.child.killed) this.child.kill("SIGTERM");
+    if (this.child.exitCode === null && this.child.signalCode === null && !this.child.killed) this.child.kill("SIGTERM");
+    // Sending SIGTERM is not an exit barrier. The CLI wrapper forwards it to
+    // the native writer, then exits after that writer has actually stopped.
+    // Keep the logical Job running until ownership is released.
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.childExited,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Codex app server did not exit after shutdown; session ownership is not released")), 10_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
 
@@ -455,12 +507,14 @@ export function normalizeCodexQuotaUsage(value: unknown): CodexQuotaUsage | null
       ? [window as JsonObject]
       : [];
   });
-  if (windows.length === 0) return null;
+  const resetCredits = Object.hasOwn(source, "rateLimitResetCredits") ? normalizeResetCredits(source) : undefined;
+  if (windows.length === 0) return resetCredits ? { remainingPercent: null, resetCredits } : null;
   const selected = windows.reduce((current, window) => (quotaUsedPercent(window) ?? 0) > (quotaUsedPercent(current) ?? 0) ? window : current);
   const usedPercent = quotaUsedPercent(selected) ?? 0;
   const resetAt = normalizeQuotaResetAt(selected.resetAt ?? selected.reset_at ?? selected.resetsAt ?? selected.resets_at);
   return {
     remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent)),
+    ...(resetCredits ? { resetCredits } : {}),
     ...(resetAt ? { resetAt } : {}),
   };
 }

@@ -25,7 +25,9 @@ export function buildProcessJournal(activities: JobEvent[]): ProcessJournalEvent
       if (earlier >= 0) normalized.splice(earlier, 1);
     }
     const previous = normalized.at(-1);
-    if (activitySignature(previous) === activitySignature(activity)) continue;
+    // Replay duplicates are removed by sequence in mergeJobEvents. Distinct
+    // errors/retries must remain visible even when their text is identical.
+    if (!["error", "retry"].includes(kind) && activitySignature(previous) === activitySignature(activity)) continue;
     normalized.push(activity);
   }
 

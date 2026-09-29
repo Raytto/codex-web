@@ -74,6 +74,37 @@ test("Worker accepts only action-specific Codex account control fields", () => {
   assert.deepEqual(parseServerMessage(JSON.stringify({ type: "codex_accounts", requestId, action: "activate" })), { ok: false, reason: "invalid_schema" });
 });
 
+test("account usage refresh accepts only optional list booleans", () => {
+  const base = { type: "codex_accounts", requestId: crypto.randomUUID(), action: "list", threadIds: [] };
+  for (const refreshUsage of [false, true]) {
+    assert.equal(parseServerMessage(JSON.stringify({ ...base, refreshUsage })).ok, true);
+  }
+  for (const refreshUsage of [null, 0, "true", {}]) {
+    assert.equal(parseServerMessage(JSON.stringify({ ...base, refreshUsage })).ok, false);
+  }
+  for (const action of ["login_start", "login_status", "login_cancel", "activate", "delete"]) {
+    assert.equal(parseServerMessage(JSON.stringify({ ...base, action, refreshUsage: true })).ok, false);
+  }
+  assert.equal(parseServerMessage(JSON.stringify({ ...base, refreshUsage: true, access_token: "forbidden" })).ok, false);
+});
+
+test("Worker sends reset-only quota and validates reset details in account replies", () => {
+  const now = new Date().toISOString();
+  const resetCredits = { availableCount: 3, earliestExpiresAt: null, expiryStatus: "unknown", state: "ok", updatedAt: now, checkedAt: now };
+  const usage = { remainingPercent: null, resetCredits };
+  assert.equal(isPersistableWorkerMessage({ type: "quota_usage", usage }), true);
+  assert.equal(isPersistableWorkerMessage({ type: "event", jobId: crypto.randomUUID(), event: { type: "quota_usage", usage } }), true);
+  const id = crypto.randomUUID();
+  const account = { id, label: "Fixture", email: null, accountHint: "masked", active: true, createdAt: now, lastUsedAt: null, resetCredits };
+  const reply = (value: unknown) => ({ type: "codex_accounts_result", requestId: id, ok: true, state: { activeAccountId: id, accounts: [{ ...account, resetCredits: value }] } });
+  assert.equal(isPersistableWorkerMessage(reply(resetCredits)), true);
+  for (const extra of [{ availableCount: -1 }, { availableCount: 1.5 }, { state: "invalid" }, { access_token: "forbidden" }]) {
+    const invalid = { ...resetCredits, ...extra };
+    assert.equal(isPersistableWorkerMessage(reply(invalid)), false);
+    assert.equal(isPersistableWorkerMessage({ type: "quota_usage", usage: { ...usage, resetCredits: invalid } }), false);
+  }
+});
+
 test("Worker protocol messages omit absent optional fields", () => {
   const requestId = crypto.randomUUID();
   const result = { type: "codex_accounts_result", requestId, ok: true } as const;
@@ -113,4 +144,12 @@ test("account lifecycle checks are bounded UUID-only list extensions", () => {
   assert.equal(parseServerMessage(JSON.stringify({ ...base, threadIds: ["../../auth.json"] })).ok, false);
   assert.equal(parseServerMessage(JSON.stringify({ ...base, action: "activate", accountId: requestId })).ok, false);
   assert.equal(parseServerMessage(JSON.stringify({ ...base, threadIds: Array(201).fill(requestId) })).ok, false);
+});
+
+test("rollout size query accepts only thread UUIDs and safe byte counts", () => {
+  const requestId = crypto.randomUUID();
+  assert.equal(parseServerMessage(JSON.stringify({ type: "thread_rollout_size", requestId, threadId: crypto.randomUUID() })).ok, true);
+  assert.equal(parseServerMessage(JSON.stringify({ type: "thread_rollout_size", requestId, threadId: "../../auth.json" })).ok, false);
+  for (const bytes of [null, 0, 1234]) assert.equal(isPersistableWorkerMessage({ type: "thread_rollout_size_result", requestId, bytes }), true);
+  for (const bytes of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal(isPersistableWorkerMessage({ type: "thread_rollout_size_result", requestId, bytes }), false);
 });

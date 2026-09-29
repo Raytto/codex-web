@@ -200,10 +200,19 @@ function handleConnection(socket: Socket): void {
         });
         return;
       }
+      if (message.type === "codex_account_reset") {
+        if (activeJobId) throw new Error("Cannot manage Codex accounts through an active job connection");
+        validateHostUser(message.userId);
+        void codexAccountManager.consumeResetCredit(message.accountId, message.attemptId).then(
+          (result) => { send(socket, { type: "codex_account_reset_result", requestId: message.requestId, result }); socket.end(); },
+          (error) => sendRequestFailure(socket, message.requestId, error),
+        );
+        return;
+      }
       if (message.type === "codex_accounts_list") {
         if (activeJobId) throw new Error("Cannot manage Codex accounts through an active job connection");
         validateHostUser(message.userId);
-        void codexAccountManager.listAccounts().then(
+        void codexAccountManager.listAccounts(message.refreshUsage === true).then(
           (result) => { send(socket, { type: "codex_accounts_result", requestId: message.requestId, ...result }); socket.end(); },
           (error) => sendRequestFailure(socket, message.requestId, error),
         );

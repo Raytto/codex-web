@@ -1,3 +1,4 @@
+import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import type { AgentOptions, AgentSelection } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import type { CodexQuotaUsage } from "./app-server-turn.js";
@@ -129,6 +130,7 @@ export type ServerToRemoteWorker =
   | { type: "run"; request: RemoteRunRequest }
   | { type: "steer"; jobId: string; requestId: string; prompt: string; attachments: RemoteAttachment[]; transferToken: string; turnContext?: { version: 1; userPrompt: string; imageInput: "preload" | "path_only" | "none" } }
   | { type: "cancel"; jobId: string }
+  | { type: "thread_rollout_size"; requestId: string; threadId: string }
   | { type: "thread_rename"; requestId: string; threadId: string; name: string }
   | { type: "thread_archive"; requestId: string; threadId: string }
   | { type: "thread_sync"; requestId: string; projectRoot: string; cursor: string | null; limit: number }
@@ -139,12 +141,12 @@ export type ServerToRemoteWorker =
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
   | { type: "worker_update_result_ack"; requestId: string }
   | { type: "worker_config"; requestId: string; capacity: number }
-  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete"; label?: string; loginId?: string; accountId?: string; threadIds?: string[] }
+  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string }
   | { type: "heartbeat_ack"; at: string };
 
 export type RemoteWorkerToServer =
   | { type: "credential_saved"; credentialId: string }
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
   | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: RemoteThreadSnapshot }
@@ -152,6 +154,7 @@ export type RemoteWorkerToServer =
   | { type: "request_failed"; requestId?: string; message: string }
   | { type: "event"; jobId: string; event: TenantWorkerEvent }
   | { type: "artifact_uploaded"; jobId: string; artifact: RemoteArtifact }
+  | { type: "thread_rollout_size_result"; requestId: string; bytes: number | null }
   | { type: "thread_rename_result"; requestId: string; ok: boolean; message?: string }
   | { type: "file_fetch_result"; requestId: string; ok: boolean; message?: string }
   | { type: "title_agent_result"; requestId: string; ok: boolean; output?: string; message?: string }
@@ -160,5 +163,5 @@ export type RemoteWorkerToServer =
   | { type: "worker_update_ack"; requestId: string; accepted: boolean; message?: string }
   | ({ type: "worker_update_result" } & RemoteWorkerUpdateResult)
   | { type: "worker_config_result"; requestId: string; ok: boolean; capacity?: number; message?: string }
-  | { type: "codex_accounts_result"; requestId: string; ok: boolean; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }
+  | { type: "codex_accounts_result"; requestId: string; ok: boolean; resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }
   | ({ type: "thread_sync_result"; requestId: string } & RemoteThreadSyncPage);

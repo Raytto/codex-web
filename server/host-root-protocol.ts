@@ -1,3 +1,4 @@
+import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import type { AgentSelection, ExecutorRuntimeStatus } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import type { TenantWorkerEvent } from "./tenant-worker-protocol.js";
@@ -49,7 +50,8 @@ export type HostRootClientMessage =
   | { type: "voice_review"; requestId: string; request: CodexVoiceReviewRequest }
   | { type: "title_agent"; requestId: string; request: ConversationTitleAgentRequest }
   | { type: "codex_upgrade"; requestId: string; userId: string; version: string }
-  | { type: "codex_accounts_list"; requestId: string; userId: string }
+  | { type: "codex_account_reset"; requestId: string; userId: string; accountId: string; attemptId: string }
+  | { type: "codex_accounts_list"; requestId: string; userId: string; refreshUsage?: boolean }
   | { type: "codex_account_login_start"; requestId: string; userId: string; label: string }
   | { type: "codex_account_login_status"; requestId: string; userId: string; loginId: string }
   | { type: "codex_account_login_cancel"; requestId: string; userId: string; loginId: string }
@@ -67,6 +69,7 @@ export type HostRootServerMessage =
   | { type: "voice_review_result"; requestId: string; output: string }
   | { type: "title_agent_result"; requestId: string; output: string }
   | ({ type: "codex_upgrade_result"; requestId: string; accepted: boolean } & ExecutorRuntimeStatus)
+  | { type: "codex_account_reset_result"; requestId: string; result: ResetConsumption }
   | { type: "codex_accounts_result"; requestId: string; accounts: CodexAccountView[]; activeAccountId: string }
   | { type: "codex_account_login_result"; requestId: string; login: CodexAccountLoginView }
   | { type: "request_failed"; requestId?: string; message: string };

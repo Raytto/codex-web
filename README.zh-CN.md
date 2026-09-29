@@ -174,7 +174,7 @@ stateDiagram-v2
 
 ## 可选语音输入
 
-在 `.env` 中设置你自己的 `DASHSCOPE_API_KEY` 和 HTTPS `PUBLIC_BASE_URL` 后，页面会显示麦克风按钮。默认使用 `qwen3.5-omni-plus`，可通过 `DASHSCOPE_ASR_MODEL` 修改。未设置 Key 时语音功能完全关闭。
+在 `.env` 中设置你自己的 `DASHSCOPE_API_KEY`、HTTPS `DASHSCOPE_BASE_URL` 和 HTTPS `PUBLIC_BASE_URL`，并通过 `DASHSCOPE_ASR_MODEL` 选择兼容模型。凭据或端点未配置时语音关闭。
 
 录音上传前，浏览器会按账号和会话把完整音频保存到 IndexedDB，保留 24 小时。若电梯等场景导致网络在发送中断，输入框会保留“语音未发送，音频已保留”的状态，可重试识别或删除，不会丢失原始音频。重试沿用同一个客户端录音 UUID；服务端记录音频大小和哈希，若第一次请求其实已经完成，会直接返回原转写结果而不会重复调用模型。浏览器草稿和服务端回执都会在 24 小时后清理。
 
@@ -193,3 +193,14 @@ stateDiagram-v2
 - 新任务在执行器目录支持时优先使用 `gpt-6-astra` / `high`；已有选择保留，不支持的选项按目录回退。
 
 升级前阅读[重试与设备凭据说明](docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md)、[冷存储维护](docs/CONVERSATION_COLD_STORAGE.md)和[Agent 内容保真](docs/AGENT_CONTENT_FIDELITY.md)。公开版继续使用用户名/密码登录、`/codex-web` 路径和默认低权限租户；扩展须自行配置后启用。
+
+
+## 2026 年 9 月 30 日：阅读、项目与恢复
+
+- [PARA 看板](docs/features/PARA_BOARD.md)从空数据开始，按账号管理想法、项目、领域与独立资料。可收录消息/文件、关联会话，并将有版本的项目简报及明确选中的资料放入新会话草稿。统一侧栏搜索覆盖看板、项目和任务，保留主动选择与正常分页位置。
+- PDF/EPUB 支持分页/连续模式、页码/章节导航及进度恢复；HTML/Markdown 首次拖选、长时间拖选和界面刷新保留原生选区。浏览器标签页显示文章或会话标题及 Codex Web 品牌。
+- [持久中断交接](docs/TASK_RECOVERY.md)在主动停止、容量等待和重启后保留目标及有界过程证据；连续任务等待上一个 Codex 写入进程退出，隐藏的回答流不再挤占可见进度窗口。
+- 已配置的宿主管理员可查看并明确确认使用[账号重置卡](docs/CODEX_RESET_CREDITS.md)。Worker 1.19.7 加入严格校验的账号刷新与有界 rollout 大小查询，不附带账号、凭据或设备记录。
+- 语音等待 Safari 最终音频块，支持十分钟录音与 30 MiB 上传上限，拒绝不完整的流式转写；手动禁用的关键词不会被自动重新启用，模型由部署者自行配置。
+
+默认 Compose 继续使用低权限租户、`/codex-web` 与用户名/密码登录。可设 `CWW_PARA_ENABLED=false` 关闭看板路由并保留数据；各外部集成仍须显式配置。升级步骤见[部署验收](docs/DEPLOYMENT.md#september-30-2026-upgrade-checks)。

@@ -15,7 +15,12 @@ export function chooseSelectedConversation(savedId: string | null, conversations
 
 export function mergeJobEvents(current: JobEvent[], incoming: JobEvent[]): JobEvent[] {
   const merged = new Map<number, JobEvent>();
-  for (const event of [...current, ...incoming]) merged.set(event.seq ?? -(merged.size + 1), event);
+  for (const event of [...current, ...incoming]) {
+    // Answer deltas are consumed by the reader, not the running work journal.
+    // Filter before trimming so invisible tokens cannot evict visible progress.
+    if (event.kind === "assistant_stream") continue;
+    merged.set(event.seq ?? -(merged.size + 1), event);
+  }
   const ordered = [...merged.values()].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
   const rollingStart = Math.max(0, ordered.length - PROCESS_EVENT_WINDOW);
   const retainedStageFeedback = ordered

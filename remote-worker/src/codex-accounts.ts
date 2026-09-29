@@ -1,3 +1,6 @@
+import { consumeAccountResetCredit, type ResetConsumption } from "./codex-reset-consumer.js";
+import { readAccountResetCredits } from "./codex-usage-reader.js";
+import { type CodexResetCredits } from "./codex-reset-credits.js";
 import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -6,6 +9,7 @@ import path from "node:path";
 export type CodexAccountView = {
   id: string; label: string; email: string | null; accountHint: string; active: boolean;
   createdAt: string; lastUsedAt: string | null;
+  resetCredits?: import("./codex-reset-credits.js").CodexResetCredits | null;
 };
 export type CodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 export type CodexAccountLoginView = {
@@ -46,6 +50,7 @@ export class RemoteCodexAccountManager {
     this.registryFile = path.join(this.accountsRoot, "index.json");
     this.loginRoot = path.join(options.stateRoot, "codex-accounts", "login-sessions");
     this.now = options.now ?? (() => new Date());
+    fs.rmSync(path.join(options.stateRoot, "codex-accounts", "usage"), { recursive: true, force: true });
     ensurePrivateDirectory(this.accountsRoot);
     ensurePrivateDirectory(this.loginRoot);
     for (const entry of fs.readdirSync(this.loginRoot, { withFileTypes: true })) {
@@ -56,6 +61,45 @@ export class RemoteCodexAccountManager {
   listAccounts(): CodexAccountsState {
     const registry = this.ensureRegistry();
     return this.state(registry);
+  }
+
+  private readonly usageReads = new Map<string, Promise<CodexResetCredits>>();
+  private readonly usageCache = new Map<string, CodexResetCredits>();
+
+  async listAccountsWithUsage(): Promise<CodexAccountsState> {
+    const registry = this.ensureRegistry();
+    const state = this.state(registry);
+    state.accounts = await Promise.all(state.accounts.map(async (account) => {
+      const cached = this.usageCache.get(account.id);
+      if (cached && Date.now() - Date.parse(cached.checkedAt) < 30_000) return { ...account, resetCredits: cached };
+      let pending = this.usageReads.get(account.id);
+      if (!pending) {
+        const metadata = registry.accounts.find((item) => item.id === account.id)!;
+        pending = readAccountResetCredits({ executable: this.options.codexExecutable(),
+          authFile: account.active ? this.authorityFile : this.accountAuthFile(account.id), expectedAccountId: metadata.codexAccountId,
+          temporaryRoot: path.join(this.options.stateRoot, "codex-accounts", "usage"),
+        }).then((value) => { this.usageCache.set(account.id, value); return value; }).finally(() => this.usageReads.delete(account.id));
+        this.usageReads.set(account.id, pending);
+      }
+      return { ...account, resetCredits: await pending };
+    }));
+    // Do not return a pre-read active-account state after a concurrent switch.
+    const current = this.listAccounts();
+    return { ...current, accounts: current.accounts.map((account) => ({ ...account, resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
+  }
+
+  async consumeResetCredit(accountId: string, attemptId: string): Promise<ResetConsumption> {
+    if (!ENTRY_ID.test(accountId)) throw new Error("账号标识无效。");
+    const registry = this.ensureRegistry();
+    const account = registry.accounts.find((item) => item.id === accountId);
+    if (!account) throw new Error("账号不存在。");
+    try {
+      return await consumeAccountResetCredit({ executable: this.options.codexExecutable(),
+        authFile: registry.activeAccountId === accountId ? this.authorityFile : this.accountAuthFile(accountId),
+        expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.options.stateRoot, "codex-accounts", "usage"),
+        journalRoot: path.join(this.options.stateRoot, "codex-accounts", "reset-receipts", accountId), attemptId,
+      });
+    } finally { this.usageCache.delete(accountId); }
   }
 
   activeAccountId(): string {

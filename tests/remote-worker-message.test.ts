@@ -65,3 +65,23 @@ test("account lifecycle replies accept native v7 thread IDs and reject arbitrary
   assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok, true);
   assert.equal(parseRemoteWorkerMessage(JSON.stringify({ ...message, threadStates: [{ threadId: "../../auth.json", status: "idle" }] })).ok, false);
 });
+
+test("reset credits traverse account and quota messages without weakening credential-field validation", () => {
+  const now = new Date().toISOString();
+  const resetCredits = { availableCount: 3, earliestExpiresAt: null, expiryStatus: "unknown", state: "ok", updatedAt: now, checkedAt: now };
+  const quota = { type: "quota_usage", usage: { remainingPercent: null, resetCredits }, accountId: crypto.randomUUID() };
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify(quota)).ok, true);
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "event", jobId: crypto.randomUUID(), event: { type: "quota_usage", usage: quota.usage } })).ok, true);
+  const accountId = crypto.randomUUID();
+  const state = { activeAccountId: accountId, accounts: [{ id: accountId, label: "Account", email: null, accountHint: "masked", active: true, createdAt: now, lastUsedAt: null, resetCredits }] };
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "codex_accounts_result", requestId: crypto.randomUUID(), ok: true, state })).ok, true);
+  for (const extra of [{ access_token: "must-not-cross" }, { availableCount: -1 }, { availableCount: 1.5 }]) {
+    assert.equal(parseRemoteWorkerMessage(JSON.stringify({ ...quota, usage: { ...quota.usage, resetCredits: { ...resetCredits, ...extra } } })).ok, false);
+  }
+});
+
+test("rollout size responses accept safe byte counts only", () => {
+  const requestId = crypto.randomUUID();
+  for (const bytes of [null, 0, 1234]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "thread_rollout_size_result", requestId, bytes })).ok, true);
+  for (const bytes of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "thread_rollout_size_result", requestId, bytes })).ok, false);
+});

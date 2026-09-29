@@ -30,6 +30,10 @@ test("public subpath keeps password login, rejects SMS routes and protects crede
   await browser.get("/codex-web/api/auth/session").expect(200);
   await browser.post("/codex-web/api/executors/remote:example/worker/credential/rotate")
     .set("X-CSRF-Token", login.body.csrfToken).send({}).expect(403);
+  await browser.post("/codex-web/api/codex-accounts/refresh-usage")
+    .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: "local-host" }).expect(403);
+  await browser.post("/codex-web/api/codex-accounts/00000000-0000-4000-8000-000000000099/reset-credit")
+    .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: "local-host", attemptId: "00000000-0000-4000-8000-000000000098" }).expect(403);
   await browser.post("/codex-web/api/auth/sms/send")
     .set("X-CSRF-Token", login.body.csrfToken).send({}).expect(404);
   await browser.post("/api/auth/login").send({ username: "public-user", password: "fixture-password" }).expect(404);

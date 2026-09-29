@@ -1,11 +1,12 @@
+import type { ResetConsumption } from "./codex-reset-consumer.js";
 export const PROTOCOL_VERSION = 5;
 export type AgentModelOption = { id: string; label: string; description: string; reasoningEfforts: string[] };
 export type AgentOptions = { models: AgentModelOption[]; reasoningEfforts: Array<{ id: string; label: string }>; defaults: { model: string; reasoningEffort: string } };
 export type RuntimeStatus = { installedVersion: string; latestVersion: string | null; versionCheckedAt: string | null; catalogUpdatedAt: string | null; agentOptions: AgentOptions | null };
 export type WorkerUpdateResult = { requestId: string; targetVersion: string; targetRef: string; ok: boolean; installedVersion: string; installedRef: string | null; installedCommit: string | null; message?: string };
 export type ContextUsage = { threadId: string; inputTokens: number; modelContextWindow: number | null };
-export type CodexQuotaUsage = { remainingPercent: number; resetAt?: string | null };
-export type CodexAccountView = { id: string; label: string; email: string | null; accountHint: string; active: boolean; createdAt: string; lastUsedAt: string | null; quotaRemainingPercent?: number | null; quotaResetAt?: string | null; quotaUpdatedAt?: string | null };
+export type CodexQuotaUsage = { remainingPercent: number | null; resetAt?: string | null; resetCredits?: import("./codex-reset-credits.js").CodexResetCredits };
+export type CodexAccountView = { id: string; label: string; email: string | null; accountHint: string; active: boolean; createdAt: string; lastUsedAt: string | null; quotaRemainingPercent?: number | null; quotaResetAt?: string | null; quotaUpdatedAt?: string | null; resetCredits?: import("./codex-reset-credits.js").CodexResetCredits | null };
 export type CodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 export type CodexAccountLoginView = { id: string; status: "starting" | "waiting_for_user" | "succeeded" | "failed" | "cancelled"; verificationUrl: string | null; userCode: string | null; error: string | null; account: CodexAccountView | null; createdAt: string; expiresAt: string };
 
@@ -77,6 +78,7 @@ export type ServerMessage =
   | { type: "run"; request: RunRequest }
   | { type: "steer"; jobId: string; requestId: string; prompt: string; attachments: Attachment[]; transferToken: string; turnContext?: { version: 1; userPrompt: string; imageInput: "preload" | "path_only" | "none" } }
   | { type: "cancel"; jobId: string }
+  | { type: "thread_rollout_size"; requestId: string; threadId: string }
   | { type: "thread_rename"; requestId: string; threadId: string; name: string }
   | { type: "thread_archive"; requestId: string; threadId: string }
   | { type: "thread_sync"; requestId: string; projectRoot: string; cursor: string | null; limit: number }
@@ -87,17 +89,18 @@ export type ServerMessage =
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
   | { type: "worker_update_result_ack"; requestId: string }
   | { type: "worker_config"; requestId: string; capacity: number }
-  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete"; label?: string; loginId?: string; accountId?: string; threadIds?: string[] }
+  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string }
   | { type: "heartbeat_ack"; at: string };
 export type WorkerMessage =
   | { type: "credential_saved"; credentialId: string }
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease: string | null; workerCommit: string | null; capabilities: { workerUpdate: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease: string | null; workerCommit: string | null; capabilities: { workerUpdate: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
   | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: ThreadSnapshot }
   | ({ type: "project_fs_result"; requestId: string } & ProjectFsResult)
   | { type: "request_failed"; requestId?: string; message: string }
   | { type: "event"; jobId: string; event: WorkerEvent }
+  | { type: "thread_rollout_size_result"; requestId: string; bytes: number | null }
   | { type: "thread_rename_result"; requestId: string; ok: boolean; message?: string }
   | { type: "file_fetch_result"; requestId: string; ok: boolean; message?: string }
   | { type: "title_agent_result"; requestId: string; ok: boolean; output?: string; message?: string }
@@ -106,5 +109,5 @@ export type WorkerMessage =
   | { type: "worker_update_ack"; requestId: string; accepted: boolean; message?: string }
   | ({ type: "worker_update_result" } & WorkerUpdateResult)
   | { type: "worker_config_result"; requestId: string; ok: boolean; capacity?: number; message?: string }
-  | { type: "codex_accounts_result"; requestId: string; ok: boolean; state?: CodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }
+  | { type: "codex_accounts_result"; requestId: string; ok: boolean; resetResult?: ResetConsumption; state?: CodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; message?: string; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }
   | { type: "thread_sync_result"; requestId: string; threads: ThreadSnapshot[]; nextCursor: string | null };

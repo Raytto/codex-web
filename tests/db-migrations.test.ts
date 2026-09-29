@@ -6,6 +6,29 @@ import path from "node:path";
 import test from "node:test";
 import { AppDatabase } from "../server/db.js";
 import { MODEL_CAPACITY_CONTINUATION_PROMPT } from "../server/internal-messages.js";
+import { ParaStore } from "../server/para-store.js";
+import { LEGACY_USER_ID } from "../server/db.js";
+
+test("PARA order migration preserves existing board identities and survives reopen", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "para-order-upgrade-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const first = new AppDatabase(root, undefined, false);
+  const store = new ParaStore(first);
+  const a = store.createBoard(LEGACY_USER_ID, "existing A", null);
+  const b = store.createBoard(LEGACY_USER_ID, "existing B", null);
+  first.sqlite.prepare("UPDATE para_boards SET created_at=? WHERE id=?").run("2026-09-28T00:00:00Z", a.id);
+  first.sqlite.exec("ALTER TABLE para_boards DROP COLUMN position; DELETE FROM schema_migrations WHERE version=2026093001");
+  first.close();
+  const upgraded = new AppDatabase(root, undefined, false);
+  const upgradedStore = new ParaStore(upgraded);
+  assert.deepEqual(upgradedStore.boards(LEGACY_USER_ID).map((board) => board.id), [a.id, b.id]);
+  upgradedStore.reorderBoards(LEGACY_USER_ID, b.id, a.id, "before");
+  upgraded.close();
+  const reopened = new AppDatabase(root, undefined, false);
+  assert.deepEqual(new ParaStore(reopened).boards(LEGACY_USER_ID).map((board) => board.id), [b.id, a.id]);
+  assert.deepEqual(reopened.sqlite.prepare("PRAGMA foreign_key_check").all(), []);
+  reopened.close();
+});
 
 test("new cross-layer schema changes are versioned and idempotent", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-schema-migrations-"));
@@ -45,10 +68,16 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026090701, name: "hide-capacity-continuation-messages" },
     { version: 2026090801, name: "durable-job-attempts" },
     { version: 2026090802, name: "worker-enrollment-and-rotation" },
+    { version: 2026092301, name: "durable-task-recovery" },
+    { version: 2026092302, name: "codex-reset-credit-snapshots" },
+    { version: 2026092903, name: "para-board-v1" },
+    { version: 2026093001, name: "para-board-order" },
+    { version: 2026093002, name: "para-sidebar-projects" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
-  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, 31);
+  assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, migrations.length);
+  assert.ok((reopened.sqlite.prepare("PRAGMA table_info(job_recovery_checkpoints)").all() as Array<{ name: string }>).some((column) => column.name === "checkpoint_json"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some((column) => column.name === "finalization_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(remote_worker_credentials)").all() as Array<{ name: string }>).some((column) => column.name === "token_hash"));
   assert.ok((reopened.sqlite.prepare("PRAGMA index_list(conversations)").all() as Array<{ name: string }>).some((index) => index.name === "conversations_active_project_thread_idx"));
@@ -198,4 +227,27 @@ test("Remote Worker credential foundation stores only hashes and rotates atomica
   assert.equal(db.revokeRemoteWorkerCredential(workerId, secondId), true);
   assert.equal(db.listRemoteWorkerCredentials(workerId).some((row) => row.state === "active"), false);
   db.close();
+});
+
+test("PARA sidebar migration starts from activity and preserves card order, data and manual order on reopen", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "para-sidebar-upgrade-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const first = new AppDatabase(root, undefined, false), store = new ParaStore(first);
+  const board = store.createBoard(LEGACY_USER_ID, "existing", null);
+  const a = store.createProject(LEGACY_USER_ID, board.id, "A"), b = store.createProject(LEGACY_USER_ID, board.id, "B");
+  first.sqlite.prepare("UPDATE para_projects SET updated_at=? WHERE id=?").run("2026-01-01T00:00:00Z", a.id);
+  const conversation = first.createConversation(crypto.randomUUID(), "recent work", { model: "gpt-6-sol", reasoningEffort: "medium" }, LEGACY_USER_ID);
+  store.linkConversation(LEGACY_USER_ID, a.id, conversation.id);
+  first.sqlite.prepare("UPDATE conversations SET last_active_at=? WHERE id=?").run("2099-01-01T00:00:00Z", conversation.id);
+  const before = [a.id, b.id].map((id) => { const { sidebar_order, ...row } = first.sqlite.prepare("SELECT * FROM para_projects WHERE id=?").get(id)!; void sidebar_order; return row; });
+  first.sqlite.exec(`DROP TRIGGER para_sidebar_event; DROP TRIGGER para_sidebar_conversation_activity; DROP TRIGGER para_sidebar_resource_activity;
+    DROP INDEX para_projects_sidebar; DROP INDEX para_conversations_activity; DROP INDEX para_resources_activity; ALTER TABLE para_projects DROP COLUMN sidebar_order; DELETE FROM schema_migrations WHERE version=2026093002;`);
+  first.close();
+  const upgraded = new AppDatabase(root, undefined, false), after = new ParaStore(upgraded);
+  assert.deepEqual(after.sidebarProjects(LEGACY_USER_ID, board.id, "", false, 5, 0).projects.map((p) => p.id), [a.id, b.id]);
+  assert.deepEqual([a.id, b.id].map((id) => { const { sidebar_order, ...row } = upgraded.sqlite.prepare("SELECT * FROM para_projects WHERE id=?").get(id)!; void sidebar_order; return row; }), before);
+  after.reorderSidebarProjects(LEGACY_USER_ID, b.id, a.id, "before"); upgraded.close();
+  const reopened = new AppDatabase(root, undefined, false);
+  assert.deepEqual(new ParaStore(reopened).sidebarProjects(LEGACY_USER_ID, board.id, "", false, 5, 0).projects.map((p) => p.id), [b.id, a.id]);
+  assert.deepEqual(reopened.sqlite.prepare("PRAGMA foreign_key_check").all(), []); reopened.close();
 });

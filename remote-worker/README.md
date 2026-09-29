@@ -109,7 +109,7 @@ shared-token installations require the explicit, expiring migration in
 
 Worker 1.13.1 advertises optional persistent-wait automation. For each Codex Web-controlled turn, the server may supply a job-scoped token and the Worker injects the bundled `wait-cli.js` path into that turn's tool-shell environment. Codex can register a one-shot time wait or an event/deadline wait; an external supervisor reports through a single-plan HTTPS receipt. No inbound Worker port is added, and a wake always re-enters the server's normal conversation queue. See `docs/WAKE_AUTOMATION.md` in the repository root.
 
-The long-lived Codex observer also forwards account rate-limit changes and performs a read-only reconciliation every 30 seconds. Quota is stored per executor, so desktop Codex activity refreshes the COM/home package percentage without starting or interrupting a Codex Web job.
+The long-lived Codex observer also forwards account rate-limit changes and performs a read-only reconciliation every 30 seconds. Quota is stored per executor, so desktop Codex activity refreshes the selected remote machine’s package percentage without starting or interrupting a Codex Web job.
 
 Remote conversations stay in the normal `%USERPROFILE%\.codex` store. Codex Web
 uses Codex app-server `thread/name/set` and `thread/archive` so task titles and
@@ -190,3 +190,15 @@ reconciliation uses rollout terminal events independently of native thread reads
 clearing stale markers while preserving real active-turn locks. Lifecycle and
 credential protocol fields remain compatible with clients that omit optional
 metadata. See the [upgrade and verification guide](../docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
+
+### Rollout size queries
+
+Worker 1.19.7 advertises the optional `threadRolloutSize` capability. The server
+can request a single thread UUID with `thread_rollout_size`; the response contains
+only a nonnegative byte count or null. The Worker indexes filenames in `sessions`
+and `archived_sessions` (60-second index, bounded to 20,000 entries), then stats
+the file without reading JSONL or reconstructing turns. Missing files invalidate
+the index. The server coalesces reads for 15 seconds and preserves the last known
+value for offline/older Workers. The conversation menu refreshes every 30 seconds
+while open and visible, using a size-only endpoint; ordinary behavior sync remains
+unchanged and size queries do not change unread flags or sidebar order.

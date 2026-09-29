@@ -71,6 +71,13 @@ const omittedArtifact = z.object({
   reason: z.enum(["count_limit", "outside_project", "missing", "not_file", "too_large", "manifest_limit"]),
 }).strict();
 
+const resetCredits = z.object({
+  availableCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  earliestExpiresAt: iso.nullable(), expiryStatus: z.enum(["complete", "partial", "unknown"]),
+  state: z.enum(["ok", "unavailable", "auth_required", "error"]), updatedAt: iso.nullable(), checkedAt: iso,
+}).strict();
+const quotaUsage = z.object({ remainingPercent: finite.min(0).max(100).nullable(), resetAt: iso.nullable().optional(), resetCredits: resetCredits.optional() }).strict();
+
 const event = z.discriminatedUnion("type", [
   z.object({ type: z.literal("thread_started"), threadId: id }).strict(),
   z.object({ type: z.literal("context_usage"), usage: z.object({
@@ -78,7 +85,7 @@ const event = z.discriminatedUnion("type", [
     inputTokens: z.number().int().nonnegative(),
     modelContextWindow: z.number().int().positive().nullable(),
   }).strict() }).strict(),
-  z.object({ type: z.literal("quota_usage"), usage: z.object({ remainingPercent: finite.min(0).max(100), resetAt: iso.nullable().optional() }).strict() }).strict(),
+  z.object({ type: z.literal("quota_usage"), usage: quotaUsage }).strict(),
   z.object({ type: z.literal("progress"), payload: z.unknown() }).strict(),
   z.object({ type: z.literal("steer_completed"), requestId: uuid, turnId: id }).strict(),
   z.object({ type: z.literal("steer_failed"), requestId: uuid, message: text(2_000, 1) }).strict(),
@@ -116,6 +123,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
       accountSkills: z.boolean().optional(),
       titleAgent: z.boolean().optional(),
       codexAccounts: z.boolean().optional(),
+      threadRolloutSize: z.boolean().optional(),
       threadLifecycle: z.boolean().optional(),
     }).strict().optional(),
     codexVersion: text(80, 1),
@@ -125,7 +133,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   // Keep them bounded strings during the compatibility window; authorization and
   // reconciliation still match them only against server-owned pending job IDs.
   z.object({ type: z.literal("heartbeat"), activeJobs: z.array(id).max(64), retainedJobs: z.array(uuid).max(64).optional() }).strict(),
-  z.object({ type: z.literal("quota_usage"), usage: z.object({ remainingPercent: finite.min(0).max(100), resetAt: iso.nullable().optional() }).strict(), accountId: uuid.optional() }).strict(),
+  z.object({ type: z.literal("quota_usage"), usage: quotaUsage, accountId: uuid.optional() }).strict(),
   z.object({ type: z.literal("thread_activity"), projectId: uuid, thread: threadSnapshot }).strict(),
   z.object({
     type: z.literal("project_fs_result"), requestId: uuid,
@@ -136,6 +144,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("request_failed"), requestId: uuid.optional(), message: text(2_000, 1) }).strict(),
   z.object({ type: z.literal("event"), jobId: uuid, event }).strict(),
   z.object({ type: z.literal("artifact_uploaded"), jobId: uuid, artifact }).strict(),
+  z.object({ type: z.literal("thread_rollout_size_result"), requestId: uuid, bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).strict(),
   z.object({ type: z.literal("thread_rename_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional() }).strict(),
   z.object({ type: z.literal("file_fetch_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional() }).strict(),
   z.object({ type: z.literal("title_agent_result"), requestId: uuid, ok: z.boolean(), output: text(1_000, 1).optional(), message: text(2_000, 1).optional() }).strict(),
@@ -150,15 +159,19 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("worker_config_result"), requestId: uuid, ok: z.boolean(), capacity: z.number().int().min(0).max(8).optional(), message: text(2_000, 1).optional() }).strict(),
   z.object({
     type: z.literal("codex_accounts_result"), requestId: uuid, ok: z.boolean(),
+    resetResult: z.object({ attemptId: uuid, outcome: z.enum(["reset", "alreadyRedeemed", "nothingToReset", "noCredit"]),
+      resetCredits, quota: z.object({ remainingPercent: z.number().min(0).max(100), resetAt: iso.nullable() }).strict().nullable(),
+      refreshed: z.boolean(),
+    }).strict().optional(),
     state: z.object({
-      accounts: z.array(z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable() }).strict()).max(20),
+      accounts: z.array(z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable(), resetCredits: resetCredits.nullable().optional() }).strict()).max(20),
       activeAccountId: uuid,
     }).strict().optional(),
     login: z.object({
       id: uuid, status: z.enum(["starting", "waiting_for_user", "succeeded", "failed", "cancelled"]),
       verificationUrl: text(2_000, 8).nullable(), userCode: z.string().regex(/^[A-Z0-9]{4}-[A-Z0-9]{5}$/).nullable(),
       error: text(2_000, 1).nullable(),
-      account: z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable() }).strict().nullable(),
+      account: z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable(), resetCredits: resetCredits.nullable().optional() }).strict().nullable(),
       createdAt: iso, expiresAt: iso,
     }).strict().optional(),
     restart: z.boolean().optional(), message: text(2_000, 1).optional(),

@@ -1,3 +1,4 @@
+import { normalizeResetCredits } from "./codex-reset-credits.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import readline from "node:readline";
@@ -335,12 +336,14 @@ export function normalizeCodexQuotaUsage(value: unknown): CodexQuotaUsage | null
       ? [window as JsonObject]
       : [];
   });
-  if (windows.length === 0) return null;
+  const resetCredits = Object.hasOwn(source, "rateLimitResetCredits") ? normalizeResetCredits(source) : undefined;
+  if (windows.length === 0) return resetCredits ? { remainingPercent: null, resetCredits } : null;
   const selected = windows.reduce((current, window) => (quotaUsedPercent(window) ?? 0) > (quotaUsedPercent(current) ?? 0) ? window : current);
   const usedPercent = quotaUsedPercent(selected) ?? 0;
   const resetAt = normalizeQuotaResetAt(selected.resetAt ?? selected.reset_at ?? selected.resetsAt ?? selected.resets_at);
   return {
     remainingPercent: Math.max(0, Math.min(100, 100 - usedPercent)),
+    ...(resetCredits ? { resetCredits } : {}),
     ...(resetAt ? { resetAt } : {}),
   };
 }
@@ -461,9 +464,12 @@ export class CodexObserver {
     }
   }
 
+  private lastResetCredits = "";
+
   private publishQuotaUsage(usage: CodexQuotaUsage | null): void {
     if (!usage || !this.onQuotaUsage
-      || (usage.remainingPercent === this.lastQuotaPercent && usage.resetAt === this.lastQuotaResetAt)) return;
+      || (usage.remainingPercent === this.lastQuotaPercent && usage.resetAt === this.lastQuotaResetAt && JSON.stringify(usage.resetCredits) === this.lastResetCredits)) return;
+    this.lastResetCredits = JSON.stringify(usage.resetCredits);
     this.lastQuotaPercent = usage.remainingPercent;
     this.lastQuotaResetAt = usage.resetAt;
     this.onQuotaUsage(usage);

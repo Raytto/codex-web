@@ -30,6 +30,7 @@ export type VoiceInputContext = {
 
 export type VoiceInputController = {
   state: ConversationVoiceState;
+  starting: boolean;
   elapsed: number;
   error: string;
   notice: string;
@@ -65,6 +66,9 @@ export function formatVoiceDuration(seconds: number): string {
 
 export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputController {
   const [state, setState] = useState<ConversationVoiceState>("idle");
+  const [starting, setStarting] = useState(false);
+  const acquiringRef = useRef(false);
+  const acquisitionRef = useRef(0);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -297,13 +301,16 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
 
   const start = useCallback(async () => {
     const current = optionsRef.current;
-    if (current.disabled || state !== "idle" || pendingDraftRef.current) return;
+    if (current.disabled || state !== "idle" || pendingDraftRef.current || acquiringRef.current) return;
     setError("");
     setNotice("");
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setError(current.unsupportedMessage ?? "当前浏览器不支持录音。");
       return;
     }
+    const acquisition = ++acquisitionRef.current;
+    acquiringRef.current = true;
+    setStarting(true);
     try {
       const targetConversationId = current.conversationId ?? null;
       if (transcriptionConversationIdRef.current !== targetConversationId) {
@@ -313,6 +320,13 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         setTranscriptionConversationId(targetConversationId);
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      // A permission prompt may finish after its dialog has closed. Never
+      // start a recorder or leave microphone tracks alive in that case.
+      if (acquisition !== acquisitionRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
       const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
       const mimeType = candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
@@ -342,7 +356,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         sessionCallbacksRef.current = null;
         changeState("idle");
       };
-      recorder.onstop = () => void process(recorder.mimeType || mimeType || "audio/webm");
+      // Safari can dispatch `stop` before the final encoded chunk has been
+      // delivered. Defer assembly by a tick so the terminal Blob includes the
+      // container footer and final dataavailable event.
+      recorder.onstop = () => window.setTimeout(() => void process(recorder.mimeType || mimeType || "audio/webm"), 0);
       recorder.start(250);
       recordingStartedAtRef.current = Date.now();
       setElapsed(0);
@@ -365,16 +382,23 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         limitTimerRef.current = window.setTimeout(() => {
           if (recorder.state !== "recording") return;
           sendAfterRef.current = false;
-          setNotice(current.maxDurationMs === 5 * 60 * 1000 ? "已达到 5 分钟录音上限，正在识别…" : "已达到录音上限，正在识别…");
+          setNotice(current.maxDurationMs === 10 * 60 * 1000 ? "已达到 10 分钟录音上限，正在识别…" : "已达到录音上限，正在识别…");
+          if (recorder.state === "recording") recorder.requestData();
           recorder.stop();
           changeState("transcribing");
         }, current.maxDurationMs);
       }
     } catch (reason) {
+      if (acquisition !== acquisitionRef.current) return;
       release();
       changeState("idle");
       const denied = reason instanceof DOMException && ["NotAllowedError", "PermissionDeniedError"].includes(reason.name);
       setError(denied ? "请允许浏览器使用麦克风，然后再试一次。" : "无法开始录音，请检查麦克风。");
+    } finally {
+      if (acquisition === acquisitionRef.current) {
+        acquiringRef.current = false;
+        setStarting(false);
+      }
     }
   }, [changeState, drawWaveform, process, release, state]);
 
@@ -394,6 +418,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const finish = useCallback((sendAfterTranscription = false) => {
     if (state !== "recording" || recorderRef.current?.state !== "recording") return;
     sendAfterRef.current = sendAfterTranscription;
+    recorderRef.current.requestData();
     recorderRef.current.stop();
     changeState("transcribing");
   }, [changeState, state]);
@@ -451,6 +476,8 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   }, []);
 
   useEffect(() => () => {
+    acquisitionRef.current += 1;
+    acquiringRef.current = false;
     discardRef.current = true;
     sendAfterRef.current = false;
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
@@ -459,6 +486,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
 
   return {
     state,
+    starting,
     elapsed,
     error,
     notice,

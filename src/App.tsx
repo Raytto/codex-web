@@ -1,10 +1,12 @@
+import { ParaSidebar, ParaWorkspace, NewProjectChoice, ParaConversationProjectsDialog, ParaCollectButton } from "./para";
+import { DeploymentDetails, deploymentStepLabel } from "./deployment-progress";
 import { createContext, useContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowLeft, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleAlert, CircleDashed, Clock, Download, Eye, File as FileIcon, FileImage, FileText, Folder, FolderArchive, FolderOpen, Gauge, HardDrive,
-  Copy, CornerUpLeft, GripVertical, KeyRound, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, MonitorUp, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RefreshCw, RotateCcw, Search, Settings2, Share2, Square, SquarePen, Sun,
+  Archive, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleAlert, CircleDashed, Clock, Download, Eye, File as FileIcon, FileImage, FileText, Folder, FolderArchive, FolderOpen, Gauge, HardDrive,
+  Copy, CornerUpLeft, GripVertical, KeyRound, LayoutDashboard, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, MonitorUp, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RefreshCw, RotateCcw, Search, Settings2, Share2, Square, SquarePen, Sun,
   Trash2, X, Zap,
 } from "lucide-react";
 import { api, BASE_PATH, fileThumbnailUrl, fileUrl, isApiErrorStatus, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type ConversationPage, type DeploymentPhase, type DeploymentStatus, type Executor, type FileShareState, type Job, type JobEvent, type MaintenancePhase, type PendingPrompt, type Project, type ProjectDirectoryPage, type ReaderAnnotation, type ReasoningEffort, type RemoteWorkerBootstrap, type Session, type SystemStatus, type WakePlan, type WorkFile } from "./api";
@@ -27,6 +29,7 @@ import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWa
 import { conversationProjectMoveBlockReason, type ConversationProjectDrag } from "./conversation-project-move";
 import { formatRemoteWorkerCapacity } from "./remote-worker-capacity";
 import { recoverBrowserSession } from "./session-recovery";
+import { usePageTitle } from "./page-title";
 import { mergeConversationMatches, removeConversationFromPage, retainSelectedConversation, sortConversationsByActivity } from "./conversation-search";
 import { buildHandoffFirstTurn, CONTEXT_HANDOFF_PROMPT, latestContextHandoff } from "./context-handoff";
 import { PersonalMemoryDialog } from "./personal-memory-dialog";
@@ -152,7 +155,7 @@ function deploymentPhaseLabel(status: DeploymentStatus): string {
   if (status.phase === "failed") return "发布失败";
   if (status.phase === "conflict") return "发布冲突";
   if (status.phase === "deferred") return "发布已延期";
-  return DEPLOYMENT_STAGES.find((stage) => stage.phase === status.phase)?.label ?? "发布处理中";
+  return deploymentStepLabel(status) ?? DEPLOYMENT_STAGES.find((stage) => stage.phase === status.phase)?.label ?? "发布处理中";
 }
 
 function deploymentStatusTone(status: DeploymentStatus): "active" | "success" | "error" {
@@ -257,11 +260,11 @@ export default function App() {
     return () => controller.abort();
   }, [publicPreviewFileId]);
 
-  if (publicPreviewFileId) return <PublicFilePreviewPage fileId={publicPreviewFileId} resolvedTheme={resolvedTheme} themePreference={guestReaderThemePreference} onThemePreferenceChange={setGuestReaderThemePreference} />;
+  if (publicPreviewFileId) return <PublicFilePreviewPage key={publicPreviewFileId} fileId={publicPreviewFileId} resolvedTheme={resolvedTheme} themePreference={guestReaderThemePreference} onThemePreferenceChange={setGuestReaderThemePreference} />;
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
   if (!session.accountId) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><span>账号信息不完整，请刷新后重新登录。</span></div>;
-  if (previewFileId) return <FilePreviewPage fileId={previewFileId} userInitials={resolveAccountIdentity(session).initials} onSessionExpired={expireSession} resolvedTheme={resolvedTheme} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
+  if (previewFileId) return <FilePreviewPage key={previewFileId} fileId={previewFileId} userInitials={resolveAccountIdentity(session).initials} onSessionExpired={expireSession} resolvedTheme={resolvedTheme} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
   return <Workspace key={session.accountId} session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
 }
 
@@ -434,6 +437,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const [share, setShare] = useState<FileShareState | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [readerManifest, setReaderManifest] = useState<import("./api").ReaderManifest | null>(null);
+  const [readerDocumentTitle, setReaderDocumentTitle] = useState<string | null>(null);
   const [readerAnnotations, setReaderAnnotations] = useState<ReaderAnnotation[]>([]);
   const [readerAnnotationSyncError, setReaderAnnotationSyncError] = useState("");
   const [activeReaderAnnotationId, setActiveReaderAnnotationId] = useState<string | null>(null);
@@ -450,6 +454,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const readerKind = file ? fileReaderKind(file) : null;
   const prepared = useMemo(() => preparedReaderDocument(file, content, resolvedTheme), [file, content, resolvedTheme]);
   const outline = useOutlineState(prepared);
+  usePageTitle(!error ? prepared.title || readerDocumentTitle || readerManifest?.source.title || file?.original_name : null);
 
   function openReaderAsk(selection: ReaderSelection) {
     if (askCloseTimerRef.current !== null) window.clearTimeout(askCloseTimerRef.current);
@@ -730,12 +735,12 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <div className="file-preview-header-start">
-        <a className="file-preview-back" href={BASE_PATH || "/"} title="返回工作站" aria-label="返回工作站"><ArrowLeft size={18} /></a>
         {conversation && <button type="button" className={`file-reader-ask-launcher${askOpen ? " active" : ""}`} onClick={() => { if (askClosing) return; if (askOpen) closeReaderAsk(); else { setAskClosing(false); setAskOpen(true); } }} title={askOpen ? "收起询问 Agent" : "返回询问 Agent"} aria-label={askOpen ? "收起询问 Agent" : "返回询问 Agent"} aria-pressed={askOpen}><Bot size={17} />{taskRunning ? <LoaderCircle className="spin" size={10} /> : hasUnreadResult ? <i className="unread" /> : null}</button>}
         {outline.hasOutline && <button className={`file-preview-toc-toggle${outline.open ? " active" : ""}`} type="button" title={outline.open ? "收起文章目录" : "打开文章目录"} aria-label={outline.open ? "收起文章目录" : "打开文章目录"} aria-expanded={outline.open} aria-controls="file-reader-outline" onClick={() => outline.setOpen((value) => !value)}><Menu size={18} /></button>}
       </div>
       <div className="file-preview-title"><strong>{file?.original_name || "正在读取文件…"}</strong></div>
       <div className="file-preview-actions">
+        {file && <ParaCollectButton fileId={file.id} />}
         {file && <ReaderSettingsMenu file={file} share={share} download={download} themePreference={themePreference} onThemePreferenceChange={onThemePreferenceChange} onShareChange={setShare} />}
       </div>
     </header>
@@ -743,7 +748,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
       {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
       {!loading && !error && readerAnnotationSyncError && <div className="reader-inline-error" role="alert">{readerAnnotationSyncError}</div>}
-      {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
+      {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} onTitleChange={setReaderDocumentTitle} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
       {!loading && !error && readerManifest && content !== null && file && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
       {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} onSelect={focusReaderAnnotation} onAsk={askReaderAnnotation} activeAnnotationId={activeReaderAnnotationId} anchor={activeReaderAnnotationAnchor} onClose={() => { setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); }} />}
       <ReaderSelectionLayer rootRef={readerBodyRef} scopeKey={readerManifest?.version.id ?? file?.id ?? ""} annotations={readerAnnotations} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onRemoveHighlight={removeReaderHighlight} onNote={applyReaderNote} />
@@ -762,6 +767,7 @@ function PublicFilePreviewPage({ fileId, resolvedTheme, themePreference, onTheme
   const readerKind = file ? fileReaderKind(file) : null;
   const prepared = useMemo(() => preparedReaderDocument(file, content, resolvedTheme), [file, content, resolvedTheme]);
   const outline = useOutlineState(prepared);
+  usePageTitle(!error ? prepared.title || file?.original_name : null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1026,11 +1032,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [projectPageLoading, setProjectPageLoading] = useState<Record<string, boolean>>({});
   const [projectBodySearchLoading, setProjectBodySearchLoading] = useState<Record<string, boolean>>({});
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
+  const [searchProjectCollapse, setSearchProjectCollapse] = useState<{ query: string; values: Record<string, boolean> }>({ query: "", values: {} });
+  const searchProjectCollapseRef = useRef(searchProjectCollapse);
   const [conversationTotal, setConversationTotal] = useState(0);
   const [conversationHasMore, setConversationHasMore] = useState(false);
   const [conversationListLoading, setConversationListLoading] = useState(false);
   const [conversationBodySearchLoading, setConversationBodySearchLoading] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [createTypeOpen, setCreateTypeOpen] = useState(false);
+  const [paraBoardId, setParaBoardId] = useState<string | null>(null);
+  const [paraProjectId, setParaProjectId] = useState<string | null>(null);
+  const [paraVisible, setParaVisible] = useState(false);
+  const [paraNavigation, setParaNavigation] = useState(0);
+  const [linkedProjectsConversation, setLinkedProjectsConversation] = useState<Conversation | null>(null);
+  function openPara(boardId: string, projectId: string | null = null) {
+    setParaBoardId(boardId); setParaProjectId(projectId); setParaNavigation(n => n + 1); setParaVisible(true); setSidebarOpen(false);
+  }
   const [projectSkillsDialogProject, setProjectSkillsDialogProject] = useState<Project | null>(null);
   const [syncingProjects, setSyncingProjects] = useState<Record<string, boolean>>({});
   const [projectMenu, setProjectMenu] = useState<{ projectId: string; top: number; left: number } | null>(null);
@@ -1091,6 +1108,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const loadingOlderMessagesRef = useRef(false);
   const prependScrollRestoreRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
   const unreadScrollTargetRef = useRef<{ conversationId: string; messageId: string } | null>(null);
+  const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const conversationMenuRef = useRef<HTMLDetailsElement>(null);
   const rolloutWarningRef = useRef<HTMLDetailsElement>(null);
   const accountAreaRef = useRef<HTMLDivElement>(null);
@@ -1098,10 +1116,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const connectedJobRef = useRef<string | null>(null);
   const selectedIdRef = useRef<string | null>(selectedId);
   const retainedConversationRef = useRef<Conversation | null>(null);
+  const retainedConversationNeedsNaturalPageRef = useRef<{ id: string; projectId: string } | null>(null);
   const editingPendingRef = useRef<PendingPrompt | null>(editingPending);
   const activeProjectIdRef = useRef<string | null>(activeProjectId);
   const projectConversationPagesRef = useRef(projectConversationPages);
   const projectSearchStateRef = useRef<Record<string, ProjectSearchState>>({});
+  const projectSearchGenerationRef = useRef(0);
   const collapsedProjectsRef = useRef(collapsedProjects);
   const projectCollapseSaveQueueRef = useRef(new Map<string, Promise<void>>());
   const projectPageGenerationRef = useRef<Record<string, number>>({});
@@ -1140,6 +1160,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   activeProjectIdRef.current = activeProjectId;
   projectConversationPagesRef.current = projectConversationPages;
   collapsedProjectsRef.current = collapsedProjects;
+  searchProjectCollapseRef.current = searchProjectCollapse;
+  function isProjectCollapsed(projectId: string) {
+    return queryRef.current ? (searchProjectCollapseRef.current.query === queryRef.current && Boolean(searchProjectCollapseRef.current.values[projectId])) : Boolean(collapsedProjectsRef.current[projectId]);
+  }
   queryRef.current = query;
   conversationsRef.current = conversations;
   inputRef.current = input;
@@ -1262,6 +1286,34 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     };
   }, []);
 
+  function retainProjectConversationPage(page: ConversationPage, projectId: string): ConversationPage {
+    const pending = retainedConversationNeedsNaturalPageRef.current;
+    const suppressRetained = !queryRef.current
+      && pending?.projectId === projectId
+      && pending.id === retainedConversationRef.current?.id;
+    const result = retainSelectedConversation(
+      page,
+      retainedConversationRef.current,
+      projectId,
+      { append: !suppressRetained },
+    );
+    if (suppressRetained && result.conversations.some((conversation) => conversation.id === pending.id)) {
+      retainedConversationNeedsNaturalPageRef.current = null;
+    }
+    return result;
+  }
+
+  function storeProjectConversationPage(projectId: string, page: ConversationPage): void {
+    projectConversationPagesRef.current = { ...projectConversationPagesRef.current, [projectId]: page };
+    setProjectConversationPages((pages) => ({ ...pages, [projectId]: page }));
+    if (activeProjectIdRef.current === projectId) {
+      conversationsRef.current = page.conversations;
+      setConversations(page.conversations);
+      setConversationTotal(page.total);
+      setConversationHasMore(page.hasMore);
+    }
+  }
+
   const refreshList = useCallback(async (reset = false, projectId = activeProjectIdRef.current, preserveSearchMatches = true) => {
     if (!session.projectMode) {
       if (reset) conversationLimitRef.current = CONVERSATION_PAGE_SIZE;
@@ -1277,7 +1329,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       limit: session.projectMode ? projectLimit : queryRef.current ? 100 : conversationLimitRef.current,
       offset: 0,
     });
-    let result = retainSelectedConversation(response, retainedConversationRef.current, projectId ?? undefined);
+    let result = session.projectMode && projectId
+      ? retainProjectConversationPage(response, projectId)
+      : retainSelectedConversation(response, retainedConversationRef.current, projectId ?? undefined);
     if (queryRef.current && preserveSearchMatches) {
       const visible = session.projectMode && projectId
         ? projectConversationPagesRef.current[projectId]?.conversations ?? []
@@ -1286,12 +1340,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       result = { ...result, conversations, total: conversations.length, hasMore: false, nextOffset: null };
     }
     if (session.projectMode && projectId) {
-      setProjectConversationPages((current) => ({ ...current, [projectId]: result }));
-      if (activeProjectIdRef.current === projectId) {
-        setConversations(result.conversations);
-        setConversationTotal(result.total);
-        setConversationHasMore(result.hasMore);
-      }
+      storeProjectConversationPage(projectId, result);
     } else {
       conversationsRef.current = result.conversations;
       setConversations(result.conversations);
@@ -1545,7 +1594,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             ? await api.validateConversationSelection(savedConversationId, projectId).catch(() => ({ valid: false }))
             : { valid: false };
           if (cancelled) return;
-          const next = restored.valid ? savedConversationId : chooseSelectedConversation(null, items);
+          const next = conversationSelectionReadyRef.current ? selectedIdRef.current
+            : restored.valid ? savedConversationId : chooseSelectedConversation(null, items);
           conversationSelectionReadyRef.current = true;
           setConversationSelectionReady(true);
           if (next !== selectedIdRef.current) setSelectedId(next);
@@ -1578,31 +1628,49 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }, query ? 220 : 0);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [activeProjectId, projectsLoaded, query, refreshList, session.projectMode]);
-  async function loadProjectSearchBatch(projectId: string, searchQuery: string, capacity: number, seed: Conversation[] = []) {
+  async function loadProjectSearchBatch(
+    projectId: string,
+    searchQuery: string,
+    capacity: number,
+    seed: Conversation[] = [],
+    onProgress?: (result: { conversations: Conversation[]; hasMore: boolean }) => void,
+    searchGeneration = projectSearchGenerationRef.current,
+    pageGeneration = projectPageGenerationRef.current[projectId] ?? 0,
+  ) {
     const previous = projectSearchStateRef.current[projectId];
     const state: ProjectSearchState = previous && previous.query === searchQuery
       ? { ...previous }
       : { query: searchQuery, titleOffset: 0, titleHasMore: true, bodyOffset: 0, bodyHasMore: true };
     let conversations = [...seed];
-    while (conversations.length < capacity) {
-      const remaining = capacity - conversations.length;
+    const targetLength = conversations.length + capacity;
+    const isCurrent = () => projectSearchGenerationRef.current === searchGeneration
+      && (projectPageGenerationRef.current[projectId] ?? 0) === pageGeneration
+      && queryRef.current === searchQuery
+      && !isProjectCollapsed(projectId);
+    const publishProgress = () => {
+      if (isCurrent()) onProgress?.({ conversations: [...conversations], hasMore: state.titleHasMore || state.bodyHasMore });
+    };
+    while (conversations.length < targetLength) {
+      const remaining = targetLength - conversations.length;
       const before = conversations.length;
       if (state.titleHasMore) {
         const page = await api.conversations({ projectId, query: searchQuery, limit: remaining, offset: state.titleOffset });
         conversations = mergeConversationMatches(conversations, page.conversations);
         state.titleOffset = page.nextOffset ?? state.titleOffset + page.conversations.length;
         state.titleHasMore = page.hasMore;
+        publishProgress();
       } else if (state.bodyHasMore) {
         const page = await api.conversationBodyMatches({ projectId, query: searchQuery, limit: remaining, offset: state.bodyOffset });
         conversations = mergeConversationMatches(conversations, page.conversations);
         state.bodyOffset = page.nextOffset ?? state.bodyOffset + page.conversations.length;
         state.bodyHasMore = page.hasMore;
+        publishProgress();
       } else {
         break;
       }
       if (conversations.length === before && !state.titleHasMore && !state.bodyHasMore) break;
     }
-    projectSearchStateRef.current[projectId] = state;
+    if (isCurrent()) projectSearchStateRef.current[projectId] = state;
     return { conversations, hasMore: state.titleHasMore || state.bodyHasMore };
   }
 
@@ -1610,36 +1678,64 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   useEffect(() => {
     if (!session.projectMode || !projectsLoaded || projects.length === 0) return;
     let cancelled = false;
+    const searchGeneration = projectSearchGenerationRef.current + 1;
+    projectSearchGenerationRef.current = searchGeneration;
     projectSearchStateRef.current = {};
-    // Hydrate only the active project for the first paint.  Other projects are
-    // fetched when expanded or selected, so a large sidebar does not block the
-    // conversation view with N parallel list requests.
-    const snapshot = projects.filter((project) => project.id === activeProjectIdRef.current);
+    // Search includes collapsed folders without overwriting their saved expansion.
+    searchProjectCollapseRef.current = { query, values: {} };
+    setSearchProjectCollapse(searchProjectCollapseRef.current);
+    const snapshot = projects.filter((project) => !isProjectCollapsed(project.id)
+      && (Boolean(query) || project.id === activeProjectIdRef.current || Boolean(projectConversationPagesRef.current[project.id])));
+    const snapshotIds = snapshot.map((project) => project.id);
+    const clearedPages = { ...projectConversationPagesRef.current };
+    for (const projectId of snapshotIds) delete clearedPages[projectId];
+    projectConversationPagesRef.current = clearedPages;
+    setProjectConversationPages(clearedPages);
+    setProjectPageLoading((current) => {
+      const next = { ...current };
+      for (const project of projects) delete next[project.id];
+      for (const projectId of snapshotIds) next[projectId] = true;
+      return next;
+    });
+    if (activeProjectIdRef.current && snapshotIds.includes(activeProjectIdRef.current)) {
+      conversationsRef.current = [];
+      setConversations([]);
+      setConversationTotal(0);
+      setConversationHasMore(false);
+    }
     const timer = window.setTimeout(() => {
-      setProjectPageLoading((current) => ({ ...current, ...Object.fromEntries(snapshot.map((project) => [project.id, true])) }));
       void Promise.all(snapshot.map(async (project) => {
-        const batch = query
-          ? await loadProjectSearchBatch(project.id, query, PROJECT_CONVERSATION_PAGE_SIZE)
-          : await api.conversations({ projectId: project.id, limit: PROJECT_CONVERSATION_PAGE_SIZE, offset: 0 });
-        return [project.id, batch] as const;
-      })).then(async (entries) => {
-        if (cancelled) return;
-        const pages = Object.fromEntries(entries.map(([projectId, page]) => [
-          projectId,
-          retainSelectedConversation({
-            conversations: page.conversations,
-            total: page.conversations.length + (page.hasMore ? 1 : 0),
-            hasMore: page.hasMore,
-            nextOffset: page.hasMore ? page.conversations.length : null,
-          }, retainedConversationRef.current, projectId),
-        ])) as Record<string, ConversationPage>;
-        projectConversationPagesRef.current = pages;
-        setProjectConversationPages(pages);
-        setProjectPageLoading({});
-        const activePage = activeProjectIdRef.current ? pages[activeProjectIdRef.current] : undefined;
-        setConversations(activePage?.conversations ?? []);
-        setConversationTotal(activePage?.total ?? 0);
-        setConversationHasMore(activePage?.hasMore ?? false);
+        const pageGeneration = projectPageGenerationRef.current[project.id] ?? 0;
+        const publish = (batch: { conversations: Conversation[]; hasMore: boolean; total?: number; nextOffset?: number | null }) => {
+          if (cancelled || projectSearchGenerationRef.current !== searchGeneration || isProjectCollapsed(project.id)) return;
+          const page = retainProjectConversationPage({
+            conversations: batch.conversations,
+            total: batch.total ?? batch.conversations.length + (batch.hasMore ? 1 : 0),
+            hasMore: batch.hasMore,
+            nextOffset: batch.nextOffset ?? (batch.hasMore ? batch.conversations.length : null),
+          }, project.id);
+          storeProjectConversationPage(project.id, page);
+        };
+        try {
+          const batch = query
+            ? await loadProjectSearchBatch(project.id, query, PROJECT_CONVERSATION_PAGE_SIZE, [], publish, searchGeneration, pageGeneration)
+            : await api.conversations({ projectId: project.id, limit: PROJECT_CONVERSATION_PAGE_SIZE, offset: 0 });
+          publish(batch);
+          return [project.id, batch] as const;
+        } finally {
+          if (!cancelled && projectSearchGenerationRef.current === searchGeneration) {
+            setProjectPageLoading((current) => ({ ...current, [project.id]: false }));
+          }
+        }
+      })).then(async () => {
+        if (cancelled || projectSearchGenerationRef.current !== searchGeneration) return;
+        const activePage = activeProjectIdRef.current ? projectConversationPagesRef.current[activeProjectIdRef.current] : undefined;
+        if (activeProjectIdRef.current && activePage) {
+          conversationsRef.current = activePage.conversations;
+          setConversations(activePage.conversations);
+          setConversationTotal(activePage.total);
+          setConversationHasMore(activePage.hasMore);
+        }
         if (!conversationSelectionReadyRef.current) {
           const savedConversationId = savedConversationIdRef.current;
           const projectId = activeProjectIdRef.current;
@@ -1647,15 +1743,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             ? await api.validateConversationSelection(savedConversationId, projectId).catch(() => ({ valid: false }))
             : { valid: false };
           if (cancelled) return;
-          const next = restored.valid ? savedConversationId : chooseSelectedConversation(null, activePage?.conversations ?? []);
+          const next = conversationSelectionReadyRef.current ? selectedIdRef.current
+            : restored.valid ? savedConversationId : chooseSelectedConversation(null, activePage?.conversations ?? []);
           conversationSelectionReadyRef.current = true;
           setConversationSelectionReady(true);
           setSelectedId(next);
         }
-      }).catch((reason) => setError(reason instanceof Error ? reason.message : "项目任务加载失败")).finally(() => {
-        if (cancelled) return;
-        setProjectPageLoading({});
-      });
+      }).catch((reason) => setError(reason instanceof Error ? reason.message : "项目任务加载失败"));
     }, query ? 220 : 0);
     return () => { cancelled = true; window.clearTimeout(timer); };
   // Project names and counts can update without changing which pages must load.
@@ -1830,6 +1924,31 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     return () => window.cancelAnimationFrame(frame);
   }, [detail?.messages.length, detail?.wakePlan?.id, activities, sending]);
   useEffect(() => {
+    const menu = conversationMenuRef.current;
+    if (!menu || !selectedId || !conversationMenuOpen) return;
+    let cancelled = false;
+    let pending = false;
+    const refresh = async () => {
+      if (!menu.open || document.visibilityState !== "visible" || pending) return;
+      pending = true;
+      try {
+        const { rolloutBytes } = await api.conversationRolloutSize(selectedId);
+        if (!cancelled) setDetail((current) => current?.conversation.id === selectedId
+          ? { ...current, rolloutBytes, conversation: { ...current.conversation, rollout_bytes: rolloutBytes } } : current);
+      } catch { /* Keep the last successful value while the Worker is unavailable. */ }
+      finally { pending = false; }
+    };
+    const onRefresh = () => { void refresh(); };
+    document.addEventListener("visibilitychange", onRefresh);
+    const timer = window.setInterval(onRefresh, 30_000);
+    onRefresh();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onRefresh);
+    };
+  }, [selectedId, conversationMenuOpen]);
+  useEffect(() => {
     const closeMenu = (event: PointerEvent) => {
       const menu = conversationMenuRef.current;
       if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) menu.open = false;
@@ -1947,77 +2066,94 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const current = projectConversationPagesRef.current[projectId];
     if (!current?.hasMore || projectPageLoading[projectId]) return;
     const requestGeneration = projectPageGenerationRef.current[projectId] ?? 0;
+    const searchGeneration = projectSearchGenerationRef.current;
+    const requestedQuery = queryRef.current;
     setProjectPageLoading((loading) => ({ ...loading, [projectId]: true }));
     try {
-      if (queryRef.current) {
-        const batch = await loadProjectSearchBatch(projectId, queryRef.current, PROJECT_CONVERSATION_PAGE_SIZE, current.conversations);
-        const searchPage = retainSelectedConversation({
-          conversations: batch.conversations,
-          total: batch.conversations.length + (batch.hasMore ? 1 : 0),
-          hasMore: batch.hasMore,
-          nextOffset: batch.hasMore ? batch.conversations.length : null,
-        }, retainedConversationRef.current, projectId);
-        projectConversationPagesRef.current = { ...projectConversationPagesRef.current, [projectId]: searchPage };
-        setProjectConversationPages((pages) => ({ ...pages, [projectId]: searchPage }));
-        if (activeProjectIdRef.current === projectId) {
-          setConversations(searchPage.conversations);
-          setConversationTotal(searchPage.total);
-          setConversationHasMore(searchPage.hasMore);
-        }
+      if (requestedQuery) {
+        const searchQuery = requestedQuery;
+        const publish = (batch: { conversations: Conversation[]; hasMore: boolean }) => {
+          if (projectSearchGenerationRef.current !== searchGeneration
+            || (projectPageGenerationRef.current[projectId] ?? 0) !== requestGeneration
+            || queryRef.current !== searchQuery
+            || isProjectCollapsed(projectId)) return;
+          storeProjectConversationPage(projectId, retainProjectConversationPage({
+            conversations: batch.conversations,
+            total: batch.conversations.length + (batch.hasMore ? 1 : 0),
+            hasMore: batch.hasMore,
+            nextOffset: batch.hasMore ? batch.conversations.length : null,
+          }, projectId));
+        };
+        const batch = await loadProjectSearchBatch(
+          projectId,
+          searchQuery,
+          PROJECT_CONVERSATION_PAGE_SIZE,
+          current.conversations,
+          publish,
+          searchGeneration,
+          requestGeneration,
+        );
+        publish(batch);
         return;
       }
       const result = await api.conversations({
         projectId,
-        query: queryRef.current,
+        query: requestedQuery,
         limit: PROJECT_CONVERSATION_PAGE_SIZE,
         offset: current.nextOffset ?? current.conversations.length,
       });
       const known = new Set(current.conversations.map((conversation) => conversation.id));
       const conversations = [...current.conversations, ...result.conversations.filter((conversation) => !known.has(conversation.id))];
-      const expandedPage = retainSelectedConversation({ ...result, conversations }, retainedConversationRef.current, projectId);
+      const expandedPage = retainProjectConversationPage({ ...result, conversations }, projectId);
       const page = (projectPageGenerationRef.current[projectId] ?? 0) === requestGeneration
         ? expandedPage
         : resetProjectConversationPage(expandedPage, PROJECT_CONVERSATION_PAGE_SIZE);
-      projectConversationPagesRef.current = { ...projectConversationPagesRef.current, [projectId]: page };
-      setProjectConversationPages((pages) => ({ ...pages, [projectId]: page }));
-      if (activeProjectIdRef.current === projectId) {
-        setConversations(page.conversations);
-        setConversationTotal(result.total);
-        setConversationHasMore(page.hasMore);
-      }
+      storeProjectConversationPage(projectId, page);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "更多项目任务加载失败");
     } finally {
-      setProjectPageLoading((loading) => ({ ...loading, [projectId]: false }));
+      if (projectSearchGenerationRef.current === searchGeneration
+        && (projectPageGenerationRef.current[projectId] ?? 0) === requestGeneration
+        && queryRef.current === requestedQuery) {
+        setProjectPageLoading((loading) => ({ ...loading, [projectId]: false }));
+      }
     }
   }
 
-  async function loadProjectPage(projectId: string) {
-    if (projectConversationPagesRef.current[projectId] || projectPageRequestsRef.current.has(projectId)) return;
+  async function loadProjectPage(projectId: string, force = false) {
+    if ((!force && projectConversationPagesRef.current[projectId]) || projectPageRequestsRef.current.has(projectId)) return;
     projectPageRequestsRef.current.add(projectId);
+    const searchGeneration = projectSearchGenerationRef.current;
+    const pageGeneration = projectPageGenerationRef.current[projectId] ?? 0;
+    const requestedQuery = queryRef.current;
     setProjectPageLoading((loading) => ({ ...loading, [projectId]: true }));
     try {
-      const batch = queryRef.current
-        ? await loadProjectSearchBatch(projectId, queryRef.current, PROJECT_CONVERSATION_PAGE_SIZE)
+      const searchQuery = requestedQuery;
+      const publish = (batch: { conversations: Conversation[]; hasMore: boolean; total?: number; nextOffset?: number | null }) => {
+        if (projectSearchGenerationRef.current !== searchGeneration
+          || (projectPageGenerationRef.current[projectId] ?? 0) !== pageGeneration
+          || queryRef.current !== searchQuery
+          || isProjectCollapsed(projectId)) return;
+        storeProjectConversationPage(projectId, retainProjectConversationPage({
+          conversations: batch.conversations,
+          total: batch.total ?? batch.conversations.length + (batch.hasMore ? 1 : 0),
+          hasMore: batch.hasMore,
+          nextOffset: batch.nextOffset ?? (batch.hasMore ? batch.conversations.length : null),
+        }, projectId));
+      };
+      const batch = searchQuery
+        ? await loadProjectSearchBatch(projectId, searchQuery, PROJECT_CONVERSATION_PAGE_SIZE, [], publish, searchGeneration, pageGeneration)
         : await api.conversations({ projectId, limit: PROJECT_CONVERSATION_PAGE_SIZE, offset: 0 });
-      const page = retainSelectedConversation({
-        conversations: batch.conversations,
-        total: batch.conversations.length + (batch.hasMore ? 1 : 0),
-        hasMore: batch.hasMore,
-        nextOffset: batch.hasMore ? batch.conversations.length : null,
-      }, retainedConversationRef.current, projectId);
-      projectConversationPagesRef.current = { ...projectConversationPagesRef.current, [projectId]: page };
-      setProjectConversationPages((pages) => ({ ...pages, [projectId]: page }));
-      if (activeProjectIdRef.current === projectId) {
-        setConversations(page.conversations);
-        setConversationTotal(page.total);
-        setConversationHasMore(page.hasMore);
-      }
+      publish(batch);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "项目任务加载失败");
     } finally {
       projectPageRequestsRef.current.delete(projectId);
-      setProjectPageLoading((loading) => ({ ...loading, [projectId]: false }));
+      if (projectSearchGenerationRef.current === searchGeneration
+        && (projectPageGenerationRef.current[projectId] ?? 0) === pageGeneration
+        && queryRef.current === requestedQuery) {
+        setProjectPageLoading((loading) => ({ ...loading, [projectId]: false }));
+      }
     }
   }
 
@@ -2035,16 +2171,23 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function toggleProject(projectId: string) {
-    const collapsing = !Boolean(collapsedProjectsRef.current[projectId]);
-    const collapsed = { ...collapsedProjectsRef.current, [projectId]: collapsing };
-    collapsedProjectsRef.current = collapsed;
-    setCollapsedProjects(collapsed);
+    const collapsing = !isProjectCollapsed(projectId);
+    if (queryRef.current) {
+      const value = { query: queryRef.current, values: { ...(searchProjectCollapseRef.current.query === queryRef.current ? searchProjectCollapseRef.current.values : {}), [projectId]: collapsing } };
+      searchProjectCollapseRef.current = value;
+      setSearchProjectCollapse(value);
+    } else {
+      const collapsed = { ...collapsedProjectsRef.current, [projectId]: collapsing };
+      collapsedProjectsRef.current = collapsed;
+      setCollapsedProjects(collapsed);
+    }
     if (collapsing) {
       projectPageGenerationRef.current[projectId] = (projectPageGenerationRef.current[projectId] ?? 0) + 1;
       resetProjectExpansion(projectId);
     } else {
-      void loadProjectPage(projectId);
+      void loadProjectPage(projectId, Boolean(queryRef.current));
     }
+    if (queryRef.current) return; // Search expansion is temporary.
     const previousSave = projectCollapseSaveQueueRef.current.get(projectId) ?? Promise.resolve();
     const save = previousSave.catch(() => undefined).then(async () => {
       await api.updateProjectSidebarCollapsed(projectId, collapsing);
@@ -2065,14 +2208,24 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     });
   }
 
+  function acceptManualConversationSelection() {
+    // A user's selection supersedes startup restoration, including validation
+    // that was already in flight when the user clicked a visible search hit.
+    conversationSelectionReadyRef.current = true;
+    setConversationSelectionReady(true);
+  }
+
   function selectProject(projectId: string) {
+    setParaVisible(false);
     if (projectId === activeProjectIdRef.current) return;
+    acceptManualConversationSelection();
     writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
     activeProjectIdRef.current = projectId;
     queryRef.current = "";
     setQuery("");
     setActiveProjectId(projectId);
     retainedConversationRef.current = null;
+    retainedConversationNeedsNaturalPageRef.current = null;
     selectedIdRef.current = null;
     setSelectedId(null);
     const page = projectConversationPagesRef.current[projectId];
@@ -2083,8 +2236,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function selectProjectConversation(projectId: string, conversationId: string) {
+    acceptManualConversationSelection();
+    setParaVisible(false);
     const conversation = projectConversationPagesRef.current[projectId]?.conversations.find((item) => item.id === conversationId);
-    if (conversation) retainedConversationRef.current = conversation;
+    if (conversation) {
+      retainedConversationRef.current = conversation;
+      retainedConversationNeedsNaturalPageRef.current = queryRef.current
+        ? { id: conversation.id, projectId }
+        : null;
+    }
     if (projectId !== activeProjectIdRef.current) {
       writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
       activeProjectIdRef.current = projectId;
@@ -2105,7 +2265,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function selectConversation(conversation: Conversation) {
+    acceptManualConversationSelection();
+    setParaVisible(false);
     retainedConversationRef.current = conversation;
+    retainedConversationNeedsNaturalPageRef.current = null;
     selectedIdRef.current = conversation.id;
     setSelectedId(conversation.id);
   }
@@ -2152,7 +2315,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setProjectMenu(null);
     const bounds = button.getBoundingClientRect();
     const width = 210;
-    const height = conversation.active_wake_count ? 220 : 212;
+    const height = conversation.active_wake_count ? 260 : 252;
     const top = bounds.bottom + 6 + height <= window.innerHeight - 8
       ? bounds.bottom + 6
       : Math.max(8, bounds.top - height - 6);
@@ -2701,6 +2864,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }, [refreshDetail, refreshList]);
 
   async function newConversation(projectId = activeProjectIdRef.current ?? undefined) {
+    setParaVisible(false);
     const creationKey = projectId ?? "__default__";
     if (creatingConversationProjectsRef.current.has(creationKey)) return;
     creatingConversationProjectsRef.current.add(creationKey);
@@ -2719,6 +2883,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       retainedConversationRef.current = result.conversation;
       selectedIdRef.current = result.conversation.id;
       setSelectedId(result.conversation.id);
+      acceptManualConversationSelection();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "新任务创建失败");
     } finally {
@@ -3234,6 +3399,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setWakeDetailsConversation(conversation);
   }
 
+  function openConversationProjects(conversation: Conversation) {
+    setTaskMenu(null);
+    if (conversationMenuRef.current) conversationMenuRef.current.open = false;
+    setLinkedProjectsConversation(conversation);
+  }
+
   async function cancelWakePlan(plan: WakePlan) {
     const conversation = detail?.conversation;
     if (!conversation || conversation.id !== plan.conversation_id) return;
@@ -3350,6 +3521,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     ? projects.find((project) => project.id === selectedConversation.project_id)
     : undefined;
   const workspaceTitle = selectedConversation?.title || "Codex Web";
+  usePageTitle(paraVisible ? null : selectedConversation?.title);
   const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || "PERSONAL AI WORKSTATION";
   const projectMenuProject = projectMenu ? projects.find((project) => project.id === projectMenu.projectId) : undefined;
   const taskMenuConversation = taskMenu
@@ -3445,13 +3617,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         <div className="wordmark"><span className="brand-mark small"><Zap size={15} /></span><span className="brand-copy"><strong>Codex Web</strong><small>PERSONAL AI WORKSTATION</small></span></div>
         <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="关闭"><X size={19} /></button>
       </div>
-      <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索任务" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
+      <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
+      <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
+      <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
-          <div className="section-label project-label"><span>项目</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
+          <div className="section-label project-label"><span>文件夹工程</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
           <div className="sidebar-scroll-region"><div className="project-list" onScroll={() => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); }} onDragOver={projectListDragOver} onDrop={(event) => void dropProjectInList(event)}>
             {projects.map((project) => {
-              const collapsed = Boolean(collapsedProjects[project.id]);
+              const collapsed = query ? searchProjectCollapse.query === query && Boolean(searchProjectCollapse.values[project.id]) : Boolean(collapsedProjects[project.id]);
               const page = projectConversationPages[project.id];
               const conversationMoveCandidate = Boolean(draggedConversation && draggedConversation.projectId !== project.id);
               const conversationMoveReason = draggedConversation && conversationMoveCandidate
@@ -3511,7 +3685,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         </div>}
         {!session.projectMode && <>
           <div className="section-label"><span>任务</span><strong>{conversationTotal}</strong></div>
-          <div className="sidebar-scroll-region"><div className="conversation-list" onScroll={handleConversationListScroll}>
+          <div className="sidebar-scroll-region"><div className="conversation-list">
             {filtered.map((conversation) => conversationRow(conversation))}
             {filtered.length === 0 && !conversationListLoading && !conversationBodySearchLoading && <div className="empty-list">{query ? "没有匹配任务" : "还没有任务"}</div>}
             {conversationListLoading && <div className="list-loading"><LoaderCircle className="spin" size={15} /><span>正在加载…</span></div>}
@@ -3519,6 +3693,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             {!conversationHasMore && !conversationBodySearchLoading && filtered.length > 0 && <div className="list-end">已显示全部 {conversationTotal} 条</div>}
           </div></div>
         </>}
+      </div>
       </div>
       <div className="account-area" ref={accountAreaRef}>
         {accountSettingsOpen && <section className="account-settings" aria-label="个人设置">
@@ -3571,7 +3746,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       aria-label="项目操作"
       style={{ top: projectSectionMenu.top, left: projectSectionMenu.left }}
     >
-      <button type="button" role="menuitem" onClick={() => { setProjectSectionMenu(null); setProjectDialogOpen(true); }}><Plus size={16} /><span>新建项目</span></button>
+      <button type="button" role="menuitem" onClick={() => { setProjectSectionMenu(null); setCreateTypeOpen(true); }}><Plus size={16} /><span>新建项目</span></button>
     </div>, document.body)}
 
     {projectMenu && projectMenuProject && createPortal(<div
@@ -3601,6 +3776,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     >
       <button type="button" role="menuitem" className={taskMenuConversation.pinned_at ? "active" : undefined} onClick={() => { setTaskMenu(null); void toggleConversationPin(taskMenuConversation); }}>{taskMenuConversation.pinned_at ? <PinOff size={16} /> : <Pin size={16} />}<span>{taskMenuConversation.pinned_at ? "取消置顶" : "置顶"}</span></button>
       <button type="button" role="menuitem" onClick={() => { setTaskMenu(null); void renameConversation(taskMenuConversation); }}><Pencil size={16} /><span>重命名</span></button>
+      <button type="button" role="menuitem" onClick={() => openConversationProjects(taskMenuConversation)}><LayoutDashboard size={16} /><span>关联项目</span></button>
       {taskMenuConversation.active_wake_count
         ? <button type="button" role="menuitem" className="wake-menu-item active" title="查看自动续跑详情" onClick={() => openWakeDetails(taskMenuConversation)}><Clock size={16} /><span className="menu-item-copy"><strong>已安排的任务</strong><small>{wakeMenuDescription(taskMenuConversation)}</small></span></button>
         : <button type="button" role="menuitem" disabled={Boolean(taskMenuConversation.archived_at)} onClick={() => { setTaskMenu(null); setWakeDialogConversation(taskMenuConversation); }}><Clock size={16} /><span>安排自动续跑</span></button>}
@@ -3608,6 +3784,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>
     </div>, document.body)}
 
+    {createTypeOpen && <NewProjectChoice engines={projects} onClose={() => setCreateTypeOpen(false)} onFolder={() => { setCreateTypeOpen(false); setProjectDialogOpen(true); }} onBoard={(board) => { setCreateTypeOpen(false); openPara(board.id); }} />}
+    {linkedProjectsConversation && <ParaConversationProjectsDialog key={linkedProjectsConversation.id} conversationId={linkedProjectsConversation.id} conversationTitle={linkedProjectsConversation.title} onClose={() => setLinkedProjectsConversation(null)} onOpen={(board, project) => { setLinkedProjectsConversation(null); openPara(board, project); }} />}
     {projectDialogOpen && <ProjectDialog onClose={() => setProjectDialogOpen(false)} onCreated={projectCreated} />}
     {projectSkillsDialogProject && <ProjectSkillsDialog project={projectSkillsDialogProject} onClose={() => setProjectSkillsDialogProject(null)} />}
     {wakeDialogConversation && <WakePlanDialog conversation={wakeDialogConversation} onClose={() => setWakeDialogConversation(null)} onCreated={(result) => {
@@ -3635,9 +3813,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {publicSharesDialogOpen && <PublicSharesDialog onClose={() => setPublicSharesDialogOpen(false)} />}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
-    <main className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+    {paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
+      onMenu={() => setSidebarOpen(true)}
+      onOpenConversation={(id, engineId) => { setParaVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
+    <main style={paraVisible ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="workspace-header">
-        <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol>{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
+        <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
           {currentDetail && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
             <summary className="icon-button" aria-label={`rollout 容量提醒：${formatRolloutBytes(currentDetail.rolloutBytes!)}`} title="rollout 容量提醒"><HardDrive size={17} /><span /></summary>
@@ -3647,10 +3828,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             </div>
           </details>}
           <button className="icon-button" onClick={() => void newConversation()} aria-label="新建会话" title="新建会话"><SquarePen size={20} /></button>
-          {selectedConversation ? <details className="conversation-menu" ref={conversationMenuRef}>
+          {selectedConversation ? <details className="conversation-menu" ref={conversationMenuRef} onToggle={(event) => setConversationMenuOpen(event.currentTarget.open)}>
             <summary className="icon-button" aria-label="会话操作" title="会话操作"><MoreHorizontal size={21} /></summary>
             <div className="conversation-menu-panel" role="menu">
-              <div className="conversation-menu-actions">{selectedConversation.archived_at
+              <div className="conversation-menu-actions">
+                <button role="menuitem" onClick={() => openConversationProjects(selectedConversation)}><LayoutDashboard size={17} /><span>关联项目</span></button>
+                {selectedConversation.archived_at
                 ? <button role="menuitem" onClick={() => void restoreConversation(selectedConversation)}><RotateCcw size={17} /><span>恢复到侧边栏</span></button>
                 : <>
                   <button role="menuitem" onClick={() => void toggleConversationPin(selectedConversation)}>{selectedConversation.pinned_at ? <PinOff size={17} /> : <Pin size={17} />}<span>{selectedConversation.pinned_at ? "取消置顶" : "置顶"}</span></button>
@@ -4406,7 +4589,7 @@ async function copyTextToClipboard(value: string): Promise<void> {
   }
 }
 
-function AssistantCopyButton({ content }: { content: string }) {
+function AssistantCopyButton({ content, messageId }: { content: string; messageId?: string }) {
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
   const resetTimerRef = useRef<number | null>(null);
@@ -4435,6 +4618,7 @@ function AssistantCopyButton({ content }: { content: string }) {
     <button type="button" className="assistant-copy-button" onClick={() => void copyReply()} aria-label={failed ? "复制失败，重试" : copied ? "已复制" : "复制回复"} title={failed ? "复制失败，点击重试" : copied ? "已复制" : "复制回复"}>
       {copied ? <Check size={12} aria-hidden="true" /> : failed ? <CircleAlert size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
     </button>
+    {messageId && <ParaCollectButton messageId={messageId} />}
   </div>;
 }
 
@@ -4543,8 +4727,8 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
           timeTitle: formatFullDateTime(message.created_at),
           hideQuote: errorNotice,
           beforeContent: !errorNotice && message.role !== "assistant" && message.attachment_references.length > 0 ? <div className="message-reference" title={message.attachment_references.join("、")}><Paperclip size={14} /><span><strong>引用</strong>{message.attachment_references.join("、")}</span></div> : null,
-          renderAssistant: () => errorNotice ? <ErrorBubble content={message.content} /> : <><AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} messageId={message.id} remoteFileFetchEnabled={remoteFileFetchEnabled} onFetchRemoteFile={onFetchRemoteFile} />{message.content && <AssistantCopyButton content={message.content} />}</>,
-          renderUser: () => errorNotice ? <ErrorBubble content={message.content} /> : <p data-agent-selectable="true">{message.content}</p>,
+          renderAssistant: () => errorNotice ? <ErrorBubble content={message.content} /> : <><AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} messageId={message.id} remoteFileFetchEnabled={remoteFileFetchEnabled} onFetchRemoteFile={onFetchRemoteFile} />{message.content && <AssistantCopyButton content={message.content} messageId={message.id} />}</>,
+          renderUser: () => errorNotice ? <ErrorBubble content={message.content} /> : <><p data-agent-selectable="true">{message.content}</p><ParaCollectButton messageId={message.id} /></>,
           afterContent: !errorNotice && (message.files.length > 0 || remoteFiles.length > 0) ? <div className="file-grid">
             {message.files.map((file) => <FileCard key={file.id} file={file} />)}
             {remoteFiles.map((file) => <RemoteFileCard key={file.sourcePath} sourcePath={file.sourcePath} onFetch={() => onFetchRemoteFile(message.id, file.sourcePath)} />)}
@@ -4760,6 +4944,7 @@ function FileCard({ file }: { file: WorkFile }) {
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
     {previewHref && <a className="preview-button" href={previewHref} target="_blank" rel="noreferrer" title="预览" aria-label={`预览 ${file.original_name}`}><Eye size={16} /></a>}
+    <ParaCollectButton fileId={file.id} />
     <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>
   </div>;
 }
@@ -4941,7 +5126,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     quoteExcerpt: askAgentQuote,
     attachmentNames: voiceAttachmentNames,
     disabled: submitting || selectionSaving,
-    maxDurationMs: 5 * 60 * 1000,
+    maxDurationMs: 10 * 60 * 1000,
     unsupportedMessage: "当前浏览器不支持录音，请改用最新版 Chrome、Edge 或 Safari。",
     fileNamePrefix: "recording",
     onTranscript: (text, transcriptionId, context) => {

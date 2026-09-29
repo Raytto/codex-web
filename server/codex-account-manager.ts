@@ -1,3 +1,6 @@
+import { consumeAccountResetCredit, type ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
+import { readAccountResetCredits } from "../remote-worker/src/codex-usage-reader.js";
+import { unavailableResetCredits, type CodexResetCredits } from "../remote-worker/src/codex-reset-credits.js";
 import crypto from "node:crypto";
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -16,6 +19,7 @@ export type CodexAccountView = {
   quotaRemainingPercent?: number | null;
   quotaResetAt?: string | null;
   quotaUpdatedAt?: string | null;
+  resetCredits?: import("../remote-worker/src/codex-reset-credits.js").CodexResetCredits | null;
 };
 
 export type CodexAccountLoginView = {
@@ -90,16 +94,74 @@ export class CodexAccountManager {
     this.ensurePrivateDirectory(this.accountsRoot);
     this.ensurePrivateDirectory(this.loginRoot);
     this.removeAbandonedLoginDirectories();
+    fs.rmSync(path.join(this.root, "account-usage"), { recursive: true, force: true });
   }
 
-  async listAccounts(): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
-    return withSharedCodexAuthLock(this.lockFile, () => {
+  private readonly usageReads = new Map<string, Promise<CodexResetCredits>>();
+  private readonly usageCache = new Map<string, CodexResetCredits>();
+
+  async listAccounts(refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+    const state = await withSharedCodexAuthLock(this.lockFile, () => {
       const registry = this.ensureRegistryUnlocked();
       return {
         accounts: registry.accounts.map((account) => this.view(account, registry.activeAccountId)),
         activeAccountId: registry.activeAccountId,
       };
     });
+    if (refreshUsage) {
+      state.accounts = await Promise.all(state.accounts.map(async (account) => ({ ...account, resetCredits: await this.refreshResetCredits(account.id) })));
+    }
+    if (!refreshUsage) return state;
+    const current = await this.listAccounts();
+    return { ...current, accounts: current.accounts.map((account) => ({ ...account, resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
+  }
+
+  private refreshResetCredits(accountId: string): Promise<CodexResetCredits> {
+    const pending = this.usageReads.get(accountId);
+    if (pending) return pending;
+    const cached = this.usageCache.get(accountId);
+    if (cached && Date.now() - Date.parse(cached.checkedAt) < 30_000) return Promise.resolve(cached);
+    const promise = withSharedCodexAuthLock(this.lockFile, async () => {
+      const registry = this.ensureRegistryUnlocked();
+      const account = registry.accounts.find((item) => item.id === accountId);
+      if (!account) return unavailableResetCredits("error");
+      const source = registry.activeAccountId === accountId ? this.authorityFile : this.accountAuthFile(accountId);
+      const egress = await selectCodexEgress({ signal: AbortSignal.timeout(5_000) });
+      return readAccountResetCredits({
+        executable: this.codexExecutable, authFile: source, expectedAccountId: account.codexAccountId,
+        temporaryRoot: path.join(this.root, "account-usage"),
+        env: applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl),
+        commitAuth: (file) => this.copyAuth(file, source, account.codexAccountId),
+      });
+    }, 25).catch(() => unavailableResetCredits("error")).then((value) => {
+      this.usageCache.set(accountId, value);
+      return value;
+    }).finally(() => this.usageReads.delete(accountId));
+    this.usageReads.set(accountId, promise);
+    return promise;
+  }
+
+  private readonly resetOperations = new Map<string, { attemptId: string; promise: Promise<ResetConsumption> }>();
+
+  consumeResetCredit(accountId: string, attemptId: string): Promise<ResetConsumption> {
+    if (!ENTRY_ID.test(accountId)) return Promise.reject(new Error("账号标识无效。"));
+    const pending = this.resetOperations.get(accountId);
+    if (pending) return pending.attemptId === attemptId ? pending.promise : Promise.reject(new Error("此账号正在使用重置卡，请等待当前操作完成。"));
+    const promise = withSharedCodexAuthLock(this.lockFile, async () => {
+      const registry = this.ensureRegistryUnlocked();
+      const account = registry.accounts.find((item) => item.id === accountId);
+      if (!account) throw new Error("账号不存在。");
+      const source = registry.activeAccountId === accountId ? this.authorityFile : this.accountAuthFile(accountId);
+      const egress = await selectCodexEgress({ signal: AbortSignal.timeout(5_000) });
+      return consumeAccountResetCredit({ executable: this.codexExecutable, authFile: source,
+        expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.root, "account-usage"),
+        journalRoot: path.join(this.root, "reset-receipts", accountId), attemptId,
+        env: applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl),
+        commitAuth: (file) => this.copyAuth(file, source, account.codexAccountId),
+      });
+    }, 90).finally(() => { this.usageCache.delete(accountId); this.resetOperations.delete(accountId); });
+    this.resetOperations.set(accountId, { attemptId, promise });
+    return promise;
   }
 
   async beginLogin(labelValue: unknown): Promise<CodexAccountLoginView> {

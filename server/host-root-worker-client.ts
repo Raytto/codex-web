@@ -1,3 +1,4 @@
+import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
 import net, { type Socket } from "node:net";
 import readline from "node:readline";
@@ -194,10 +195,17 @@ export class HostRootWorkerClient {
     );
   }
 
-  listCodexAccounts(userId: string): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+  consumeResetCredit(userId: string, accountId: string, attemptId: string): Promise<ResetConsumption> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({ type: "codex_account_reset", requestId, userId, accountId, attemptId },
+      (message) => message.type === "codex_account_reset_result" && message.requestId === requestId ? message.result : undefined,
+      undefined, 90_000);
+  }
+
+  listCodexAccounts(userId: string, refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
     const requestId = crypto.randomUUID();
     return this.singleRequest(
-      { type: "codex_accounts_list", requestId, userId },
+      { type: "codex_accounts_list", requestId, userId, refreshUsage },
       (message) => message.type === "codex_accounts_result" && message.requestId === requestId
         ? { accounts: message.accounts, activeAccountId: message.activeAccountId }
         : undefined,

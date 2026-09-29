@@ -1,3 +1,4 @@
+import { CodexResetCreditDetails } from "./codex-reset-credits";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, ExternalLink, LoaderCircle, Monitor, Plus, RefreshCw, Server, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
 import { api, type CodexAccount, type CodexAccountLogin, type CodexAccountsState, type Executor } from "./api";
@@ -15,14 +16,42 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState(false);
+  const [refreshingUsage, setRefreshingUsage] = useState(false);
+  const selectedMachine = useRef(SERVER_EXECUTOR_ID);
+  const refreshInFlight = useRef<string | null>(null);
+  const mounted = useRef(true);
+  const consuming = useRef(false);
+  const usageGeneration = useRef(0);
+  const resetAttempts = useRef(new Map<string, string>());
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const refreshUsage = useCallback(async (targetExecutorId: string) => {
+    if (consuming.current || refreshInFlight.current === targetExecutorId) return;
+    const generation = usageGeneration.current;
+    refreshInFlight.current = targetExecutorId;
+    setRefreshingUsage(true);
+    try {
+      const result = await api.refreshCodexAccountUsage(targetExecutorId);
+      if (generation === usageGeneration.current && !consuming.current && mounted.current && selectedMachine.current === targetExecutorId) { setState(result); setError(""); }
+    } catch (reason) {
+      if (generation === usageGeneration.current && mounted.current && selectedMachine.current === targetExecutorId) setError(reason instanceof Error ? reason.message : "账号用量刷新失败");
+    } finally {
+      if (refreshInFlight.current === targetExecutorId) refreshInFlight.current = null;
+      if (mounted.current && selectedMachine.current === targetExecutorId) setRefreshingUsage(false);
+    }
+  }, []);
   const closeButton = useRef<HTMLButtonElement>(null);
 
   const load = useCallback(async (targetExecutorId: string) => {
+    if (consuming.current) return false;
+    const generation = usageGeneration.current;
     try {
       setError("");
-      setState(await api.codexAccounts(targetExecutorId));
+      const result = await api.codexAccounts(targetExecutorId);
+      if (generation === usageGeneration.current && !consuming.current && mounted.current && selectedMachine.current === targetExecutorId) setState(result);
+      return true;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "账号列表读取失败");
+      if (generation === usageGeneration.current && mounted.current && selectedMachine.current === targetExecutorId) setError(reason instanceof Error ? reason.message : "账号列表读取失败");
+      return false;
     }
   }, []);
 
@@ -30,10 +59,10 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     void api.executors().then(({ executors: available }) => {
       setExecutors(available.filter((executor) => executor.kind !== "tenant_container"));
       const initial = available.find((executor) => executor.id === SERVER_EXECUTOR_ID) ?? available[0];
-      if (initial) { setExecutorId(initial.id); void load(initial.id); }
+      if (initial && mounted.current) { selectedMachine.current = initial.id; setExecutorId(initial.id); void load(initial.id).then((loaded) => { if (loaded) void refreshUsage(initial.id); }); }
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "执行机器读取失败"));
     closeButton.current?.focus();
-  }, [load]);
+  }, [load, refreshUsage]);
 
   useEffect(() => {
     if (!login || !["starting", "waiting_for_user"].includes(login.status)) return;
@@ -58,6 +87,13 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     window.addEventListener("codex-web-executor-quota-changed", changed);
     return () => window.removeEventListener("codex-web-executor-quota-changed", changed);
   }, [executorId, load]);
+
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === "visible") void refreshUsage(executorId); };
+    const timer = window.setInterval(refresh, 60_000);
+    window.addEventListener("focus", refresh);
+    return () => { window.clearInterval(timer); window.removeEventListener("focus", refresh); };
+  }, [executorId, refreshUsage]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -117,6 +153,44 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function consumeReset(account: CodexAccount) {
+    if (consuming.current) return;
+    const storageKey = `codex-web-reset-attempt:${executorId}:${account.id}`;
+    let attemptId = resetAttempts.current.get(storageKey);
+    try { attemptId ||= localStorage.getItem(storageKey) ?? undefined; } catch { /* Memory fallback. */ }
+    if (!attemptId && !window.confirm(`为“${account.label}”使用 1 张重置卡？\n\n将重新查询并使用最早到期的一张；没有到期限制的卡排在最后。`)) return;
+    attemptId ||= crypto.randomUUID();
+    resetAttempts.current.set(storageKey, attemptId);
+    try { localStorage.setItem(storageKey, attemptId); } catch { /* The owning machine also persists unresolved attempts. */ }
+    consuming.current = true;
+    usageGeneration.current += 1;
+    setBusyId(`reset:${account.id}`); setError(""); setNotice("");
+    try {
+      const result = await api.consumeCodexResetCredit(executorId, account.id, attemptId);
+      resetAttempts.current.delete(storageKey);
+      try { localStorage.removeItem(storageKey); } catch {}
+      if (mounted.current) {
+        const messages = { reset: "已使用 1 张最早到期的重置卡。", alreadyRedeemed: "已确认这次重置成功，没有重复使用重置卡。", nothingToReset: "当前没有可重置的额度窗口。", noCredit: "当前没有可用的重置卡。" };
+        setNotice(messages[result.outcome] + (result.refreshed ? "额度和重置卡信息已更新。" : "最新额度暂未取得，请稍后刷新。"));
+      }
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "重置结果未确认。";
+      const busy = message.includes("此账号正在使用重置卡");
+      if (busy) {
+        resetAttempts.current.delete(storageKey);
+        try { localStorage.removeItem(storageKey); } catch {}
+      }
+      if (mounted.current) setError(message + (busy ? "" : " 再次点击将核对同一次操作。"));
+    } finally {
+      consuming.current = false;
+      if (mounted.current) {
+        setBusyId("");
+        // Preserve any redemption error while refreshing the persisted display.
+        try { const current = await api.codexAccounts(executorId); if (mounted.current && selectedMachine.current === executorId) setState(current); } catch {}
+      }
+    }
+  }
+
   async function remove(account: CodexAccount) {
     if (account.active || !window.confirm(`从 ${selectedExecutor?.machineName ?? "当前机器"} 删除“${account.label}”的登录凭据？\n\n此操作不会注销 ChatGPT 网站，也不会删除 OpenAI 账号。`)) return;
     setBusyId(account.id);
@@ -145,14 +219,17 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
   const loginActive = Boolean(login && ["starting", "waiting_for_user"].includes(login.status));
   const selectedExecutor = executors.find((executor) => executor.id === executorId) ?? null;
   const remote = selectedExecutor?.kind === "remote_worker";
+  const workerVersion = selectedExecutor?.worker?.installedVersion?.split(".").map(Number) ?? [];
+  const resetCapable = !remote || workerVersion[0] > 1 || (workerVersion[0] === 1 && (workerVersion[1] > 19 || (workerVersion[1] === 19 && workerVersion[2] >= 6)));
 
   async function chooseExecutor(nextId: string) {
     if (nextId === executorId) return;
     if (loginActive && login) {
       try { await api.cancelCodexAccountLogin(executorId, login.id); } catch {}
     }
+    selectedMachine.current = nextId;
     setExecutorId(nextId); setState(null); setLogin(null); setAdding(false); setLabel(""); setError(""); setNotice("");
-    void load(nextId);
+    void load(nextId).then((loaded) => { if (loaded) void refreshUsage(nextId); });
   }
 
   return <div className="codex-account-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) void close(); }}>
@@ -185,6 +262,9 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
 
         <div className="codex-account-section-title"><div><strong>账号列表</strong><small>当前账号用于这台机器之后启动的 Codex Web 任务</small></div><button type="button" onClick={() => { setAdding(true); setLogin(null); setError(""); setNotice(""); }} disabled={loginActive || !selectedExecutor?.codexAccountManagementCapable}><Plus size={15} />新增账号</button></div>
 
+        <div className="codex-account-usage-refresh"><button type="button" disabled={refreshingUsage || Boolean(busyId) || !selectedExecutor?.codexAccountManagementCapable} onClick={() => void refreshUsage(executorId)}>
+          {refreshingUsage ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}{refreshingUsage ? "正在刷新重置卡…" : "刷新重置卡"}
+        </button></div>
         {!state && !error && <div className="codex-account-loading"><LoaderCircle className="spin" size={18} />正在读取账号…</div>}
         <div className="codex-account-list">
           {state?.accounts.map((account) => <article key={account.id} className={`codex-account-card ${account.active ? "active" : ""}`}>
@@ -195,7 +275,16 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
               <small>{account.lastUsedAt ? `最近启用 ${formatDate(account.lastUsedAt)}` : `添加于 ${formatDate(account.createdAt)}`}</small>
               <div className="codex-account-quota">
                 <span>剩余额度 {account.quotaRemainingPercent === null || account.quotaRemainingPercent === undefined ? "暂无数据" : `${Math.round(account.quotaRemainingPercent)}%`}</span>
-                <span>重置时间 {account.quotaResetAt ? formatDate(account.quotaResetAt) : "暂无数据"}</span>
+                <span>额度重置 {account.quotaResetAt ? formatDate(account.quotaResetAt) : "暂无数据"}</span>
+              </div>
+              <div className="codex-account-reset-row">
+                <CodexResetCreditDetails value={account.resetCredits} />
+                <button type="button" className="codex-reset-use" disabled={Boolean(busyId) || !resetCapable || loginActive}
+                  title={resetCapable ? "使用前重新核对，优先使用最早到期的一张" : "请先升级 Worker"}
+                  onClick={() => void consumeReset(account)}>
+                  {busyId === `reset:${account.id}` && <LoaderCircle className="spin" size={14} />}
+                  {busyId === `reset:${account.id}` ? "正在使用…" : "使用重置卡"}
+                </button>
               </div>
             </div>
             <div className="codex-account-actions">

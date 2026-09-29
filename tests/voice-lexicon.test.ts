@@ -154,3 +154,38 @@ test("service waits below threshold and reviews immediately at threshold", async
   assert.equal(db.voiceReviewQueueStats(LEGACY_USER_ID, new Date().toISOString()).pending, 0);
   service.stop();
 });
+
+
+test("manual suppression survives new review evidence and reopening, while restore respects eligibility", (t) => {
+  const { root, db, project, conversation } = fixture(t);
+  const add = (key: string, error = false) => {
+    const id = crypto.randomUUID();
+    db.createVoiceTranscription({ id, userId: LEGACY_USER_ID, conversationId: conversation.id, rawText: key, model: "test", promptVersion: "test" });
+    db.applyVoiceTermEvidence(LEGACY_USER_ID, [{ transcriptionId: id, canonicalText: key, canonicalKey: key,
+      observedText: error ? "wrong" : key, termKind: "product", confidence: 0.96, useWeight: 1, errorWeight: error ? 0.8 : 0 }]);
+    return db.listVoiceLexiconManagementTerms(LEGACY_USER_ID).find((term) => term.canonical_key === key)!;
+  };
+  const active = add("ActiveTerm", true);
+  const candidate = add("CandidateTerm");
+  assert.equal(active.status, "active");
+  assert.equal(candidate.status, "candidate");
+  assert.equal(db.setVoiceLexiconTermDisabled("other-user", active.id, true), false);
+  for (const term of [active, candidate]) {
+    assert.equal(db.setVoiceLexiconTermDisabled(LEGACY_USER_ID, term.id, true), true);
+    assert.equal(db.setVoiceLexiconTermDisabled(LEGACY_USER_ID, term.id, true), true);
+  }
+  const updated = add("ActiveTerm", true);
+  assert.equal(updated.id, active.id);
+  assert.equal(updated.status, "suppressed");
+  assert.equal(updated.evidence_count, 2);
+  assert.deepEqual(formatVoiceLexiconTerms(db.listVoiceLexiconTerms(LEGACY_USER_ID, project.id)).lines, []);
+  const reopened = new AppDatabase(root, undefined, false);
+  try {
+    assert.equal(reopened.listVoiceLexiconManagementTerms(LEGACY_USER_ID).filter((term) => term.status === "suppressed").length, 2);
+    reopened.setVoiceLexiconTermDisabled(LEGACY_USER_ID, active.id, false);
+    reopened.setVoiceLexiconTermDisabled(LEGACY_USER_ID, candidate.id, false);
+    reopened.setVoiceLexiconTermDisabled(LEGACY_USER_ID, candidate.id, false);
+    assert.deepEqual(formatVoiceLexiconTerms(reopened.listVoiceLexiconTerms(LEGACY_USER_ID, project.id)).lines, ["ActiveTerm"]);
+    assert.equal(reopened.listVoiceLexiconManagementTerms(LEGACY_USER_ID).find((term) => term.id === candidate.id)?.status, "candidate");
+  } finally { reopened.close(); }
+});

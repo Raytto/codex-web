@@ -6,6 +6,7 @@ export type FileReaderOutlineItem = {
 export type PreparedHtmlDocument = {
   content: string;
   outline: FileReaderOutlineItem[];
+  title?: string;
 };
 
 /**
@@ -233,11 +234,12 @@ function markdownHeadingId(label: string, index: number, used: Set<string>): str
   return uniqueHeadingId(slug, index, used);
 }
 
-/** Extract document sections from Markdown. H1 is the document title; H2 is the reader outline level. */
-export function markdownReaderOutline(source: string): FileReaderOutlineItem[] {
+function markdownReaderHeadings(source: string, level: 1 | 2): FileReaderOutlineItem[] {
   const outline: FileReaderOutlineItem[] = [];
   const used = new Set<string>();
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const atxPattern = level === 1 ? /^\s{0,3}#(?!#)\s+(.+?)\s*#*\s*$/ : /^\s{0,3}##(?!#)\s+(.+?)\s*#*\s*$/;
+  const setextPattern = level === 1 ? /^\s{0,3}={2,}\s*$/ : /^\s{0,3}-{2,}\s*$/;
   let fence: string | null = null;
 
   for (let index = 0; index < lines.length; index += 1) {
@@ -251,8 +253,8 @@ export function markdownReaderOutline(source: string): FileReaderOutlineItem[] {
     }
     if (fence) continue;
 
-    const atx = line.match(/^\s{0,3}##(?!#)\s+(.+?)\s*#*\s*$/);
-    const setext = index + 1 < lines.length && /^\s{0,3}-{2,}\s*$/.test(lines[index + 1])
+    const atx = line.match(atxPattern);
+    const setext = index + 1 < lines.length && setextPattern.test(lines[index + 1])
       ? line.trim()
       : "";
     const label = markdownHeadingLabel(atx?.[1] ?? setext);
@@ -261,6 +263,15 @@ export function markdownReaderOutline(source: string): FileReaderOutlineItem[] {
     if (setext) index += 1;
   }
   return outline;
+}
+
+/** H1 is the document title; H2 is the reader outline level. */
+export function markdownReaderOutline(source: string): FileReaderOutlineItem[] {
+  return markdownReaderHeadings(source, 2);
+}
+
+export function markdownReaderTitle(source: string): string | undefined {
+  return markdownReaderHeadings(source, 1)[0]?.label;
 }
 
 /**
@@ -275,6 +286,7 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
   if (typeof DOMParser === "undefined") return { content: source, outline: [] };
 
   const document = new DOMParser().parseFromString(source, "text/html");
+  const title = document.title.trim() || document.querySelector("h1")?.textContent?.trim() || undefined;
   const used = new Set<string>();
   const outline = Array.from(document.querySelectorAll("h2")).map((heading, index) => {
     const id = uniqueHeadingId(heading.id, index, used);
@@ -339,5 +351,6 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
   return {
     content: `${authorStyles.map((style) => `<style data-codex-web-author>${style}</style>`).join("")}<style data-codex-web-reader>${viewerStyles}</style><div class="codex-web-reader-body">${document.body.innerHTML}</div>`,
     outline,
+    title,
   };
 }

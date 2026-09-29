@@ -345,3 +345,12 @@ the root extension, set `CODEX_WEB_HOST_BRIDGE_DIR` and explicitly include
 `compose.host-root.yaml` with `docker compose -f compose.yaml -f compose.host-root.yaml`.
 The standard build, browser API URLs, Compose environment, health check and Nginx
 routes use `/codex-web`; the exact Worker connect route permits WSS upgrades.
+
+
+## PARA boards and new optional-operation checks
+
+PARA is an authenticated local product feature. It starts empty, uses existing tenant/database volumes, and grants no host or external-provider capability. `CWW_PARA_ENABLED=false` disables its routes while retaining data; the default is `true`. Plan backup and explicit resource deletion separately from conversation deletion. See [PARA storage and authorization](features/PARA_BOARD.md).
+
+Voice now permits ten-minute recordings and 30 MiB requests; keep reverse-proxy limits at least as large as the application ceiling. Configure your own compatible HTTPS endpoint/model. No private model switch is applied. Keywords can be suppressed/restored per account; no keyword content ships with the application.
+
+Configured account-management deployments may inspect reset credits without spending them. Redemption is explicit and requires a compatible Codex runtime plus Worker 1.19.6 or newer on a remote machine. Worker 1.19.7 additionally supports size-only rollout reads. The public edition does not provide real account balances, credentials or acceptance sessions. Optional deployment details show only fields emitted by an operator-configured coordinator; configuring the display does not install or run backup/deploy services.

@@ -22,6 +22,7 @@ services:
       CWW_SHARED_CODEX_AUTH_LOCK: /app/shared-codex-auth/refresh.lock
       CWW_SHARED_CODEX_AUTH_POLICY_FILE: /app/shared-codex-auth/policy.json
       CODEX_WEB_HOST_SOCKET_PATH: ${CODEX_WEB_HOST_SOCKET_PATH:-}
+      CWW_PARA_ENABLED: ${CWW_PARA_ENABLED:-true}
       CODEX_WEB_DEPLOY_STATUS_FILE: /app/deploy-status/status.json
       CODEX_WEB_HOST_TENANT_ROOT: ${CODEX_WEB_HOST_TENANT_ROOT:-}
       CODEX_WEB_KNOWLEDGE_ROOT: ${CODEX_WEB_KNOWLEDGE_ROOT:-}

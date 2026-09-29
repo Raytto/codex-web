@@ -17,6 +17,7 @@ import remarkMath from "remark-math";
 import request from "supertest";
 import sharp from "sharp";
 import { WebSocket } from "ws";
+import { parseServerMessage } from "../remote-worker/src/protocol-validation.js";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import { createApp, fileResponseContentType, migrateExistingOutputFiles, projectDisplayName } from "../server/app.js";
 import { IMAGE_THUMBNAIL_HEIGHT, IMAGE_THUMBNAIL_WIDTH } from "../server/image-thumbnail.js";
@@ -646,6 +647,34 @@ test("voice draft retention expires malformed and older local records", () => {
   assert.equal(isVoiceDraftExpired({ updatedAt: "not-a-date" }, now), true);
 });
 
+test("voice upload accepts a ten-minute PCM-sized payload and rejects above 30 MiB", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-upload-limit-"));
+  const originalTranscribe = TranscriptionService.prototype.transcribe;
+  let calls = 0;
+  TranscriptionService.prototype.transcribe = async function () { calls += 1; return "十分钟录音"; };
+  const instance = createApp({
+    projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
+    username: "demo", passwordHash: bcrypt.hashSync("Voice-Upload-Limit-2026!", 8),
+    sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
+  });
+  context.after(() => {
+    TranscriptionService.prototype.transcribe = originalTranscribe;
+    instance.db.close(); fs.rmSync(root, { recursive: true, force: true });
+  });
+  const agent = request.agent(instance.app);
+  const login = await agent.post("/api/auth/login").send({ username: "demo", password: "Voice-Upload-Limit-2026!" }).expect(200);
+  const accepted = await agent.post("/api/transcriptions").set("X-CSRF-Token", login.body.csrfToken)
+    .attach("audio", Buffer.alloc(16_000 * 2 * 600 + 44), { filename: "ten-minutes.wav", contentType: "audio/wav" }).expect(200);
+  const stored = instance.db.sqlite.prepare("SELECT model,prompt_version,audio_bytes FROM voice_transcriptions WHERE id=?").get(accepted.body.transcriptionId) as { model: string; prompt_version: string; audio_bytes: number };
+  assert.equal(stored.model, instance.config.dashscopeModel);
+  assert.equal(stored.prompt_version, "transcription-context-v4");
+  assert.equal(stored.audio_bytes, 19_200_044);
+  const rejected = await agent.post("/api/transcriptions").set("X-CSRF-Token", login.body.csrfToken)
+    .attach("audio", Buffer.alloc(30 * 1024 * 1024 + 1), { filename: "oversize.wav", contentType: "audio/wav" });
+  assert.equal(rejected.status, 413);
+  assert.equal(calls, 1);
+});
+
 test("Codex context usage keeps only the latest input size and model window", () => {
   assert.deepEqual(normalizeContextTokenUsage({
     threadId: "019f9480-c808-7ad3-8347-e2c9f7e3fe8b",
@@ -865,12 +894,12 @@ test("voice input defers an instance reload until its result is durable", () => 
   assert.equal(canApplyDeferredInstanceReload({ ...base, input: "", currentDraftSignature: "", syncedDraftSignature: undefined }), true);
 });
 
-test("voice input explains the five-minute recording limit before transcription starts", () => {
+test("voice input explains the ten-minute recording limit before transcription starts", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const voiceSource = fs.readFileSync(path.join(process.cwd(), "src", "conversation", "useVoiceInput.ts"), "utf8");
   const voiceViewSource = fs.readFileSync(path.join(process.cwd(), "src", "conversation", "ConversationVoiceInput.tsx"), "utf8");
-  assert.match(appSource, /maxDurationMs: 5 \* 60 \* 1000/);
-  assert.match(voiceSource, /已达到 5 分钟录音上限，正在识别…/);
+  assert.match(appSource, /maxDurationMs: 10 \* 60 \* 1000/);
+  assert.match(voiceSource, /已达到 10 分钟录音上限，正在识别…/);
   assert.match(voiceViewSource, /className="voice-notice" role="status"/);
 });
 
@@ -1373,17 +1402,21 @@ test("project groups use five-task expansion with a legacy flat-list fallback", 
   assert.match(appSource, /offset: current\.nextOffset \?\? current\.conversations\.length/);
   assert.doesNotMatch(appSource, /<span>项目任务<\/span>/);
   assert.doesNotMatch(appSource, /<FolderOpen size=\{16\} \/><span>\{conversation\.title\}/);
-  assert.match(appSource, /onScroll={handleConversationListScroll}/);
+  assert.match(appSource, /className="sidebar-content" onScroll=\{[^\n]*handleConversationListScroll\(event\)/);
   assert.match(appSource, /offset: current\.length/);
 });
 
 test("project search keeps five-item pages and appends body matches after title matches", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   assert.match(appSource, /type ProjectSearchState = \{/);
-  assert.match(appSource, /loadProjectSearchBatch\(project\.id, query, PROJECT_CONVERSATION_PAGE_SIZE\)/);
+  assert.match(appSource, /loadProjectSearchBatch\(project\.id, query, PROJECT_CONVERSATION_PAGE_SIZE, \[\], publish, searchGeneration, pageGeneration\)/);
   assert.match(appSource, /if \(state\.titleHasMore\)[\s\S]*api\.conversations\([\s\S]*state\.titleOffset/);
   assert.match(appSource, /else if \(state\.bodyHasMore\)[\s\S]*api\.conversationBodyMatches\([\s\S]*state\.bodyOffset/);
-  assert.match(appSource, /loadProjectSearchBatch\(projectId, queryRef\.current, PROJECT_CONVERSATION_PAGE_SIZE, current\.conversations\)/);
+  assert.match(appSource, /loadProjectSearchBatch\([\s\S]*projectId[\s\S]*PROJECT_CONVERSATION_PAGE_SIZE[\s\S]*current\.conversations/);
+  assert.match(appSource, /const targetLength = conversations\.length \+ capacity/);
+  assert.match(appSource, /onProgress\?\.\(\{ conversations: \[\.\.\.conversations\], hasMore: state\.titleHasMore \|\| state\.bodyHasMore \}\)/);
+  assert.match(appSource, /projects\.filter\(\(project\) => !isProjectCollapsed\(project\.id\)/);
+  assert.match(appSource, /loadProjectPage\(projectId, Boolean\(queryRef\.current\)\)/);
   assert.doesNotMatch(appSource, /limit: query \? 100 : PROJECT_CONVERSATION_PAGE_SIZE/);
 });
 
@@ -1896,7 +1929,7 @@ test("configured tenants have distinct Unix identities and workers reject cross-
   const appServerSource = fs.readFileSync(path.join(process.cwd(), "server", "app-server-turn.ts"), "utf8");
   assert.match(appServerSource, /"turn\/steer"/);
   assert.match(appServerSource, /expectedTurnId: this\.activeTurnId/);
-  assert.match(appServerSource, /this\.request\("thread\/resume", \{ threadId: this\.options\.threadId, \.\.\.common, excludeTurns: true \}\)/);
+  assert.match(appServerSource, /this\.resumeThread\(\{ threadId: this\.options\.threadId, \.\.\.common, excludeTurns: true \}\)/);
   assert.match(appServerSource, /this\.request\("thread\/start", \{[\s\S]{0,240}developerInstructions/);
   assert.match(appServerSource, /model_reasoning_summary: "auto"/);
   assert.match(appServerSource, /show_raw_agent_reasoning: false/);
@@ -2327,7 +2360,7 @@ test("voice lexicon management API exposes the ranked top one hundred and every 
   insert.run(crypto.randomUUID(), otherUser.id, null, "private-term", "其他账号私有词", "[]", "private", "candidate", 1, 1, 1, 1, 100, now, now);
 
   const agent = request.agent(instance.app);
-  await agent.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
+  const login = await agent.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
   const response = await agent.get("/api/voice-lexicon").expect(200);
   assert.match(response.headers["cache-control"], /no-store/);
   assert.equal(response.body.maxSelectedTerms, 100);
@@ -2340,6 +2373,28 @@ test("voice lexicon management API exposes the ranked top one hundred and every 
   assert.equal(response.body.candidateTerms.length, 2);
   assert.equal(response.body.candidateTerms.some((term: { canonical_text: string }) => term.canonical_text === "其他账号私有词"), false);
   assert.equal("user_id" in response.body.selectedTerms[0], false);
+  const termId = response.body.selectedTerms[0].id;
+  const endpoint = `/api/voice-lexicon/terms/${termId}`;
+  await request(instance.app).patch(endpoint).send({ disabled: true }).expect(401);
+  await agent.patch(endpoint).send({ disabled: true }).expect(403);
+  await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: "true" }).expect(400);
+  const foreignId = (instance.db.sqlite.prepare("SELECT id FROM voice_lexicon_terms WHERE user_id=?").get(otherUser.id) as { id: string }).id;
+  for (const id of [foreignId, "missing"]) {
+    await agent.patch(`/api/voice-lexicon/terms/${id}`).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: true }).expect(404);
+  }
+  const disabled = await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: true }).expect(200);
+  assert.equal(disabled.body.suppressedCount, 1);
+  assert.equal(disabled.body.suppressedTerms[0].id, termId);
+  assert.equal(disabled.body.selectedTerms.length, 100);
+  assert.equal(disabled.body.selectedTerms.at(-1).canonical_text, "Term 4");
+  assert.equal(instance.db.listVoiceLexiconTerms(LEGACY_USER_ID, project.id).some((term) => term.id === termId), false);
+  await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: true }).expect(200);
+  const refreshed = await agent.get("/api/voice-lexicon").expect(200);
+  assert.equal(refreshed.body.suppressedTerms[0].id, termId);
+  const restored = await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: false }).expect(200);
+  assert.equal(restored.body.suppressedCount, 0);
+  assert.equal(restored.body.candidateTerms.some((term: { id: string }) => term.id === termId), true);
+  assert.equal(instance.db.listVoiceLexiconManagementTerms(otherUser.id)[0].status, "candidate");
 });
 
 test("context handoff requires a completed marked summary and bounds the new first turn", () => {
@@ -4041,7 +4096,7 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.match(mathSource, /import\("katex\/dist\/katex\.min\.css"\)/);
   assert.match(appSource, /rehypePlugins=\{math\.plugins/);
   assert.match(legacyReaderSource, /className="file-reader-html file-preview-scroll reader-text-container"/);
-  assert.match(legacyReaderSource, /dangerouslySetInnerHTML=\{\{ __html: content \}\}/);
+  assert.match(legacyReaderSource, /dangerouslySetInnerHTML=\{html\}/);
   assert.match(legacyReaderSource, /onActiveAnchorChange/);
   assert.doesNotMatch(appSource, /closeOutsideOutline|onCloseOutline/);
   assert.match(legacyReaderSource, /getBoundingClientRect\(\)/);
@@ -4095,7 +4150,6 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.doesNotMatch(readerAskSource, /addEventListener\("touchstart"/);
   assert.match(readerAskSource, /document\.addEventListener\("pointerdown", handlePointerDown, true\)/);
   assert.match(readerAskSource, /const isReaderNavigationTarget/);
-  assert.match(readerAskSource, /CSS multi-column geometry can be/);
   assert.match(readerAskSource, /createPortal\(action, document\.body\)/);
   assert.match(styles, /\.file-preview-header\s*\{[^}]*min-height:\s*48px[^}]*z-index:\s*12/);
   assert.match(styles, /grid-template-columns:\s*auto minmax\(0, 1fr\) auto/);
@@ -4824,6 +4878,8 @@ test("remote Worker behavior updates import automatically without duplicating me
   const remoteAccountB = crypto.randomUUID();
   let currentRemoteAccount = remoteAccountA;
   let lifecycleReplies: Array<{ threadId: string; status: "idle" | "running" }> = [];
+  let resetRefreshRequested = false;
+  let sizeRequests = 0;
   const remoteAccountState = () => ({
     activeAccountId: currentRemoteAccount,
     accounts: [
@@ -4849,8 +4905,8 @@ test("remote Worker behavior updates import automatically without duplicating me
     socket.once("error", reject);
     socket.once("open", () => socket.send(JSON.stringify({
       type: "hello", protocolVersion: REMOTE_WORKER_PROTOCOL_VERSION, workerId, machineName: "LIVE-PC",
-      enrollmentToken, platform: "win32-x64", workerVersion: "1.7.0", codexVersion: "test", capacity: 1,
-      capabilities: { codexAccounts: true, threadLifecycle: true },
+      enrollmentToken, platform: "win32-x64", workerVersion: "1.19.6", codexVersion: "test", capacity: 1,
+      capabilities: { codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
     })));
     socket.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as {
@@ -4858,11 +4914,37 @@ test("remote Worker behavior updates import automatically without duplicating me
         requestId?: string;
         action?: string;
         accountId?: string;
+        refreshUsage?: boolean;
+        attemptId?: string;
         projects?: Array<{ id: string; rootPath: string }>;
       };
       if (message.type === "codex_accounts" && message.requestId) {
+        assert.equal(parseServerMessage(raw.toString()).ok, true, "account requests must pass the real Worker validator");
+        if (!message.refreshUsage) assert.equal(Object.hasOwn(message, "refreshUsage"), false, "ordinary lists stay compatible with older Workers");
+        if (message.action === "reset_credit") {
+          assert.equal(message.accountId, remoteAccountB);
+          assert.equal(typeof message.attemptId, "string");
+          socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, resetResult: {
+            attemptId: message.attemptId, outcome: "reset", refreshed: true,
+            quota: { remainingPercent: 100, resetAt: "2026-10-01T00:00:00.000Z" },
+            resetCredits: { availableCount: 2, earliestExpiresAt: "2026-10-05T00:00:00.000Z", expiryStatus: "complete", state: "ok", updatedAt: now, checkedAt: now },
+          } }));
+          return;
+        }
         if (message.action === "activate" && message.accountId) currentRemoteAccount = message.accountId;
-        socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, state: remoteAccountState(), restart: false, threadStates: lifecycleReplies }));
+        if (message.refreshUsage) resetRefreshRequested = true;
+        const state = remoteAccountState();
+        const accounts = state.accounts.map((account) => ({ ...account, ...(message.refreshUsage ? { resetCredits: {
+          availableCount: account.id === remoteAccountA ? 3 : 0, earliestExpiresAt: account.id === remoteAccountA ? "2026-10-04T00:41:43.000Z" : null,
+          expiryStatus: "complete", state: "ok", updatedAt: now, checkedAt: now,
+        } } : {}) }));
+        socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, state: { ...state, accounts }, restart: false, threadStates: lifecycleReplies }));
+        return;
+      }
+      if (message.type === "thread_rollout_size" && message.requestId) {
+        assert.equal(parseServerMessage(raw.toString()).ok, true);
+        sizeRequests += 1;
+        socket.send(JSON.stringify({ type: "thread_rollout_size_result", requestId: message.requestId, bytes: 123456 }));
         return;
       }
       if (message.type === "thread_rename" && message.requestId) {
@@ -4964,7 +5046,16 @@ test("remote Worker behavior updates import automatically without duplicating me
 
   const agent = request.agent(server);
   const login = await agent.post("/api/auth/login").send({ username: "owner", password: "fixture" }).expect(200);
+  await request(server).get(`/api/conversations/${ppConversation.id}/rollout-size`).expect(401);
+  const sizeResponses = await Promise.all(Array.from({ length: 3 }, () => agent.get(`/api/conversations/${ppConversation.id}/rollout-size`).expect(200)));
+  assert.ok(sizeResponses.every(result => result.body.rolloutBytes === 123456));
+  assert.equal(sizeRequests, 1, "concurrent and repeated reads share the bounded cache");
+  assert.equal(instance.db.getConversation(ppConversation.id)?.rollout_bytes, 123456);
+  assert.equal(instance.db.getConversation(ppConversation.id)?.has_unread_result, 0);
+  await agent.get(`/api/conversations/${crypto.randomUUID()}/rollout-size`).expect(404);
   const ppDetail = await agent.get(`/api/conversations/${ppConversation.id}`).expect(200);
+  assert.equal(ppDetail.body.rolloutBytes, 123456);
+  assert.equal(sizeRequests, 1);
   assert.deepEqual(ppDetail.body.remoteActivities.map((activity: { label: string }) => activity.label), ["本机处理步骤完成"]);
   const detail = await agent.get(`/api/conversations/${imported.id}`).expect(200);
   assert.equal(detail.body.conversation.external_status, "idle");
@@ -4972,6 +5063,32 @@ test("remote Worker behavior updates import automatically without duplicating me
 
   const accounts = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
   assert.equal(accounts.body.activeAccountId, remoteAccountA);
+  await agent.post("/api/codex-accounts/refresh-usage").send({ executorId: `remote:${workerId}` }).expect(403);
+  const resetResponse = await agent.post("/api/codex-accounts/refresh-usage")
+    .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(200);
+  assert.equal(resetRefreshRequested, true);
+  assert.equal(resetResponse.body.accounts[0].resetCredits.availableCount, 3);
+  assert.equal(resetResponse.body.accounts[0].resetCredits.earliestExpiresAt, "2026-10-04T00:41:43.000Z");
+  assert.equal(resetResponse.body.accounts[1].resetCredits.availableCount, 0);
+  assert.equal(instance.db.getExecutorActiveCodexAccount(`remote:${workerId}`), remoteAccountA);
+  const resetReload = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
+  assert.equal(resetReload.body.accounts[0].resetCredits.availableCount, 3);
+
+  const resetPath = `/api/codex-accounts/${remoteAccountB}/reset-credit`;
+  const resetBody = { executorId: `remote:${workerId}`, attemptId: crypto.randomUUID() };
+  await request(server).post(resetPath).send(resetBody).expect(401);
+  await agent.post(resetPath).send(resetBody).expect(403);
+  await agent.post(resetPath).set("X-CSRF-Token", login.body.csrfToken).send({ ...resetBody, attemptId: "invalid" }).expect(400);
+  const consumed = await agent.post(resetPath).set("X-CSRF-Token", login.body.csrfToken).send(resetBody).expect(200);
+  assert.equal(consumed.body.outcome, "reset");
+  assert.equal(instance.db.getExecutorActiveCodexAccount(`remote:${workerId}`), remoteAccountA, "reset does not switch accounts");
+  const afterReset = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
+  const resetAccount = afterReset.body.accounts.find((a: { id: string }) => a.id === remoteAccountB);
+  assert.equal(resetAccount.quotaRemainingPercent, 100);
+  assert.equal(resetAccount.resetCredits.availableCount, 2);
+  assert.equal(afterReset.body.activeAccountId, remoteAccountA);
+
+  instance.db.sqlite.prepare("DELETE FROM codex_quota_snapshots WHERE scope_id=?").run(`executor:remote:${workerId}:account:${remoteAccountB}`);
   instance.db.sqlite.prepare("UPDATE conversations SET external_status='running' WHERE id=?").run(imported.id);
   await agent.post(`/api/codex-accounts/${remoteAccountB}/activate`)
     .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(409);
@@ -4994,6 +5111,13 @@ test("remote Worker behavior updates import automatically without duplicating me
     .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(200);
   const switchedBack = await agent.get(`/api/conversations/${ppConversation.id}`).expect(200);
   assert.equal(switchedBack.body.packageQuota.remainingPercent, 63);
+  const disconnected = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+  socket.close();
+  await disconnected;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const offlineSize = await agent.get(`/api/conversations/${ppConversation.id}/rollout-size`).expect(200);
+  assert.equal(offlineSize.body.rolloutBytes, 123456, "offline Worker retains last known bytes");
+
 });
 
 test("remote Worker capacity can be changed to unlimited through the managed protocol", async (context) => {
@@ -6179,6 +6303,25 @@ test("maintenance preparation exposes safe wait progress and flags stale activit
   const hostStatus = await host.get("/api/system/status").expect(200);
   assert.equal(hostStatus.body.maintenanceWait.taskTitle, "内部维护任务");
   assert.match(hostStatus.body.message, /等待“内部维护任务”完成/);
+  // Building already forecasts blockers; only the host administrator sees titles.
+  const deployStatusFile = path.join(root, "deployment-preview.json");
+  instance.config.deployStatusFile = deployStatusFile;
+  const runningAt = new Date(Date.now() - 90_000).toISOString();
+  instance.db.appendEvent(job.id, "status", { status: "running" });
+  instance.db.sqlite.prepare("UPDATE job_events SET created_at=? WHERE job_id=?").run(runningAt, job.id);
+  fs.rmSync(path.join(dataRoot, ".codex-update-maintenance"));
+  fs.writeFileSync(deployStatusFile, JSON.stringify({ requestId: 1, phase: "building", status: "building" }));
+  const preview = await host.get("/api/system/status").expect(200);
+  assert.equal(preview.body.maintenance, false);
+  assert.equal(preview.body.deployment.runningJobCount, 1);
+  assert.equal(preview.body.deployment.blockers[0].title, "内部维护任务");
+  assert.equal(preview.body.deployment.blockers[0].startedAt, runningAt);
+  assert.equal(preview.body.deployment.blockers[0].executor, "服务器容器");
+  const privatePreview = await member.get("/api/system/status").expect(200);
+  assert.equal(privatePreview.body.deployment.runningJobCount, 1);
+  assert.deepEqual(privatePreview.body.deployment.blockers, []);
+  assert.doesNotMatch(JSON.stringify(privatePreview.body), /内部维护任务/);
+
 });
 
 test("system status keeps the latest deployment phase after maintenance ends", async (context) => {
@@ -6196,6 +6339,11 @@ test("system status keeps the latest deployment phase after maintenance ends", a
   fs.writeFileSync(deployStatusFile, JSON.stringify({
     requestId: 29, targetSha: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     status: "promoting", phase: "health_check", message: "正在进行生产健康检查。", requestedAt: new Date().toISOString(),
+    stepHistory: [
+      { step: "database_backup", startedAt: "2026-08-26T00:01:00Z", finishedAt: "2026-08-26T00:01:03Z", completedUnits: 40, totalUnits: 40, secret: "hidden" },
+      { step: "unknown", startedAt: "2026-08-26T00:01:00Z" },
+      { step: "file_backup", startedAt: "invalid" },
+    ],
     errorCode: null, errorSummary: null,
     phaseHistory: [
       { phase: "queued", at: "2026-08-26T00:00:00Z" },
@@ -6211,6 +6359,7 @@ test("system status keeps the latest deployment phase after maintenance ends", a
   assert.equal(status.body.deployment.phase, "health_check");
   assert.equal(status.body.deployment.targetSha.length, 64);
   assert.equal(status.body.deployment.errorSummary, null);
+  assert.deepEqual(status.body.deployment.stepHistory, [{ step: "database_backup", startedAt: "2026-08-26T00:01:00Z", finishedAt: "2026-08-26T00:01:03Z", completedUnits: 40, totalUnits: 40 }]);
   assert.deepEqual(status.body.deployment.phaseHistory, [
     { phase: "queued", at: "2026-08-26T00:00:00Z" },
     { phase: "building", at: "2026-08-26T00:00:01Z" },

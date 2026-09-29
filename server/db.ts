@@ -1,3 +1,5 @@
+import { migratePara, migrateParaSidebar } from "./para-schema.js";
+import { mergeResetCredits, type CodexResetCredits } from "../remote-worker/src/codex-reset-credits.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -13,6 +15,7 @@ import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import { containsPersonalContext, stripPersonalContext } from "./personal-context.js";
 import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, ReadingSourceRow, ReadingSourceVersionRow, ReadingUnitRow, ReaderFormat, ReaderVersionKind, ReaderVersionStatus } from "./reader-types.js";
 import { isModelCapacityContinuationPrompt } from "./internal-messages.js";
+import { buildTaskRecoveryCheckpoint, stripTaskRecoveryPrompt, type TaskRecoveryCheckpoint } from "./task-recovery.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
@@ -243,6 +246,9 @@ export type RunningJobSummary = {
   title: string;
   created_at: string;
   updated_at: string;
+  started_at: string | null;
+  executor_id: string;
+  executor_label: string;
 };
 
 export type ConversationTitleSource = "default" | "ai" | "manual" | "legacy";
@@ -690,7 +696,7 @@ const normalizePersonalMemoryStatement = (value: string): string => value
   .replace(/[\s`*_~，。！？；：、,.!?;:'"“”‘’（）()\[\]【】]+/g, "")
   .trim();
 const remoteUserMessageMatchesJob = (remoteContent: string, jobContent: string, jobQuoteExcerpt?: string | null): boolean => {
-  const remote = normalizedMessageContent(stripPersonalContext(remoteContent));
+  const remote = normalizedMessageContent(stripTaskRecoveryPrompt(stripPersonalContext(remoteContent)));
   const job = normalizedMessageContent(jobQuoteExcerpt ? buildAskAgentDraft(jobContent, jobQuoteExcerpt) : jobContent);
   if (!job || remote === job) return remote === job;
   if (remote.startsWith(job)) {
@@ -748,6 +754,11 @@ export class AppDatabase {
     this.sqlite = new DatabaseSync(path.join(dataRoot, "codex-web.sqlite"));
     this.sqlite.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate(legacyUser);
+    this.applyMigration(2026092903, "para-board-v1", () => migratePara(this.sqlite));
+    this.applyMigration(2026093001, "para-board-order", () => {
+      this.sqlite.exec("ALTER TABLE para_boards ADD COLUMN position REAL NOT NULL DEFAULT 0");
+    });
+    this.applyMigration(2026093002, "para-sidebar-projects", () => migrateParaSidebar(this.sqlite));
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain
@@ -768,6 +779,7 @@ export class AppDatabase {
             && fs.existsSync(path.join(dataRoot, "remote-worker-recovery", `${job.id}.json`));
           if (remoteLease) continue;
           const error = "服务重启，原运行任务已中断";
+          this.captureJobRecovery(job.id, "interrupted", error);
           const event = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(job.id) as { seq: number };
           this.sqlite.prepare(`
             UPDATE jobs
@@ -1898,6 +1910,16 @@ export class AppDatabase {
         credential_id TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL
       );`);
     });
+    this.applyMigration(2026092301, "durable-task-recovery", () => {
+      this.sqlite.exec(`CREATE TABLE job_recovery_checkpoints (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+        checkpoint_json TEXT NOT NULL
+      );`);
+    });
+    this.applyMigration(2026092302, "codex-reset-credit-snapshots", () => {
+      this.sqlite.exec("CREATE TABLE IF NOT EXISTS codex_reset_credit_snapshots (scope_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL)");
+    });
+
     const titleAuditRecoveryAt = new Date().toISOString();
     this.sqlite.prepare(`
       UPDATE conversation_title_audits
@@ -2778,6 +2800,7 @@ export class AppDatabase {
         AND rollout_bytes IS NULL AND context_input_tokens IS NULL AND context_window_tokens IS NULL
         AND context_usage_updated_at IS NULL AND personal_context_revision=0
         AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state='active'
+        AND NOT EXISTS (SELECT 1 FROM para_conversations WHERE para_conversations.conversation_id=conversations.id)
         AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.conversation_id=conversations.id)
         AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id)
         AND NOT EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id)
@@ -3004,7 +3027,7 @@ export class AppDatabase {
       let existingCursor = 0;
       for (const item of thread.messages) {
         const parsed = item.role === "user" ? parseResponseAnnotatedRequest(item.content) : null;
-        const content = stripPersonalContext(parsed?.content ?? item.content);
+        const content = stripTaskRecoveryPrompt(stripPersonalContext(parsed?.content ?? item.content));
         const quoteExcerpt = parsed?.quoteExcerpt ?? null;
         const alreadyMapped = this.sqlite.prepare(`
           SELECT message_id FROM remote_thread_items WHERE executor_id=? AND thread_id=? AND turn_id=? AND item_id=?
@@ -3275,6 +3298,10 @@ export class AppDatabase {
     return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage);
   }
 
+  setAccountCodexQuota(executorId: string, accountId: string, usage: CodexQuotaUsage): boolean {
+    return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage);
+  }
+
   setExecutorActiveCodexAccount(executorId: string, accountId: string): void {
     if (!executorId || !/^[0-9a-f-]{36}$/i.test(accountId)) throw new Error("执行机器 Codex 账号状态无效");
     this.sqlite.prepare(`
@@ -3299,7 +3326,8 @@ export class AppDatabase {
     const remainingPercent = typeof usage.remainingPercent === "number" && Number.isFinite(usage.remainingPercent)
       ? Math.max(0, Math.min(100, usage.remainingPercent))
       : null;
-    if (remainingPercent === null) return false;
+    if (usage.resetCredits) this.setResetCreditsScope(scopeId, usage.resetCredits);
+    if (remainingPercent === null) return Boolean(usage.resetCredits);
     const resetAt = typeof usage.resetAt === "string" && !Number.isNaN(Date.parse(usage.resetAt))
       ? new Date(usage.resetAt).toISOString()
       : null;
@@ -3309,6 +3337,34 @@ export class AppDatabase {
       ON CONFLICT(scope_id) DO UPDATE SET remaining_percent=excluded.remaining_percent,reset_at=excluded.reset_at,updated_at=excluded.updated_at
     `).run(scopeId, remainingPercent, resetAt, new Date().toISOString());
     return true;
+  }
+
+  setAccountResetCredits(executorId: string, accountId: string, value: CodexResetCredits): void {
+    if (!executorId || !/^[0-9a-f-]{36}$/i.test(accountId)) return;
+    this.setResetCreditsScope(this.executorCodexQuotaScope(executorId, accountId), value);
+  }
+
+  getAccountResetCredits(executorId: string, accountId: string): CodexResetCredits | null {
+    return this.getResetCreditsScope(this.executorCodexQuotaScope(executorId, accountId));
+  }
+
+  private getResetCreditsScope(scopeId: string): CodexResetCredits | null {
+    const row = this.sqlite.prepare("SELECT payload_json FROM codex_reset_credit_snapshots WHERE scope_id=?").get(scopeId) as { payload_json: string } | undefined;
+    return row ? JSON.parse(row.payload_json) as CodexResetCredits : null;
+  }
+
+  private setResetCreditsScope(scopeId: string, value: CodexResetCredits): void {
+    if (!value || !["ok", "unavailable", "auth_required", "error"].includes(value.state) || !Number.isFinite(Date.parse(value.checkedAt))
+      || (value.state === "ok" && (typeof value.availableCount !== "number" || !Number.isSafeInteger(value.availableCount) || value.availableCount < 0))) return;
+    if (!["complete", "partial", "unknown"].includes(value.expiryStatus)
+      || (value.earliestExpiresAt !== null && !Number.isFinite(Date.parse(value.earliestExpiresAt)))
+      || (value.updatedAt !== null && !Number.isFinite(Date.parse(value.updatedAt)))) return;
+    const next = mergeResetCredits(this.getResetCreditsScope(scopeId), {
+      availableCount: value.availableCount, earliestExpiresAt: value.earliestExpiresAt, expiryStatus: value.expiryStatus,
+      state: value.state, updatedAt: value.updatedAt, checkedAt: value.checkedAt,
+    });
+    this.sqlite.prepare("INSERT INTO codex_reset_credit_snapshots(scope_id,payload_json) VALUES(?,?) ON CONFLICT(scope_id) DO UPDATE SET payload_json=excluded.payload_json")
+      .run(scopeId, JSON.stringify(next));
   }
 
   getConversationCodexQuota(id: string): CodexQuotaSnapshot | null {
@@ -3685,6 +3741,20 @@ export class AppDatabase {
     `).all(userId, projectId, Math.max(1, Math.min(100, Math.trunc(limit)))) as VoiceLexiconTermRow[];
   }
 
+  setVoiceLexiconTermDisabled(userId: string, termId: string, disabled: boolean): boolean {
+    // Restore eligibility from retained evidence; never force a candidate into ASR.
+    const result = this.sqlite.prepare(`
+      UPDATE voice_lexicon_terms SET status=CASE
+        WHEN ? THEN 'suppressed'
+        WHEN pinned=1 OR (SELECT count(*) FROM voice_term_evidence WHERE term_id=voice_lexicon_terms.id)>=2
+          OR EXISTS(SELECT 1 FROM voice_term_evidence WHERE term_id=voice_lexicon_terms.id AND error_weight>=0.8 AND confidence>=0.9)
+          THEN 'active'
+        ELSE 'candidate' END, updated_at=?
+      WHERE id=? AND user_id=? AND (status='suppressed')!=?
+    `).run(Number(disabled), new Date().toISOString(), termId, userId, Number(disabled));
+    return Boolean(result.changes || this.sqlite.prepare("SELECT 1 FROM voice_lexicon_terms WHERE id=? AND user_id=?").get(termId, userId));
+  }
+
   listVoiceLexiconManagementTerms(userId: string): VoiceLexiconManagementTermRow[] {
     return this.sqlite.prepare(`
       SELECT term.*,project.name AS project_name,
@@ -3852,7 +3922,7 @@ export class AppDatabase {
         const reliableErrorRate = (errors + 5 * 0.05) / (opportunities + 5);
         const recentError = lastError ? Math.exp(-Math.max(0, (now.getTime() - Date.parse(lastError)) / 86_400_000) / 30) : 0;
         const rankIndex = 100 * (0.72 * reliableErrorRate + 0.20 * usageScore + 0.08 * recentError);
-        const status = term.pinned || rows.length >= 2 || rows.some((row) => row.error_weight >= 0.8 && row.confidence >= 0.9)
+        const status = term.status === "suppressed" ? "suppressed" : term.pinned || rows.length >= 2 || rows.some((row) => row.error_weight >= 0.8 && row.confidence >= 0.9)
           ? "active" : "candidate";
         update.run(
           item.canonicalText, JSON.stringify([...aliases].slice(0, 12)), item.termKind, status, usageScore,
@@ -5395,6 +5465,9 @@ export class AppDatabase {
         INSERT INTO jobs(id,conversation_id,message_id,agent_model,reasoning_effort,queue_seq,status,created_at,updated_at)
         VALUES(?,?,?,?,?,?,'queued',?,?)
       `).run(jobId, prompt.conversation_id, messageId, prompt.agent_model, prompt.reasoning_effort, next.value, now, now);
+      // Keep the background accepted when this queued prompt was submitted.
+      this.sqlite.prepare("DELETE FROM para_job_context WHERE job_id=?").run(jobId);
+      this.sqlite.prepare("INSERT INTO para_job_context(job_id,snapshot) SELECT ?,snapshot FROM para_pending_context WHERE pending_id=?").run(jobId, pendingId);
       this.sqlite.prepare("UPDATE wake_plans SET job_id=?,pending_prompt_id=NULL,updated_at=? WHERE pending_prompt_id=?")
         .run(jobId, now, pendingId);
       this.sqlite.prepare("DELETE FROM pending_prompts WHERE id=?").run(pendingId);
@@ -5523,9 +5596,16 @@ export class AppDatabase {
 
   listRunningJobSummaries(): RunningJobSummary[] {
     return this.sqlite.prepare(`
-      SELECT job.id,conversation.title,job.created_at,job.updated_at
+      SELECT job.id,conversation.title,job.created_at,job.updated_at,
+        (SELECT event.created_at FROM job_events event WHERE event.job_id=job.id
+          AND event.event_type='status' AND json_extract(event.payload,'$.status')='running'
+          ORDER BY event.seq LIMIT 1) AS started_at,
+        COALESCE(project.executor_id,'local') AS executor_id,
+        COALESCE(worker.machine_name,CASE WHEN project.executor_id='local-host' THEN 'CODEX_WEB 服务器' ELSE '服务器容器' END) AS executor_label
       FROM jobs job
       JOIN conversations conversation ON conversation.id=job.conversation_id
+      LEFT JOIN projects project ON project.id=conversation.project_id
+      LEFT JOIN remote_workers worker ON project.executor_id='remote:' || worker.id
       WHERE job.status='running' AND conversation.deleted_at IS NULL
       ORDER BY job.queue_seq,job.id
     `).all() as RunningJobSummary[];
@@ -5550,6 +5630,81 @@ export class AppDatabase {
     return row ? JSON.parse(row.state_json) as JobAttemptState : undefined;
   }
 
+  getJobRecoveryCheckpoint(jobId: string): TaskRecoveryCheckpoint | undefined {
+    const row = this.sqlite.prepare("SELECT checkpoint_json FROM job_recovery_checkpoints WHERE job_id=?").get(jobId) as { checkpoint_json: string } | undefined;
+    return row ? JSON.parse(row.checkpoint_json) as TaskRecoveryCheckpoint : undefined;
+  }
+
+  jobHasExecutionHistory(jobId: string): boolean {
+    const job = this.getJob(jobId);
+    if (!job) return false;
+    if (job.status === "running" || this.getJobRecoveryCheckpoint(jobId)) return true;
+    const attempt = this.getJobAttemptState(jobId);
+    if (attempt && (attempt.acceptedTurnId || attempt.continuation || attempt.retries > 0)) return true;
+    return Boolean(this.sqlite.prepare(`SELECT 1 FROM job_events WHERE job_id=? AND event_type='progress'
+      AND json_valid(payload) AND json_extract(payload,'$.kind') IN ('update','reasoning','todo','command','file','tool','search','status','error','retry') LIMIT 1`).get(jobId));
+  }
+
+  captureJobRecovery(jobId: string, reason: TaskRecoveryCheckpoint["reason"], error?: string | null): TaskRecoveryCheckpoint | undefined {
+    const job = this.getJob(jobId);
+    const conversation = job && this.getConversation(job.conversation_id);
+    if (!job || !conversation || !this.jobHasExecutionHistory(jobId)) return undefined;
+    const previous = this.getJobRecoveryCheckpoint(jobId);
+    const events = this.sqlite.prepare(`SELECT seq,event_type,payload,created_at FROM (
+      SELECT seq,event_type,payload,created_at FROM job_events WHERE job_id=? AND event_type='progress'
+      AND json_valid(payload) AND json_extract(payload,'$.kind') IN ('update','reasoning','todo','command','file','tool','search','error')
+      ORDER BY seq DESC LIMIT 200) ORDER BY seq`).all(jobId) as JobEventRow[];
+    const checkpoint = buildTaskRecoveryCheckpoint({ jobId, threadId: conversation.codex_thread_id,
+      capturedAt: new Date().toISOString(), reason, error,
+      goal: job.message_id ? this.getMessage(job.message_id)?.content ?? "" : previous?.goalExcerpt ?? "",
+      inputAccepted: Boolean(this.getJobAttemptState(jobId)?.acceptedTurnId || previous?.inputAccepted),
+    }, events);
+    const project = conversation.project_id ? this.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+    if (project) checkpoint.project = { id: project.id, root: project.root_path, executor: project.executor_id };
+    if (previous) {
+      checkpoint.files = [...new Set([...previous.files, ...checkpoint.files])].slice(-12);
+      if (!checkpoint.plan.length) checkpoint.plan = previous.plan;
+      if (!checkpoint.updates.length) checkpoint.updates = previous.updates;
+      if (!checkpoint.actions.length) checkpoint.actions = previous.actions;
+    }
+    const parentRow = previous?.priorGoalExcerpt ? undefined : this.sqlite.prepare(`
+      SELECT cp.checkpoint_json FROM job_recovery_checkpoints cp JOIN jobs prior ON prior.id=cp.job_id
+      WHERE prior.conversation_id=? AND prior.queue_seq<? AND prior.status IN ('cancelled','failed','interrupted')
+        AND NOT EXISTS (SELECT 1 FROM jobs done WHERE done.conversation_id=prior.conversation_id
+          AND done.status='completed' AND done.queue_seq>prior.queue_seq AND done.queue_seq<?)
+      ORDER BY prior.queue_seq DESC LIMIT 1`).get(job.conversation_id, job.queue_seq, job.queue_seq) as { checkpoint_json: string } | undefined;
+    const parent = parentRow ? JSON.parse(parentRow.checkpoint_json) as TaskRecoveryCheckpoint : undefined;
+    const priorGoal = previous?.priorGoalExcerpt ?? (parent?.threadId === checkpoint.threadId ? parent?.priorGoalExcerpt || parent?.goalExcerpt : undefined);
+    if (priorGoal) checkpoint.priorGoalExcerpt = priorGoal;
+    this.sqlite.prepare(`INSERT INTO job_recovery_checkpoints(job_id,checkpoint_json) VALUES(?,?)
+      ON CONFLICT(job_id) DO UPDATE SET checkpoint_json=excluded.checkpoint_json`).run(jobId, JSON.stringify(checkpoint));
+    return checkpoint;
+  }
+
+  getTaskRecoveryForTurn(conversationId: string, jobId: string): TaskRecoveryCheckpoint | undefined {
+    const job = this.getJob(jobId);
+    const conversation = this.getConversation(conversationId);
+    if (!job || job.conversation_id !== conversationId || !conversation) return undefined;
+    const own = this.getJobRecoveryCheckpoint(jobId)
+      ?? (this.getJobAttemptState(jobId)?.retries
+        ? this.captureJobRecovery(jobId, "capacity", "模型容量等待后恢复") : undefined);
+    if (own?.threadId === conversation.codex_thread_id) return own;
+    // A completed later task closes the recovery context. Commentary, imports,
+    // failed continuations and cancellation of unstarted queue items do not.
+    const source = this.sqlite.prepare(`SELECT prior.* FROM jobs prior
+      WHERE prior.conversation_id=? AND prior.queue_seq<? AND prior.status IN ('cancelled','failed','interrupted')
+        AND (EXISTS (SELECT 1 FROM job_recovery_checkpoints cp WHERE cp.job_id=prior.id)
+          OR EXISTS (SELECT 1 FROM job_events e WHERE e.job_id=prior.id AND e.event_type='progress'))
+        AND NOT EXISTS (SELECT 1 FROM jobs done WHERE done.conversation_id=prior.conversation_id
+          AND done.status='completed' AND done.queue_seq>prior.queue_seq AND done.queue_seq<?)
+      ORDER BY prior.queue_seq DESC LIMIT 1`).get(conversationId, job.queue_seq, job.queue_seq) as JobRow | undefined;
+    if (!source) return undefined;
+    // Upgrade existing interrupted Jobs lazily from their durable audit rows.
+    const checkpoint = this.getJobRecoveryCheckpoint(source.id)
+      ?? this.captureJobRecovery(source.id, source.status as TaskRecoveryCheckpoint["reason"], source.error);
+    return checkpoint?.threadId === conversation.codex_thread_id ? checkpoint : undefined;
+  }
+
   saveJobAttemptState(jobId: string, state: JobAttemptState): void {
     this.sqlite.prepare(`INSERT INTO job_attempt_state(job_id,next_attempt_at,state_json) VALUES(?,?,?)
       ON CONFLICT(job_id) DO UPDATE SET next_attempt_at=excluded.next_attempt_at,state_json=excluded.state_json`)
@@ -5562,6 +5717,7 @@ export class AppDatabase {
       const job = this.getJob(jobId);
       if (!job || job.status !== "running") { this.sqlite.exec("ROLLBACK"); return false; }
       this.saveJobAttemptState(jobId, state);
+      this.captureJobRecovery(jobId, "capacity", "模型容量不足，等待续接");
       this.updateJob(jobId, "queued");
       this.updateConversation(job.conversation_id, { status: "idle" });
       this.sqlite.exec("COMMIT");
@@ -5692,7 +5848,8 @@ export class AppDatabase {
       JOIN conversations conversation ON conversation.id=file.conversation_id
       WHERE conversation.user_id=?
     `).get(userId) as { value: number };
-    return Number(row.value);
+    const resources = this.sqlite.prepare("SELECT COALESCE(sum(size),0) AS value FROM para_resources WHERE user_id=?").get(userId) as { value: number };
+    return Number(row.value) + Number(resources.value);
   }
 
   private assertUserFileQuota(userId: string, files: FileRow[], maximumStoredBytes: number, removedBytes = 0): void {
@@ -5863,13 +6020,20 @@ export class AppDatabase {
   }
 
   cancelQueuedJob(id: string): boolean {
-    const result = this.sqlite.prepare(`
-      UPDATE jobs
-      SET status='cancelled',error='任务已停止',finalization_state='published',
-        finalization_payload=NULL,finalization_error=NULL,updated_at=?
-      WHERE id=? AND status='queued'
-    `).run(new Date().toISOString(), id);
-    return result.changes > 0;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.getJob(id)?.status !== "queued") { this.sqlite.exec("ROLLBACK"); return false; }
+      // Capture atomically before the terminal trigger removes accepted input.
+      this.captureJobRecovery(id, "cancelled", "用户主动停止任务");
+      const result = this.sqlite.prepare(`
+        UPDATE jobs
+        SET status='cancelled',error='任务已停止',finalization_state='published',
+          finalization_payload=NULL,finalization_error=NULL,updated_at=?
+        WHERE id=? AND status='queued'
+      `).run(new Date().toISOString(), id);
+      this.sqlite.exec("COMMIT");
+      return result.changes > 0;
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
   }
 
   finishJob(id: string, conversationId: string, status: Exclude<JobStatus, "queued" | "running">, error: string | null = null, assistantNotice?: string): void {
@@ -5877,6 +6041,7 @@ export class AppDatabase {
     const assistantNoticeId = assistantNotice ? crypto.randomUUID() : null;
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
+      if (status !== "completed" && this.getJob(id)?.conversation_id === conversationId) this.captureJobRecovery(id, status, error);
       this.sqlite.prepare(`
         UPDATE jobs
         SET status=?,error=?,
@@ -5960,7 +6125,20 @@ export class AppDatabase {
   listRecentEventsWithRetainedUpdates(jobId: string, limit: number, retainedUpdateLimit: number): JobEventRow[] {
     const boundedLimit = Math.max(1, Math.min(200, Math.floor(limit)));
     const boundedRetainedLimit = Math.max(0, Math.min(20, Math.floor(retainedUpdateLimit)));
-    const recent = this.listRecentEvents(jobId, boundedLimit);
+    // Match the browser's activity window: answer streaming is kept in the raw
+    // event log/SSE for readers, but must not consume progress snapshot slots.
+    const recent = this.sqlite.prepare(`
+      SELECT seq,event_type,payload,created_at
+      FROM (
+        SELECT seq,event_type,payload,created_at
+        FROM job_events
+        WHERE job_id=?
+          AND COALESCE(json_extract(payload,'$.kind'), '') != 'assistant_stream'
+        ORDER BY seq DESC
+        LIMIT ?
+      )
+      ORDER BY seq
+    `).all(jobId, boundedLimit) as JobEventRow[];
     if (boundedRetainedLimit === 0 || recent.length < boundedLimit) return recent;
     const oldestRecentSeq = recent[0]?.seq;
     if (oldestRecentSeq === undefined) return recent;

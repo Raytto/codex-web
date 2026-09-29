@@ -34,7 +34,6 @@ const READER_SELECTION_MOUSE_DELAY_MS = 320;
 const READER_SELECTION_TOUCH_DELAY_MS = 350;
 const READER_SELECTION_HANDLE_IDLE_DELAY_MS = 450;
 const READER_SELECTION_REFRESH_FRAMES = 4;
-const READER_SELECTION_CLICK_SEQUENCE_MAX_MS = 2_000;
 
 export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scopeKey = ""): ReaderSelection | null {
   const [selection, setSelection] = useState<ReaderSelection | null>(null);
@@ -50,7 +49,7 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
     // paginated viewport. Keep the selection that existed at pointerdown so
     // a drag which creates a *new* selection is not mistaken for a dismissal
     // when Chromium emits a compatibility click after the drag.
-    let pointerDownAt = 0;
+    let pointerDownPosition: { x: number; y: number } | null = null;
     let pointerDownHadReaderSelection = false;
     let pointerDownAnchor: ReaderTextAnchor | null = null;
     let pointerDownTouchInsideSelection = false;
@@ -221,13 +220,13 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
           const nativeMatches = Boolean(nativeAnchor && readerTextAnchorsEqual(nativeAnchor, session.anchor));
           // During the short release/handle settle window, leave the browser's
           // native selection entirely alone. Once that window has ended, a
-          // missing/collapsed range is the expected off-screen transaction;
-          // on a refresh, even a connected reader Range is rebuilt when its
-          // durable anchor matches, because CSS multi-column geometry can be
-          // stale while the boundary nodes remain connected. A non-reader
-          // range (chat/browser chrome) is never clobbered.
+          // missing/collapsed range is the expected off-screen transaction.
+          // Fresh geometry is read from the rebound range above, but a live
+          // matching native selection must not be removed/re-added merely for
+          // scroll or resize: that interrupts browser-owned handles/menus.
+          // A non-reader range (chat/browser chrome) is never clobbered.
           const shouldRestore = !nativeRange
-            || (nativeRangeIsReader && (nativeRange.collapsed || !nativeMatches || mode === "refresh"));
+            || (nativeRangeIsReader && (nativeRange.collapsed || !nativeMatches));
           if (shouldRestore) {
             restoringNative = true;
             native?.removeAllRanges();
@@ -294,7 +293,7 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
       }, delay);
     };
     const resetPointerDown = () => {
-      pointerDownAt = 0;
+      pointerDownPosition = null;
       pointerDownHadReaderSelection = false;
       pointerDownAnchor = null;
       pointerDownTouchInsideSelection = false;
@@ -334,8 +333,13 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
       const current = currentReaderRange(root);
       const existing = sessionRef.current;
       const captured = !existing && root && current ? captureReaderTextAnchor(root, current) : null;
-      pointerDownAt = Date.now();
-      pointerDownHadReaderSelection = Boolean(sessionRef.current || nativeReaderSelection(root));
+      const pointer = event as PointerEvent;
+      pointerDownPosition = { x: pointer.clientX, y: pointer.clientY };
+      // An ordinary click leaves a collapsed caret in non-editable prose.
+      // Counting that caret as a prior selection clears the *first* drag at
+      // click, while the next drag succeeds because removeAllRanges erased it.
+      const native = nativeReaderSelection(root);
+      pointerDownHadReaderSelection = Boolean(existing || (native && !native.isCollapsed));
       pointerDownAnchor = existing?.anchor ?? captured;
       pointerDownTouchInsideSelection = pointerInsideNativeSelection(event, root);
       if (isActionTarget(event.target)) return;
@@ -357,7 +361,10 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
       if (!isReaderNavigationTarget(target)) clearSession(true);
     };
     const handleReaderClick = (event: Event) => {
-      if (isActionTarget(event.target)) {
+      // Touch handles can target document.body even though their coordinates
+      // are over the selected glyphs. Protect that transaction before the
+      // outside-root dismissal, including compatibility clicks after cancel.
+      if (isActionTarget(event.target) || pointerDownTouchInsideSelection || pointerInsideNativeSelection(event, rootRef.current)) {
         resetPointerDown();
         return;
       }
@@ -369,10 +376,14 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
         return;
       }
 
-      const hasRecentPointerDown = pointerDownAt > 0 && Date.now() - pointerDownAt <= READER_SELECTION_CLICK_SEQUENCE_MAX_MS;
-      const hadReaderSelection = hasRecentPointerDown ? pointerDownHadReaderSelection : true;
-      const previousAnchor = hasRecentPointerDown ? pointerDownAnchor : null;
-      const touchInsideSelection = hasRecentPointerDown && pointerDownTouchInsideSelection;
+      // A selection gesture can legitimately take several seconds. Keep its
+      // start state until click/cancel instead of expiring it on a timer. An
+      // unpaired compatibility click is not evidence of a deliberate dismissal.
+      const hadReaderSelection = pointerDownPosition !== null && pointerDownHadReaderSelection;
+      const previousAnchor = pointerDownAnchor;
+      const click = event as MouseEvent;
+      const dragged = pointerDownPosition !== null
+        && Math.hypot(click.clientX - pointerDownPosition.x, click.clientY - pointerDownPosition.y) > 6;
       const current = sessionRef.current;
       const liveRange = previousAnchor ? currentReaderRange(root) : null;
       const liveAnchor = previousAnchor && liveRange ? captureReaderTextAnchor(root, liveRange) : null;
@@ -382,15 +393,12 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
       // just created one by dragging. Leave that new selection alone; the
       // next ordinary click will dismiss it normally.
       if (!hadReaderSelection) return;
+      // Re-selecting exactly the same text is still a drag, not a click-away.
+      if (dragged && currentReaderRange(root)) return;
       // Likewise, if the anchor changed during the sequence, this is a new
       // selection rather than a click-away from the old one.
       if (previousAnchor && current && !readerTextAnchorsEqual(previousAnchor, current.anchor)) return;
       if (previousAnchor && liveAnchor && !readerTextAnchorsEqual(previousAnchor, liveAnchor)) return;
-      // Keep Safari/Chrome touch handles usable when a compatibility click is
-      // emitted over the selected glyphs. A tap anywhere else still reaches
-      // the dismissal below.
-      if (touchInsideSelection) return;
-
       if (current || nativeReaderSelection(root)) clearSession(true);
     };
     const handleSelectionChange = () => {
@@ -436,6 +444,7 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
     const root = rootRef.current;
     document.addEventListener("selectionchange", handleSelectionChange);
     document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("pointercancel", resetPointerDown, true);
     document.addEventListener("click", handleReaderClick, true);
     window.addEventListener("pointerup", handleSelectionEnd, { passive: true });
     window.addEventListener("touchend", handleSelectionEnd, { passive: true });
@@ -463,6 +472,7 @@ export function useReaderSelection(rootRef: RefObject<HTMLElement | null>, scope
       resetPointerDown();
       document.removeEventListener("selectionchange", handleSelectionChange);
       document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("pointercancel", resetPointerDown, true);
       document.removeEventListener("click", handleReaderClick, true);
       window.removeEventListener("pointerup", handleSelectionEnd);
       window.removeEventListener("touchend", handleSelectionEnd);

@@ -126,3 +126,14 @@ the root extension, set `CODEX_WEB_HOST_BRIDGE_DIR` and explicitly include
 `compose.host-root.yaml` with `docker compose -f compose.yaml -f compose.host-root.yaml`.
 The standard build, browser API URLs, Compose environment, health check and Nginx
 routes use `/codex-web`; the exact Worker connect route permits WSS upgrades.
+
+
+## September 30, 2026 upgrade checks
+
+Back up the application database and tenant volumes. Additive migrations create durable recovery checkpoints, reset-credit snapshots, and empty PARA tables, including board/sidebar order. Resource files live in each account's `para-resources/`; include them in tenant backups. Rolling back code does not roll back business data. `CWW_PARA_ENABLED=false` closes the PARA routes without deleting data.
+
+Verify login and static files under `/codex-web`, an empty board, resource upload/collection, a conflicting revision, conversation links, sidebar search/selection, and a draft containing only explicitly selected material. Resources are account-private and count toward the existing quota. Check PDF/EPUB mode changes and HTML/Markdown first selection. See [PARA](features/PARA_BOARD.md) and [task recovery](TASK_RECOVERY.md).
+
+Optional Worker users should deploy the matching 1.19.7 package from this public checkout. Check account usage refresh and rollout-size reads against an idle test device. Reset-credit consumption is a separate, explicit administrator action; automated tests use synthetic credentials and never consume a real card. Older Workers remain gated where capabilities are missing.
+
+Run `npm run verify` and the Docker `test` target. For isolated Chromium checks, set `PLAYWRIGHT_MODULE` to an installed Playwright package entry file and optionally `PLAYWRIGHT_CHROMIUM_EXECUTABLE`. Run `node tests/browser/reader-first-selection.mjs` and `node --import tsx tests/browser/para.mjs`; the latter starts a temporary loopback application with fresh synthetic password accounts, uses `/codex-web`, and stubs ASR. It does not log into a deployed installation or start model tasks. `BROWSER_ARTIFACTS_DIR` selects the evidence directory. Target-device Safari and real provider/account operations require separate operator acceptance.

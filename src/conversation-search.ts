@@ -18,9 +18,12 @@ export function retainSelectedConversation(
   page: ConversationPage,
   selected: Conversation | null,
   projectId?: string,
+  options: { append?: boolean } = {},
 ): ConversationPage {
   if (!selected || (projectId && selected.project_id !== projectId)) return page;
   if (page.conversations.some((conversation) => conversation.id === selected.id)) return page;
+  // Preserve the selected detail while natural pagination reveals its row.
+  if (options.append === false) return page;
   return {
     ...page,
     // Keep a selected task visible when it falls outside a refreshed page, but

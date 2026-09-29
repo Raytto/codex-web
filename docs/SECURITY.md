@@ -36,3 +36,14 @@ explicit, expiring [migration procedure](JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
 Clearing the bootstrap setting alone does not revoke issued device credentials.
 Cold-storage [maintenance](CONVERSATION_COLD_STORAGE.md) keeps upload verification
 and local grace periods even when processing all eligible candidates.
+
+
+## PARA and recovery data
+
+PARA routes share authenticated username/password sessions, same-origin checks and CSRF protection. Every board, resource and conversation relation is checked against the current account; a board link grants no executor or filesystem permission. Uploads are bounded to 64 MiB and existing account/disk quotas. Independent copies survive deletion or cold storage of the source conversation, so deleting a source is not erasure of a collected resource. Nothing is preseeded from an operator account. Set `CWW_PARA_ENABLED=false` to reject PARA operations while retaining storage.
+
+Project background is snapshotted when an input is accepted. It is reference data, not an instruction override. Files are delivered only when explicitly selected, copied through the ordinary tenant attachment path, and hash-checked. Resource access rejects symlink escapes and preserves tenant ACL separation.
+
+Recovery checkpoints are bounded, account-scoped operational data, not proof that an external action completed. They never authorize repeating side effects. Reset-credit APIs require the reserved host-administrator identity and CSRF protection. Queries do not consume credits; redemption requires explicit confirmation and a durable idempotency key. Credit IDs and credentials remain on the owning machine. See [reset-credit handling](CODEX_RESET_CREDITS.md).
+
+Optional deployment progress accepts only known step fields. Ordinary accounts receive counts; only the host administrator sees blocking task titles. This repository includes no production backup configuration or privileged browser-session minting script.

@@ -161,6 +161,20 @@ test("paginated reader uses a full-bleed viewport, a bottom page indicator, and 
   assert.match(readerSource, /fontScale/);
   assert.doesNotMatch(readerStyles, /\.reader-(?:pdf-track|epub-page-viewport) \{[^}]*touch-action:/);
   assert.match(readerSource, /Math\.abs\(page - activePage\) <= 2/);
+  assert.match(readerSource, /viewMode, setViewMode/);
+  assert.match(readerSource, /reader-pdf-track\$\{viewMode === "continuous"/);
+  assert.match(readerSource, /aria-label="跳转到页码"/);
+  assert.match(readerSource, /title="适合宽度"/);
+  assert.match(readerSource, /const \[viewMode, setViewMode\] = useState<"paged" \| "continuous">/);
+  assert.match(readerSource, /reader-epub-page-viewport\$\{viewMode === "continuous"/);
+  assert.match(readerSource, /scrollPosition: scrollPositionRef\.current/);
+  assert.match(readerSource, /scrollPositionRef\.current, scrollLeft: scrollPositionRef\.current, viewMode/);
+  assert.match(readerSource, /aria-label="跳转到当前章节页码"/);
+  assert.match(readerSource, /title=\{viewMode === "continuous" \? "切换分页阅读" : "切换连续阅读"\}/);
+  assert.match(readerSource, /target\.scrollIntoView\(\{ behavior: "smooth", block: "start"/);
+  assert.match(readerStyles, /\.reader-pdf-track\.is-continuous \{[^}]*flex-direction: column;[^}]*scroll-snap-type: y proximity/);
+  assert.match(readerStyles, /\.reader-epub-page-viewport\.is-continuous \{[^}]*overflow-y: auto;[^}]*scroll-snap-type: y proximity/);
+  assert.match(readerStyles, /\.reader-epub-content\.is-continuous \{[^}]*column-width: auto;[^}]*column-gap: 0/);
   assert.match(readerSource, /scrollFrameRef/);
   assert.match(readerSource, /contentRef/);
   assert.match(readerSource, /reader-pdf-text-layer textLayer file-reader-document reader-text-container/);
@@ -504,6 +518,7 @@ test("reader normalized resources round-trip through the encrypted cold-storage 
       age: fakeAge(tools), aliyunpan: fakeAliyun(tools, cloud), ageRecipient, ageIdentity,
       relayDir: path.join(root, "relay"), downloadDir: path.join(root, "downloads"),
       isolationRoot: path.join(root, "isolated"), readerIsolationRoot: path.join(root, "reader-isolated"), driveId: "test-drive",
+      readerOwnerUid: process.getuid?.(), readerOwnerGid: process.getgid?.(),
     };
     const archived = archiveReaderVersion(roots, fixture.version.id, 15);
     assert.equal(fs.existsSync(resource), false);
@@ -512,6 +527,12 @@ test("reader normalized resources round-trip through the encrypted cold-storage 
     assert.equal(cold?.storage_state, "cold");
     restoreReaderVersion(roots, fixture.version.id, LEGACY_USER_ID);
     assert.equal(fs.readFileSync(resource, "utf8"), "<p>round-trip</p>");
+    const restoredRootStat = fs.statSync(path.dirname(resource));
+    assert.equal(restoredRootStat.mode & 0o777, 0o700);
+    if (process.getuid && process.getgid) {
+      assert.equal(restoredRootStat.uid, process.getuid());
+      assert.equal(restoredRootStat.gid, process.getgid());
+    }
     const restored = db.getReadingVersion(fixture.version.id, LEGACY_USER_ID);
     assert.equal(restored?.storage_state, "local");
     assert.equal(restored?.status, "ready");

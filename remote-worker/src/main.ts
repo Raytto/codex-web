@@ -22,6 +22,7 @@ import { collectGeneratedImages, snapshotGeneratedImages } from "./generated-ima
 import { buildRemoteSteerPrompt, buildRemoteTurnPrompt } from "./agent-context.js";
 import { syncAccountSkills } from "./account-skills.js";
 import { runConversationTitleAgent } from "./conversation-title-agent.js";
+import { RolloutSizes } from "./rollout-sizes.js";
 import { localThreadLifecycles } from "./rollout-lifecycle.js";
 import { RemoteCodexAccountManager } from "./codex-accounts.js";
 
@@ -45,6 +46,7 @@ const workerUpdateResultPath = path.join(stateRoot, "worker-update-result.json")
 const workerOnlinePath = path.join(stateRoot, "worker-online.json");
 const outboxPath = path.join(stateRoot, "worker-outbox-v1.json");
 const lock = acquireLock(lockPath);
+const rolloutSizes = new RolloutSizes(codexHome);
 const activeRuns = new Map<string, ActiveRun>();
 const activeTitleAgents = new Map<string, AbortController>();
 const codexAccounts = new RemoteCodexAccountManager({
@@ -85,7 +87,7 @@ function connect(): void {
     type: "hello", protocolVersion: PROTOCOL_VERSION, workerId: config.workerId, machineName: config.machineName,
     enrollmentToken: config.enrollmentToken, platform: `${process.platform}-${process.arch}`,
     workerVersion: WORKER_VERSION, workerRelease: workerRelease().ref, workerCommit: workerRelease().commit,
-    capabilities: { deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true },
+    capabilities: { deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
     codexVersion: runtimeManager.snapshot().installedVersion, capacity: config.capacity,
   }));
   socket.on("message", (data, isBinary) => {
@@ -184,12 +186,14 @@ async function handle(message: ServerMessage): Promise<void> {
       let state;
       let login;
       let restart = false;
-      if (message.action === "list") state = codexAccounts.listAccounts();
+      let resetResult;
+      if (message.action === "list") state = message.refreshUsage ? await codexAccounts.listAccountsWithUsage() : codexAccounts.listAccounts();
       else if (message.action === "login_start") login = codexAccounts.beginLogin(message.label ?? "");
       else if (message.action === "login_status") login = codexAccounts.loginStatus(message.loginId ?? "");
       else if (message.action === "login_cancel") login = codexAccounts.cancelLogin(message.loginId ?? "");
       else if (message.action === "activate") { state = codexAccounts.activate(message.accountId ?? ""); restart = true; }
       else if (message.action === "delete") state = codexAccounts.delete(message.accountId ?? "");
+      else if (message.action === "reset_credit") resetResult = await codexAccounts.consumeResetCredit(message.accountId ?? "", message.attemptId ?? "");
       const response: Extract<WorkerMessage, { type: "codex_accounts_result" }> = {
         type: "codex_accounts_result", requestId: message.requestId, ok: true,
       };
@@ -198,6 +202,7 @@ async function handle(message: ServerMessage): Promise<void> {
         projectSyncMonitor?.reconcileLifecycles(response.threadStates);
       }
       if (state !== undefined) response.state = state;
+      if (resetResult !== undefined) response.resetResult = resetResult;
       if (login !== undefined) response.login = login;
       if (restart) response.restart = true;
       send(response);
@@ -220,6 +225,13 @@ async function handle(message: ServerMessage): Promise<void> {
       send({ type: "codex_upgrade_result", requestId: message.requestId, ok: true, runtime });
       setTimeout(() => shutdown(75), 1_000).unref();
     }, (error) => send({ type: "codex_upgrade_result", requestId: message.requestId, ok: false, message: error instanceof Error ? error.message : "Codex 升级失败" }));
+    return;
+  }
+  if (message.type === "thread_rollout_size") {
+    void rolloutSizes.read(message.threadId).then(
+      (bytes) => send({ type: "thread_rollout_size_result", requestId: message.requestId, bytes }),
+      () => send({ type: "thread_rollout_size_result", requestId: message.requestId, bytes: null }),
+    );
     return;
   }
   if (message.type === "project_fs") {

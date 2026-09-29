@@ -14,7 +14,18 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
 const READER_REMOTE_ROOT = "/codex-web/readers";
 const READER_ARCHIVE_FORMAT = "reader-normalized-v1";
 
-export type ReaderColdRoots = ColdStorageRoots & { readerIsolationRoot: string; readerRemoteRoot: string };
+export type ReaderColdRoots = ColdStorageRoots & {
+  readerIsolationRoot: string;
+  readerRemoteRoot: string;
+  /**
+   * The web container cannot read a tree restored by the root bridge while it
+   * is still owned by root.  Host invocations provide these IDs so the final
+   * atomic rename exposes the same ownership as a normal web-side ingest.
+   * They stay optional for the non-container test/local fallback.
+   */
+  readerOwnerUid?: number;
+  readerOwnerGid?: number;
+};
 export type ReaderColdCandidate = {
   versionId: string;
   sourceId: string;
@@ -78,6 +89,8 @@ function readerRoots(input: Partial<ReaderColdRoots> = {}): ReaderColdRoots {
     ...base,
     readerIsolationRoot: input.readerIsolationRoot ?? path.join(path.dirname(base.isolationRoot), "reader-isolated"),
     readerRemoteRoot: input.readerRemoteRoot ?? READER_REMOTE_ROOT,
+    readerOwnerUid: input.readerOwnerUid,
+    readerOwnerGid: input.readerOwnerGid,
   };
 }
 
@@ -261,6 +274,31 @@ function transition(sqlite: DatabaseSync, row: ReaderStorageRow, expected: strin
 function copyFile(source: string, target: string): void {
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   fs.copyFileSync(source, target); fs.chmodSync(target, 0o600);
+}
+
+function prepareReaderTreeForWeb(root: string, roots: ReaderColdRoots): void {
+  const uid = roots.readerOwnerUid;
+  const gid = roots.readerOwnerGid;
+  if (uid === undefined && gid === undefined) return;
+  if (uid === undefined || gid === undefined || !Number.isSafeInteger(uid) || uid < 0 || !Number.isSafeInteger(gid) || gid < 0) {
+    throw new Error("阅读资源网页属主配置无效");
+  }
+  const ownerUid = uid as number;
+  const ownerGid = gid as number;
+  const visit = (directory: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) throw new Error("恢复后的阅读资源包含符号链接");
+      if (stat.isDirectory()) visit(target);
+      else if (!stat.isFile()) throw new Error("恢复后的阅读资源包含非普通文件");
+      fs.chownSync(target, ownerUid, ownerGid);
+      fs.chmodSync(target, stat.isDirectory() ? 0o700 : 0o600);
+    }
+    fs.chownSync(directory, ownerUid, ownerGid);
+    fs.chmodSync(directory, 0o700);
+  };
+  visit(root);
 }
 
 export function listReaderColdCandidates(input: Partial<ReaderColdRoots> = {}, inactiveDays = 15): ReaderColdCandidate[] {
@@ -519,6 +557,11 @@ export function restoreReaderVersion(input: Partial<ReaderColdRoots>, versionId:
       if (!stat.isFile() || stat.size !== entry.size || sha256File(source) !== entry.sha256) throw new Error(`阅读资源成员校验失败: ${relative}`);
       copyFile(source, path.join(restored, relative));
     }
+    // The restore worker runs in the root-owned host bridge.  Match the
+    // ownership used by web-side EPUB ingest before publishing the tree;
+    // otherwise the first container scandir fails with EACCES even though
+    // the archive and every member hash are valid.
+    prepareReaderTreeForWeb(restored, roots);
 
     assertNoSymlinkAncestors(roots.dataRoot, path.dirname(target));
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });

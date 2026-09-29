@@ -1,3 +1,4 @@
+import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -45,7 +46,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -54,7 +55,7 @@ type PendingRuntime = { workerId: string; resolve(value: ExecutorRuntimeStatus):
 type PendingUpgrade = { workerId: string; resolve(value: ExecutorRuntimeStatus): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingWorkerConfig = { workerId: string; capacity: number; resolve(value: ExecutorView): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingTitleAgent = { workerId: string; resolve(output: string): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
-type PendingCodexAccounts = { workerId: string; action: string; resolve(value: { state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
+type PendingCodexAccounts = { workerId: string; action: string; resolve(value: { resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingFileFetch = {
   workerId: string;
   transferToken: string;
@@ -150,6 +151,8 @@ export type ExecutorView = {
 export class RemoteWorkerGateway extends EventEmitter {
   private readonly server = new WebSocketServer({ noServer: true, maxPayload: REMOTE_WORKER_MAX_MESSAGE_BYTES });
   private readonly connections = new Map<string, Connection>();
+  private readonly pendingRolloutSizes = new Map<string, { workerId: string; resolve(value: number | null): void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly rolloutSizes = new Map<string, { expiresAt: number; value: Promise<number | null> }>();
   private readonly pendingFs = new Map<string, PendingFs>();
   private readonly pendingRenames = new Map<string, PendingRename>();
   private readonly pendingThreadSyncs = new Map<string, PendingThreadSync>();
@@ -218,6 +221,9 @@ export class RemoteWorkerGateway extends EventEmitter {
     for (const [requestId, pending] of this.pendingCodexAccounts) {
       clearTimeout(pending.timer); this.pendingCodexAccounts.delete(requestId); pending.reject(new Error("服务正在停止"));
     }
+    for (const pending of this.pendingRolloutSizes.values()) { clearTimeout(pending.timer); pending.resolve(null); }
+    this.pendingRolloutSizes.clear();
+    this.rolloutSizes.clear();
     this.server.close();
   }
 
@@ -359,10 +365,22 @@ export class RemoteWorkerGateway extends EventEmitter {
     return Boolean(connection?.codexAccounts && connection.socket.readyState === WebSocket.OPEN);
   }
 
-  listCodexAccounts(executorId: string): Promise<RemoteCodexAccountsState> {
+  consumeResetCredit(executorId: string, accountId: string, attemptId: string): Promise<ResetConsumption> {
+    const version = this.executor(executorId)?.worker?.installedVersion ?? "";
+    const parts = version.split(".").map(Number);
+    if (!(parts[0] > 1 || (parts[0] === 1 && (parts[1] > 19 || (parts[1] === 19 && parts[2] >= 6))))) {
+      return Promise.reject(new Error("请先升级此机器的 Worker，才能使用重置卡。"));
+    }
+    return this.codexAccountsRequest(executorId, "reset_credit", { accountId, attemptId }).then((result) => {
+      if (!result.resetResult) throw new Error("远程 Worker 未返回重置结果，请重试核对同一次操作。");
+      return result.resetResult;
+    });
+  }
+
+  listCodexAccounts(executorId: string, refreshUsage = false): Promise<RemoteCodexAccountsState> {
     const workerId = workerIdFromExecutor(executorId);
     const threadIds = workerId && this.connection(workerId).threadLifecycle ? this.db.listRunningCodexThreadIdsForExecutor(executorId) : undefined;
-    return this.codexAccountsRequest(executorId, "list", threadIds ? { threadIds } : {}).then((result) => {
+    return this.codexAccountsRequest(executorId, "list", { ...(threadIds ? { threadIds } : {}), ...(refreshUsage ? { refreshUsage: true } : {}) }).then((result) => {
       const requested = new Set(threadIds);
       for (const state of result.threadStates ?? []) {
         if (!requested.has(state.threadId)) continue;
@@ -423,14 +441,14 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[] }): Promise<{ state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
+  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string }): Promise<{ resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
     const connection = this.connection(workerId);
     if (!connection.codexAccounts) return Promise.reject(new Error("该节点需要先升级 Worker，才能管理 Codex 账号。"));
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pendingCodexAccounts.delete(requestId); reject(new Error("远程 Codex 账号请求超时")); }, 30_000);
+      const timer = setTimeout(() => { this.pendingCodexAccounts.delete(requestId); reject(new Error("远程 Codex 账号请求超时")); }, action === "reset_credit" ? 90_000 : 30_000);
       this.pendingCodexAccounts.set(requestId, { workerId, action, resolve, reject, timer });
       this.send(connection.socket, { type: "codex_accounts", requestId, action, ...fields });
     });
@@ -492,6 +510,24 @@ export class RemoteWorkerGateway extends EventEmitter {
       this.pendingWorkerConfigs.set(requestId, { workerId, capacity, resolve, reject, timer });
       this.send(connection.socket, { type: "worker_config", requestId, capacity });
     });
+  }
+
+  threadRolloutBytes(workerId: string, threadId: string): Promise<number | null> {
+    const connection = this.connections.get(workerId);
+    if (!connection?.threadRolloutSize || connection.socket.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+    const key = `${workerId}:${threadId}`;
+    const now = Date.now();
+    const cached = this.rolloutSizes.get(key);
+    if (cached && cached.expiresAt > now) return cached.value;
+    for (const [id, entry] of this.rolloutSizes) if (entry.expiresAt <= now) this.rolloutSizes.delete(id);
+    const requestId = crypto.randomUUID();
+    const value = new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => { this.pendingRolloutSizes.delete(requestId); resolve(null); }, 3_000);
+      this.pendingRolloutSizes.set(requestId, { workerId, resolve, timer });
+      this.send(connection.socket, { type: "thread_rollout_size", requestId, threadId });
+    });
+    this.rolloutSizes.set(key, { expiresAt: now + 15_000, value });
+    return value;
   }
 
   async projectFs(executorId: string, action: "list" | "create" | "validate" | "initialize", directory: string, name?: string, content?: string): Promise<RemoteProjectFsResult> {
@@ -970,6 +1006,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       accountSkills: Boolean(hello.capabilities?.accountSkills),
       titleAgent: Boolean(hello.capabilities?.titleAgent),
       codexAccounts: Boolean(hello.capabilities?.codexAccounts),
+      threadRolloutSize: Boolean(hello.capabilities?.threadRolloutSize),
       threadLifecycle: Boolean(hello.capabilities?.threadLifecycle),
       accountSwitching: false,
       deviceCredentials: Boolean(hello.capabilities?.deviceCredentials),
@@ -1004,7 +1041,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     }
     if (currentConnection?.migrationOnly && !["heartbeat", "worker_update_ack", "worker_update_result"].includes(message.type)) return;
     if (message.type === "quota_usage") {
-      if (!message.usage || typeof message.usage.remainingPercent !== "number" || !Number.isFinite(message.usage.remainingPercent)) return;
+      if (!message.usage || (message.usage.remainingPercent !== null && (typeof message.usage.remainingPercent !== "number" || !Number.isFinite(message.usage.remainingPercent)))) return;
       const executorId = remoteExecutorId(workerId);
       if (this.db.setExecutorCodexQuota(executorId, message.usage, message.accountId)) {
         this.emit("quota_usage", { workerId, executorId, usage: message.usage });
@@ -1106,7 +1143,15 @@ export class RemoteWorkerGateway extends EventEmitter {
       clearTimeout(pending.timer);
       this.pendingCodexAccounts.delete(message.requestId);
       if (!message.ok) pending.reject(new Error(message.message || "远程 Codex 账号操作失败"));
-      else pending.resolve({ state: message.state, login: message.login, restart: message.restart, threadStates: message.threadStates });
+      else pending.resolve({ state: message.state, login: message.login, restart: message.restart, threadStates: message.threadStates, resetResult: message.resetResult });
+      return;
+    }
+    if (message.type === "thread_rollout_size_result") {
+      const pending = this.pendingRolloutSizes.get(message.requestId);
+      if (!pending || pending.workerId !== workerId) return;
+      clearTimeout(pending.timer);
+      this.pendingRolloutSizes.delete(message.requestId);
+      pending.resolve(message.bytes);
       return;
     }
     if (message.type === "title_agent_result") {
@@ -1210,6 +1255,11 @@ export class RemoteWorkerGateway extends EventEmitter {
   }
 
   private armJobDisconnectTimers(workerId: string): void {
+    for (const [id, pending] of this.pendingRolloutSizes) {
+      if (pending.workerId !== workerId) continue;
+      clearTimeout(pending.timer); this.pendingRolloutSizes.delete(id); pending.resolve(null);
+    }
+    for (const key of this.rolloutSizes.keys()) if (key.startsWith(`${workerId}:`)) this.rolloutSizes.delete(key);
     for (const [jobId, pending] of this.pendingJobs) {
       if (pending.workerId !== workerId || pending.disconnectTimer) continue;
       pending.disconnectTimer = setTimeout(() => this.failJob(jobId, new Error("远程电脑断线超过 90 秒")), 90_000);

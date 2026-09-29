@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, CircleDashed, Gauge, LoaderCircle, Mic, RefreshCw, Search, X } from "lucide-react";
+import { Activity, Ban, CircleDashed, Gauge, LoaderCircle, Mic, RefreshCw, Search, Undo2, X } from "lucide-react";
 import { api, type VoiceLexiconManagement, type VoiceLexiconTerm } from "./api";
 
-type VoiceLexiconTab = "selected" | "candidates";
+type VoiceLexiconTab = "selected" | "candidates" | "suppressed";
 
 function formatDate(value: string | null): string {
   if (!value) return "暂无";
@@ -29,16 +29,27 @@ function termMatches(term: VoiceLexiconTerm, query: string): boolean {
   return haystack.includes(query.toLocaleLowerCase());
 }
 
-function VoiceKeywordCard({ term, rank }: { term: VoiceLexiconTerm; rank?: number }) {
+function VoiceKeywordCard({ term, rank, busy, pending, onToggle }: {
+  term: VoiceLexiconTerm; rank?: number; busy: boolean; pending: boolean;
+  onToggle: (term: VoiceLexiconTerm) => void;
+}) {
   const weight = Math.max(0, Math.min(100, term.rank_index));
   return <article className="voice-keyword-card">
     <header>
-      {rank && <strong className="voice-keyword-rank">#{rank}</strong>}
+      {rank ? <strong className="voice-keyword-rank">#{rank}</strong> : <span />}
       <div className="voice-keyword-copy">
         <div><h3>{term.canonical_text}</h3>{term.pinned && <span className="pinned">置顶</span>}<span>{term.term_kind || "专业术语"}</span><span>{term.project_name ?? "全局"}</span></div>
         {term.aliases.length > 0 && <p>常见误识别：{term.aliases.join("、")}</p>}
       </div>
-      <span className={`voice-keyword-state ${term.status}`}>{term.status === "active" ? "已选" : term.status === "conflicted" ? "有冲突" : "候选"}</span>
+      <div className="voice-keyword-actions">
+        <span className={`voice-keyword-state ${term.status}`}>{term.status === "suppressed" ? "已禁用" : term.status === "active" ? "已选" : term.status === "conflicted" ? "有冲突" : "候选"}</span>
+        <button type="button" disabled={busy} onClick={() => onToggle(term)}
+          aria-label={`${term.status === "suppressed" ? "恢复" : "禁用"}关键词 ${term.canonical_text}`}
+          title={term.status === "suppressed" ? "恢复后按证据和排名参与筛选" : `禁用${term.project_name ? `“${term.project_name}”项目` : "全局"}范围的关键词；可在已禁用中恢复`}>
+          {pending ? <LoaderCircle className="spin" size={13} /> : term.status === "suppressed" ? <Undo2 size={13} /> : <Ban size={13} />}
+          {term.status === "suppressed" ? "恢复" : "禁用"}
+        </button>
+      </div>
     </header>
     <div className="voice-keyword-weight" title="综合权重：可靠误识别率、使用强度和近期误识别共同计算">
       <span><Gauge size={14} /><b>综合权重</b><strong>{formatDecimal(term.rank_index)}</strong></span>
@@ -62,6 +73,18 @@ export function VoiceLexiconDialog({ onClose }: { onClose: () => void }) {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [pendingId, setPendingId] = useState<string | null>(null);
+  const [notice, setNotice] = useState("");
+
+  const toggleTerm = async (term: VoiceLexiconTerm) => {
+    const disabled = term.status !== "suppressed";
+    setPendingId(term.id); setError(""); setNotice("");
+    try {
+      setData(await api.setVoiceKeywordDisabled(term.id, disabled));
+      setNotice(disabled ? `已禁用“${term.canonical_text}”，可在“已禁用”中恢复。` : `已恢复“${term.canonical_text}”，将按证据和排名参与筛选。`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "关键词操作失败，请重试"); }
+    finally { setPendingId(null); }
+  };
 
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -77,19 +100,20 @@ export function VoiceLexiconDialog({ onClose }: { onClose: () => void }) {
     return () => document.removeEventListener("keydown", close);
   }, [onClose]);
 
-  const sourceTerms = tab === "selected" ? data?.selectedTerms ?? [] : data?.candidateTerms ?? [];
+  const sourceTerms = tab === "selected" ? data?.selectedTerms ?? [] : tab === "suppressed" ? data?.suppressedTerms ?? [] : data?.candidateTerms ?? [];
   const visibleTerms = useMemo(() => sourceTerms.filter((term) => termMatches(term, query.trim())), [query, sourceTerms]);
   const selectedRanks = useMemo(() => new Map((data?.selectedTerms ?? []).map((term, index) => [term.id, index + 1])), [data?.selectedTerms]);
 
   return <div className="project-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="project-dialog personal-memory-dialog voice-lexicon-dialog" role="dialog" aria-modal="true" aria-labelledby="voice-lexicon-dialog-title">
       <header>
-        <div><h2 id="voice-lexicon-dialog-title">语音关键词</h2><p>查看当前账号用于语音识别的高价值词和仍在积累证据的候选词。</p></div>
+        <div><h2 id="voice-lexicon-dialog-title">语音关键词</h2><p>禁用错误关键词后不再用于后续识别，也不会被自动启用；仅影响卡片所示范围，可随时恢复。</p></div>
         <button type="button" onClick={onClose} aria-label="关闭语音关键词"><X size={18} /></button>
       </header>
       <nav className="personal-memory-tabs" aria-label="语音关键词页面">
         <button type="button" className={tab === "selected" ? "active" : ""} onClick={() => { setTab("selected"); setQuery(""); }}><Mic size={15} />已选词{data && <span>{data.selectedTerms.length}</span>}</button>
         <button type="button" className={tab === "candidates" ? "active" : ""} onClick={() => { setTab("candidates"); setQuery(""); }}><Activity size={15} />候选词{data && data.candidateCount > 0 && <span>{data.candidateCount}</span>}</button>
+        <button type="button" className={tab === "suppressed" ? "active" : ""} onClick={() => { setTab("suppressed"); setQuery(""); }}><Ban size={16} />已禁用<span>{data?.suppressedCount ?? 0}</span></button>
       </nav>
       <div className="project-dialog-body personal-memory-body voice-lexicon-body" aria-busy={loading}>
         {loading && !data && <div className="personal-memory-state"><LoaderCircle className="spin" size={20} />正在加载语音关键词…</div>}
@@ -103,22 +127,23 @@ export function VoiceLexiconDialog({ onClose }: { onClose: () => void }) {
               <div><strong>{data.submitted_pending}</strong><span>待复核语音</span></div>
               <div><strong>{data.run_count}</strong><span>累计批次</span></div>
             </div>
-            <button type="button" onClick={() => void load()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={15} />刷新</button>
+            <button type="button" onClick={() => void load()} disabled={loading || pendingId !== null}><RefreshCw className={loading ? "spin" : ""} size={15} />刷新</button>
           </section>
           <details className="voice-lexicon-explainer">
             <summary>指标怎样计算</summary>
             <p>这里展示账号内的综合排名；实际识别会从全局词和当前项目词中选取最重要的 {data.maxSelectedTerms} 个。综合权重以可靠误识别率为主（72%），使用强度（20%）和近期误识别（8%）为辅；使用次数按30天半衰期衰减，误识别按60天半衰期衰减。候选词出现重复证据或一次高置信严重误识别后，才会进入已选词。</p>
           </details>
           <div className="voice-lexicon-toolbar">
-            <label><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={tab === "selected" ? "搜索已选关键词" : "搜索全部候选词"} aria-label="搜索语音关键词" /></label>
+            <label><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={tab === "selected" ? "搜索已选关键词" : tab === "suppressed" ? "搜索已禁用关键词" : "搜索全部候选词"} aria-label="搜索语音关键词" /></label>
             <span>显示 {visibleTerms.length} / {sourceTerms.length}</span>
           </div>
+          {notice && <div className="voice-lexicon-notice" role="status">{notice}</div>}
           <section className="voice-keyword-list">
-            {visibleTerms.map((term) => <VoiceKeywordCard key={term.id} term={term} rank={tab === "selected" ? selectedRanks.get(term.id) : undefined} />)}
-            {visibleTerms.length === 0 && <div className="personal-memory-empty"><Mic size={22} /><strong>{query ? "没有匹配的关键词" : tab === "selected" ? "还没有已选关键词" : "还没有候选关键词"}</strong><span>{query ? "换一个关键词、别名或词类试试。" : "新的已提交语音达到批次条件后，系统会自动复核并更新这里。"}</span></div>}
+            {visibleTerms.map((term) => <VoiceKeywordCard key={term.id} term={term} rank={tab === "selected" ? selectedRanks.get(term.id) : undefined} busy={loading || pendingId !== null} pending={pendingId === term.id} onToggle={(item) => void toggleTerm(item)} />)}
+            {visibleTerms.length === 0 && <div className="personal-memory-empty"><Mic size={22} /><strong>{query ? "没有匹配的关键词" : tab === "selected" ? "还没有已选关键词" : tab === "suppressed" ? "没有已禁用关键词" : "还没有候选关键词"}</strong><span>{query ? "换一个关键词、别名或词类试试。" : tab === "suppressed" ? "禁用的关键词会保留在这里，可随时恢复。" : "新的已提交语音达到批次条件后，系统会自动复核并更新这里。"}</span></div>}
           </section>
         </>}
-        {error && <div className="project-dialog-error personal-memory-error">{error}</div>}
+        {error && <div role="alert" className="project-dialog-error personal-memory-error">{error}</div>}
       </div>
     </section>
   </div>;

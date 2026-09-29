@@ -1,3 +1,4 @@
+import { paraJobPrompt } from "./para-schema.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { ThreadEvent } from "@openai/codex-sdk";
@@ -6,7 +7,6 @@ import { AppDatabase, type FileRow, type JobFinalizationPayload, type JobAttempt
 import { codexThreadRolloutBytes, ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, normalizeStoredRelativePath, resolveGeneratedImage, resolveInside, snapshotDeliverables, snapshotGeneratedImages } from "./paths.js";
 import { cleanupJobRuntime, jobRuntimeRoot, prepareJobRuntime, resolvePythonRuntime, type JobRuntimeCleanupTarget } from "./python-runtime.js";
 import { assessTaskPolicy } from "./task-policy.js";
-import { latestUserCancellationContext } from "./cancellation-summary.js";
 import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import type { AgentSelection, ExecutorRuntimeStatus } from "./model-options.js";
 import { startTenantTurn } from "./tenant-worker-execution.js";
@@ -32,6 +32,7 @@ import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wa
 import { cleanupFinalizationDirectory, prepareFinalizationFiles, recoverPreparedFinalization, rollbackUncommittedFinalization, sweepFinalizationOrphans, type FinalizationFileSource } from "./job-finalization.js";
 import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
 import { MODEL_CAPACITY_CONTINUATION_PROMPT } from "./internal-messages.js";
+import { withTaskRecoveryPrompt } from "./task-recovery.js";
 
 export { MODEL_CAPACITY_CONTINUATION_PROMPT, isModelCapacityContinuationPrompt } from "./internal-messages.js";
 
@@ -267,7 +268,8 @@ export class CodexRunner {
       return codexThreadRolloutBytes(ensureTenant(this.config.tenantRoot, conversation.user_id).codexHome, conversation.codex_thread_id);
     }
     const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
-    if (project && workerIdFromExecutor(project.executor_id)) return conversation.rollout_bytes;
+    const remoteWorkerId = project && workerIdFromExecutor(project.executor_id);
+    if (remoteWorkerId) return (await this.remoteWorkers.threadRolloutBytes(remoteWorkerId, conversation.codex_thread_id)) ?? conversation.rollout_bytes;
     return this.hostWorkerClient.threadRolloutBytes(conversation.user_id, conversation.codex_thread_id);
   }
 
@@ -335,15 +337,26 @@ export class CodexRunner {
     return this.remoteWorkers.upgradeCodex(executorId, version);
   }
 
-  async listCodexAccounts(userId: string, executorId = HOST_EXECUTOR_ID): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
+  async listCodexAccounts(userId: string, executorId = HOST_EXECUTOR_ID, refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
     if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
     const previousAccountId = this.db.getExecutorActiveCodexAccount(executorId);
     const state = executorId === HOST_EXECUTOR_ID
-      ? await this.hostWorkerClient.listCodexAccounts(userId)
-      : await this.remoteWorkers.listCodexAccounts(executorId);
+      ? await this.hostWorkerClient.listCodexAccounts(userId, refreshUsage)
+      : await this.remoteWorkers.listCodexAccounts(executorId, refreshUsage);
     this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId);
     if (previousAccountId !== state.activeAccountId) this.remoteWorkers.emit("quota_usage", { executorId });
     return this.withAccountQuotas(executorId, state);
+  }
+
+  async consumeResetCredit(userId: string, accountId: string, attemptId: string, executorId = HOST_EXECUTOR_ID) {
+    if (!isHostRootUser(userId)) throw new Error("当前账号不能管理 Codex 账号");
+    const result = executorId === HOST_EXECUTOR_ID
+      ? await this.hostWorkerClient.consumeResetCredit(userId, accountId, attemptId)
+      : await this.remoteWorkers.consumeResetCredit(executorId, accountId, attemptId);
+    this.db.setAccountCodexQuota(executorId, accountId, { remainingPercent: result.quota?.remainingPercent ?? null,
+      resetAt: result.quota?.resetAt ?? null, resetCredits: result.resetCredits });
+    this.remoteWorkers.emit("quota_usage", { executorId });
+    return result;
   }
 
   beginCodexAccountLogin(userId: string, label: string, executorId = HOST_EXECUTOR_ID): Promise<CodexAccountLoginView> {
@@ -389,11 +402,13 @@ export class CodexRunner {
       ...state,
       accounts: state.accounts.map((account) => {
         const quota = this.db.getExecutorCodexQuota(executorId, account.id);
+        if (account.resetCredits) this.db.setAccountResetCredits(executorId, account.id, account.resetCredits);
         return {
           ...account,
           quotaRemainingPercent: quota?.remainingPercent ?? null,
           quotaResetAt: quota?.resetAt ?? null,
           quotaUpdatedAt: quota?.updatedAt ?? null,
+          resetCredits: this.db.getAccountResetCredits(executorId, account.id),
         };
       }),
     };
@@ -465,6 +480,7 @@ export class CodexRunner {
     let remoteOmittedArtifacts: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]> = [];
     let executionObserved = false;
     let capacityAttemptHadProgress = false;
+    const reportedErrors = new Set<string>();
     let attemptState: JobAttemptState | undefined = this.db.getJobAttemptState(jobId);
     let capacityContinuationRequired = attemptState?.continuation ?? false;
     this.abortControllers.set(jobId, controller);
@@ -502,14 +518,8 @@ export class CodexRunner {
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
-      const latestAssistant = this.db.getLatestAssistantMessage(conversationId);
-      const interruptedContext = latestUserCancellationContext(latestAssistant ? [{
-        id: latestAssistant.id,
-        conversation_id: conversationId,
-        role: "assistant",
-        content: latestAssistant.content,
-        created_at: "",
-      }] : []);
+      const recoveryCheckpoint = this.db.getTaskRecoveryForTurn(conversationId, jobId);
+      const recoveredPrompt = withTaskRecoveryPrompt(prompt, recoveryCheckpoint);
       const storedCapabilities = this.db.getConversationOptionalCapabilities(conversationId);
       const optionalCapabilities = storedCapabilities
         ? updateOptionalAgentCapabilities(storedCapabilities, [prompt])
@@ -529,10 +539,9 @@ export class CodexRunner {
       const attachments = this.attachmentContext(uploads, workspace, agentWorkspace, hostRoot);
       const imageInputDecision = decideImageInput(attachments);
       const baseEffectivePrompt = buildAgentTurnPrompt({
-        userPrompt: prompt,
+        userPrompt: recoveredPrompt + paraJobPrompt(this.db.sqlite, jobId),
         attachments,
         personalContext,
-        interruptedContext,
         runtimeWarning: !hostRoot && !pythonRuntime.ready
           ? "共享 Python 尚未初始化；如本轮需要 Python 或第三方包，请说明需要管理员先初始化，勿修改系统 Python。"
           : undefined,
@@ -545,7 +554,7 @@ export class CodexRunner {
       const legacyWaitInstructions = Boolean(automation && remoteWorkerId && !remoteDynamicWait && !conversation.codex_thread_id);
       const effectivePrompt = appendWaitAutomationInstructions(baseEffectivePrompt, legacyWaitInstructions);
       const continuationEffectivePrompt = buildAgentTurnPrompt({
-        userPrompt: MODEL_CAPACITY_CONTINUATION_PROMPT,
+        userPrompt: withTaskRecoveryPrompt(MODEL_CAPACITY_CONTINUATION_PROMPT, recoveryCheckpoint, true),
         attachments: [],
         personalContext,
         runtimeWarning: !hostRoot && !pythonRuntime.ready
@@ -642,6 +651,10 @@ export class CodexRunner {
             return;
           }
           if (containsPersonalContext(payload)) return;
+          if (payload && typeof payload === "object" && "kind" in payload && payload.kind === "error") {
+            const event = payload as { label?: string; detail?: string; message?: string };
+            for (const value of [event.label, event.detail, event.message]) if (value) reportedErrors.add(value);
+          }
           this.publish(jobId, "progress", payload);
         },
       };
@@ -660,9 +673,9 @@ export class CodexRunner {
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
         capacityAttemptHadProgress = false;
         const continuationAttempt = capacityContinuationRequired;
-        const attemptUserPrompt = capacityRetryPrompt(prompt, continuationAttempt);
+        const attemptUserPrompt = withTaskRecoveryPrompt(capacityRetryPrompt(prompt, continuationAttempt), recoveryCheckpoint, continuationAttempt);
         const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
-        const attemptRemotePrompt = appendPersonalContextToUserPrompt(attemptUserPrompt, personalContext);
+        const attemptRemotePrompt = appendPersonalContextToUserPrompt(attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)), personalContext);
         const attemptUploads = continuationAttempt ? [] : uploads;
         request.effectivePrompt = attemptEffectivePrompt;
         request.imagePaths = continuationAttempt ? [] : selectedImagePaths
@@ -693,7 +706,6 @@ export class CodexRunner {
               turnContext: {
                 version: 1 as const,
                 userPrompt: attemptRemotePrompt,
-                ...(!continuationAttempt && interruptedContext ? { interruptedContext } : {}),
                 imageInput: !continuationAttempt && imageInputDecision.preload ? "preload" as const : "none" as const,
               },
             } : {}),
@@ -824,6 +836,11 @@ export class CodexRunner {
         console.warn("Finalization staging cleanup failed", error instanceof Error ? error.message : error);
       });
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Agent 任务失败";
+      if (!controller.signal.aborted && !reportedErrors.has(errorMessage)) {
+        try { this.publish(jobId, "progress", { kind: "error", label: errorMessage }); }
+        catch { /* Preserve terminal handling if the event store is unavailable. */ }
+      }
       if (!controller.signal.aborted && isModelCapacityError(error) && attemptState) {
         const now = Date.now();
         attemptState.capacityStartedAt ??= now;

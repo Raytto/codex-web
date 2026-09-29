@@ -39,3 +39,12 @@ on the authenticated outbound Worker channel. See the invariants in
 Reader/chat selections retain native DOM identity and restored text anchors;
 Agent streams preserve literal commands as described in
 [content fidelity](AGENT_CONTENT_FIDELITY.md).
+
+
+## Project boards, task handoffs and reader updates
+
+The [PARA module](features/PARA_BOARD.md) keeps boards, areas, projects, resource versions and conversation relations in additive SQLite tables. Tenant-owned resource files are independent of the source conversation. Triggers capture a primary-project snapshot for Jobs and pending inputs; queue promotion carries the accepted snapshot forward. Reference associations do not inject context or change executor authorization. Revision checks and idempotency keys guard writes, while generation checks discard stale browser reads.
+
+[Recovery checkpoints](TASK_RECOVERY.md) are captured before terminal cleanup and retrieved only across the same conversation/thread with valid job ordering. Successful completion closes prior recovery context. Writer shutdown forms an exit barrier before a new task takes ownership. Raw answer stream events remain durable but no longer consume the visible progress snapshot window.
+
+Worker 1.19.7 carries sanitized reset-credit summaries and optional single-thread rollout byte counts. Reads are bounded and coalesced; account redemption remains on the selected machine with durable receipts. The reader adds paged/continuous PDF and EPUB modes without removing bounded rendering, and memoizes HTML/Markdown document insertion so UI updates preserve native ranges.

@@ -24,6 +24,7 @@ function testConfig(dataRoot: string) {
     publicBaseUrl: "https://example.test",
     dashscopeApiKey: "test-dashscope-key",
     dashscopeBaseUrl: "https://example.test/v1",
+    dashscopeModel: "fixture-transcription-model",
     transcriptionPollMs: 0,
     transcriptionTimeoutMs: 1000,
   });
@@ -117,7 +118,9 @@ test("Qwen Omni streams mixed-language text with bounded spelling context", asyn
     assert.equal(calls.length, 1);
     assert.equal(new Headers(calls[0].init?.headers).get("Authorization"), "Bearer test-dashscope-key");
     const submitted = JSON.parse(String(calls[0].init?.body));
-    assert.equal(submitted.model, "qwen3.5-omni-plus");
+    assert.equal(submitted.model, "fixture-transcription-model");
+    assert.equal(submitted.reasoning_effort, undefined);
+    assert.match(submitted.messages[0].content, /保留口头改口、重复、否定、数字和单位/);
     assert.deepEqual(submitted.modalities, ["text"]);
     assert.equal(submitted.stream, true);
     assert.match(submitted.messages[0].content, /当前尚未发送的输入草稿.*PowerPoint/s);
@@ -240,6 +243,39 @@ test("Omni SSE extraction ignores malformed and terminal events", () => {
   assert.equal(textFromSseLine("data: [DONE]"), "");
   assert.equal(textFromSseLine("event: message"), "");
   assert.equal(textFromSseLine("data: not-json"), "");
+  assert.equal(textFromSseLine('data: {"choices":[{"delta":{"reasoning_content":"不应进入转写的思考"}}]}'), "");
+});
+
+test("legacy Qwen 3.5 override keeps a compatible request without reasoning_effort", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-"));
+  try {
+    const service = new TranscriptionService({ ...testConfig(root), dashscopeModel: "qwen3.5-omni-plus" }, (async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.model, "qwen3.5-omni-plus");
+      assert.equal("reasoning_effort" in body, false);
+      return new Response('data: {"choices":[{"delta":{"content":"兼容旧模型"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    }) as typeof fetch);
+    const name = `${crypto.randomUUID()}.wav`;
+    fs.writeFileSync(path.join(service.audioRoot, name), testWavBuffer());
+    assert.equal(await service.transcribe(name), "兼容旧模型");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("truncated or failed SSE never returns a partial transcription as success", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-"));
+  try {
+    const prefix = 'data: {"choices":[{"delta":{"content":"只有前半句"}}]}\n\n';
+    for (const [suffix, expected] of [
+      ['', /语音识别连接中断/],
+      ['data: {"error":{"code":"InternalError"}}\n\ndata: [DONE]\n\n', /语音识别连接中断/],
+      ['data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n', /录音转写未完整生成/],
+    ] as const) {
+      const service = new TranscriptionService(testConfig(root), (async () => new Response(prefix + suffix)) as typeof fetch, undefined, undefined, []);
+      const name = `${crypto.randomUUID()}.wav`;
+      fs.writeFileSync(path.join(service.audioRoot, name), testWavBuffer());
+      await assert.rejects(() => service.transcribe(name), expected);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("transcription context is normalized, capped and marked as non-audio data", () => {
