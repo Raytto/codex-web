@@ -82,24 +82,30 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
   const outputPath = path.join(dataRoot, "deliverables", outputId, "report.txt");
   const sharedId = crypto.randomUUID();
   const sharedPath = path.join(dataRoot, "deliverables", sharedId, "shared.txt");
+  const imageId = crypto.randomUUID();
+  const imagePath = path.join(dataRoot, "deliverables", imageId, "chart.png");
   const rolloutPath = path.join(codexHome, "archived_sessions", `rollout-${threadId}.jsonl`);
-  for (const file of [uploadPath, htmlPath, runtimePath, rootReportPath, outputPath, sharedPath, rolloutPath]) fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (const file of [uploadPath, htmlPath, runtimePath, rootReportPath, outputPath, sharedPath, imagePath, rolloutPath]) fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(uploadPath, "user upload");
   fs.writeFileSync(htmlPath, "<html>report</html>");
   fs.writeFileSync(runtimePath, "runtime cache");
   fs.writeFileSync(rootReportPath, "<html>root report</html>");
   fs.writeFileSync(outputPath, "text output");
   fs.writeFileSync(sharedPath, "public share");
+  fs.writeFileSync(imagePath, "public image");
   fs.writeFileSync(rolloutPath, "rollout history");
 
   const rows: FileRow[] = [
     { id: crypto.randomUUID(), conversation_id: conversationId, message_id: null, original_name: "input.txt", relative_path: "uploads/input.txt", mime_type: "text/plain", size: 11, kind: "upload", created_at: now },
     { id: outputId, conversation_id: conversationId, message_id: null, original_name: "report.txt", relative_path: `deliverables/${outputId}/report.txt`, mime_type: "text/plain", size: 11, kind: "output", created_at: now },
     { id: sharedId, conversation_id: conversationId, message_id: null, original_name: "shared.txt", relative_path: `deliverables/${sharedId}/shared.txt`, mime_type: "text/plain", size: 12, kind: "output", created_at: now },
+    { id: imageId, conversation_id: conversationId, message_id: null, original_name: "chart.png", relative_path: `deliverables/${imageId}/chart.png`, mime_type: "image/png", size: 12, kind: "output", created_at: now },
   ];
   db.addFiles(rows);
-  db.sqlite.prepare("INSERT INTO public_file_shares(id,file_id,user_id,file_name_snapshot,enabled,created_at,enabled_at) VALUES(?,?,?,?,1,?,?)")
-    .run(crypto.randomUUID(), sharedId, LEGACY_USER_ID, "shared.txt", now, now);
+  db.sqlite.prepare("INSERT INTO public_file_shares(id,file_id,user_id,file_name_snapshot,enabled,created_at,enabled_at,expires_at) VALUES(?,?,?,?,1,?,?,?)")
+    .run(crypto.randomUUID(), sharedId, LEGACY_USER_ID, "shared.txt", now, now, new Date(Date.now() + 30 * 24 * 60 * 60_000).toISOString());
+  db.sqlite.prepare("INSERT INTO public_file_share_assets(share_id,asset_file_id,source_ref,created_at) VALUES(?,?,?,?)")
+    .run(db.getPublicFileShare(sharedId)!.id, imageId, "chart.png", now);
   const normalId = crypto.randomUUID();
   const normalThreadId = crypto.randomUUID();
   db.createConversation(normalId, "normal old");
@@ -119,10 +125,10 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
   const candidate = listColdCandidates(roots).find((item) => item.conversationId === conversationId);
   assert.equal(candidate?.archived, true);
   assert.equal(candidate?.eligible, true, candidate?.reasons.join(","));
-  assert.equal(candidate?.drawing, false);
+  assert.equal(candidate?.drawing, true);
   assert.equal(candidate?.entries, 6);
   assert.equal(candidate?.reasons.includes("active_within_15_days"), false);
-  assert.equal(candidate?.sharedFiles, 1);
+  assert.equal(candidate?.sharedFiles, 2);
   const normalCandidate = listColdCandidates(roots).find((item) => item.conversationId === normalId);
   assert.equal(normalCandidate?.eligible, true);
   assert.equal(normalCandidate?.drawing, false);
@@ -139,7 +145,7 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
   assert.equal(fs.existsSync(archived.isolatedPath), true);
 
   let inspection = new AppDatabase(dataRoot, undefined, false);
-  const storage = inspection.sqlite.prepare("SELECT state,manifest_json,local_isolated_path FROM conversation_storage WHERE conversation_id=?").get(conversationId) as { state: string; manifest_json: string; local_isolated_path: string };
+  let storage = inspection.sqlite.prepare("SELECT state,manifest_json,local_isolated_path FROM conversation_storage WHERE conversation_id=?").get(conversationId) as { state: string; manifest_json: string; local_isolated_path: string };
   assert.equal(storage.state, "cold");
   const manifest = JSON.parse(storage.manifest_json) as ColdManifest;
   assert.equal(manifest.format, COLD_STORAGE_FORMAT);
@@ -153,6 +159,40 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
     "report.html",
     "uploads/input.txt",
   ]);
+  inspection.close();
+
+  assert.equal(listColdCandidates(roots).find((item) => item.conversationId === conversationId)?.eligible, false);
+  inspection = new AppDatabase(dataRoot, undefined, false);
+  // Expiry does not depend on a sweeper deleting the asset mappings.
+  inspection.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE file_id=?").run("2000-01-01T00:00:00.000Z", sharedId);
+  inspection.close();
+  const residual = listColdCandidates(roots).find((item) => item.conversationId === conversationId)!;
+  assert.equal(residual.eligible, true, residual.reasons.join(","));
+  assert.equal(residual.entries, 2);
+  assert.equal(residual.sharedFiles, 0);
+  const failUpload = executable(tools, "aliyunpan-fail-upload", `
+const { execFileSync } = require("node:child_process"); const args = process.argv.slice(2);
+if (args[0] === "upload") process.exit(2);
+process.stdout.write(execFileSync(${JSON.stringify(roots.aliyunpan)}, args));
+`);
+  assert.throws(() => archiveConversation({ ...roots, aliyunpan: failUpload }, conversationId));
+  inspection = new AppDatabase(dataRoot, undefined, false);
+  const failedStorage = inspection.getConversationStorage(conversationId)!;
+  assert.equal(failedStorage.state, "error");
+  assert.equal(failedStorage.generation, archived.generation, "failed replacement keeps the previous cloud generation recoverable");
+  assert.equal(failedStorage.remote_path, archived.remotePath);
+  inspection.close();
+  assert.equal(fs.readFileSync(uploadPath, "utf8"), "user upload");
+  assert.equal(fs.readFileSync(sharedPath, "utf8"), "public share");
+  const merged = archiveConversation(roots, conversationId);
+  assert.equal(merged.generation, archived.generation + 1);
+  assert.equal(fs.existsSync(sharedPath), false);
+  assert.equal(fs.existsSync(imagePath), false);
+  assert.equal(fs.existsSync(archived.isolatedPath), false, "superseded isolation has a fresh verified replacement");
+  inspection = new AppDatabase(dataRoot, undefined, false);
+  storage = inspection.sqlite.prepare("SELECT state,manifest_json,local_isolated_path FROM conversation_storage WHERE conversation_id=?").get(conversationId) as typeof storage;
+  assert.equal(JSON.parse(storage.manifest_json).entries.length, 8, "old rollout/files and expired public document/image all survive in the new archive");
+  assert.equal(inspection.getConversation(conversationId)!.last_active_at, now, "maintenance restore does not fabricate user activity");
   inspection.close();
 
   assert.deepEqual(purgeColdIsolated(roots, 7), []);
@@ -172,6 +212,7 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
   assert.equal(fs.readFileSync(outputPath, "utf8"), "text output");
   assert.equal(fs.readFileSync(rolloutPath, "utf8"), "rollout history");
   assert.equal(fs.readFileSync(sharedPath, "utf8"), "public share");
+  assert.equal(fs.readFileSync(imagePath, "utf8"), "public image");
   inspection = new AppDatabase(dataRoot, undefined, false);
   assert.equal((inspection.sqlite.prepare("SELECT state FROM conversation_storage WHERE conversation_id=?").get(conversationId) as { state: string }).state, "local");
   inspection.close();

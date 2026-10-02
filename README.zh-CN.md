@@ -204,3 +204,13 @@ stateDiagram-v2
 - 语音等待 Safari 最终音频块，支持十分钟录音与 30 MiB 上传上限，拒绝不完整的流式转写；手动禁用的关键词不会被自动重新启用，模型由部署者自行配置。
 
 默认 Compose 继续使用低权限租户、`/codex-web` 与用户名/密码登录。可设 `CWW_PARA_ENABLED=false` 关闭看板路由并保留数据；各外部集成仍须显式配置。升级步骤见[部署验收](docs/DEPLOYMENT.md#september-30-2026-upgrade-checks)。
+
+## 2026 年 10 月 3 日：项目看板、分享期限与正文优先阅读
+
+- [项目看板](docs/features/PERSONAL_KANBAN.md)替换原 PARA 导航，按想法池、准备中、进行中、待验收、已完成推进，终止单独记录。支持等待、暂停原因、回顾日期与验收结论；Agent 任务完成不会自动完成项目。阶段标签可直接操作，侧栏共用一个滚动区。
+- [账号功能选择](docs/features/FEATURE_SELECTION.md)默认隐藏项目看板，用户可在个人设置主动开启并跨设备同步。隐藏不删除数据或已有项目背景；`CWW_PARA_ENABLED=false` 仍是独立的服务端路由关闭开关。
+- [公开分享](docs/PUBLIC_FILE_SHARING.md)开启后有效期为 30 天，续期从当前时间重新计算并保留链接。既有无限期分享在升级时获得一次 30 天宽限期。单独配置的可选冷存储可合并归档分享到期后的本地残留文件，并核验旧归档。
+- [草稿同步](docs/COMPOSER_SYNC.md)拒绝发送后迟到的旧读取回填；待发送任务编辑中的语音走同一提交路径，并保留独立的普通草稿。
+- [HTML/Markdown 阅读](docs/READER_PROGRESSIVE_LOADING.md)先展示正文，再依文档顺序加载图片；坏图片不阻塞后续图片，原文件下载保持原样。账号弹窗采用可复用的[字号与布局规范](docs/UI_DIALOG_GUIDELINES.md)。
+
+升级前请阅读[本轮部署检查](docs/DEPLOYMENT.md#october-3-2026-upgrade-checks)。用户名/密码登录、`/codex-web`、默认容器权限和外部模块显式配置边界保持不变。

@@ -558,7 +558,7 @@ test("reader conversation keeps main chat identity and adjacent voice/send actio
   assert.match(styles, /\.file-reader-ask-launcher \{[^}]*background: transparent;/);
   assert.match(styles, /\.file-reader-ask-launcher\.active \{ background: var\(--indigo-pale\); \}/);
   assert.match(appSource, /attempts < 4/);
-  assert.match(appSource, /setTimeout\(\(\) => \{ if \(!cancelled\) applyReaderTextHighlights/);
+  assert.match(appSource, /setTimeout\(replay, 180\)/);
   assert.match(readerSource, /const READER_SELECTION_MOUSE_DELAY_MS = 320/);
   assert.match(readerSource, /const READER_SELECTION_TOUCH_DELAY_MS = 350/);
   assert.match(readerSource, /let lastTouchEndAt = 0/);
@@ -4012,10 +4012,10 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
   const owner = request.agent(instance.app);
   const login = await owner.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
   const privatePreview = await owner.get(`/api/files/${parentId}/preview`).expect(200);
-  assert.deepEqual(privatePreview.body.share, { enabled: false, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
+  assert.deepEqual(privatePreview.body.share, { enabled: false, expired: false, expiresAt: null, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
   await owner.post(`/api/files/${parentId}/share`).expect(403);
   const enabled = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
-  assert.deepEqual(enabled.body.share, { enabled: true, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
+  assert.deepEqual(enabled.body.share, { enabled: true, expired: false, expiresAt: enabled.body.share.expiresAt, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
   assert.equal(instance.db.listPublicFileShareAssets(instance.db.getPublicFileShare(parentId)!.id)[0]?.asset_file_id, imageId);
   const listed = await owner.get("/api/public-shares").expect(200);
   assert.equal(listed.body.shares.length, 1);
@@ -4029,6 +4029,7 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
     conversationId: conversation.id,
     conversationTitle: "public report",
     enabledAt: listed.body.shares[0].enabledAt,
+    expiresAt: enabled.body.share.expiresAt,
     publicUrl: `https://agent.example.test/files/${parentId}/preview/public`,
   });
 
@@ -4067,6 +4068,51 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
   assert.equal(reopened.body.share.publicUrl, enabled.body.share.publicUrl);
   assert.equal(instance.db.listPublicFileShareAssets(instance.db.getPublicFileShare(parentId)!.id)[0]?.asset_file_id, imageId);
   await request(instance.app).get(`/api/files/${parentId}/preview/public/assets/${imageId}`).expect(200);
+  const shareRow = instance.db.getPublicFileShare(parentId)!;
+  assert.equal(Date.parse(shareRow.expires_at!) - Date.parse(shareRow.enabled_at!), 30 * 24 * 60 * 60_000);
+  await member.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", memberLogin.body.csrfToken).expect(404);
+
+  // Renewal resets the deadline, it does not append another month to it.
+  instance.db.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE file_id=?")
+    .run(new Date(Date.now() + 90 * 24 * 60 * 60_000).toISOString(), parentId);
+  const renewed = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  assert.ok(Date.parse(renewed.body.share.expiresAt) - Date.now() <= 30 * 24 * 60 * 60_000);
+  assert.equal(renewed.body.share.publicUrl, enabled.body.share.publicUrl);
+
+  // The archive state write and renewal are serialized, before any files move.
+  instance.db.transitionConversationStorage(conversation.id, ["local"], "uploading", "test_archive");
+  await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(409);
+  assert.equal(instance.db.getPublicFileShare(parentId)!.expires_at, renewed.body.share.expiresAt);
+  instance.db.transitionConversationStorage(conversation.id, ["uploading"], "local", "test_archive_cancel");
+
+  for (const format of ["html", "markdown"]) {
+    let fileId = parentId;
+    if (format === "markdown") {
+      fileId = crypto.randomUUID();
+      const markdown = "# Public Markdown\n\n![chart](chart.png)";
+      instance.db.addFile({ id: fileId, conversation_id: conversation.id, message_id: messageId,
+        original_name: "report.md", relative_path: writeDeliverable(fileId, "report.md", markdown),
+        mime_type: "text/markdown", size: Buffer.byteLength(markdown), kind: "output", created_at: new Date().toISOString() });
+      await owner.post(`/api/files/${fileId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+    }
+    const anonymousPath = `/api/files/${fileId}/preview/public`;
+    await request(instance.app).get(anonymousPath).expect(200);
+    instance.db.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE file_id=?").run("2000-01-01T00:00:00.000Z", fileId);
+    const beforeVisits = instance.db.sqlite.prepare("SELECT count(*) AS n FROM public_share_access_events").get();
+    await request(instance.app).head(anonymousPath).expect(404);
+    await request(instance.app).get(anonymousPath).expect(404);
+    await request(instance.app).get(`${anonymousPath}/assets/${imageId}`).expect(404);
+    await request(instance.app).head(`${anonymousPath}/assets/${imageId}`).expect(404);
+    assert.deepEqual(instance.db.sqlite.prepare("SELECT count(*) AS n FROM public_share_access_events").get(), beforeVisits);
+    assert.equal((await owner.get("/api/public-shares").expect(200)).body.shares.some((item: { fileId: string }) => item.fileId === fileId), false);
+    const expired = (await owner.get(`/api/files/${fileId}/preview`).expect(200)).body.share;
+    assert.equal(expired.enabled, false); assert.equal(expired.expired, true);
+    const reactivated = await owner.post(`/api/files/${fileId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+    assert.equal(reactivated.body.share.enabled, true); assert.equal(reactivated.body.share.expired, false);
+    await request(instance.app).get(anonymousPath).expect(200);
+    await request(instance.app).get(`${anonymousPath}/assets/${imageId}`).expect(200);
+    await owner.delete(`/api/files/${fileId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
+  }
 });
 
 test("image file cards use a compact thumbnail without a duplicate file icon", () => {
@@ -4104,7 +4150,7 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.match(legacyReaderSource, /selection\.isCollapsed \|\| selection\.rangeCount === 0/);
   assert.match(legacyReaderSource, /Leave the document[\s\S]*while WebKit owns a native selection/);
   assert.match(appSource, /function ReaderSelectionLayer\([\s\S]*useReaderSelection\(rootRef, scopeKey\)[\s\S]*<ReaderSelectionAction/);
-  assert.match(appSource, /<ReaderSelectionLayer rootRef=\{readerBodyRef\} scopeKey=\{readerManifest\?\.version\.id \?\? file\?\.id \?\? ""\}/);
+  assert.match(appSource, /<ReaderSelectionLayer rootRef=\{readerBodyRef\} scopeKey=\{file\?\.id \?\? ""\}/);
   assert.doesNotMatch(appSource, /const readerSelection = useReaderSelection\(readerBodyRef\)/);
   assert.match(legacyReaderSource, /export const FileReaderLayout = memo\(function FileReaderLayout/);
   assert.match(legacyReaderSource, /const visibleHeadings = headings\.filter\(\(heading\) => heading\.getClientRects\(\)\.length > 0\)/);

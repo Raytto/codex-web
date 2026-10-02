@@ -1,3 +1,6 @@
+import { FeatureSelectionProvider, useFeatureSelection } from "./feature-selection-context";
+import { FeatureSelectionDialog } from "./feature-selection-dialog";
+import type { FeatureSelection } from "./feature-selection";
 import { ParaSidebar, ParaWorkspace, NewProjectChoice, ParaConversationProjectsDialog, ParaCollectButton } from "./para";
 import { DeploymentDetails, deploymentStepLabel } from "./deployment-progress";
 import { createContext, useContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
@@ -35,6 +38,8 @@ import { buildHandoffFirstTurn, CONTEXT_HANDOFF_PROMPT, latestContextHandoff } f
 import { PersonalMemoryDialog } from "./personal-memory-dialog";
 import { VoiceLexiconDialog } from "./voice-lexicon-dialog";
 import { PublicSharesDialog } from "./public-shares-dialog";
+import { isPublicShareActive, publicShareRemaining } from "./public-share";
+import { useShareClock } from "./use-share-clock";
 import { canApplyDeferredInstanceReload } from "./reload-protection";
 import { AccountAuthDialog } from "./account-auth-dialog";
 import { DisplaySettingsDialog } from "./display-settings-dialog";
@@ -264,8 +269,8 @@ export default function App() {
   if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
   if (!session.accountId) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><span>账号信息不完整，请刷新后重新登录。</span></div>;
-  if (previewFileId) return <FilePreviewPage key={previewFileId} fileId={previewFileId} userInitials={resolveAccountIdentity(session).initials} onSessionExpired={expireSession} resolvedTheme={resolvedTheme} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
-  return <Workspace key={session.accountId} session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} />;
+  if (previewFileId) return <FeatureSelectionProvider key={session.accountId} initial={session.features}><FilePreviewPage key={previewFileId} fileId={previewFileId} userInitials={resolveAccountIdentity(session).initials} onSessionExpired={expireSession} resolvedTheme={resolvedTheme} themePreference={themePreference} onThemePreferenceChange={setThemePreference} /></FeatureSelectionProvider>;
+  return <FeatureSelectionProvider key={session.accountId} initial={session.features}><Workspace key={session.accountId} session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} /></FeatureSelectionProvider>;
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
@@ -325,6 +330,9 @@ function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const closeButton = useRef<HTMLButtonElement>(null);
+  const now = useShareClock(open);
+  const active = isPublicShareActive(share.enabled, share.expiresAt, now);
+  const expired = share.expired || (share.enabled && !active);
 
   const closeDialog = useCallback(() => {
     onClose();
@@ -376,16 +384,17 @@ function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<
   return open ? createPortal(<div className="file-share-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
       <section id="file-share-dialog" className="file-share-panel" role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title">
         <header className="file-share-heading">
-          <div className="file-share-titleline"><strong id="file-share-dialog-title">公开分享</strong>{share.enabled && <span>● 已开启</span>}</div>
+          <div className="file-share-titleline"><strong id="file-share-dialog-title">公开分享</strong><span>{active ? "● 已开启" : expired ? "已到期" : "未开启"}</span></div>
           <button ref={closeButton} className="file-share-close" type="button" aria-label="关闭分享设置" onClick={closeDialog}><X size={18} /></button>
         </header>
-        <p>{share.enabled ? "任何获得链接的人都能查看此文件及其中引用的图片，无需登录。" : "默认保持私有。开启后，任何获得固定链接的人都能查看。"}</p>
-        {share.enabled && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
+        <p>{active ? "任何获得链接的人都能查看此文件及配图。续期会从现在重新计算 30 天。" : expired ? "公开链接及配图已失效。重新开启后，原链接恢复访问，有效期为 30 天。" : "默认保持私有。开启后，获得链接的人可查看文件及配图，有效期为 30 天。"}</p>
+        {active && share.expiresAt && <p className="file-share-expiry">{publicShareRemaining(share.expiresAt, now)} · <time dateTime={share.expiresAt}>{new Date(share.expiresAt).toLocaleString("zh-CN", { hour12: false })}</time> 到期</p>}
+        {active && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
         {error && <div className="file-share-error">{error}</div>}
         <div className="file-share-actions">
-          {share.enabled
-            ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>{busy ? "正在关闭…" : "关闭分享"}</button></>
-            : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : "开启公开分享"}</button>}
+          {active
+            ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button type="button" disabled={busy} onClick={() => void enable()}><RefreshCw size={14} />续期 30 天</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>关闭分享</button></>
+            : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : expired ? "重新开启分享（30 天）" : "开启公开分享（30 天）"}</button>}
         </div>
       </section>
     </div>, document.body) : null;
@@ -416,6 +425,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
   return <details ref={menu} className="file-reader-settings-menu">
     <summary className="file-reader-settings-button" title="阅读器设置" aria-label="阅读器设置" aria-haspopup="menu"><Settings2 size={18} /></summary>
     <div className="file-reader-settings-popover" role="menu" aria-label="阅读器设置选项">
+      {download && <ParaCollectButton fileId={file.id} menuItem onOpen={() => { if (menu.current) menu.current.open = false; }} />}
       {shareable && share && <button className="file-reader-settings-item" type="button" role="menuitem" onClick={() => { if (menu.current) menu.current.open = false; setShareOpen(true); }}><Share2 size={15} /><span>分享</span></button>}
       {download && <a className="file-reader-settings-item" role="menuitem" href={download} download={file.original_name} onClick={() => { if (menu.current) menu.current.open = false; }}><Download size={15} /><span>下载</span></a>}
       {(shareable && share || download) && <div className="file-reader-settings-divider" />}
@@ -439,6 +449,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const [readerManifest, setReaderManifest] = useState<import("./api").ReaderManifest | null>(null);
   const [readerDocumentTitle, setReaderDocumentTitle] = useState<string | null>(null);
   const [readerAnnotations, setReaderAnnotations] = useState<ReaderAnnotation[]>([]);
+  const [readerAnnotationsReady, setReaderAnnotationsReady] = useState(false);
   const [readerAnnotationSyncError, setReaderAnnotationSyncError] = useState("");
   const [activeReaderAnnotationId, setActiveReaderAnnotationId] = useState<string | null>(null);
   const [activeReaderAnnotationAnchor, setActiveReaderAnnotationAnchor] = useState<ReaderAnnotationAnchor | null>(null);
@@ -588,7 +599,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true); setError(""); setReaderAnnotationSyncError(""); setContent(null); setReaderManifest(null); setReaderAnnotations([]); setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); setReaderNoteSelection(null); setAskSelection(null);
+    setLoading(true); setError(""); setReaderAnnotationSyncError(""); setContent(null); setReaderManifest(null); setReaderAnnotations([]); setReaderAnnotationsReady(false); setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); setReaderNoteSelection(null); setAskSelection(null);
     void (async () => {
       try {
         const metadata = await api.filePreview(fileId, controller.signal);
@@ -610,26 +621,34 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
           setError(`文件大小为 ${formatSize(metadata.file.size)}，超过 ${formatSize(FILE_READER_MAX_BYTES)} 的在线阅读上限，请直接下载。`); return;
         }
         const kind = fileReaderKind(metadata.file);
-        const manifest = await api.readerFileManifest(metadata.file.id, controller.signal);
-        if (controller.signal.aborted) return;
-        setReaderManifest(manifest);
-        let annotations: { annotations: ReaderAnnotation[] } = { annotations: [] };
-        try {
-          annotations = await loadReaderAnnotationsWithRetry(manifest.version.id, controller.signal);
-        } catch (reason) {
-          if (controller.signal.aborted) return;
-          if (reason instanceof Error && reason.message === "请先登录。") throw reason;
-          // Keep the document readable during a transient annotation request
-          // failure, but make the missing sync explicit instead of silently
-          // presenting an apparently empty annotation list.
-          setReaderAnnotationSyncError("标注暂时未同步，请稍后重新打开此文件重试。");
-        }
-        if (controller.signal.aborted) return;
-        setReaderAnnotations(annotations.annotations);
-        if (kind === "markdown" || kind === "html") {
+        const isText = kind === "markdown" || kind === "html";
+        const loadReadingMetadata = async () => {
+          let manifestReady = false;
+          try {
+            const manifest = await api.readerFileManifest(metadata.file.id, controller.signal);
+            if (controller.signal.aborted) return;
+            setReaderManifest(manifest);
+            manifestReady = true;
+            if (!isText) setLoading(false);
+            const annotations = await loadReaderAnnotationsWithRetry(manifest.version.id, controller.signal);
+            if (controller.signal.aborted) return;
+            setReaderAnnotations(annotations.annotations);
+            setReaderAnnotationsReady(true);
+          } catch (reason) {
+            if (controller.signal.aborted) return;
+            const message = reason instanceof Error ? reason.message : "阅读信息读取失败";
+            if (message === "请先登录。") { setError(message); onSessionExpired(); }
+            else if (isText || manifestReady) setReaderAnnotationSyncError("标注暂时未同步，请稍后重新打开此文件重试。");
+            else setError(message);
+            if (!isText) setLoading(false);
+          }
+        };
+        // Text is independently readable while its manifest/annotations sync.
+        if (isText) {
+          void loadReadingMetadata();
           const text = await api.fileText(metadata.file, controller.signal);
           if (!controller.signal.aborted) setContent(text);
-        }
+        } else await loadReadingMetadata();
       } catch (reason) {
         if (controller.signal.aborted) return;
         const message = reason instanceof Error ? reason.message : "文件读取失败";
@@ -666,15 +685,26 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
     let cancelled = false;
     let frame: number | null = null;
     let attempts = 0;
+    let selectionPending = false;
     const replay = () => {
       if (cancelled) return;
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed && selection.anchorNode && root.contains(selection.anchorNode)) {
+        // Annotation synchronization may now finish after reading has begun.
+        // Wait for native selection to end before splitting its text nodes.
+        selectionPending = true;
+        return;
+      }
+      selectionPending = false;
       applyReaderTextHighlights(root, readerAnnotations);
       attempts += 1;
       if (attempts < 4) frame = window.requestAnimationFrame(replay);
     };
     frame = window.requestAnimationFrame(replay);
-    const delayed = window.setTimeout(() => { if (!cancelled) applyReaderTextHighlights(root, readerAnnotations); }, 180);
-    return () => { cancelled = true; if (frame !== null) window.cancelAnimationFrame(frame); window.clearTimeout(delayed); };
+    const delayed = window.setTimeout(replay, 180);
+    const selectionChanged = () => { if (selectionPending) replay(); };
+    document.addEventListener("selectionchange", selectionChanged);
+    return () => { cancelled = true; if (frame !== null) window.cancelAnimationFrame(frame); window.clearTimeout(delayed); document.removeEventListener("selectionchange", selectionChanged); };
   }, [content, prepared.content, readerAnnotations, readerManifest]);
 
   useEffect(() => {
@@ -740,7 +770,6 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
       </div>
       <div className="file-preview-title"><strong>{file?.original_name || "正在读取文件…"}</strong></div>
       <div className="file-preview-actions">
-        {file && <ParaCollectButton fileId={file.id} />}
         {file && <ReaderSettingsMenu file={file} share={share} download={download} themePreference={themePreference} onThemePreferenceChange={onThemePreferenceChange} onShareChange={setShare} />}
       </div>
     </header>
@@ -749,9 +778,9 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
       {!loading && !error && readerAnnotationSyncError && <div className="reader-inline-error" role="alert">{readerAnnotationSyncError}</div>}
       {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} onTitleChange={setReaderDocumentTitle} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
-      {!loading && !error && readerManifest && content !== null && file && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
+      {!loading && !error && content !== null && file && (readerKind === "markdown" || readerKind === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
       {!loading && !error && readerManifest && (readerManifest.source.format === "markdown" || readerManifest.source.format === "html") && <ReaderAnnotationPanel annotations={readerAnnotations} onDelete={deleteReaderAnnotation} onSelect={focusReaderAnnotation} onAsk={askReaderAnnotation} activeAnnotationId={activeReaderAnnotationId} anchor={activeReaderAnnotationAnchor} onClose={() => { setActiveReaderAnnotationId(null); setActiveReaderAnnotationAnchor(null); }} />}
-      <ReaderSelectionLayer rootRef={readerBodyRef} scopeKey={readerManifest?.version.id ?? file?.id ?? ""} annotations={readerAnnotations} onAsk={openReaderAsk} onHighlight={applyReaderHighlight} onRemoveHighlight={removeReaderHighlight} onNote={applyReaderNote} />
+      <ReaderSelectionLayer rootRef={readerBodyRef} scopeKey={file?.id ?? ""} annotations={readerAnnotations} onAsk={openReaderAsk} onHighlight={readerAnnotationsReady ? applyReaderHighlight : undefined} onRemoveHighlight={removeReaderHighlight} onNote={readerAnnotationsReady ? applyReaderNote : undefined} />
       {readerNoteSelection && <ReaderNoteEditor selection={readerNoteSelection} onClose={() => setReaderNoteSelection(null)} onSave={(note) => saveReaderNote(readerNoteSelection, note)} />}
       {conversation && (askOpen || askClosing) && <ReaderAskBubble conversationId={conversation.id} conversationTitle={conversation.title} quoteExcerpt={askQuote} quoteLabel={file ? `${file.original_name}${askSelection?.page ? ` · 第 ${askSelection.page} 页` : ""}` : undefined} userInitials={userInitials} open={askOpen || askClosing} closing={askClosing} onClose={closeReaderAsk} />}
     </section>
@@ -1021,6 +1050,9 @@ function SearchVoiceInput({ query, projectId, disabled = false, onTranscript }: 
 }
 
 function Workspace({ session, onLogout, themePreference, onThemePreferenceChange }: { session: Session; onLogout: () => void; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
+  const { features, applyFeatures } = useFeatureSelection();
+  const [featureSelectionOpen, setFeatureSelectionOpen] = useState(false);
+  const closeFeatureSelection = useCallback(() => setFeatureSelectionOpen(false), []);
   const selectionStorageKeys = useMemo(() => accountSelectionStorageKeys(session.accountId!), [session.accountId]);
   const savedProjectIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.project));
   const savedConversationIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.conversation));
@@ -1040,14 +1072,36 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [conversationBodySearchLoading, setConversationBodySearchLoading] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [createTypeOpen, setCreateTypeOpen] = useState(false);
-  const [paraBoardId, setParaBoardId] = useState<string | null>(null);
-  const [paraProjectId, setParaProjectId] = useState<string | null>(null);
-  const [paraVisible, setParaVisible] = useState(false);
+  const kanbanLocationKey = `codex-web:${session.accountId}:kanban-location`;
+  const [initialKanbanLocation] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(kanbanLocationKey) || "null");
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      return features.paraBoard && saved && typeof saved.board === "string" && uuid.test(saved.board)
+        ? { board: saved.board as string, project: typeof saved.project === "string" && uuid.test(saved.project) ? saved.project as string : null } : null;
+    } catch { return null; }
+  });
+  const [paraBoardId, setParaBoardId] = useState<string | null>(initialKanbanLocation?.board ?? null);
+  const [paraProjectId, setParaProjectId] = useState<string | null>(initialKanbanLocation?.project ?? null);
+  const [paraVisible, setParaVisible] = useState(Boolean(initialKanbanLocation));
+  useEffect(() => {
+    try {
+      if (features.paraBoard && paraVisible && paraBoardId) window.localStorage.setItem(kanbanLocationKey, JSON.stringify({ board: paraBoardId, project: paraProjectId }));
+      else window.localStorage.removeItem(kanbanLocationKey);
+    } catch { /* Private browsing may disallow local storage. */ }
+  }, [kanbanLocationKey, features.paraBoard, paraVisible, paraBoardId, paraProjectId]);
   const [paraNavigation, setParaNavigation] = useState(0);
   const [linkedProjectsConversation, setLinkedProjectsConversation] = useState<Conversation | null>(null);
   function openPara(boardId: string, projectId: string | null = null) {
+    if (!features.paraBoard) return;
     setParaBoardId(boardId); setParaProjectId(projectId); setParaNavigation(n => n + 1); setParaVisible(true); setSidebarOpen(false);
   }
+  useEffect(() => {
+    if (!features.paraBoard) {
+      setParaVisible(false); setParaBoardId(null); setParaProjectId(null);
+      setCreateTypeOpen(false); setLinkedProjectsConversation(null);
+    }
+  }, [features.paraBoard]);
   const [projectSkillsDialogProject, setProjectSkillsDialogProject] = useState<Project | null>(null);
   const [syncingProjects, setSyncingProjects] = useState<Record<string, boolean>>({});
   const [projectMenu, setProjectMenu] = useState<{ projectId: string; top: number; left: number } | null>(null);
@@ -1143,6 +1197,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const draftCacheRef = useRef(new Map<string, CachedComposerDraft>());
   const draftSyncedSignaturesRef = useRef(new Map<string, string>());
   const draftMutationGenerationRef = useRef(new Map<string, number>());
+  const composerMutationsRef = useRef(new Map<string, number>());
   const draftSaveTimerRef = useRef<number | null>(null);
   const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const touchDragRef = useRef<TouchDrag | null>(null);
@@ -1215,6 +1270,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       try {
         const status = JSON.parse(event.data) as SystemStatus & {
           type?: string;
+          features?: FeatureSelection;
           executors?: Executor[];
           projectId?: string;
           conversationId?: string;
@@ -1222,6 +1278,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           toProjectId?: string;
           executorId?: string;
         };
+        if (status.type === "feature_selection" && status.features) applyFeatures(status.features);
         if (status.type === "system_status") {
           if (!applySystemStatus(status)) return;
         }
@@ -1284,7 +1341,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       window.removeEventListener("online", reconcileWhenVisible);
       document.removeEventListener("visibilitychange", reconcileWhenVisible);
     };
-  }, []);
+  }, [applyFeatures]);
 
   function retainProjectConversationPage(page: ConversationPage, projectId: string): ConversationPage {
     const pending = retainedConversationNeedsNaturalPageRef.current;
@@ -1468,9 +1525,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         // Viewing the task must still work if the acknowledgement request is temporarily unavailable.
       }
     }
+    if (selectedIdRef.current !== id) return result;
+    // All composer hydration paths must reject snapshots from before a local
+    // mutation, including first-load drafts and pending-prompt edit recovery.
+    const canRestoreComposer = !composerMutationsRef.current.has(id)
+      && (draftMutationGenerationRef.current.get(id) ?? 0) === draftGenerationAtRequest;
     setDetail((current) => current?.conversation.id === id
       ? {
           ...result,
+          pendingPrompts: canRestoreComposer ? result.pendingPrompts : current.pendingPrompts,
+          editingPrompt: canRestoreComposer ? result.editingPrompt : current.editingPrompt,
+          composerDraft: canRestoreComposer ? result.composerDraft : current.composerDraft,
           messages: mergeMessagePages(current.messages, result.messages),
           messagePage: preparedUnreadHistory ? result.messagePage : current.messagePage,
         }
@@ -1492,7 +1557,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (result.activeJob?.status !== "queued" || latestQueueStatus?.label !== MAINTENANCE_QUEUE_GUIDANCE) {
       setNotice((current) => current === MAINTENANCE_QUEUE_GUIDANCE ? "" : current);
     }
-    if (result.editingPrompt) {
+    if (canRestoreComposer && result.editingPrompt) {
       composerDraftRef.current = result.composerDraft;
       setComposerDraft(result.composerDraft);
       const cachedDraft = draftCacheRef.current.get(id);
@@ -1505,7 +1570,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         setInput(result.editingPrompt.content);
         setAskAgentQuote(result.editingPrompt.quote_excerpt ?? "");
       }
-    } else {
+    } else if (canRestoreComposer) {
       const wasEditing = Boolean(editingPendingRef.current);
       if (wasEditing) {
         editingPendingRef.current = null;
@@ -1538,12 +1603,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         const serverContent = result.composerDraft?.content ?? "";
         const serverQuote = result.composerDraft?.quote_excerpt ?? "";
         const serverSignature = composerDraftSignature(serverContent, serverQuote);
-        const currentDraft = composerDraftRef.current;
-        const responseIsStale = (draftMutationGenerationRef.current.get(id) ?? 0) !== draftGenerationAtRequest;
-        const serverDraft = responseIsStale ? currentDraft : result.composerDraft;
+        const serverDraft = result.composerDraft;
         composerDraftRef.current = serverDraft;
         setComposerDraft(serverDraft);
-        if (!responseIsStale && localSignature === syncedSignature && serverSignature !== syncedSignature) {
+        if (localSignature === syncedSignature && serverSignature !== syncedSignature) {
           setInput(serverContent);
           setAskAgentQuote(serverQuote);
           draftSyncedSignaturesRef.current.set(id, serverSignature);
@@ -1815,7 +1878,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationSelectionReady, selectedId, selectionStorageKeys.conversation]);
   useEffect(() => {
-    if (!selectedId || editingPending || draftLoadedConversationRef.current !== selectedId) return;
+    if (!selectedId || editingPending || composerMutationsRef.current.has(selectedId) || draftLoadedConversationRef.current !== selectedId) return;
     const signature = composerDraftSignature(input, askAgentQuote);
     draftCacheRef.current.set(selectedId, { content: input, quoteExcerpt: askAgentQuote, composerDraft: composerDraftRef.current });
     if (signature === draftSyncedSignaturesRef.current.get(selectedId)) {
@@ -1832,7 +1895,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
       draftSaveTimerRef.current = null;
     };
-  }, [askAgentQuote, editingPending, input, persistComposerDraft, selectedId]);
+  }, [askAgentQuote, editingPending, input, persistComposerDraft, selectedId, submitting]);
   useEffect(() => {
     if (!instanceReloadDeferred) return;
     const currentDraftSignature = composerDraftSignature(input, askAgentQuote);
@@ -1856,7 +1919,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   useEffect(() => () => {
     if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
     const conversationId = selectedId;
-    if (!conversationId || editingPendingRef.current || draftLoadedConversationRef.current !== conversationId) return;
+    if (!conversationId || editingPendingRef.current || composerMutationsRef.current.has(conversationId) || draftLoadedConversationRef.current !== conversationId) return;
     const content = inputRef.current;
     const quoteExcerpt = askAgentQuoteRef.current;
     if (composerDraftSignature(content, quoteExcerpt) !== draftSyncedSignaturesRef.current.get(conversationId)) {
@@ -1868,7 +1931,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const visible = () => {
       if (document.visibilityState === "visible") return resume();
       const conversationId = selectedIdRef.current;
-      if (!conversationId || editingPendingRef.current || draftLoadedConversationRef.current !== conversationId) return;
+      if (!conversationId || editingPendingRef.current || composerMutationsRef.current.has(conversationId) || draftLoadedConversationRef.current !== conversationId) return;
       const content = inputRef.current;
       const quoteExcerpt = askAgentQuoteRef.current;
       if (composerDraftSignature(content, quoteExcerpt) !== draftSyncedSignaturesRef.current.get(conversationId)) {
@@ -1977,6 +2040,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       window.removeEventListener("resize", closeSidebarMenus);
     };
   }, [accountSettingsOpen, projectMenu, projectSectionMenu, taskMenu]);
+  useEffect(() => {
+    const sidebarContent = accountAreaRef.current?.parentElement;
+    if (accountSettingsOpen && sidebarContent) sidebarContent.scrollTop = sidebarContent.scrollHeight;
+  }, [accountSettingsOpen]);
 
   function handleMessagesScroll(event: React.UIEvent<HTMLDivElement>) {
     const messages = event.currentTarget;
@@ -3131,20 +3198,43 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     } catch (reason) { setError(reason instanceof Error ? reason.message : "删除草稿附件失败"); }
   }
 
+  function beginComposerMutation(conversationId: string) {
+    composerMutationsRef.current.set(conversationId, (composerMutationsRef.current.get(conversationId) ?? 0) + 1);
+    if (selectedIdRef.current === conversationId && draftSaveTimerRef.current !== null) {
+      window.clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      const remaining = (composerMutationsRef.current.get(conversationId) ?? 1) - 1;
+      if (remaining > 0) composerMutationsRef.current.set(conversationId, remaining);
+      else composerMutationsRef.current.delete(conversationId);
+      // Invalidate reads started both before and during this mutation, even
+      // when it failed. A later fresh read can resume cross-device hydration.
+      draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
+    };
+  }
+
   async function clearComposerDraft() {
     const conversationId = selectedIdRef.current;
     if (!conversationId || editingPendingRef.current || draftUploads.length > 0) return;
     if (!window.confirm("清空这个会话尚未发送的正文、引用和附件？")) return;
-    if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
-    await draftSaveQueueRef.current;
+    setSubmitting(true);
+    const finishMutation = beginComposerMutation(conversationId);
     try {
+      await draftSaveQueueRef.current;
       await api.deleteConversationDraft(conversationId);
       draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
       draftCacheRef.current.delete(conversationId);
       draftSyncedSignaturesRef.current.set(conversationId, composerDraftSignature("", ""));
-      composerDraftRef.current = null;
-      setComposerDraft(null); setInput(""); setAskAgentQuote(""); setFiles([]); setDraftSaveState("idle");
+      if (selectedIdRef.current === conversationId) {
+        composerDraftRef.current = null; inputRef.current = ""; askAgentQuoteRef.current = "";
+        setComposerDraft(null); setInput(""); setAskAgentQuote(""); setFiles([]); setDraftSaveState("idle");
+      }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "清空草稿失败"); }
+    finally { finishMutation(); setSubmitting(false); }
   }
 
   async function persistVoiceDraft(conversationId: string | null, content: string, quoteExcerpt: string) {
@@ -3169,6 +3259,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   async function sendVoiceTranscription(conversationId: string | null, content: string, quoteExcerpt: string, voiceTranscriptionIds: string[]) {
     if (!conversationId || !content.trim()) return;
+    const finishMutation = beginComposerMutation(conversationId);
     const selected = selectedIdRef.current === conversationId;
     if (selected) {
       setError(""); setNotice(""); setSubmitting(true);
@@ -3189,6 +3280,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         if (result.needsInstruction) setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
         else if (result.externalRunning) setNotice(result.guidance || "任务正在本机客户端中执行；刷新项目确认空闲后会自动开始。");
         else if (result.maintenance) setNotice(result.guidance || MAINTENANCE_QUEUE_GUIDANCE);
+        finishMutation();
         await reconcile(conversationId);
       } else {
         await refreshList(false).catch(() => undefined);
@@ -3197,6 +3289,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (selectedIdRef.current === conversationId) setError(reason instanceof Error ? reason.message : "语音任务发送失败");
       else setNotice("原会话的语音任务发送失败；切回该会话后可以从草稿重试。");
     } finally {
+      finishMutation();
       if (selectedIdRef.current === conversationId) setSubmitting(false);
     }
   }
@@ -3208,6 +3301,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (draftUploads.length > 0) { setNotice("请等待草稿附件上传完成后再发送。"); return; }
     setError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
+    let finishMutation: (() => void) | undefined;
     try {
       let id = selectedId;
       const useComposerDraft = Boolean(id && !editingPending);
@@ -3216,13 +3310,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         setSelectedModel(created.agentSelection.model); setReasoningEffort(created.agentSelection.reasoningEffort);
         selectedIdRef.current = id; setSelectedId(id);
       }
+      finishMutation = beginComposerMutation(id);
       if (editingPending) {
         const result = await api.updatePendingPrompt(id, editingPending.id, message, files, removedEditingFileIds, askAgentQuote, voiceTranscriptionIds);
-        if (result.needsInstruction) {
+        if (selectedIdRef.current === id && result.needsInstruction) {
           const persisted = result.editingPrompt ?? result.pendingPrompt ?? editingPending;
           editingPendingRef.current = persisted; setEditingPending(persisted); setRemovedEditingFileIds([]);
           setNotice(result.guidance || "文件已上传，请输入具体操作后再发送。");
-        } else {
+        } else if (selectedIdRef.current === id) {
           editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]);
           draftLoadedConversationRef.current = null;
         }
@@ -3241,19 +3336,26 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
           draftCacheRef.current.delete(id);
           draftSyncedSignaturesRef.current.set(id, composerDraftSignature("", ""));
-          composerDraftRef.current = null; setComposerDraft(null); setDraftSaveState("idle");
+          if (selectedIdRef.current === id) {
+            composerDraftRef.current = null; setComposerDraft(null); setDraftSaveState("idle");
+          }
         }
       }
-      setInput(""); setAskAgentQuote(""); setFiles([]);
+      if (selectedIdRef.current === id) {
+        inputRef.current = ""; askAgentQuoteRef.current = "";
+        setInput(""); setAskAgentQuote(""); setFiles([]);
+      }
+      finishMutation();
       await reconcile(id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "发送失败");
-    } finally { setSubmitting(false); }
+    } finally { finishMutation?.(); setSubmitting(false); }
   }
 
   async function beginPendingEdit(prompt: PendingPrompt) {
     if (!selectedId || editingPending || submitting) return;
     setError(""); setSubmitting(true);
+    const finishMutation = beginComposerMutation(selectedId);
     try {
       if (draftLoadedConversationRef.current === selectedId) {
         if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
@@ -3261,29 +3363,37 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         await persistComposerDraft(selectedId, inputRef.current, askAgentQuoteRef.current);
       }
       const result = await api.editPendingPrompt(selectedId, prompt.id);
+      if (selectedIdRef.current !== selectedId) return;
       editingPendingRef.current = result.editingPrompt;
+      inputRef.current = result.editingPrompt.content;
+      askAgentQuoteRef.current = result.editingPrompt.quote_excerpt ?? "";
       setEditingPending(result.editingPrompt); setRemovedEditingFileIds([]); setFiles([]); setAskAgentQuote(result.editingPrompt.quote_excerpt ?? ""); setInput(result.editingPrompt.content);
       draftLoadedConversationRef.current = null;
       if (selectedModel !== prompt.agent_model || reasoningEffort !== prompt.reasoning_effort) {
         await persistAgentSelection({ model: prompt.agent_model, reasoningEffort: prompt.reasoning_effort });
       }
+      finishMutation();
       await refreshDetail(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "进入编辑状态失败"); }
-    finally { setSubmitting(false); }
+    finally { finishMutation(); setSubmitting(false); }
   }
 
   async function cancelPendingEdit() {
     if (!selectedId || !editingPending || submitting) return;
     setSubmitting(true); setError("");
+    const finishMutation = beginComposerMutation(selectedId);
     try {
       if (editingPending.content.trim() || editingPending.quote_excerpt) await api.restorePendingPrompt(selectedId, editingPending.id);
       else await api.deletePendingPrompt(selectedId, editingPending.id);
+      if (selectedIdRef.current !== selectedId) return;
+      inputRef.current = ""; askAgentQuoteRef.current = "";
       editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setInput(""); setAskAgentQuote(""); setFiles([]);
       draftLoadedConversationRef.current = null;
       setNotice("");
+      finishMutation();
       await reconcile(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "取消编辑失败"); }
-    finally { setSubmitting(false); }
+    finally { finishMutation(); setSubmitting(false); }
   }
 
   async function deletePendingPrompt(prompt: PendingPrompt) {
@@ -3617,9 +3727,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         <div className="wordmark"><span className="brand-mark small"><Zap size={15} /></span><span className="brand-copy"><strong>Codex Web</strong><small>PERSONAL AI WORKSTATION</small></span></div>
         <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="关闭"><X size={19} /></button>
       </div>
-      <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
-      <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />
+      <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
+      {features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />}
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
           <div className="section-label project-label"><span>文件夹工程</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
@@ -3694,11 +3804,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </div></div>
         </>}
       </div>
-      </div>
       <div className="account-area" ref={accountAreaRef}>
         {accountSettingsOpen && <section className="account-settings" aria-label="个人设置">
           <div className="account-settings-heading"><Settings2 size={15} /><strong>个人设置</strong></div>
           <button className="account-settings-archive display-settings-trigger" type="button" aria-haspopup="dialog" aria-expanded={displaySettingsDialogOpen} onClick={() => { setAccountSettingsOpen(false); setDisplaySettingsDialogOpen(true); }}><Settings2 size={16} /><span>显示设置</span></button>
+          <button className="account-settings-archive" type="button" aria-haspopup="dialog" aria-expanded={featureSelectionOpen} onClick={() => { setAccountSettingsOpen(false); setFeatureSelectionOpen(true); }}><LayoutDashboard size={16} /><span>功能选择</span></button>
           {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setAccountAuthDialogOpen(true); }}><KeyRound size={16} /><span>Codex 账号管理</span></button>}
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setPersonalMemoryDialogOpen(true); }}><BookOpen size={16} /><span>个人知识</span></button>
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setVoiceLexiconDialogOpen(true); }}><Mic size={16} /><span>语音关键词</span></button>
@@ -3712,6 +3822,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </button>
         </div>
       </div>
+      </div>
+      {featureSelectionOpen && createPortal(<FeatureSelectionDialog onClose={closeFeatureSelection} />, document.body)}
       {displaySettingsDialogOpen && <DisplaySettingsDialog
         chatFontSize={chatFontSize}
         fontSizeSaving={fontSizeSaving}
@@ -3746,7 +3858,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       aria-label="项目操作"
       style={{ top: projectSectionMenu.top, left: projectSectionMenu.left }}
     >
-      <button type="button" role="menuitem" onClick={() => { setProjectSectionMenu(null); setCreateTypeOpen(true); }}><Plus size={16} /><span>新建项目</span></button>
+      <button type="button" role="menuitem" onClick={() => { setProjectSectionMenu(null); if (features.paraBoard) setCreateTypeOpen(true); else setProjectDialogOpen(true); }}><Plus size={16} /><span>新建项目</span></button>
     </div>, document.body)}
 
     {projectMenu && projectMenuProject && createPortal(<div
@@ -3776,7 +3888,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     >
       <button type="button" role="menuitem" className={taskMenuConversation.pinned_at ? "active" : undefined} onClick={() => { setTaskMenu(null); void toggleConversationPin(taskMenuConversation); }}>{taskMenuConversation.pinned_at ? <PinOff size={16} /> : <Pin size={16} />}<span>{taskMenuConversation.pinned_at ? "取消置顶" : "置顶"}</span></button>
       <button type="button" role="menuitem" onClick={() => { setTaskMenu(null); void renameConversation(taskMenuConversation); }}><Pencil size={16} /><span>重命名</span></button>
-      <button type="button" role="menuitem" onClick={() => openConversationProjects(taskMenuConversation)}><LayoutDashboard size={16} /><span>关联项目</span></button>
+      {features.paraBoard && <button type="button" role="menuitem" onClick={() => openConversationProjects(taskMenuConversation)}><LayoutDashboard size={16} /><span>关联项目</span></button>}
       {taskMenuConversation.active_wake_count
         ? <button type="button" role="menuitem" className="wake-menu-item active" title="查看自动续跑详情" onClick={() => openWakeDetails(taskMenuConversation)}><Clock size={16} /><span className="menu-item-copy"><strong>已安排的任务</strong><small>{wakeMenuDescription(taskMenuConversation)}</small></span></button>
         : <button type="button" role="menuitem" disabled={Boolean(taskMenuConversation.archived_at)} onClick={() => { setTaskMenu(null); setWakeDialogConversation(taskMenuConversation); }}><Clock size={16} /><span>安排自动续跑</span></button>}
@@ -3784,8 +3896,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>
     </div>, document.body)}
 
-    {createTypeOpen && <NewProjectChoice engines={projects} onClose={() => setCreateTypeOpen(false)} onFolder={() => { setCreateTypeOpen(false); setProjectDialogOpen(true); }} onBoard={(board) => { setCreateTypeOpen(false); openPara(board.id); }} />}
-    {linkedProjectsConversation && <ParaConversationProjectsDialog key={linkedProjectsConversation.id} conversationId={linkedProjectsConversation.id} conversationTitle={linkedProjectsConversation.title} onClose={() => setLinkedProjectsConversation(null)} onOpen={(board, project) => { setLinkedProjectsConversation(null); openPara(board, project); }} />}
+    {features.paraBoard && createTypeOpen && <NewProjectChoice engines={projects} onClose={() => setCreateTypeOpen(false)} onFolder={() => { setCreateTypeOpen(false); setProjectDialogOpen(true); }} onBoard={(board) => { setCreateTypeOpen(false); openPara(board.id); }} />}
+    {features.paraBoard && linkedProjectsConversation && <ParaConversationProjectsDialog key={linkedProjectsConversation.id} conversationId={linkedProjectsConversation.id} conversationTitle={linkedProjectsConversation.title} onClose={() => setLinkedProjectsConversation(null)} onOpen={(board, project) => { setLinkedProjectsConversation(null); openPara(board, project); }} />}
     {projectDialogOpen && <ProjectDialog onClose={() => setProjectDialogOpen(false)} onCreated={projectCreated} />}
     {projectSkillsDialogProject && <ProjectSkillsDialog project={projectSkillsDialogProject} onClose={() => setProjectSkillsDialogProject(null)} />}
     {wakeDialogConversation && <WakePlanDialog conversation={wakeDialogConversation} onClose={() => setWakeDialogConversation(null)} onCreated={(result) => {
@@ -3813,10 +3925,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {publicSharesDialogOpen && <PublicSharesDialog onClose={() => setPublicSharesDialogOpen(false)} />}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
-    {paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
+    {features.paraBoard && paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
       onMenu={() => setSidebarOpen(true)}
       onOpenConversation={(id, engineId) => { setParaVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
-    <main style={paraVisible ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+    <main style={features.paraBoard && paraVisible ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="workspace-header">
         <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
@@ -3832,7 +3944,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             <summary className="icon-button" aria-label="会话操作" title="会话操作"><MoreHorizontal size={21} /></summary>
             <div className="conversation-menu-panel" role="menu">
               <div className="conversation-menu-actions">
-                <button role="menuitem" onClick={() => openConversationProjects(selectedConversation)}><LayoutDashboard size={17} /><span>关联项目</span></button>
+                {features.paraBoard && <button role="menuitem" onClick={() => openConversationProjects(selectedConversation)}><LayoutDashboard size={17} /><span>关联项目</span></button>}
                 {selectedConversation.archived_at
                 ? <button role="menuitem" onClick={() => void restoreConversation(selectedConversation)}><RotateCcw size={17} /><span>恢复到侧边栏</span></button>
                 : <>
@@ -5122,6 +5234,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     persistDraft: true,
     draftScope: "main-composer",
     conversationId,
+    pendingPromptId: editingPending?.id ?? null,
     draftText: input,
     quoteExcerpt: askAgentQuote,
     attachmentNames: voiceAttachmentNames,
@@ -5131,15 +5244,31 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     fileNamePrefix: "recording",
     onTranscript: (text, transcriptionId, context) => {
       const sourceConversationId = context?.conversationId ?? conversationIdRef.current;
-      const existing = sourceConversationId === conversationIdRef.current ? inputRef.current : context?.draftText ?? "";
+      // A queued edit is a separate draft. Never persist its transcription as
+      // the ordinary composer draft, even when recognition finishes later.
+      if (context?.pendingPromptId && (sourceConversationId !== conversationIdRef.current
+        || context.pendingPromptId !== editingPendingRef.current?.id)) {
+        throw new Error("录音对应的待发送任务已退出编辑，请回到原任务的编辑状态后重试识别；录音已保留。");
+      }
+      const sameComposer = sourceConversationId === conversationIdRef.current
+        && (context?.pendingPromptId ?? null) === (editingPendingRef.current?.id ?? null);
+      const existing = sameComposer ? inputRef.current : context?.draftText ?? "";
       const combined = existing ? `${existing}${/\s$/.test(existing) ? "" : "\n"}${text}` : text;
-      if (sourceConversationId === conversationIdRef.current) {
+      if (sameComposer) {
         inputRef.current = combined;
         setInput(combined);
       }
-      onVoiceTranscript(sourceConversationId, combined, context?.quoteExcerpt ?? askAgentQuote, transcriptionId);
+      if (!context?.pendingPromptId) onVoiceTranscript(sourceConversationId, combined, context?.quoteExcerpt ?? askAgentQuote, transcriptionId);
     },
-    onSendAfterTranscription: (text, ids, context) => onVoiceSendAfterTranscription(context?.conversationId ?? conversationIdRef.current, text, context?.quoteExcerpt ?? askAgentQuote, ids),
+    onSendAfterTranscription: (text, ids, context) => {
+      if (context?.pendingPromptId) {
+        // Use the same submission path as the visible Send button, including
+        // attachments, failure retention, clearing and ordinary-draft restore.
+        onSendRef.current(text, ids);
+      } else {
+        onVoiceSendAfterTranscription(context?.conversationId ?? conversationIdRef.current, text, context?.quoteExcerpt ?? askAgentQuote, ids);
+      }
+    },
   });
 
   useEffect(() => {
@@ -5279,7 +5408,10 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     window.clearTimeout(pasteTimer.current);
     pasteTimer.current = window.setTimeout(() => setPasteNotice(""), 2600);
   }
-  function currentVoiceTranscriptionIds() { return voice.transcriptionConversationId === conversationId ? voice.transcriptionIds : []; }
+  function currentVoiceTranscriptionIds() {
+    return voice.transcriptionConversationId === conversationId && voice.transcriptionPendingPromptId === (editingPending?.id ?? null)
+      ? voice.transcriptionIds : [];
+  }
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds()); } }
   const selectedModelOption = agentOptions?.models.find((model) => model.id === selectedModel);
   const effortOptions = agentOptions?.reasoningEfforts.filter((effort) => selectedModelOption?.reasoningEfforts.includes(effort.id)) ?? [];

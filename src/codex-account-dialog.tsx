@@ -233,10 +233,10 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
   }
 
   return <div className="codex-account-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) void close(); }}>
-    <section className="codex-account-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-account-title">
+    <section className="codex-account-dialog ui-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-account-title">
       <header>
-        <div><ShieldCheck size={20} /><div><h2 id="codex-account-title">Codex 账号管理</h2><p>选择机器并管理该机器使用的 Codex 账号</p></div></div>
-        <button ref={closeButton} type="button" aria-label="关闭 Codex 账号管理" onClick={() => void close()}><X size={19} /></button>
+        <div><ShieldCheck size={20} /><div><h2 id="codex-account-title" className="dialog-title">Codex 账号管理</h2><p className="dialog-description">选择机器，管理在这台机器上使用的账号</p></div></div>
+        <button ref={closeButton} type="button" aria-label="关闭 Codex 账号管理" onClick={() => void close()}><X size={20} /></button>
       </header>
 
       <div className="codex-account-body">
@@ -248,56 +248,62 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
           </select>
         </label>
         {selectedExecutor && <div className="codex-account-machine">
-          <span>{remote ? <Monitor size={18} /> : <Server size={18} />}</span>
+          <span>{remote ? <Monitor size={20} /> : <Server size={20} />}</span>
           <div><strong>{selectedExecutor.machineName}</strong><small>{remote ? `Windows Remote Worker · ${selectedExecutor.status === "online" ? "在线" : "离线"}` : "Codex Web 服务器 · 在线"}</small></div>
           <em>{selectedExecutor.codexAccountManagementCapable ? "账号保存在本机" : "需要升级 Worker"}</em>
         </div>}
         <div className="codex-account-summary">
-          <div><strong>{state?.accounts.length ?? "—"}</strong><span>已保存账号</span></div>
-          <p><ShieldCheck size={15} />登录凭据仅保存在所选机器的受保护目录中，不会返回浏览器或传到其他机器。</p>
+          <ShieldCheck size={16} /><p>登录凭据仅保存在所选机器，不会返回浏览器或传到其他机器。</p>
         </div>
 
         {error && <div className="codex-account-alert error" role="alert">{error}</div>}
         {notice && <div className="codex-account-alert success" role="status"><Check size={15} />{notice}</div>}
 
-        <div className="codex-account-section-title"><div><strong>账号列表</strong><small>当前账号用于这台机器之后启动的 Codex Web 任务</small></div><button type="button" onClick={() => { setAdding(true); setLogin(null); setError(""); setNotice(""); }} disabled={loginActive || !selectedExecutor?.codexAccountManagementCapable}><Plus size={15} />新增账号</button></div>
-
-        <div className="codex-account-usage-refresh"><button type="button" disabled={refreshingUsage || Boolean(busyId) || !selectedExecutor?.codexAccountManagementCapable} onClick={() => void refreshUsage(executorId)}>
-          {refreshingUsage ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}{refreshingUsage ? "正在刷新重置卡…" : "刷新重置卡"}
-        </button></div>
+        <div className="codex-account-section-title">
+          <div><h3 className="dialog-section-heading">账号列表 <span className="codex-account-count" aria-label={`已保存 ${state?.accounts.length ?? "—"} 个账号`}>{state?.accounts.length ?? "—"}</span></h3><p className="dialog-description">当前账号用于这台机器之后启动的新任务</p></div>
+          <div className="codex-account-toolbar">
+            <button type="button" className="codex-account-refresh" disabled={refreshingUsage || Boolean(busyId) || !selectedExecutor?.codexAccountManagementCapable} onClick={() => void refreshUsage(executorId)}>
+              {refreshingUsage ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshingUsage ? "正在刷新…" : "刷新重置卡"}
+            </button>
+            <button type="button" className="codex-account-add" onClick={() => { setAdding(true); setLogin(null); setError(""); setNotice(""); }} disabled={loginActive || !selectedExecutor?.codexAccountManagementCapable}><Plus size={16} />新增账号</button>
+          </div>
+        </div>
         {!state && !error && <div className="codex-account-loading"><LoaderCircle className="spin" size={18} />正在读取账号…</div>}
         <div className="codex-account-list">
+          {state?.accounts.length === 0 && <p className="codex-account-empty">这台机器还没有保存账号。点击“新增账号”完成登录。</p>}
           {state?.accounts.map((account) => <article key={account.id} className={`codex-account-card ${account.active ? "active" : ""}`}>
-            <span className="codex-account-avatar"><UserRound size={18} /></span>
-            <div className="codex-account-copy">
-              <div><strong>{account.label}</strong>{account.active && <span className="codex-account-active"><Check size={12} />当前机器使用中</span>}</div>
-              <small>{account.email || "已验证的 ChatGPT 账号"} · {account.accountHint}</small>
-              <small>{account.lastUsedAt ? `最近启用 ${formatDate(account.lastUsedAt)}` : `添加于 ${formatDate(account.createdAt)}`}</small>
-              <div className="codex-account-quota">
-                <span>剩余额度 {account.quotaRemainingPercent === null || account.quotaRemainingPercent === undefined ? "暂无数据" : `${Math.round(account.quotaRemainingPercent)}%`}</span>
-                <span>额度重置 {account.quotaResetAt ? formatDate(account.quotaResetAt) : "暂无数据"}</span>
+            <div className="codex-account-identity">
+              <span className="codex-account-avatar"><UserRound size={20} /></span>
+              <div className="codex-account-copy">
+                <div className="codex-account-name"><h4>{account.label}</h4>{account.active && <span className="codex-account-active"><Check size={14} />当前机器使用中</span>}</div>
+                <p>{account.email || "已验证的 ChatGPT 账号"} · {account.accountHint}</p>
               </div>
-              <div className="codex-account-reset-row">
-                <CodexResetCreditDetails value={account.resetCredits} />
-                <button type="button" className="codex-reset-use" disabled={Boolean(busyId) || !resetCapable || loginActive}
-                  title={resetCapable ? "使用前重新核对，优先使用最早到期的一张" : "请先升级 Worker"}
-                  onClick={() => void consumeReset(account)}>
-                  {busyId === `reset:${account.id}` && <LoaderCircle className="spin" size={14} />}
-                  {busyId === `reset:${account.id}` ? "正在使用…" : "使用重置卡"}
-                </button>
-              </div>
+            </div>
+            <p className="codex-account-last-used">{account.lastUsedAt ? `最近启用 ${formatDate(account.lastUsedAt)}` : `添加于 ${formatDate(account.createdAt)}`}</p>
+            <dl className="codex-account-quota">
+              <div><dt>剩余额度</dt><dd>{account.quotaRemainingPercent === null || account.quotaRemainingPercent === undefined ? "暂无数据" : `${Math.round(account.quotaRemainingPercent)}%`}</dd></div>
+              <div><dt>额度重置</dt><dd>{account.quotaResetAt ? formatDate(account.quotaResetAt) : "暂无数据"}</dd></div>
+            </dl>
+            <div className="codex-account-reset-row">
+              <CodexResetCreditDetails value={account.resetCredits} />
+              <button type="button" className="codex-reset-use" disabled={Boolean(busyId) || !resetCapable || loginActive}
+                title={resetCapable ? "使用前重新核对，优先使用最早到期的一张" : "请先升级 Worker"}
+                onClick={() => void consumeReset(account)}>
+                {busyId === `reset:${account.id}` && <LoaderCircle className="spin" size={16} />}
+                {busyId === `reset:${account.id}` ? "正在使用…" : "使用重置卡"}
+              </button>
             </div>
             <div className="codex-account-actions">
               {account.active
-                ? <button type="button" className="primary active" disabled><Check size={14} />使用中</button>
-                : <button type="button" className="primary" disabled={Boolean(busyId)} onClick={() => void activate(account)}>{busyId === account.id ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}切换</button>}
-              <button type="button" className="danger" aria-label={`删除 ${account.label}`} title={account.active ? "请先切换到其他账号" : "删除账号"} disabled={account.active || Boolean(busyId)} onClick={() => void remove(account)}><Trash2 size={15} /></button>
+                ? <span className="codex-account-current">新任务使用此账号</span>
+                : <button type="button" className="primary" disabled={Boolean(busyId)} onClick={() => void activate(account)}>{busyId === account.id ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}切换</button>}
+              <button type="button" className="danger" aria-label={`删除 ${account.label}`} title={account.active ? "请先切换到其他账号" : "删除账号"} disabled={account.active || Boolean(busyId)} onClick={() => void remove(account)}><Trash2 size={16} /></button>
             </div>
           </article>)}
         </div>
 
         {adding && <section className="codex-login-panel" aria-label="新增 Codex 账号">
-          <div className="codex-login-heading"><div><strong>新增 Codex 账号</strong><small>使用设备码在你自己的浏览器中完成登录</small></div>{!loginActive && <button type="button" aria-label="收起新增账号" onClick={() => setAdding(false)}><X size={16} /></button>}</div>
+          <div className="codex-login-heading"><div><h3 className="dialog-section-heading">新增 Codex 账号</h3><p className="dialog-description">使用设备码在你自己的浏览器中完成登录</p></div>{!loginActive && <button type="button" aria-label="收起新增账号" onClick={() => setAdding(false)}><X size={18} /></button>}</div>
           {!login && <>
             <label>账号备注（可选）<input value={label} maxLength={60} placeholder="例如：个人 Plus、公司账号" onChange={(event) => setLabel(event.target.value)} /></label>
             <button type="button" className="codex-login-start" disabled={busyId === "login"} onClick={() => void beginLogin()}>{busyId === "login" ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}生成登录验证链接</button>

@@ -1,3 +1,4 @@
+import { isFeatureSelection } from "../src/feature-selection.js";
 import { mountParaRoutes } from "./para-routes.js";
 import { parseDeploymentSteps, type DeploymentStepStatus, type DeploymentBlocker } from "./deployment-progress.js";
 import crypto from "node:crypto";
@@ -15,7 +16,8 @@ import { sanitizeAgentMarkdown } from "../src/agent-content.js";
 import { ASK_AGENT_SELECTION_MAX_CHARS, buildAskAgentDraft, normalizeAskAgentSelection } from "../src/ask-agent-selection.js";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
 import { parseCodexFileMentionRequest } from "../src/codex-file-mentions.js";
-import { AppDatabase, StorageQuotaExceededError, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type PersonalMemoryReviewAction, type ProjectRow, type SessionRow, type UserRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
+import { AppDatabase, PublicShareStorageBusyError, StorageQuotaExceededError, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type PersonalMemoryReviewAction, type ProjectRow, type SessionRow, type UserRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
+import { isPublicShareActive } from "../src/public-share.js";
 import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TRANSCRIPTION_PROMPT_VERSION, TranscriptionError, TranscriptionService } from "./transcription.js";
@@ -44,6 +46,7 @@ import { bootstrapScript, type RemoteWorkerBootstrapPlatform } from "./remote-wo
 import { ReaderIngestError } from "./reader-ingest.js";
 import { parseReaderRange, ReaderRangeError } from "./reader-range.js";
 import { ReaderService, ReaderUnavailableError } from "./reader-service.js";
+import { ReaderTextResources } from "./reader-text-resources.js";
 import type { ReadingAnnotationType } from "./reader-types.js";
 
 const COOKIE_NAME = "cww_session";
@@ -366,6 +369,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   } as const;
   const serverInstanceId = crypto.randomUUID();
   const imageThumbnails = new ImageThumbnailService();
+  const readerTextResources = new ReaderTextResources();
   const systemSubscribers = new Map<Response, string>();
   let systemStatusSequence = 0;
   let systemStatusTimer: ReturnType<typeof setInterval> | undefined;
@@ -419,7 +423,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function publicShareState(req: Request, fileId: string) {
-    return { enabled: Boolean(db.getPublicFileShare(fileId)?.enabled), publicUrl: publicPreviewUrl(req, fileId) };
+    const share = db.getPublicFileShare(fileId);
+    const enabled = isPublicShareActive(share?.enabled, share?.expires_at);
+    return { enabled, expired: Boolean(share?.enabled && !enabled), expiresAt: share?.expires_at ?? null, publicUrl: publicPreviewUrl(req, fileId) };
   }
 
   function publicResponseHeaders(res: Response): void {
@@ -1338,14 +1344,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.status(204).end();
   });
 
-  api.get("/files/:id/preview/public", publicShareLimiter, (req, res) => {
+  api.get("/files/:id/preview/public", publicShareLimiter, async (req, res) => {
     publicResponseHeaders(res);
     const fileId = String(req.params.id);
     const active = activePublicDocument(fileId);
-    if (!active) return res.status(404).json({ error: "公开文件不存在或分享已关闭。" });
+    if (!active) return res.status(404).json({ error: "公开文件不存在，或分享已到期、关闭。" });
     let content: string;
-    try { content = fs.readFileSync(active.absolute, "utf8").replace(/^\uFEFF/, ""); }
-    catch { return res.status(404).json({ error: "公开文件不存在或分享已关闭。" }); }
+    const embeddedUrls = new Set<string>();
+    try {
+      content = await readerTextResources.content(active.absolute, (revision, index) => {
+        const url = `${config.basePath}/api/files/${encodeURIComponent(fileId)}/preview/public/images/${revision}/${index}`;
+        embeddedUrls.add(url);
+        return url;
+      });
+    }
+    catch { return res.status(404).json({ error: "公开文件不存在，或分享已到期、关闭。" }); }
     const assets = db.listPublicFileShareAssets(active.share.id).map((asset) => ({
       sourceRef: asset.source_ref,
       assetFileId: asset.asset_file_id,
@@ -1353,10 +1366,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     try {
       content = rewritePublicShareDocument(active.kind, content, assets, (assetFileId) => (
         `${publicOrigin(req)}${config.basePath}/api/files/${encodeURIComponent(fileId)}/preview/public/assets/${encodeURIComponent(assetFileId)}`
-      ));
+      ), embeddedUrls);
     } catch {
       return res.status(404).json({ error: "公开文件资源不完整。" });
     }
+    if (!activePublicDocument(fileId)) return res.status(404).json({ error: "公开分享已到期或关闭。" });
     const suppliedViewId = String(req.get("x-codex-view-id") ?? "");
     const viewId = /^[A-Za-z0-9_-]{8,100}$/.test(suppliedViewId)
       ? suppliedViewId
@@ -1375,25 +1389,38 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     });
   });
 
+  api.get("/files/:id/preview/public/images/:revision/:index", publicShareLimiter, async (req, res) => {
+    publicResponseHeaders(res);
+    const active = activePublicDocument(String(req.params.id));
+    if (!active || !/^\d+$/.test(String(req.params.index)) || !/^[a-f0-9]{24}$/.test(String(req.params.revision))) return res.status(404).end();
+    try {
+      const image = await readerTextResources.image(active.absolute, String(req.params.revision), Number(req.params.index));
+      if (!image || !activePublicDocument(String(req.params.id))) return res.status(404).end();
+      res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      return res.type(image.mime).send(image.body);
+    } catch { return res.status(404).end(); }
+  });
+
   api.get("/files/:id/preview/public/assets/:assetId", publicShareLimiter, (req, res) => {
     publicResponseHeaders(res);
     const active = activePublicDocument(String(req.params.id));
-    if (!active) return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+    if (!active) return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
     const assetId = String(req.params.assetId);
     const mapping = db.listPublicFileShareAssets(active.share.id).find((asset) => asset.asset_file_id === assetId);
     const asset = mapping ? db.getFile(assetId) : undefined;
     const conversation = asset ? db.getConversation(asset.conversation_id) : undefined;
     if (!asset || !conversation || conversation.user_id !== active.share.user_id || conversation.deleted_at
       || asset.kind !== "output" || !isPublicShareImage(asset) || !isPersistedDeliverablePath(asset.relative_path)) {
-      return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+      return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
     }
     let absolute: string;
     try { absolute = resolveFilePath(asset, active.share.user_id); }
-    catch { return res.status(404).json({ error: "公开图片不存在或分享已关闭。" }); }
+    catch { return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" }); }
     let stat: fs.Stats;
     try { stat = fs.statSync(absolute); }
-    catch { return res.status(404).json({ error: "公开图片不存在或分享已关闭。" }); }
-    if (!stat.isFile() || stat.size !== asset.size) return res.status(404).json({ error: "公开图片不存在或分享已关闭。" });
+    catch { return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" }); }
+    if (!stat.isFile() || stat.size !== asset.size) return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
     res.setHeader("Content-Type", fileResponseContentType(asset.mime_type));
     res.setHeader("Content-Length", String(stat.size));
     return res.sendFile(path.basename(absolute), { root: path.dirname(absolute) });
@@ -1590,14 +1617,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       expires: expiresAt,
     });
     const maintenancePhase = codexUpdateMaintenancePhase();
-    return res.json({ authenticated: true, accountId: user.id, username: user.username, displayName: user.display_name, csrfToken, chatFontSize: db.getChatFontSize(user.id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
+    return res.json({ authenticated: true, accountId: user.id, username: user.username, displayName: user.display_name, csrfToken, chatFontSize: db.getChatFontSize(user.id), features: db.getFeatureSelection(user.id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
   });
 
   api.get("/auth/session", (req, res) => {
     const session = readSession(req, db, config);
     if (!session) return res.json({ authenticated: false });
     const maintenancePhase = codexUpdateMaintenancePhase();
-    return res.json({ authenticated: true, accountId: session.user_id, username: session.username, displayName: session.display_name, csrfToken: session.csrf_token, chatFontSize: db.getChatFontSize(session.user_id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
+    return res.json({ authenticated: true, accountId: session.user_id, username: session.username, displayName: session.display_name, csrfToken: session.csrf_token, chatFontSize: db.getChatFontSize(session.user_id), features: db.getFeatureSelection(session.user_id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
   });
 
   api.use((req, res, next) => {
@@ -2109,6 +2136,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     startSystemStatusMonitor();
     systemStatusSequence += 1;
     writeSse(res, systemStatusSequence, "system_status", systemStatusPayload(session.user_id));
+    writeSse(res, systemStatusSequence, "feature_selection", { features: db.getFeatureSelection(session.user_id) });
     if (isHostRootUser(session.user_id)) writeSse(res, systemStatusSequence, "executor_status", { executors: remoteWorkers.listExecutors() });
     const heartbeat = setInterval(() => res.write(": keepalive\n\n"), 20_000);
     req.on("close", () => {
@@ -2546,6 +2574,26 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     try { return res.json({ selection: saveAgentSelection(session.user_id, req.body?.model, req.body?.reasoningEffort, undefined, typeof req.body?.executorId === "string" ? req.body.executorId : undefined) }); }
     catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "模型选项无效。" }); }
+  });
+
+  api.get("/user-settings/features", (_req, res) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.json(db.getFeatureSelection((res.locals.session as SessionRow).user_id));
+  });
+
+  api.put("/user-settings/features", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    res.setHeader("Cache-Control", "private, no-store");
+    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "revision"].includes(key))) {
+      return res.status(400).json({ error: "功能选择无效，请重新打开设置。" });
+    }
+    const features = db.setFeatureSelection(session.user_id, req.body);
+    if (!features) return res.status(409).json({ error: "设置已在其他设备更新，请确认当前选项后重试。" });
+    systemStatusSequence += 1;
+    for (const [response, userId] of systemSubscribers) {
+      if (userId === session.user_id) writeSse(response, systemStatusSequence, "feature_selection", { features });
+    }
+    return res.json(features);
   });
 
   api.put("/user-settings/chat-font-size", (req, res) => {
@@ -3625,6 +3673,38 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   });
 
+  api.get("/files/:id/preview/content", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    if (!publicShareDocumentKind(file)) return res.status(415).json({ error: "该文件不支持正文预览。" });
+    try {
+      const absolute = resolveExistingFilePath(file, session.user_id);
+      if (!fs.existsSync(absolute) && reader.ensureOriginalFileAvailable(file, session.user_id) === "restoring") {
+        return readerRequestError(res, new ReaderUnavailableError());
+      }
+      const content = await readerTextResources.content(absolute, (revision, index) =>
+        `${config.basePath}/api/files/${encodeURIComponent(file.id)}/preview/images/${revision}/${index}`);
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json({ content });
+    } catch { return res.status(422).json({ error: "正文暂时无法读取，请稍后重新打开。" }); }
+  });
+
+  api.get("/files/:id/preview/images/:revision/:index", async (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file || !publicShareDocumentKind(file)) return res.status(404).end();
+    if (!/^\d+$/.test(String(req.params.index)) || !/^[a-f0-9]{24}$/.test(String(req.params.revision))) return res.status(404).end();
+    try {
+      const image = await readerTextResources.image(resolveExistingFilePath(file, session.user_id), String(req.params.revision), Number(req.params.index));
+      if (!image) return res.status(404).end();
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
+      return res.type(image.mime).send(image.body);
+    } catch { return res.status(404).end(); }
+  });
+
   api.get("/files/:id/preview", (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
@@ -3670,6 +3750,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         conversationId: share.conversation_id,
         conversationTitle: share.conversation_title,
         enabledAt: share.enabled_at,
+        expiresAt: share.expires_at,
         publicUrl: publicPreviewUrl(req, share.file_id),
       }];
     });
@@ -3686,6 +3767,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       return res.status(400).json({ error: "只有已完成的 Markdown 或 HTML 成品可以公开分享。" });
     }
     if (file.size > PUBLIC_FILE_READER_MAX_BYTES) return res.status(413).json({ error: "超过 5 MiB 的文件不能在线公开分享。" });
+    const storage = db.getConversationStorage(file.conversation_id);
+    if (storage && !["local", "cold"].includes(storage.state)) return res.status(409).json({ error: new PublicShareStorageBusyError().message });
     let absolute: string;
     try { absolute = resolveFilePath(file, session.user_id); }
     catch { return res.status(404).json({ error: "文件不存在。" }); }
@@ -3711,6 +3794,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       db.enablePublicFileShare({ id: newId(), file, userId: session.user_id, assets });
       return res.json({ share: publicShareState(req, file.id) });
     } catch (error) {
+      if (error instanceof PublicShareStorageBusyError) return res.status(409).json({ error: error.message });
       if (error instanceof PublicShareAssetError) return res.status(422).json({ error: error.message });
       return res.status(500).json({ error: "公开分享创建失败。" });
     }

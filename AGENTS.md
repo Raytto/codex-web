@@ -4,3 +4,5 @@
 - Preserve server-side persistence for queued prompts, attachments, messages, events, and Codex threads.
 - Maintain the separation between the web UID and the tenant worker UID.
 - Run `npm test` before submitting changes.
+
+- For new or redesigned dialogs, follow `docs/UI_DIALOG_GUIDELINES.md` and reuse the semantic typography tokens and `ui-dialog` baseline in `src/dialog-tokens.css`.

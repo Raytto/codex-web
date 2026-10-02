@@ -1,3 +1,4 @@
+import type { FeatureSelection } from "./feature-selection";
 export const BASE_PATH = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
 
 export type MaintenancePhase = "idle" | "preparing" | "active";
@@ -18,7 +19,7 @@ export type DeploymentStatus = {
   runningJobCount?: number;
   blockers?: import("../server/deployment-progress").DeploymentBlocker[];
 };
-export type Session = { authenticated: boolean; accountId?: string; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; projectMode?: boolean; maintenance?: boolean; maintenancePhase?: MaintenancePhase };
+export type Session = { authenticated: boolean; accountId?: string; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; features?: FeatureSelection; projectMode?: boolean; maintenance?: boolean; maintenancePhase?: MaintenancePhase };
 export type SystemStatus = {
   instanceId: string;
   maintenance: boolean;
@@ -132,7 +133,7 @@ export type ConversationPage = { conversations: Conversation[]; total: number; h
 export type WorkFile = {
   id: string; original_name: string; relative_path: string; source_path?: string | null; mime_type: string; size: number; kind: "upload" | "output";
 };
-export type FileShareState = { enabled: boolean; publicUrl: string };
+export type FileShareState = { enabled: boolean; expired: boolean; expiresAt: string | null; publicUrl: string };
 export type ManagedPublicShare = {
   id: string;
   fileId: string;
@@ -143,6 +144,7 @@ export type ManagedPublicShare = {
   conversationId: string;
   conversationTitle: string;
   enabledAt: string | null;
+  expiresAt: string;
   publicUrl: string;
 };
 export type FilePreviewConversation = Pick<Conversation, "id" | "title" | "status" | "external_status" | "has_unread_result" | "has_pending_work">;
@@ -573,6 +575,8 @@ export const api = {
     `/executors/${encodeURIComponent(executorId)}/worker/credential/${action}`, { method: "POST" },
   ),
   createRemoteWorkerBootstrap: () => request<RemoteWorkerBootstrap>("/remote-worker-bootstrap", { method: "POST" }),
+  featureSelection: (signal?: AbortSignal) => request<FeatureSelection>("/user-settings/features", { signal, cache: "no-store" }),
+  updateFeatureSelection: (selection: FeatureSelection, signal?: AbortSignal) => request<FeatureSelection>("/user-settings/features", { method: "PUT", body: JSON.stringify(selection), signal }),
   updateChatFontSize: (chatFontSize: number) => request<{ chatFontSize: number }>("/user-settings/chat-font-size", {
     method: "PUT", body: JSON.stringify({ chatFontSize }),
   }),
@@ -775,20 +779,18 @@ export const api = {
     const response = await fetch(`${BASE_PATH}/api/files/${encodeURIComponent(id)}/preview/public`, {
       method: "HEAD", credentials: "same-origin", cache: "no-store", signal,
     });
-    if (!response.ok) throw new Error("公开分享已关闭或文件不存在。");
+    if (!response.ok) throw new Error("公开分享已到期、关闭或文件不存在。");
   },
   fileText: async (file: WorkFile, signal?: AbortSignal) => {
-    const response = await fetch(fileUrl(file), { credentials: "same-origin", signal });
-    const body = await response.text();
-    if (!response.ok) {
-      let message = `文件读取失败 (${response.status})`;
-      try {
-        const parsed = JSON.parse(body) as { error?: unknown };
-        if (typeof parsed.error === "string") message = parsed.error;
-      } catch { /* A non-JSON error body keeps the generic status message. */ }
-      throw new Error(message);
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const body = await request<{ content?: string; restoring?: boolean }>(
+        `/files/${encodeURIComponent(file.id)}/preview/content`, { signal }, { allowStatuses: [202] },
+      );
+      if (typeof body.content === "string") return body.content;
+      if (!body.restoring) throw new Error("正文暂时无法读取，请稍后重新打开。");
+      await waitForReaderRetry(signal, 1_000);
     }
-    return body.replace(/^\uFEFF/, "");
+    throw new Error("原文件仍在恢复，请稍后重试。");
   },
 };
 

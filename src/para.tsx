@@ -1,3 +1,4 @@
+import { useFeatureSelection } from "./feature-selection-context";
 import {
   useEffect,
   useState,
@@ -20,7 +21,6 @@ import {
   LayoutDashboard,
   Folder,
   Menu,
-  Search,
   ArrowRight,
   MessageSquare,
   Paperclip,
@@ -45,13 +45,14 @@ import type {
   ParaBoard,
   ParaSidebarProject,
   ParaProject,
-  ParaArea,
   ParaResource,
   ParaDetail,
   ParaStage,
   ParaBrief,
   ParaConversation,
 } from "../server/para-types";
+import { FLOW, LifecycleForm, KanbanLimitSettings, KanbanAttention, projectAttention, actionTitle, type LifecycleAction } from "./kanban-lifecycle";
+import type { KanbanSummary } from "../server/para-types";
 import "./para.css";
 
 const BRIEF: Record<keyof ParaBrief, string> = {
@@ -87,11 +88,13 @@ function Dialog({
   children,
   onClose,
   closeDisabled = false,
+  className = "",
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   closeDisabled?: boolean;
+  className?: string;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -101,7 +104,7 @@ function Dialog({
   }, []);
   return createPortal(
     <dialog
-      className="para-dialog"
+      className={`para-dialog ${className}`}
       ref={ref}
       onCancel={(e) => {
         e.preventDefault();
@@ -248,8 +251,8 @@ export function NewProjectChoice({
             onClick={() => setType("board")}
           >
             <LayoutDashboard />
-            <strong>PARA 看板</strong>
-            <span>聚合想法、资料、多个会话与成果</span>
+            <strong>项目看板</strong>
+            <span>从想法、推进到验收，管理项目完整生命周期</span>
           </button>
         </div>
         {type === "board" && (
@@ -488,7 +491,7 @@ export function ParaSidebar({
   return (
     <section className="para-sidebar">
       <div className="section-label project-label">
-        <span>PARA 看板</span>
+        <span>项目看板</span>
         <button type="button" aria-label="看板操作" title="看板操作" aria-haspopup="menu" aria-expanded={menu?.id === "section"} onClick={(event) => openMenu("section", event.currentTarget)}>
           <MoreHorizontal size={15} />
         </button>
@@ -612,48 +615,59 @@ export function ParaWorkspace({
   onMenu: () => void;
   onOpenConversation: (id: string, engineId: string) => void;
 }) {
+  const [summary, setSummary] = useState<KanbanSummary | null>(null);
+  const [attentionFilter, setAttentionFilter] = useState("attention");
+  const [transitionBusy, setTransitionBusy] = useState(false);
+  const [transition, setTransition] = useState<{ project: ParaProject; action: LifecycleAction; position?: number } | null>(null);
   const [data, setData] = useState<BoardData | null>(null),
     [detail, setDetail] = useState<ParaDetail | null>(null),
     [pid, setPid] = useState<string | null>(openProjectId),
     [tab, setTab] = useState("projects"),
     [detailTab, setDetailTab] = useState("overview");
-  const [query, setQuery] = useState(""),
-    [stage, setStage] = useState(() =>
-      window.matchMedia("(max-width:720px)").matches ? "idea" : "all",
-    ),
-    [area, setArea] = useState(""),
-    [paused, setPaused] = useState(false),
+  const [stage, setStage] = useState("all"),
     [sort, setSort] = useState("manual"),
     [view, setView] = useState("board");
   const [modal, setModal] = useState<
-      "idea" | "edit" | "resource" | "area" | "link" | "new" | "settings" | null
+      "idea" | "edit" | "resource" | "link" | "new" | "settings" | null
     >(null),
     [addStage, setAddStage] = useState<ParaStage>("idea"),
     [template, setTemplate] = useState(""),
-    [resource, setResource] = useState<ParaResource | null>(null),
-    [editArea, setEditArea] = useState<ParaArea | null>(null);
+    [resource, setResource] = useState<ParaResource | null>(null);
   const [notice, setNotice] = useState(""),
     [undo, setUndo] = useState<{
       id: string;
       revision: number;
       stage: ParaStage;
+      outcome: string;
     } | null>(null);
   const action = useAction(),
     scroll = useRef<HTMLDivElement>(null),
     listScroll = useRef(0),
     dragged = useRef<ParaProject | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    if (!undo) return;
+    const timer = window.setTimeout(() => setUndo(null), 10000);
+    return () => window.clearTimeout(timer);
+  }, [undo]);
   const generation = useRef(0);
   const refresh = useCallback(async () => {
     const gen = ++generation.current;
-    const [b, d] = await Promise.all([
+    const [b, d, overview] = await Promise.all([
       para.board(boardId),
       pid ? para.project(pid) : Promise.resolve(null),
+      para.summary(),
     ]);
     if (gen === generation.current) {
       setData(b);
       setDetail(d);
+      setSummary(overview);
     }
-  }, [boardId, pid]);
+  }, [boardId, pid, navigationKey]);
   useEffect(() => {
     void refresh().catch((e) => action.setError(message(e)));
   }, [refresh]);
@@ -693,6 +707,7 @@ export function ParaWorkspace({
     // A write receipt is immediately authoritative. Discard reads started
     // before it so the next action cannot submit an already stale revision.
     generation.current++;
+    setUndo(previous => previous?.id === project.id && previous.revision !== project.revision ? null : previous);
     setDetail((d) =>
       d?.project.id === project.id ? { ...d, project } : d,
     );
@@ -708,13 +723,20 @@ export function ParaWorkspace({
     );
   }
   async function patch(p: ParaProject, change: Record<string, unknown>) {
+    if (change.stage && change.stage !== p.stage) {
+      const stage = change.stage as ParaStage;
+      if (["active", "review", "done", "stopped"].includes(stage)) {
+        setTransition({ project: p, action: stage, position: typeof change.position === "number" ? change.position : undefined });
+        return;
+      }
+    }
     const result = await para.updateProject(p.id, {
       revision: p.revision,
       ...change,
     });
     acceptProject(result.project);
     if (change.stage)
-      setUndo({ id: p.id, revision: result.project.revision, stage: p.stage });
+      setUndo({ id: p.id, revision: result.project.revision, stage: p.stage, outcome: p.outcome });
     await refresh();
   }
   function addIdea(s: ParaStage) {
@@ -730,6 +752,7 @@ export function ParaWorkspace({
       <article
         key={p.id}
         className={`para-card stage-${p.stage}`}
+        data-project-id={p.id}
         draggable={!p.archived_at && !action.busy}
         onDragStart={(e) => {
           dragged.current = p;
@@ -754,33 +777,34 @@ export function ParaWorkspace({
             );
         }}
       >
+        <div className="para-card-header">
+          <ParaStageMenu label={`${p.title} 的阶段`} value={p.stage} disabled={action.busy}
+            onChange={(stage) => void action.run(() => patch(p, { stage }))} />
+          {p.archived_at && <button disabled={action.busy} onClick={() => void action.run(() => patch(p, { archived: false }))}>恢复</button>}
+        </div>
         <button className="para-card-body" onClick={() => open(p)}>
-          <span className="para-card-eyebrow">
-            {data?.areas.find((a) => a.id === p.area_id)?.title ||
-              "尚未设置领域"}
-            {p.paused ? (
-              <span>
-                <Pause size={12} />
-                已暂停
-              </span>
-            ) : null}
-          </span>
           <h3>{p.title}</h3>
-          <p>
-            {p.brief.next
+          {(p.paused || p.waiting_for || (p.stage === "incubating" && p.ready) || p.review_on) && !["done", "stopped"].includes(p.stage) && <span className="para-card-eyebrow">
+            {Boolean(p.paused) && <span>已暂停</span>}
+            {Boolean(p.waiting_for) && <span>等待中</span>}
+            {p.stage === "incubating" && Boolean(p.ready) && <span>已就绪</span>}
+            {p.review_on && <span>回顾 {p.review_on}</span>}
+          </span>}
+          {(p.outcome || p.waiting_for || (p.paused && p.hold_reason) || p.brief.next || p.brief.goal) && <p>
+            {["done", "stopped"].includes(p.stage) ? p.outcome : p.waiting_for ? `等待：${p.waiting_for}` : p.paused && p.hold_reason ? `暂停：${p.hold_reason}` : p.brief.next
               ? `下一步：${p.brief.next}`
-              : p.brief.goal || "先留下这个念头，细节慢慢补。"}
-          </p>
-          <span className="para-card-count">
-            <span>
+              : p.brief.goal}
+          </p>}
+          {Boolean(p.resource_count || p.conversation_count) && <span className="para-card-count">
+            {Boolean(p.resource_count) && <span>
               <Paperclip size={13} />
               {p.resource_count ?? 0} 份资料
-            </span>
-            <span>
+            </span>}
+            {Boolean(p.conversation_count) && <span>
               <MessageSquare size={13} />
               {p.conversation_count ?? 0} 个会话
-            </span>
-          </span>
+            </span>}
+          </span>}
           {Boolean(p.unread_count || p.running_count) && (
             <span className="para-activity">
               {p.running_count
@@ -789,20 +813,6 @@ export function ParaWorkspace({
             </span>
           )}
         </button>
-        <div className="para-card-stage">
-          <ParaStageMenu label={`${p.title} 的阶段`} value={p.stage} disabled={action.busy}
-            onChange={(stage) => void action.run(() => patch(p, { stage }))} />
-          {p.archived_at && (
-            <button
-              disabled={action.busy}
-              onClick={() =>
-                void action.run(() => patch(p, { archived: false }))
-              }
-            >
-              恢复
-            </button>
-          )}
-        </div>
       </article>
     ));
   }
@@ -816,8 +826,7 @@ export function ParaWorkspace({
         </button>
         <ErrorBox error={action.error} />
         <Empty>
-          <LoaderCircle className="spin" />
-          正在加载看板…
+          {action.error ? <><span>暂时无法打开这个看板。</span><button onClick={() => { action.setError(""); void refresh().catch(e => action.setError(message(e))); }}>重新加载</button>{pid && <button onClick={back}>返回看板</button>}</> : <><LoaderCircle className="spin" />正在加载看板…</>}
         </Empty>
       </main>
     );
@@ -826,18 +835,15 @@ export function ParaWorkspace({
       .filter(
         (p) =>
           !p.archived_at &&
-          (!paused || p.paused) &&
-          (stage === "all" || p.stage === stage) &&
-          (!area || p.area_id === area) &&
-          `${p.title} ${p.brief.goal} ${p.brief.next}`
-            .toLowerCase()
-            .includes(query.toLowerCase()),
+          (stage === "all" ? p.stage !== "stopped" : p.stage === stage),
       )
       .sort((a, b) =>
         sort === "updated"
           ? b.updated_at.localeCompare(a.updated_at)
           : a.position - b.position,
       );
+  const hasFilters = stage !== "all";
+  const clearFilters = () => setStage("all");
   return (
     <main
       className={`workspace para-workspace ${!visible ? "para-hidden" : ""}`}
@@ -859,7 +865,7 @@ export function ParaWorkspace({
           ) : (
             <span className="para-kicker">
               <LayoutDashboard size={18} />
-              PARA
+              项目看板
             </span>
           )}
         </div>
@@ -867,7 +873,7 @@ export function ParaWorkspace({
           <Settings2 size={19} />
         </button>
       </header>
-      <div className="para-scroll" ref={scroll}>
+      <div className={`para-scroll ${!pid ? "para-board-scroll" : ""}`} ref={scroll}>
         <ErrorBox error={action.error} />
         {notice && (
           <div className="para-notice" role="status">
@@ -885,6 +891,7 @@ export function ParaWorkspace({
                   const result = await para.updateProject(undo.id, {
                     revision: undo.revision,
                     stage: undo.stage,
+                    outcome: undo.outcome,
                   });
                   acceptProject(result.project);
                   setUndo(null);
@@ -906,9 +913,7 @@ export function ParaWorkspace({
                 <span className="para-kicker">项目档案</span>
                 <h1>{current.title}</h1>
                 <p>
-                  {data.areas.find((a) => a.id === current.area_id)?.title ||
-                    "未设置领域"}{" "}
-                  · 默认工程：
+                  {projectAttention(current)} · 默认工程：
                   {engines.find(
                     (e) =>
                       e.id ===
@@ -941,6 +946,32 @@ export function ParaWorkspace({
                 </button>
               </div>
             )}
+            {data.board.archived_at && <div className="para-notice">所属看板已归档，请先恢复再继续推进。<button disabled={action.busy} onClick={() => void action.run(async () => { await para.updateBoard(boardId, { revision: data.board.revision, archived: false }); await refresh(); })}>恢复所属看板</button></div>}
+            <section className="kanban-project-focus" aria-label="项目推进状态" aria-busy={action.busy}>
+              <ol className="kanban-steps">{FLOW.map(s => <li key={s} className={current.stage === s ? "current" : ""} aria-current={current.stage === s ? "step" : undefined}>{STAGES[s]}</li>)}</ol>
+              {current.stage === "stopped" ? <h2>已终止：{current.outcome}</h2> : current.stage === "done" ? <h2>验收结论：{current.outcome || "已完成"}</h2> : <>
+                <span className="para-kicker">{current.waiting_for ? "当前等待" : current.paused ? "暂时停一停" : current.stage === "review" ? "待我验收" : "当前下一步"}</span>
+                <h2>{current.waiting_for || (current.paused ? current.hold_reason : current.brief.next) || "写下接下来能执行的一件事"}</h2>
+              </>}
+              {current.stage === "review" && <><p>完成标准：{current.brief.success || "尚未填写"}</p><p className="kanban-evidence">{current.acceptance || "补充成果入口、已验证项和未验证项，让验收有据可查。"}</p><button disabled={action.busy} onClick={() => setTransition({ project: current, action: "review" })}>编辑验收说明</button><button disabled={action.busy} onClick={() => setDetailTab("outputs")}>查看成果 · {detail.resources.filter(r => r.is_output && !r.archived_at).length}</button></>}
+              {current.review_on && <p>下次回顾：{current.review_on}</p>}
+              {current.effort && <p>投入边界：{current.effort}</p>}
+              {(current.started_at || current.ended_at || current.reviewed_at) && <p className="para-hint">{current.started_at && `开始于 ${new Date(current.started_at).toLocaleDateString("zh-CN")} · `}{current.ended_at ? `结束于 ${new Date(current.ended_at).toLocaleDateString("zh-CN")}` : current.reviewed_at ? `最近回顾 ${new Date(current.reviewed_at).toLocaleDateString("zh-CN")}` : "尚未结束"}</p>}
+              <div className="para-actions">
+                {!current.archived_at && !data.board.archived_at && <>
+                  {current.stage === "idea" && <button disabled={action.busy} className="para-primary" onClick={() => void action.run(() => patch(current, { stage: "incubating" }))}>开始准备</button>}
+                  {current.stage === "incubating" && <><button disabled={action.busy} className="para-primary" onClick={() => setTransition({ project: current, action: "active" })}>开始推进</button><button disabled={action.busy} onClick={() => void action.run(() => patch(current, { ready: !current.ready }))}>{current.ready ? "已准备好 ✓" : "标记准备就绪"}</button></>}
+                  {current.stage === "active" && !current.waiting_for && !current.paused && <><button disabled={action.busy} className="para-primary" onClick={() => newChat(current.brief.next || "根据项目简报与选定资料，明确并推进下一步。")}>推进下一步</button><button disabled={action.busy} onClick={() => setTransition({ project: current, action: "review" })}>提交验收</button></>}
+                  {current.stage === "review" && <><button disabled={action.busy} className="para-primary" onClick={() => setTransition({ project: current, action: "done" })}>确认完成</button><button disabled={action.busy} onClick={() => setTransition({ project: current, action: "active" })}>退回修改</button></>}
+                  {["done", "stopped"].includes(current.stage) ? <><button disabled={action.busy} onClick={() => void action.run(() => patch(current, { stage: "incubating" }))}>重新打开</button><button disabled={action.busy} onClick={() => setTransition({ project: current, action: current.stage })}>补充结论</button></> : <>
+                    {Boolean(current.waiting_for) && <button disabled={action.busy} onClick={() => void action.run(() => patch(current, { waiting_for: "" }))}>解除等待</button>}
+                    {Boolean(current.paused) && <button disabled={action.busy} onClick={() => void action.run(() => patch(current, { paused: false }))}>恢复推进</button>}
+                    <button disabled={action.busy} onClick={() => setTransition({ project: current, action: "recap" })}>回顾 / 更新下一步</button>
+                  </>}
+                </>}
+              </div>
+              {action.busy && <p className="para-hint" role="status">正在保存项目…</p>}
+            </section>
             <nav className="para-tabs" aria-label="项目内容">
               {[
                 ["overview", "概览"],
@@ -993,7 +1024,7 @@ export function ParaWorkspace({
                         )
                       }
                     >
-                      开始规划
+                      帮我理清下一步
                       <ArrowRight size={16} />
                     </button>
                   </section>
@@ -1052,17 +1083,11 @@ export function ParaWorkspace({
                     />
                   </section>
                   <div className="para-actions">
-                    <button
-                      disabled={action.busy}
-                      onClick={() =>
-                        void action.run(() =>
-                          patch(current, { paused: !current.paused }),
-                        )
-                      }
-                    >
-                      <Pause size={14} />
-                      {current.paused ? "继续推进" : "暂停项目"}
-                    </button>
+                    {!["done", "stopped"].includes(current.stage) && <>
+                      <button disabled={action.busy} onClick={() => setTransition({ project: current, action: "wait" })}>记录等待</button>
+                      <button disabled={action.busy} onClick={() => setTransition({ project: current, action: "pause" })}><Pause size={14} />暂停项目</button>
+                      <button disabled={action.busy} onClick={() => setTransition({ project: current, action: "stopped" })}>终止项目</button>
+                    </>}
                     <button
                       disabled={action.busy}
                       onClick={() => {
@@ -1155,11 +1180,9 @@ export function ParaWorkspace({
           <Empty>正在加载项目…</Empty>
         ) : (
           <>
-            <div className="para-title-row">
+            <div className="para-title-row para-board-title">
               <div>
-                <span className="para-kicker">从想法到成果</span>
                 <h1>{data.board.name}</h1>
-                <p>把资料、讨论和下一步，放回同一个项目。</p>
               </div>
               <button className="para-primary" onClick={() => addIdea("idea")}>
                 <Plus size={18} />
@@ -1188,52 +1211,26 @@ export function ParaWorkspace({
             <nav className="para-tabs" aria-label="看板内容">
               {[
                 ["projects", "项目推进"],
-                ["areas", "领域"],
-                ["resources", "资源"],
+                ["attention", "待我处理"],
+                ["resources", "项目资料"],
+                ["stopped", "已终止"],
                 ["archive", "归档"],
               ].map(([v, n]) => (
                 <button
                   key={v}
                   className={tab === v ? "active" : ""}
+                  aria-current={tab === v ? "page" : undefined}
                   onClick={() => setTab(v)}
                 >
                   {n}
                 </button>
               ))}
             </nav>
+            {tab === "attention" && summary && <KanbanAttention summary={summary} filter={attentionFilter} setFilter={setAttentionFilter} onOpen={(b, p) => { if (b === boardId) { const item = data.projects.find(item => item.id === p); if (item) open(item); } else onNavigate(b, p); }} />}
+            {tab === "stopped" && <section className="para-panel"><h2>已终止</h2><p className="para-hint">保留原因与已有成果，需要时可重新打开。</p><div className="para-area-grid">{renderCards(data.projects.filter(p => p.stage === "stopped" && !p.archived_at))}</div>{!data.projects.some(p => p.stage === "stopped" && !p.archived_at) && <Empty>没有已终止的项目。</Empty>}</section>}
             {tab === "projects" && (
               <>
                 <div className="para-filters">
-                  <label className="para-search">
-                    <Search size={17} />
-                    <input
-                      placeholder="搜索项目"
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                    />
-                  </label>
-                  <select
-                    aria-label="领域筛选"
-                    value={area}
-                    onChange={(e) => setArea(e.target.value)}
-                  >
-                    <option value="">所有领域</option>
-                    {data.areas
-                      .filter((a) => !a.archived_at)
-                      .map((a) => (
-                        <option key={a.id} value={a.id}>
-                          {a.title}
-                        </option>
-                      ))}
-                  </select>
-                  <label className="para-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={paused}
-                      onChange={(e) => setPaused(e.target.checked)}
-                    />
-                    只看暂停
-                  </label>
                   <ParaStageMenu filter label="阶段筛选" value={stage} onChange={setStage} />
                   <select
                     aria-label="项目排序"
@@ -1244,17 +1241,22 @@ export function ParaWorkspace({
                     <option value="updated">最近更新</option>
                   </select>
                   <button
+                    aria-label={view === "board" ? "切换为列表视图" : "切换为看板视图"}
                     onClick={() => setView(view === "board" ? "list" : "board")}
                   >
                     {view === "board" ? "列表视图" : "看板视图"}
                   </button>
+                  {hasFilters && <button className="para-clear-filters" onClick={clearFilters}><X size={14} />清除筛选</button>}
                 </div>
+                {hasFilters && shown.length === 0 ? <div className="para-filter-empty" role="status">
+                  <LayoutDashboard size={22} aria-hidden="true" /><p>这个阶段还没有项目</p><button onClick={clearFilters}>查看全部项目</button>
+                </div> :
                 <div
-                  className={`para-board ${view === "list" ? "para-list-view" : ""}`}
+                  className={`para-board ${view === "list" ? "para-list-view" : ""} ${stage !== "all" ? "para-filtered-board" : ""}`}
                 >
-                  {Object.entries(STAGES)
-                    .filter(([s]) => stage === "all" || s === stage)
-                    .map(([s, n]) => (
+                  {(stage === "stopped" ? ["stopped" as ParaStage] : [...FLOW])
+                    .filter(s => stage === "all" || s === stage)
+                    .map(s => (
                       <section
                         key={s}
                         className={`para-column stage-${s}`}
@@ -1269,84 +1271,23 @@ export function ParaWorkspace({
                         }}
                       >
                         <h2>
-                          <span className="para-stage-dot" />
-                          {n}
+                          <span className="para-stage-dot" aria-hidden="true" />
+                          {STAGES[s]}
                           <small>
                             {shown.filter((p) => p.stage === s).length}
                           </small>
                         </h2>
                         {renderCards(shown.filter((p) => p.stage === s))}
-                        <button
+                        {!["done", "stopped", "review"].includes(s) && <button
                           className="para-add-card"
                           onClick={() => addIdea(s as ParaStage)}
                         >
                           <Plus size={15} />
                           {s === "idea" ? "添加想法" : "添加项目"}
-                        </button>
+                        </button>}
                       </section>
                     ))}
-                </div>
-              </>
-            )}
-            {tab === "areas" && (
-              <>
-                <div className="para-section-title">
-                  <p className="para-hint">
-                    领域承载长期责任，连接相关项目与资料。
-                  </p>
-                  <button
-                    className="para-primary"
-                    onClick={() => {
-                      setEditArea(null);
-                      setModal("area");
-                    }}
-                  >
-                    <Plus size={16} />
-                    添加领域
-                  </button>
-                </div>
-                <div className="para-area-grid">
-                  {data.areas
-                    .filter((a) => !a.archived_at)
-                    .map((a) => (
-                      <section className="para-panel" key={a.id}>
-                        <h2>{a.title}</h2>
-                        <p>{a.body || "记录长期关注与回顾重点。"}</p>
-                        <div className="para-actions">
-                          <button
-                            onClick={() => {
-                              setArea(a.id);
-                              setTab("projects");
-                            }}
-                          >
-                            查看项目 ·{" "}
-                            {
-                              data.projects.filter(
-                                (p) => p.area_id === a.id && !p.archived_at,
-                              ).length
-                            }
-                          </button>
-                          <button
-                            onClick={() => {
-                              setEditArea(a);
-                              setModal("area");
-                            }}
-                          >
-                            编辑
-                          </button>
-                        </div>
-                        <ResourceRows
-                          resources={data.resources.filter(
-                            (r) => r.area_id === a.id && !r.archived_at,
-                          )}
-                          onOpen={setResource}
-                        />
-                      </section>
-                    ))}
-                </div>
-                {!data.areas.some((a) => !a.archived_at) && (
-                  <Empty>例如：健康、家庭、个人表达。领域不是推进阶段。</Empty>
-                )}
+                </div>}
               </>
             )}
             {tab === "resources" && (
@@ -1376,26 +1317,12 @@ export function ParaWorkspace({
                 <div className="para-area-grid">
                   {renderCards(data.projects.filter((p) => p.archived_at))}
                 </div>
-                <h2>已归档领域</h2>
+                {data.areas.length > 0 && <h2>原有分类笔记</h2>}
                 {data.areas
-                  .filter((a) => a.archived_at)
                   .map((a) => (
                     <div className="para-resource-row" key={a.id}>
                       <span>{a.title}</span>
-                      <button
-                        disabled={action.busy}
-                        onClick={() =>
-                          void action.run(async () => {
-                            await para.updateArea(a.id, {
-                              revision: a.revision,
-                              archived: false,
-                            });
-                            await refresh();
-                          })
-                        }
-                      >
-                        恢复
-                      </button>
+                      <p>{a.body}</p>
                     </div>
                   ))}
                 <h2>已归档资料</h2>
@@ -1423,6 +1350,9 @@ export function ParaWorkspace({
           </button>
         </div>
       )}
+      {transition && <Dialog title={actionTitle(transition.action)} closeDisabled={transitionBusy} onClose={() => setTransition(null)}>
+        <LifecycleForm position={transition.position} onBusyChange={setTransitionBusy} project={transition.project} action={transition.action} summary={summary} onClose={() => setTransition(null)} onSaved={p => { acceptProject(p); setTransition(null); setNotice("项目已更新"); void refresh().catch(e => action.setError(message(e))); }} />
+      </Dialog>}
       {modal === "idea" && (
         <IdeaForm
           accountId={accountId}
@@ -1464,17 +1394,7 @@ export function ParaWorkspace({
           }}
         />
       )}
-      {modal === "area" && (
-        <AreaForm
-          area={editArea}
-          boardId={boardId}
-          onClose={() => setModal(null)}
-          onSaved={() => {
-            setModal(null);
-            void refresh();
-          }}
-        />
-      )}
+
       {modal === "link" && current && (
         <LinkConversations
           projectId={current.id}
@@ -1503,6 +1423,8 @@ export function ParaWorkspace({
         <BoardSettings
           board={data.board}
           engines={engines}
+          summary={summary}
+          onPreferencesChanged={refresh}
           onClose={() => setModal(null)}
           onSaved={() => {
             setModal(null);
@@ -1569,7 +1491,7 @@ function IdeaForm({
           placeholder="你想做什么？打字或说出来…" value={title} onChange={setTitle}
           voice={voice} disabled={action.busy} />
         <p className="para-hint">
-          不需要先填工程、领域或日期。{title ? "文字已保存在本机草稿。" : ""}
+          只需一句话，之后再明确目标与下一步。{title ? "文字已保存在本机草稿。" : ""}
         </p>
         <ErrorBox error={action.error} />
         <footer>
@@ -1599,8 +1521,10 @@ function ProjectForm({
 }) {
   const [title, setTitle] = useState(project.title),
     [brief, setBrief] = useState(project.brief),
+    [effort, setEffort] = useState(project.effort),
+    [briefTemplate, setBriefTemplate] = useState("general"),
     [engine, setEngine] = useState(project.default_project_id ?? ""),
-    [area, setArea] = useState(project.area_id ?? ""),
+    [area] = useState(project.area_id ?? ""),
     [board, setBoard] = useState(project.board_id),
     [boards, setBoards] = useState<ParaBoard[]>([]);
   const action = useAction(),
@@ -1631,6 +1555,7 @@ function ProjectForm({
               revision: expectedRevision.current,
               title,
               brief,
+              effort,
               default_project_id: engine || null,
               area_id: board === project.board_id ? area || null : null,
               board_id: board,
@@ -1648,36 +1573,13 @@ function ProjectForm({
             onChange={(e) => setTitle(e.target.value)}
           />
         </label>
-        {(Object.keys(BRIEF) as (keyof ParaBrief)[]).map((k) => (
-          <label key={k}>
-            {BRIEF[k]}
-            <textarea
-              aria-label={BRIEF[k]}
-              rows={k === "next" ? 2 : 3}
-              maxLength={50000}
-              value={brief[k]}
-              onChange={(e) => setBrief({ ...brief, [k]: e.target.value })}
-            />
-          </label>
-        ))}
-        <label>
-          领域
-          <select value={area} onChange={(e) => setArea(e.target.value)}>
-            <option value="">未设置</option>
-            {area && data.areas.find((a) => a.id === area)?.archived_at && (
-              <option value={area}>
-                {data.areas.find((a) => a.id === area)?.title}（已归档）
-              </option>
-            )}
-            {data.areas
-              .filter((a) => !a.archived_at)
-              .map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.title}
-                </option>
-              ))}
-          </select>
-        </label>
+        <label>简报模板<select aria-label="简报模板" value={briefTemplate} onChange={e => setBriefTemplate(e.target.value)}><option value="general">通用项目</option><option value="build">开发 / 制作</option><option value="explore">探索 / 验证</option></select></label>
+        <p className="para-hint">{briefTemplate === "build" ? "先明确交付范围、这次不做什么，以及愿意投入多少。" : briefTemplate === "explore" ? "先写要验证的假设、最小实验与判断依据；否定假设也可以是有效成果。" : "用三句话说明目标、怎样算完成，以及接下来做什么。"}切换模板只改变填写提示，已有内容保留。</p>
+        {(["goal", "success", "next"] as const).map(k => <label key={k}>{BRIEF[k]}<textarea aria-label={BRIEF[k]} rows={2} maxLength={50000} value={brief[k]} onChange={e => setBrief({ ...brief, [k]: e.target.value })} placeholder={k === "next" ? "动作 + 对象 + 预期结果" : briefTemplate === "explore" ? (k === "goal" ? "这次要验证的关键假设是什么？" : "用什么实验与证据判断结果？") : (k === "goal" ? "要交付什么结果？" : "满足哪些条件就可以结束？")} /></label>)}
+        <details className="kanban-brief-more"><summary>范围、投入与决定（可选）</summary>
+          <label>投入边界<input aria-label="投入边界" value={effort} maxLength={400} onChange={e => setEffort(e.target.value)} placeholder="例如：一个晚上，只完成第一版" /></label>
+          {(["constraints", "decisions", "questions"] as const).map(k => <label key={k}>{BRIEF[k]}<textarea aria-label={BRIEF[k]} rows={3} maxLength={50000} value={brief[k]} onChange={e => setBrief({ ...brief, [k]: e.target.value })} placeholder={k === "constraints" ? "本次范围、明确不做的内容和约束" : undefined} /></label>)}
+        </details>
         <EngineSelect
           engines={engines}
           value={engine}
@@ -1698,7 +1600,7 @@ function ProjectForm({
         </label>
         {board !== project.board_id && (
           <p className="para-hint">
-            移动会保留项目身份、资料和会话。领域将清空；继承默认工程的项目会沿用新看板设置。
+            移动会保留项目身份、资料和会话。继承默认工程的项目会沿用新看板设置。
           </p>
         )}
         <p className="para-hint">
@@ -1757,11 +1659,15 @@ function ProjectForm({
 function BoardSettings({
   board,
   engines,
+  summary,
+  onPreferencesChanged,
   onClose,
   onSaved,
 }: {
   board: ParaBoard;
   engines: Project[];
+  summary: KanbanSummary | null;
+  onPreferencesChanged: () => Promise<void>;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -1769,11 +1675,13 @@ function BoardSettings({
     [engine, setEngine] = useState(board.default_project_id ?? "");
   const action = useAction(),
     expectedRevision = useRef(board.revision);
+  const [limitBusy, setLimitBusy] = useState(false);
   return (
-    <Dialog title="看板设置" onClose={onClose}>
+    <Dialog title="看板设置" className="ui-dialog para-board-settings" closeDisabled={action.busy || limitBusy} onClose={onClose}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (limitBusy) return;
           void action.run(async () => {
             await para.updateBoard(board.id, {
               revision: expectedRevision.current,
@@ -1806,7 +1714,7 @@ function BoardSettings({
         <footer>
           <button
             type="button"
-            disabled={action.busy}
+            disabled={action.busy || limitBusy}
             onClick={() => {
               if (
                 window.confirm(
@@ -1824,96 +1732,12 @@ function BoardSettings({
           >
             {board.archived_at ? "恢复看板" : "归档看板"}
           </button>
-          <button className="para-primary" disabled={action.busy}>
+          <button className="para-primary" disabled={action.busy || limitBusy}>
             保存设置
           </button>
         </footer>
       </form>
-    </Dialog>
-  );
-}
-function AreaForm({
-  area,
-  boardId,
-  onClose,
-  onSaved,
-}: {
-  area: ParaArea | null;
-  boardId: string;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [title, setTitle] = useState(area?.title ?? ""),
-    [body, setBody] = useState(area?.body ?? "");
-  const action = useAction(),
-    key = useRef(newKey()),
-    expectedRevision = useRef(area?.revision);
-  return (
-    <Dialog title={area ? "编辑领域" : "添加领域"} onClose={onClose}>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void action.run(async () => {
-            if (area)
-              await para.updateArea(area.id, {
-                revision: expectedRevision.current,
-                title,
-                body,
-              });
-            else
-              await para.createArea(boardId, { key: key.current, title, body });
-            onSaved();
-          });
-        }}
-      >
-        <label>
-          领域名称
-          <input
-            autoFocus
-            required
-            maxLength={180}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-          />
-        </label>
-        <label>
-          长期责任与回顾重点
-          <textarea
-            aria-label="长期责任与回顾重点"
-            rows={5}
-            maxLength={50000}
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-          />
-        </label>
-        <ErrorBox error={action.error} />
-        <footer>
-          {area ? (
-            <button
-              type="button"
-              disabled={action.busy}
-              onClick={() =>
-                void action.run(async () => {
-                  await para.updateArea(area.id, {
-                    revision: expectedRevision.current,
-                    archived: true,
-                  });
-                  onSaved();
-                })
-              }
-            >
-              归档领域
-            </button>
-          ) : (
-            <button type="button" onClick={onClose}>
-              取消
-            </button>
-          )}
-          <button className="para-primary" disabled={action.busy}>
-            保存领域
-          </button>
-        </footer>
-      </form>
+      {summary && <KanbanLimitSettings summary={summary} disabled={action.busy} onBusyChange={setLimitBusy} onChange={onPreferencesChanged} />}
     </Dialog>
   );
 }
@@ -1938,7 +1762,7 @@ function ResourceForm({
     [title, setTitle] = useState(""),
     [url, setUrl] = useState(""),
     [file, setFile] = useState<File | null>(null),
-    [area, setArea] = useState(""),
+    [area] = useState(""),
     [progress, setProgress] = useState(0),
     [isOutput, setOutput] = useState(output),
     [existing, setExisting] = useState("");
@@ -2036,19 +1860,7 @@ function ResourceForm({
             <p className="para-hint">
               每份文件最大 64 MiB。链接保留网址与备注，不自动抓取网页正文。
             </p>
-            <label>
-              所属领域
-              <select value={area} onChange={(e) => setArea(e.target.value)}>
-                <option value="">待整理</option>
-                {data.areas
-                  .filter((a) => !a.archived_at)
-                  .map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.title}
-                    </option>
-                  ))}
-              </select>
-            </label>
+
           </>
         )}
         {projectId && (
@@ -2841,21 +2653,29 @@ export function ParaConversationProjectsDialog({
 export function ParaCollectButton({
   messageId,
   fileId,
+  menuItem = false,
+  onOpen,
 }: {
   messageId?: string;
   fileId?: string;
+  menuItem?: boolean;
+  onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const { features } = useFeatureSelection();
+  useEffect(() => { if (!features.paraBoard) setOpen(false); }, [features.paraBoard]);
+  if (!features.paraBoard) return null;
   return (
     <>
       <button
         type="button"
-        className="para-collect"
-        onClick={() => setOpen(true)}
+        className={menuItem ? "file-reader-settings-item" : "para-collect"}
+        role={menuItem ? "menuitem" : undefined}
+        onClick={() => { onOpen?.(); setOpen(true); }}
         title="独立收录到项目"
       >
-        <LayoutDashboard size={13} />
-        加入项目
+        <LayoutDashboard size={menuItem ? 15 : 13} />
+        <span>加入项目</span>
       </button>
       {open && (
         <CollectDialog
@@ -2944,7 +2764,7 @@ function CollectDialog({
         </label>
         {!boards.length && (
           <p className="para-hint">
-            请先从侧栏「新建项目」创建一个 PARA 看板。
+            请先从侧栏「新建项目」创建一个项目看板。
           </p>
         )}
         {!conversationId && (

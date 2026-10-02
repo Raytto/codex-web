@@ -47,3 +47,9 @@ provider settings to disable future transfers. A long batch with measurable
 progress is running, not failed. Monitor stage failures, stalled progress and
 missed intervals, and rehearse restoration with non-sensitive fixtures before
 allowing local purge. See [deployment profiles](DEPLOYMENT_OPTIONS.md).
+
+## Expired public-share leftovers
+
+Only currently enabled, unexpired public documents and their approved images are retained locally. After expiry or explicit closure they become ordinary cold-storage candidates, subject to the existing age, activity, queue, draft and ownership gates. No new timer is installed; operators must configure the optional maintenance schedule themselves.
+
+An already cold conversation may still have local files retained by a share. Archive processing restores and verifies the previous generation under the same conversation lock before combining it with those leftovers. It advances the generation only together with the newly verified manifest. Upload or verification failures retain the previous cloud generation and local material; successful isolation starts a fresh seven-day grace period. Sharing/renewal is rejected during an in-progress archive or restore. See [public-share expiry](PUBLIC_FILE_SHARING.md).

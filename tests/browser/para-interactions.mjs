@@ -194,7 +194,7 @@ export async function run({ page, context, origin, work, assert }) {
     const mobileMenu = await page.getByRole("listbox").boundingBox();
     assert.ok(mobileMenu.x >= 0 && mobileMenu.x + mobileMenu.width <= 320 && mobileMenu.y >= 0 && mobileMenu.y + mobileMenu.height <= 844);
     await board.screenshot({ path: path.join(work, "stages-mobile.png") });
-    await page.getByRole("option", { name: "酝酿", exact: true }).click();
+    await page.getByRole("option", { name: "准备中", exact: true }).click();
     report.checks.push("stage_menu_320px_fits_and_selects");
     await page.setViewportSize({ width: 1440, height: 900 });
     await board.getByRole("button", { name: "项目阶段", exact: true }).click();
@@ -203,13 +203,13 @@ export async function run({ page, context, origin, work, assert }) {
     await board.locator(".para-scroll").evaluate((el) => el.dispatchEvent(new Event("scroll")));
     await page.waitForTimeout(100);
     assert.equal(await page.getByRole("listbox").count(), 1);
-    await page.getByRole("option", { name: "酝酿", exact: true }).click();
+    await page.getByRole("option", { name: "准备中", exact: true }).click();
     await until(async () => (await api("GET", "/para/boards/" + mainId)).projects[0]?.stage === "incubating");
     await board.getByRole("button", { name: renamed, exact: true }).click();
     const stage = board.locator(".para-card .setting-select").first();
     await stage.click();
-    assert.equal(await page.getByRole("option", { name: "酝酿", exact: true }).getAttribute("aria-selected"), "true");
-    assert.equal(await page.getByRole("option", { name: "酝酿", exact: true }).locator("svg").count(), 1);
+    assert.equal(await page.getByRole("option", { name: "准备中", exact: true }).getAttribute("aria-selected"), "true");
+    assert.equal(await page.getByRole("option", { name: "准备中", exact: true }).locator("svg").count(), 1);
     const menu = await page.getByRole("listbox").boundingBox();
     assert.ok(menu.x >= 0 && menu.y >= 0 && menu.y + menu.height <= 900 && menu.height >= 140 && menu.width < 250);
     // Unrelated sidebar scrolling cannot move the stage trigger either.
@@ -219,6 +219,7 @@ export async function run({ page, context, origin, work, assert }) {
     await board.screenshot({ path: path.join(work, "stages-desktop.png") });
     await stage.press("ArrowDown");
     await stage.press("Enter");
+    await dialog.getByRole("button", { name: "开始推进", exact: true }).click();
     await until(async () => (await api("GET", "/para/boards/" + mainId)).projects[0]?.stage === "active");
     report.checks.push("stage_chat_setting_menu_checkmark_keyboard_and_persistence");
     // The same field is used for notes; closing a recording must release it.
@@ -267,6 +268,8 @@ export async function run({ page, context, origin, work, assert }) {
     await page.locator(".para-sidebar-item").filter({ hasText: new RegExp(`^${renamed}$`) }).click();
     await board.locator(".para-card .setting-select").first().click();
     await page.getByRole("option", { name: "已完成", exact: true }).click();
+    await dialog.getByLabel("验收结论", { exact: true }).fill("交互验收通过");
+    await dialog.getByRole("button", { name: "确认完成", exact: true }).click();
     await until(async () => (await api("GET", "/para/boards/" + mainId)).projects[0]?.stage === "done");
     await page.getByRole("button", { name: `看板 ${renamed} 操作`, exact: true }).click();
     await page.getByRole("menuitem", { name: "归档看板", exact: true }).click();

@@ -3,6 +3,7 @@ export type VoiceDraftRecord = {
   accountId: string;
   scope: string;
   conversationId: string | null;
+  pendingPromptId?: string | null;
   projectId: string | null;
   draftText: string;
   quoteExcerpt: string;

@@ -309,3 +309,13 @@ Read [retry and device upgrade instructions](docs/JOB_RETRY_AND_DEVICE_CREDENTIA
 - Voice waits for Safari's final audio chunk, supports ten-minute recordings (30 MiB request ceiling), rejects incomplete streamed transcripts, and retains explicit keyword suppression. The configured provider remains an operator choice.
 
 The default Compose remains a low-privilege tenant deployment with username/password login at `/codex-web`. PARA starts with no data and can be disabled using `CWW_PARA_ENABLED=false`; integrations still require their own explicit configuration. See the [upgrade checklist](docs/DEPLOYMENT.md#september-30-2026-upgrade-checks).
+
+## Project boards, share expiry and reader loading (October 3, 2026)
+
+- [Project boards](docs/features/PERSONAL_KANBAN.md) replace the earlier PARA navigation with ideas, preparation, active work, review and completion, plus a distinct stopped state. Waiting, pause reasons, review dates and completion evidence remain under user control; a finished Agent task never completes a project automatically. Compact stage badges and a single scrolling sidebar work on narrow screens.
+- [Account feature selection](docs/features/FEATURE_SELECTION.md) hides project boards by default. Enable them in personal settings; the preference syncs across the account's devices. Hiding preserves data and existing project context. `CWW_PARA_ENABLED=false` remains the separate server route switch.
+- [Public shares](docs/PUBLIC_FILE_SHARING.md) expire after 30 days. Renewal starts a new 30-day period from now and keeps the URL. Existing unlimited shares receive a one-time 30-day migration grace period. Optional, separately configured cold storage can merge expired local leftovers with a verified older archive.
+- [Draft reconciliation](docs/COMPOSER_SYNC.md) ignores stale reads after submission. Voice input while editing a queued prompt uses that prompt's submission path and retains the independent ordinary draft.
+- [HTML/Markdown reading](docs/READER_PROGRESSIVE_LOADING.md) shows text before loading images in document order. Failed images do not block later ones; original downloads remain unchanged. Account dialogs use reusable [typography and layout guidance](docs/UI_DIALOG_GUIDELINES.md).
+
+Read the [October upgrade checks](docs/DEPLOYMENT.md#october-3-2026-upgrade-checks). Username/password login, `/codex-web`, default container capabilities and external-module opt-in remain unchanged.

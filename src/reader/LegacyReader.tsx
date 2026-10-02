@@ -7,6 +7,7 @@ import { markdownReaderOutline, markdownReaderTitle, prepareHtmlReaderDocument, 
 import { readReaderPosition, restoreReaderScrollTop, writeReaderPosition } from "../reader-position";
 import type { ResolvedTheme } from "../theme";
 import type { WorkFile } from "../api";
+import { loadReaderImages } from "./image-queue";
 
 const READER_POSITION_SAVE_DELAY_MS = 2_000;
 const READER_POSITION_SAVE_INTERVAL_MS = 5_000;
@@ -69,6 +70,7 @@ function HtmlFileReader({ file, content, activeAnchor, navigationToken }: { file
   // is unchanged. Keep the prop identity stable through reader chrome updates
   // so the selected text nodes (and replayed annotation marks) stay connected.
   const html = useMemo(() => ({ __html: content }), [content]);
+  useEffect(() => scrollRoot.current ? loadReaderImages(scrollRoot.current) : undefined, [content]);
   useEffect(() => {
     if (!activeAnchor || navigationToken === 0 || !scrollRoot.current) return;
     const root = scrollRoot.current;
@@ -82,6 +84,8 @@ function HtmlFileReader({ file, content, activeAnchor, navigationToken }: { file
 
 function MarkdownFileReader({ content, outline }: { content: string; outline: PreparedHtmlDocument["outline"] }) {
   const math = useAsyncMarkdownMath(content);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => root.current ? loadReaderImages(root.current) : undefined, [math.content, math.plugins, outline]);
   // Keep the renderer functions and their tree stable when only the outline
   // UI/parent changes. Inline component types otherwise remount headings,
   // links and whole tables, invalidating the browser's native selection.
@@ -92,11 +96,11 @@ function MarkdownFileReader({ content, outline }: { content: string; outline: Pr
     components={{
       h2: ({ children, ...props }) => { const item = outline[headingCursor++]; return <h2 id={item?.id} {...props}>{children}</h2>; },
       a: ({ href, children }) => href?.startsWith("#") ? <a href={href}>{children}</a> : <a href={href} target="_blank" rel="noreferrer">{children}</a>,
-      img: ({ node: _node, alt, ...props }) => <img {...props} alt={alt ?? ""} loading="lazy" />,
+      img: ({ node: _node, alt, src, srcSet, ...props }) => <img {...props} alt={alt ?? ""} data-reader-src={src} data-reader-srcset={srcSet} data-reader-image-state="queued" decoding="async" />,
       table: ({ node: _node, ...props }) => <div className="file-reader-table"><table {...props} /></div>,
     }}
   >{math.content}</ReactMarkdown>; }, [math.content, math.plugins, outline]);
-  return <div className="file-preview-scroll reader-text-container"><article className="file-reader-markdown markdown">{document}</article></div>;
+  return <div ref={root} className="file-preview-scroll reader-text-container"><article className="file-reader-markdown markdown">{document}</article></div>;
 }
 
 function FileReaderContent({ file, content, prepared, activeAnchor, navigationToken }: { file: Pick<WorkFile, "original_name" | "mime_type">; content: string; prepared: PreparedHtmlDocument; activeAnchor: string | null; navigationToken: number }) {

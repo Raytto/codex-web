@@ -13,6 +13,8 @@ import type {
   ParaConversation,
   ParaSidebarBoard,
   ParaSidebarProject,
+  KanbanSummary,
+  KanbanPreferences,
 } from "../server/para-types";
 export type BoardData = {
   board: ParaBoard;
@@ -43,6 +45,8 @@ async function write<T>(
   return r;
 }
 export const para = {
+  summary: () => request<KanbanSummary>("/para/summary"),
+  updatePreferences: (revision: number, wip_limit: number) => write<{ preferences: KanbanPreferences }>("/preferences", "PATCH", { revision, wip_limit }),
   boards: () => request<{ boards: ParaBoard[] }>("/para/boards"),
   sidebar: (query: string, archived: boolean) => request<{ boards: ParaSidebarBoard[] }>(`/para/sidebar?q=${encodeURIComponent(query)}&archived=${Number(archived)}`),
   sidebarProjects: (id: string, query: string, archived: boolean, limit = 5, offset = 0) =>

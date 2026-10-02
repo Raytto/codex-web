@@ -349,7 +349,7 @@ routes use `/codex-web`; the exact Worker connect route permits WSS upgrades.
 
 ## PARA boards and new optional-operation checks
 
-PARA is an authenticated local product feature. It starts empty, uses existing tenant/database volumes, and grants no host or external-provider capability. `CWW_PARA_ENABLED=false` disables its routes while retaining data; the default is `true`. Plan backup and explicit resource deletion separately from conversation deletion. See [PARA storage and authorization](features/PARA_BOARD.md).
+Project boards are an authenticated local product feature. They start empty and hidden until an account enables them in personal settings, use existing tenant/database volumes, and grant no host or external-provider capability. `CWW_PARA_ENABLED=false` disables its routes while retaining data; the default is `true`. Plan backup and explicit resource deletion separately from conversation deletion. See [project lifecycle](features/PERSONAL_KANBAN.md), [account visibility](features/FEATURE_SELECTION.md), and the historical [PARA storage boundary](features/PARA_BOARD.md).
 
 Voice now permits ten-minute recordings and 30 MiB requests; keep reverse-proxy limits at least as large as the application ceiling. Configure your own compatible HTTPS endpoint/model. No private model switch is applied. Keywords can be suppressed/restored per account; no keyword content ships with the application.
 

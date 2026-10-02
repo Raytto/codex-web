@@ -1,4 +1,4 @@
-export const PARA_STAGES = ["idea", "incubating", "active", "done"] as const;
+export const PARA_STAGES = ["idea", "incubating", "active", "review", "done", "stopped"] as const;
 export type ParaStage = (typeof PARA_STAGES)[number];
 export type ParaBrief = {
   goal: string;
@@ -38,6 +38,18 @@ export type ParaProject = {
   title: string;
   stage: ParaStage;
   paused: number;
+  workflow_stage: ParaStage;
+  hold_reason: string;
+  waiting_for: string;
+  review_on: string | null;
+  reviewed_at: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  stage_changed_at: string | null;
+  outcome: string;
+  acceptance: string;
+  ready: number;
+  effort: string;
   area_id: string | null;
   brief: ParaBrief;
   default_project_id: string | null;
@@ -101,4 +113,11 @@ export type ParaDetail = {
     revision: number;
     created_at: string;
   }[];
+};
+
+export type KanbanPreferences = { wip_limit: number; revision: number };
+export type KanbanSummary = {
+  preferences: KanbanPreferences;
+  counts: { wip: number; review: number; waiting: number; paused: number; preparing: number; overdue: number; archived_wip: number };
+  attention: (ParaProject & { board_name: string; board_archived_at: string | null })[];
 };

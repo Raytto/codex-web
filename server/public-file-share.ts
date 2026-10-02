@@ -98,19 +98,22 @@ export function resolvePublicShareAssets(
   return [...resolved.values()];
 }
 
-function rewriteUrl(raw: string, urls: ReadonlyMap<string, string>): string {
+function rewriteUrl(raw: string, urls: ReadonlyMap<string, string>, embeddedUrls?: ReadonlySet<string>): string {
+  // Only URLs minted from this document's embedded images may bypass relative
+  // asset resolution. Arbitrary absolute URLs still fail the sharing policy.
+  if (embeddedUrls?.has(raw.trim())) return raw;
   const reference = normalizeImageReference(raw);
   if (reference.kind !== "relative") return raw;
   return urls.get(reference.key) ?? raw;
 }
 
-function rewriteSrcset(value: string, urls: ReadonlyMap<string, string>): string {
+function rewriteSrcset(value: string, urls: ReadonlyMap<string, string>, embeddedUrls?: ReadonlySet<string>): string {
   if (/^\s*data:/i.test(value)) return value;
   return value.split(",").map((candidate) => {
     const trimmed = candidate.trim();
     const match = /^(\S+)(\s+.*)?$/.exec(trimmed);
     if (!match) return candidate;
-    return `${rewriteUrl(match[1], urls)}${match[2] ?? ""}`;
+    return `${rewriteUrl(match[1], urls, embeddedUrls)}${match[2] ?? ""}`;
   }).join(", ");
 }
 
@@ -119,12 +122,13 @@ export function rewritePublicShareDocument(
   content: string,
   assets: PublicShareAsset[],
   assetUrl: (assetFileId: string) => string,
+  embeddedUrls?: ReadonlySet<string>,
 ): string {
   const urls = new Map(assets.map((asset) => [asset.sourceRef.toLocaleLowerCase(), assetUrl(asset.assetFileId)]));
   if (kind === "markdown") {
     return content.replace(/!\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+["'][^"']*["'])?\s*\)/g, (full, angled: string | undefined, plain: string | undefined) => {
       const raw = angled ?? plain ?? "";
-      const rewritten = rewriteUrl(raw, urls);
+      const rewritten = rewriteUrl(raw, urls, embeddedUrls);
       return rewritten === raw ? full : full.replace(raw, rewritten);
     });
   }
@@ -132,7 +136,7 @@ export function rewritePublicShareDocument(
     /\b(srcset|src|xlink:href|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi,
     (attribute, name: string, doubleQuoted: string | undefined, singleQuoted: string | undefined, bare: string | undefined) => {
       const value = doubleQuoted ?? singleQuoted ?? bare ?? "";
-      const rewritten = name.toLowerCase() === "srcset" ? rewriteSrcset(value, urls) : rewriteUrl(value, urls);
+      const rewritten = name.toLowerCase() === "srcset" ? rewriteSrcset(value, urls, embeddedUrls) : rewriteUrl(value, urls, embeddedUrls);
       const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : '"';
       return `${name}=${quote}${rewritten}${quote}`;
     },

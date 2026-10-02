@@ -15,7 +15,7 @@
 - Voice recordings and their bounded spelling/topic context are sent to the DashScope endpoint configured by the operator. Context can include the draft, attachment names, text attachment heads, recent messages, and a small number of images. Disable voice by leaving `DASHSCOPE_API_KEY` empty.
 - A complete recording is kept only in the signing browser's account/conversation-scoped IndexedDB for 24 hours when recognition fails. The retry card offers explicit retry or deletion. Server receipts retain only the bounded result, audio size/hash, and status for the same 24-hour window; they are keyed by a validated client UUID and reject a changed payload under the same UUID.
 - Archiving is not deletion: archived conversations retain messages, files, and Codex thread references until explicitly deleted.
-- Public report sharing is opt-in. Anyone holding an enabled link can read that report and its approved images without logging in; disable the share before the content should become private again.
+- Public report sharing is opt-in. Anyone holding an enabled, unexpired link can read that report and its approved images without logging in. Links expire after 30 days; explicit renewal restarts that period. Disable the share immediately when access should end earlier.
 - Set storage ceilings and a free-disk watermark. Resumable partial uploads expire automatically, while ordinary multipart uploads are rejected when the same limits would be exceeded.
 - Interrupted jobs are never automatically retried because the previous turn may already have produced side effects.
 - Back up state volumes and test restore procedures before upgrades.
@@ -47,3 +47,9 @@ Project background is snapshotted when an input is accepted. It is reference dat
 Recovery checkpoints are bounded, account-scoped operational data, not proof that an external action completed. They never authorize repeating side effects. Reset-credit APIs require the reserved host-administrator identity and CSRF protection. Queries do not consume credits; redemption requires explicit confirmation and a durable idempotency key. Credit IDs and credentials remain on the owning machine. See [reset-credit handling](CODEX_RESET_CREDITS.md).
 
 Optional deployment progress accepts only known step fields. Ordinary accounts receive counts; only the host administrator sees blocking task titles. This repository includes no production backup configuration or privileged browser-session minting script.
+
+## Feature visibility and expiring reader resources
+
+Project-board visibility is an account preference, not an access-control boundary. Its API retains authentication, CSRF and owner checks even when the UI is hidden. A stale revision cannot overwrite a newer device choice. Existing board context is retained for linked conversations; hiding the feature does not revoke previously selected inputs.
+
+Expiry checks apply to anonymous document, approved asset and extracted embedded-image requests, including HEAD. Embedded-image URLs are minted only for the authorized source document and validated against a content revision; replacing a file invalidates old image revisions. Reader files must be regular files, symlinks are rejected, and size/cache/concurrency bounds limit parsing. Raw document download remains a separate authenticated route. See [sharing](PUBLIC_FILE_SHARING.md) and [reader limits](READER_PROGRESSIVE_LOADING.md).

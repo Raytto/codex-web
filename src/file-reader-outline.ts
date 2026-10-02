@@ -285,7 +285,13 @@ export function markdownReaderTitle(source: string): string | undefined {
 export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark" = "light"): PreparedHtmlDocument {
   if (typeof DOMParser === "undefined") return { content: source, outline: [] };
 
-  const document = new DOMParser().parseFromString(source, "text/html");
+  // Defer sources before parsing too: an inert document may still fetch images.
+  const deferred = source.replace(/<(?:img|source)\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi, (tag) => tag.replace(
+    /\s+([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g,
+    (attribute, name: string, value?: string) => /^(src|srcset)$/i.test(name) && value
+      ? ` data-reader-${name.toLowerCase()}=${value}` : attribute,
+  ));
+  const document = new DOMParser().parseFromString(deferred, "text/html");
   const title = document.title.trim() || document.querySelector("h1")?.textContent?.trim() || undefined;
   const used = new Set<string>();
   const outline = Array.from(document.querySelectorAll("h2")).map((heading, index) => {
@@ -307,6 +313,10 @@ export function prepareHtmlReaderDocument(source: string, theme: "light" | "dark
       const name = attribute.name.toLowerCase();
       if (name.startsWith("on") || name === "srcdoc") node.removeAttribute(attribute.name);
     });
+  });
+  document.querySelectorAll("img[data-reader-src], img[data-reader-srcset]").forEach((image) => {
+    image.setAttribute("data-reader-image-state", "queued");
+    image.setAttribute("decoding", "async");
   });
 
   // Reader links must never navigate the Codex Web shell itself.

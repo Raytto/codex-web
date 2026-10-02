@@ -1,4 +1,5 @@
-import { migratePara, migrateParaSidebar } from "./para-schema.js";
+import { DEFAULT_FEATURE_SELECTION, isFeatureSelection, type FeatureSelection } from "../src/feature-selection.js";
+import { migratePara, migrateParaSidebar, migratePersonalKanban } from "./para-schema.js";
 import { mergeResetCredits, type CodexResetCredits } from "../remote-worker/src/codex-reset-credits.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -16,6 +17,7 @@ import { containsPersonalContext, stripPersonalContext } from "./personal-contex
 import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, ReadingSourceRow, ReadingSourceVersionRow, ReadingUnitRow, ReaderFormat, ReaderVersionKind, ReaderVersionStatus } from "./reader-types.js";
 import { isModelCapacityContinuationPrompt } from "./internal-messages.js";
 import { buildTaskRecoveryCheckpoint, stripTaskRecoveryPrompt, type TaskRecoveryCheckpoint } from "./task-recovery.js";
+import { isPublicShareActive, PUBLIC_SHARE_LIFETIME_MS } from "../src/public-share.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
@@ -23,6 +25,10 @@ const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
 export class StorageQuotaExceededError extends Error {
   readonly code = "USER_STORAGE_LIMIT";
   constructor() { super("User storage quota would be exceeded"); }
+}
+
+export class PublicShareStorageBusyError extends Error {
+  constructor() { super("文件正在归档或恢复，请在阅读器恢复完成后重试分享。"); }
 }
 
 export type JobAttemptState = {
@@ -473,6 +479,7 @@ export type PublicFileShareRow = {
   created_at: string;
   enabled_at: string | null;
   disabled_at: string | null;
+  expires_at: string | null;
 };
 
 export type PublicFileShareAssetRow = {
@@ -759,6 +766,25 @@ export class AppDatabase {
       this.sqlite.exec("ALTER TABLE para_boards ADD COLUMN position REAL NOT NULL DEFAULT 0");
     });
     this.applyMigration(2026093002, "para-sidebar-projects", () => migrateParaSidebar(this.sqlite));
+    this.applyMigration(2026093003, "para-default-hidden", () => {
+      // One-time rollout for every existing account. Later explicit opt-ins
+      // survive restarts; accounts without a row use the shared hidden default.
+      const rows = this.sqlite.prepare("SELECT user_id FROM user_settings WHERE key='feature_selection'").all() as { user_id: string }[];
+      const update = this.sqlite.prepare("UPDATE user_settings SET value=?,updated_at=? WHERE user_id=? AND key='feature_selection'");
+      const time = new Date().toISOString();
+      for (const { user_id } of rows) {
+        const current = this.getFeatureSelection(user_id);
+        update.run(JSON.stringify({ paraBoard: false, revision: current.revision + 1 }), time, user_id);
+      }
+    });
+    this.applyMigration(2026093004, "personal-kanban-lifecycle", () => migratePersonalKanban(this.sqlite));
+    this.applyMigration(2026093005, "public-share-expiry", () => {
+      this.sqlite.exec("ALTER TABLE public_file_shares ADD COLUMN expires_at TEXT");
+      // One-time grace period for existing unlimited shares; restarts never renew them.
+      const expiresAt = new Date(Date.now() + PUBLIC_SHARE_LIFETIME_MS).toISOString();
+      this.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE enabled=1").run(expiresAt);
+      this.sqlite.exec("CREATE INDEX public_file_shares_expiry_idx ON public_file_shares(enabled,expires_at)");
+    });
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain
@@ -4779,14 +4805,15 @@ export class AppDatabase {
       JOIN files file ON file.id=share.file_id
       JOIN conversations conversation ON conversation.id=file.conversation_id
       WHERE share.user_id=? AND share.enabled=1 AND file.kind='output'
+        AND share.expires_at>?
         AND conversation.user_id=? AND conversation.deleted_at IS NULL AND conversation.deletion_state='active'
       ORDER BY share.enabled_at DESC,share.id DESC
-    `).all(userId, userId) as ManagedPublicFileShareRow[];
+    `).all(userId, new Date().toISOString(), userId) as ManagedPublicFileShareRow[];
   }
 
   getActivePublicFile(fileId: string): { share: PublicFileShareRow; file: FileRow } | undefined {
     const share = this.getPublicFileShare(fileId);
-    if (!share?.enabled) return undefined;
+    if (!share || !isPublicShareActive(share.enabled, share.expires_at)) return undefined;
     const file = this.getFile(fileId);
     if (!file || file.kind !== "output") return undefined;
     const conversation = this.getConversation(file.conversation_id);
@@ -4808,16 +4835,21 @@ export class AppDatabase {
   }): PublicFileShareRow {
     const now = new Date().toISOString();
     const existing = this.getPublicFileShare(input.file.id);
+    const expiresAt = new Date(Date.parse(now) + PUBLIC_SHARE_LIFETIME_MS).toISOString();
     const shareId = existing?.id ?? input.id;
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
+      // The archiver transitions before collecting its file list. Serialize the
+      // share write with that transition so a successful renewal cannot be evicted.
+      const storage = this.getConversationStorage(input.file.conversation_id);
+      if (storage && !["local", "cold"].includes(storage.state)) throw new PublicShareStorageBusyError();
       this.sqlite.prepare(`
-        INSERT INTO public_file_shares(id,file_id,user_id,file_name_snapshot,enabled,created_at,enabled_at,disabled_at)
-        VALUES(?,?,?,?,1,?,?,NULL)
+        INSERT INTO public_file_shares(id,file_id,user_id,file_name_snapshot,enabled,created_at,enabled_at,disabled_at,expires_at)
+        VALUES(?,?,?,?,1,?,?,NULL,?)
         ON CONFLICT(file_id) DO UPDATE SET
           user_id=excluded.user_id,file_name_snapshot=excluded.file_name_snapshot,
-          enabled=1,enabled_at=excluded.enabled_at,disabled_at=NULL
-      `).run(shareId, input.file.id, input.userId, input.file.original_name, existing?.created_at ?? now, now);
+          enabled=1,enabled_at=excluded.enabled_at,disabled_at=NULL,expires_at=excluded.expires_at
+      `).run(shareId, input.file.id, input.userId, input.file.original_name, existing?.created_at ?? now, now, expiresAt);
       this.sqlite.prepare("DELETE FROM public_file_share_assets WHERE share_id=?").run(shareId);
       const insertAsset = this.sqlite.prepare(`
         INSERT INTO public_file_share_assets(share_id,asset_file_id,source_ref,created_at) VALUES(?,?,?,?)
@@ -5517,6 +5549,35 @@ export class AppDatabase {
       INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'agent_selection',?,?)
       ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
     `).run(userId, JSON.stringify(selection), new Date().toISOString());
+  }
+
+  getFeatureSelection(userId: string): FeatureSelection {
+    const row = this.sqlite.prepare("SELECT value FROM user_settings WHERE user_id=? AND key='feature_selection'").get(userId) as { value: string } | undefined;
+    try {
+      const value: unknown = JSON.parse(row?.value ?? "null");
+      if (isFeatureSelection(value)) return value;
+    } catch { /* An absent or invalid preference keeps optional features hidden. */ }
+    return { ...DEFAULT_FEATURE_SELECTION };
+  }
+
+  setFeatureSelection(userId: string, value: FeatureSelection): FeatureSelection | null {
+    // Synchronous compare-and-set inside the shared DB transaction also protects
+    // concurrent clients/processes from silently overwriting a newer selection.
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getFeatureSelection(userId);
+      if (current.revision !== value.revision) {
+        this.sqlite.exec("ROLLBACK");
+        return null;
+      }
+      const next = { paraBoard: value.paraBoard, revision: current.revision + 1 };
+      this.sqlite.prepare(`
+        INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'feature_selection',?,?)
+        ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+      `).run(userId, JSON.stringify(next), new Date().toISOString());
+      this.sqlite.exec("COMMIT");
+      return next;
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
   }
 
   getChatFontSize(userId = LEGACY_USER_ID): number {

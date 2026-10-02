@@ -177,13 +177,27 @@ function fileRows(sqlite: DatabaseSync, conversationId: string): FileRow[] {
 }
 
 function sharedFileIds(sqlite: DatabaseSync, conversationId: string): Set<string> {
+  const now = new Date().toISOString();
   const rows = sqlite.prepare(`
     SELECT DISTINCT f.id FROM files f
-    LEFT JOIN public_file_shares share ON share.file_id=f.id AND share.enabled=1
+    LEFT JOIN public_file_shares share ON share.file_id=f.id AND share.enabled=1 AND share.expires_at>?
     LEFT JOIN public_file_share_assets asset ON asset.asset_file_id=f.id
-    WHERE f.conversation_id=? AND (share.file_id IS NOT NULL OR asset.asset_file_id IS NOT NULL)
-  `).all(conversationId) as Array<{ id: string }>;
+    LEFT JOIN public_file_shares parent ON parent.id=asset.share_id AND parent.enabled=1 AND parent.expires_at>?
+    WHERE f.conversation_id=? AND (share.file_id IS NOT NULL OR parent.id IS NOT NULL)
+  `).all(now, now, conversationId) as Array<{ id: string }>;
   return new Set(rows.map((row) => row.id));
+}
+
+function storedManifest(row: StorageDbRow): ColdManifest | undefined {
+  if (!row.manifest_json || !row.remote_path || !row.archive_sha256) return undefined;
+  const manifest = JSON.parse(row.manifest_json) as ColdManifest;
+  if (crypto.createHash("sha256").update(row.manifest_json).digest("hex") !== row.manifest_sha256
+    || ![COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format)
+    || manifest.conversationId !== row.conversation_id || manifest.userId !== row.user_id
+    || manifest.threadId !== row.codex_thread_id || manifest.generation !== row.generation) {
+    throw new Error("已有冷存储清单不一致");
+  }
+  return manifest;
 }
 
 function codexHomeFor(roots: ColdStorageRoots, userId: string): string {
@@ -297,11 +311,13 @@ function coldFileSources(
   row: StorageDbRow,
   shared: Set<string>,
   reasons: string[],
+  archivedEntries: ColdManifestEntry[] = [],
 ): ColdFileSource[] {
   const files = fileRows(sqlite, row.conversation_id);
   const protectedPaths = new Set(files.filter((file) => shared.has(file.id)).map((file) => file.relative_path));
   const sources: ColdFileSource[] = [];
   const seen = new Set<string>();
+  const archivedPaths = new Set(archivedEntries.map((entry) => `${entry.root}:${entry.relativePath}`));
   for (const file of files) {
     // A path referenced by a shared file is protected even if a legacy DB has
     // a second file row pointing at the same path.
@@ -309,7 +325,10 @@ function coldFileSources(
     let source: ColdFileSource | undefined;
     try { source = fileSourceFor(roots, row, file); } catch { reasons.push("unsafe_file_path"); continue; }
     if (!source) { reasons.push("unsupported_file_path"); continue; }
-    if (!fs.existsSync(source.absolute)) { reasons.push("file_missing"); continue; }
+    if (!fs.existsSync(source.absolute)) {
+      if (!archivedPaths.has(`${source.root}:${file.relative_path}`)) reasons.push("file_missing");
+      continue;
+    }
     const stat = fs.lstatSync(source.absolute);
     if (!stat.isFile() || stat.isSymbolicLink()) { reasons.push("file_not_regular"); continue; }
     const key = `${source.root}:${file.relative_path}`;
@@ -339,7 +358,7 @@ function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: Storag
   // User-archived conversations are candidates on the next run; the 15-day
   // inactivity window applies only to ordinary, still-visible sessions.
   if (!archived && lastActive >= cutoff) reasons.push("active_within_15_days");
-  if (!["local", "error"].includes(row.storage_state)) reasons.push(`storage_${row.storage_state}`);
+  if (!["local", "error", "cold"].includes(row.storage_state)) reasons.push(`storage_${row.storage_state}`);
   const jobs = Number((sqlite.prepare("SELECT count(*) AS n FROM jobs WHERE conversation_id=? AND status IN ('queued','running')").get(row.conversation_id) as { n: number }).n);
   if (jobs) reasons.push("queued_or_running_job");
   const prompts = Number((sqlite.prepare("SELECT count(*) AS n FROM pending_prompts WHERE conversation_id=? AND status IN ('queued','editing')").get(row.conversation_id) as { n: number }).n);
@@ -357,7 +376,15 @@ function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: Storag
   const files = fileRows(sqlite, row.conversation_id);
   const drawingFiles = files.filter((file) => file.kind === "output" && /^image\//i.test(file.mime_type));
   const drawing = drawingFiles.length > 0;
-  const coldFiles = coldFileSources(sqlite, roots, row, shared, reasons);
+  // A cold conversation may retain publicly shared files. Once they expire or
+  // are closed, pick those local leftovers up without treating archived files
+  // as missing. Archive restores the verified old generation before merging.
+  let archivedEntries: ColdManifestEntry[] = [];
+  if (["cold", "error"].includes(row.storage_state) && row.remote_path) {
+    try { archivedEntries = storedManifest(row)?.entries ?? []; }
+    catch { reasons.push("invalid_stored_manifest"); }
+  }
+  const coldFiles = coldFileSources(sqlite, roots, row, shared, reasons, archivedEntries);
   let rolloutBytes = 0;
   let rolloutEntries = 0;
   if (row.codex_thread_id) {
@@ -598,8 +625,17 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     const candidate = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
     if (!candidate.eligible) throw new Error(`会话不满足冷存储条件: ${candidate.reasons.join(",")}`);
     assertColdStorageConfigured(roots);
+    const previousIsolation = row.local_isolated_path;
+    if (["cold", "error"].includes(row.storage_state) && row.remote_path) {
+      restoreColdConversationLocked(roots, sqlite, conversationId, row.user_id);
+      row = rowForConversation(sqlite, conversationId)!;
+      const refreshed = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
+      if (!refreshed.eligible) throw new Error(`恢复后会话不满足冷存储条件: ${refreshed.reasons.join(",")}`);
+    }
     const generation = row.generation + 1;
-    row = transition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { generation, retry_count: 0, last_error: null });
+    // Keep the old generation usable if upload/verification fails. Advance it
+    // atomically with its new verified manifest, never before that point.
+    row = transition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { retry_count: 0, last_error: null });
     work = fs.mkdtempSync(path.join(path.dirname(roots.isolationRoot), `.package-${conversationId}-`));
     const codexHome = codexHomeFor(roots, row.user_id);
     const entries: ColdManifestEntry[] = [];
@@ -649,6 +685,7 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     } finally { try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} }
     row = rowForConversation(sqlite, conversationId)!;
     row = transition(sqlite, row, ["uploading"], "remote_verified", "remote_verify", {
+      generation,
       manifest_json: manifestText, manifest_sha256: manifestSha256, archive_sha256: archiveSha256, archive_bytes: archiveBytes,
       plaintext_bytes: manifest.plaintextBytes, remote_drive_id: roots.driveId, remote_path: remotePath,
       uploaded_at: new Date().toISOString(), verified_at: new Date().toISOString(), last_error: null,
@@ -657,6 +694,12 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     const isolatedPath = moveToIsolation(roots, manifest, conversationId);
     row = rowForConversation(sqlite, conversationId)!;
     transition(sqlite, row, ["evicting"], "cold", "local_evict_complete", { local_isolated_path: isolatedPath, last_error: null });
+    // Restored bytes now have a newly verified cloud copy and a fresh 7-day
+    // isolation copy. Only discard the redundant prior generation directory.
+    if (previousIsolation && previousIsolation !== isolatedPath
+      && path.resolve(previousIsolation) === path.join(roots.isolationRoot, conversationId, String(generation - 1))) {
+      try { fs.rmSync(previousIsolation, { recursive: true, force: true }); } catch { /* redundant copy can be retained */ }
+    }
     return { conversationId, generation, archiveBytes, plaintextBytes: manifest.plaintextBytes, archiveSha256, manifestSha256, remotePath, isolatedPath };
   } catch (error) {
     const row = rowForConversation(sqlite, conversationId);
@@ -708,8 +751,15 @@ function restoreFilesFromExtract(roots: ColdStorageRoots, manifest: ColdManifest
 export function restoreColdConversation(rootsInput: Partial<ColdStorageRoots>, conversationId: string, userId: string): void {
   const roots = defaultColdStorageRoots(rootsInput);
   assertUuid(conversationId, "conversation id"); assertUuid(userId, "user id");
-  const lock = acquireOperationLock(roots, conversationId);
-  const sqlite = openDb(roots.databasePath);
+  const lock = acquireColdStorageLock(roots, conversationId);
+  const sqlite = openColdStorageDb(roots.databasePath);
+  try { restoreColdConversationLocked(roots, sqlite, conversationId, userId); }
+  finally { sqlite.close(); removeColdStorageLock(lock); }
+}
+
+// The archive path reuses this under the same conversation lock, so a residual
+// share cannot race an independent restore or discard the earlier manifest.
+function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: DatabaseSync, conversationId: string, userId: string): void {
   let downloadWork = "";
   let extractWork = "";
   try {
@@ -759,10 +809,9 @@ export function restoreColdConversation(rootsInput: Partial<ColdStorageRoots>, c
     }
     throw error;
   } finally {
-    sqlite.close();
     if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {}
     if (extractWork) try { fs.rmSync(extractWork, { recursive: true, force: true }); } catch {}
-    removeOperationLock(lock);
+    if (extractWork) try { fs.rmSync(`${extractWork}.plain.tar`, { force: true }); } catch {}
   }
 }
 

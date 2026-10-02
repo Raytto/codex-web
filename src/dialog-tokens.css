@@ -1,0 +1,46 @@
+/* Shared dialog scale. See docs/UI_DIALOG_GUIDELINES.md before adding a dialog. */
+:root {
+  --dialog-font-title: 1.25rem;
+  --dialog-font-heading: 1rem;
+  --dialog-font-body: .9375rem;
+  --dialog-font-secondary: .875rem;
+  --dialog-font-control: .875rem;
+  --dialog-font-caption: .8125rem;
+  --dialog-font-input: 1rem;
+  --dialog-line-title: 1.4;
+  --dialog-line-body: 1.6;
+  --dialog-line-control: 1.4;
+  --dialog-weight-heading: 650;
+  --dialog-weight-control: 600;
+  --dialog-control-height: 44px;
+  --dialog-text-secondary: #626675;
+  --dialog-primary-ink: #fff;
+}
+
+:root[data-theme="dark"] {
+  --dialog-text-secondary: #b1b5c2;
+  --dialog-primary-ink: #20263f;
+}
+
+/* Opt in explicitly; existing dialogs can migrate with their own layout review. */
+.ui-dialog { font-size:var(--dialog-font-body); line-height:var(--dialog-line-body); }
+.ui-dialog :where(button, .dialog-button) {
+  min-height:var(--dialog-control-height);
+  font-family:inherit;
+  font-size:var(--dialog-font-control);
+  font-weight:var(--dialog-weight-control);
+  line-height:var(--dialog-line-control);
+}
+.ui-dialog :where(input, select, textarea) {
+  min-height:var(--dialog-control-height);
+  min-width:0;
+  font-family:inherit;
+  font-size:var(--dialog-font-input);
+  font-weight:400;
+  line-height:1.5;
+}
+.ui-dialog :where(button, a, input, select, textarea):focus-visible { outline:3px solid var(--indigo); outline-offset:3px; }
+.dialog-title { margin:0; font-size:var(--dialog-font-title); font-weight:var(--dialog-weight-heading); line-height:var(--dialog-line-title); }
+.dialog-section-heading { margin:0; font-size:var(--dialog-font-heading); font-weight:var(--dialog-weight-heading); line-height:1.5; }
+.dialog-description { margin:0; color:var(--dialog-text-secondary); font-size:var(--dialog-font-secondary); line-height:var(--dialog-line-body); }
+.dialog-caption { font-size:var(--dialog-font-caption); line-height:1.5; }

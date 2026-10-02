@@ -41,10 +41,10 @@ try {
     status: "active", created_at: now, updated_at: now });
   browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
     ignoreDefaultArgs: ["--disable-dev-shm-usage"], args: ["--no-sandbox", "--disable-gpu"] });
-  const suites = (process.env.PARA_BROWSER_SUITES || "para-acceptance,para-interactions,para-sidebar-search,para-conversation-projects").split(",");
+  const suites = (process.env.PARA_BROWSER_SUITES || "feature-default-off,personal-kanban,kanban-compact,sidebar-scroll").split(",");
   for (const username of ["demo-owner", "demo-member"]) {
     for (const suite of suites) {
-      assert.match(suite, /^para-(acceptance|interactions|sidebar-search|conversation-projects)$/);
+      assert.match(suite, /^(para-(acceptance|interactions|sidebar-search|conversation-projects)|feature-(default-off|selection)|personal-kanban|kanban-compact|sidebar-scroll)$/);
       const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
       const page = await context.newPage();
       const work = path.join(artifacts, username, suite);
@@ -52,6 +52,10 @@ try {
       try {
         const login = await context.request.post(origin + "/api/auth/login", { data: { username, password } });
         assert.equal(login.status(), 200, "public password login");
+        if (suite.startsWith("para-") && suite !== "para-acceptance") {
+          const features = await (await context.request.get(origin + "/api/user-settings/features")).json();
+          await context.request.put(origin + "/api/user-settings/features", { data: { ...features, paraBoard: true }, headers: { "X-CSRF-Token": (await login.json()).csrfToken } });
+        }
         await page.goto(origin + "/");
         await page.locator(".sidebar").waitFor();
         const { run } = await import(`./${suite}.mjs`);

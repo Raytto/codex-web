@@ -135,6 +135,12 @@ export function mountParaRoutes(
         {
           title: detail.project.title,
           revision: detail.project.revision,
+          stage: detail.project.stage,
+          waitingFor: detail.project.waiting_for,
+          holdReason: detail.project.hold_reason,
+          acceptance: detail.project.acceptance,
+          outcome: detail.project.outcome,
+          effort: detail.project.effort,
           brief: detail.project.brief,
         },
         null,
@@ -151,8 +157,13 @@ export function mountParaRoutes(
   };
   api.use("/para", (req, res, next) => {
     if (process.env.CWW_PARA_ENABLED === "false")
-      return res.status(503).json({ error: "PARA 看板暂时关闭。" });
+      return res.status(503).json({ error: "项目看板暂时关闭。" });
     next();
+  });
+  api.get("/para/summary", (req, res) => res.json(store.summary(user(res))));
+  api.patch("/para/preferences", (req, res) => {
+    const d = z.object({ revision: z.number().int().nonnegative(), wip_limit: z.number().int().min(1).max(30) }).strict().parse(req.body);
+    res.json({ preferences: store.updatePreferences(user(res), d.revision, d.wip_limit) });
   });
   api.get("/para/boards", (req, res) =>
     res.json({ boards: store.boards(user(res)) }),
@@ -259,6 +270,14 @@ export function mountParaRoutes(
         title: title.optional(),
         stage: z.enum(PARA_STAGES).optional(),
         paused: z.boolean().optional(),
+        hold_reason: z.string().trim().max(4000).optional(),
+        waiting_for: z.string().trim().max(4000).optional(),
+        review_on: z.iso.date().nullable().optional(),
+        reviewed: z.boolean().optional(),
+        outcome: z.string().trim().max(10000).optional(),
+        acceptance: z.string().trim().max(10000).optional(),
+        ready: z.boolean().optional(),
+        effort: z.string().trim().max(400).optional(),
         area_id: uuid.nullable().optional(),
         brief: brief.optional(),
         default_project_id: uuid.nullable().optional(),

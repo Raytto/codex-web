@@ -12,7 +12,7 @@
     "user": "node dist-server/server/manage-user.js",
     "hash-password": "node scripts/hash-password.mjs",
     "test": "npm run test:app",
-    "test:app": "npm run build && node --import tsx --test tests/*.test.ts",
+    "test:app": "npm run build && node tests/run-app-tests.mjs",
     "test:worker": "npm --prefix remote-worker test",
     "lint": "tsc --noEmit",
     "verify": "npm run lint && npm run test:app && npm run test:worker"

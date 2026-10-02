@@ -9,6 +9,7 @@ export type UseVoiceInputOptions = {
   persistDraft?: boolean;
   draftScope?: string;
   conversationId?: string | null;
+  pendingPromptId?: string | null;
   draftText: string;
   quoteExcerpt?: string;
   attachmentNames?: string[];
@@ -23,6 +24,7 @@ export type UseVoiceInputOptions = {
 export type VoiceInputContext = {
   clientRecordingId: string;
   conversationId: string | null;
+  pendingPromptId?: string | null;
   draftText: string;
   quoteExcerpt: string;
   attachmentNames: string[];
@@ -39,6 +41,7 @@ export type VoiceInputController = {
   draftStorageError: string;
   transcriptionIds: string[];
   transcriptionConversationId: string | null;
+  transcriptionPendingPromptId: string | null;
   waveformRef: RefObject<HTMLCanvasElement | null>;
   start: () => Promise<void>;
   finish: (sendAfterTranscription?: boolean) => void;
@@ -77,6 +80,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const [draftStorageError, setDraftStorageError] = useState("");
   const [transcriptionIds, setTranscriptionIds] = useState<string[]>([]);
   const [transcriptionConversationId, setTranscriptionConversationId] = useState<string | null>(null);
+  const [transcriptionPendingPromptId, setTranscriptionPendingPromptId] = useState<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -99,6 +103,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const recordingStartedAtRef = useRef<number | null>(null);
   const transcriptionIdsRef = useRef<string[]>([]);
   const transcriptionConversationIdRef = useRef<string | null>(null);
+  const transcriptionPendingPromptIdRef = useRef<string | null>(null);
   draftTextRef.current = options.draftText;
   quoteExcerptRef.current = options.quoteExcerpt ?? "";
   attachmentNamesRef.current = options.attachmentNames ?? [];
@@ -204,11 +209,15 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         attachmentNames: session.attachmentNames,
         clientRecordingId: draft.id,
       });
-      const nextIds = [...transcriptionIdsRef.current, result.transcriptionId].slice(-20);
+      const sameTarget = transcriptionConversationIdRef.current === session.conversationId
+        && transcriptionPendingPromptIdRef.current === (session.pendingPromptId ?? null);
+      const nextIds = [...new Set([...(sameTarget ? transcriptionIdsRef.current : []), result.transcriptionId])].slice(-20);
       transcriptionIdsRef.current = nextIds;
       setTranscriptionIds(nextIds);
       transcriptionConversationIdRef.current = session.conversationId;
       setTranscriptionConversationId(session.conversationId);
+      transcriptionPendingPromptIdRef.current = session.pendingPromptId ?? null;
+      setTranscriptionPendingPromptId(session.pendingPromptId ?? null);
       const text = appendTranscript(session.draftText, result.text);
       const callbacks = sessionCallbacksRef.current ?? current;
       callbacks.onTranscript?.(result.text, result.transcriptionId, session);
@@ -269,6 +278,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     const session = sessionRef.current ?? {
       clientRecordingId: crypto.randomUUID(),
       conversationId: current.conversationId ?? null,
+      pendingPromptId: current.pendingPromptId ?? null,
       draftText: draftTextRef.current,
       quoteExcerpt: quoteExcerptRef.current,
       attachmentNames: attachmentNamesRef.current.slice(0, 12),
@@ -278,6 +288,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
       accountId: current.accountId ?? "",
       scope: current.draftScope ?? "main-composer",
       conversationId: session.conversationId,
+      pendingPromptId: session.pendingPromptId ?? null,
       projectId: null,
       draftText: session.draftText,
       quoteExcerpt: session.quoteExcerpt,
@@ -313,11 +324,14 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     setStarting(true);
     try {
       const targetConversationId = current.conversationId ?? null;
-      if (transcriptionConversationIdRef.current !== targetConversationId) {
+      if (transcriptionConversationIdRef.current !== targetConversationId
+        || transcriptionPendingPromptIdRef.current !== (current.pendingPromptId ?? null)) {
         transcriptionIdsRef.current = [];
         setTranscriptionIds([]);
         transcriptionConversationIdRef.current = targetConversationId;
         setTranscriptionConversationId(targetConversationId);
+        transcriptionPendingPromptIdRef.current = current.pendingPromptId ?? null;
+        setTranscriptionPendingPromptId(current.pendingPromptId ?? null);
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       // A permission prompt may finish after its dialog has closed. Never
@@ -338,6 +352,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
       sessionRef.current = {
         clientRecordingId: crypto.randomUUID(),
         conversationId: current.conversationId ?? null,
+        pendingPromptId: current.pendingPromptId ?? null,
         draftText: current.draftText,
         quoteExcerpt: current.quoteExcerpt ?? "",
         attachmentNames: (current.attachmentNames ?? []).slice(0, 12),
@@ -441,6 +456,8 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     setTranscriptionIds([]);
     transcriptionConversationIdRef.current = null;
     setTranscriptionConversationId(null);
+    transcriptionPendingPromptIdRef.current = null;
+    setTranscriptionPendingPromptId(null);
   }, []);
 
   const retryPending = useCallback(() => {
@@ -456,6 +473,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     const session: VoiceInputContext = {
       clientRecordingId: retrying.id,
       conversationId: retrying.conversationId,
+      pendingPromptId: retrying.pendingPromptId ?? null,
       draftText: retrying.draftText,
       quoteExcerpt: retrying.quoteExcerpt,
       attachmentNames: retrying.attachmentNames,
@@ -495,6 +513,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     draftStorageError,
     transcriptionIds,
     transcriptionConversationId,
+    transcriptionPendingPromptId,
     waveformRef,
     start,
     finish,

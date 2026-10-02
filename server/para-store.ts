@@ -12,6 +12,8 @@ import type {
   ParaConversation,
   ParaSidebarBoard,
   ParaSidebarProject,
+  KanbanPreferences,
+  KanbanSummary,
 } from "./para-types.js";
 
 export class ParaError extends Error {
@@ -32,6 +34,8 @@ export const emptyBrief = (): ParaBrief => ({
 });
 const now = () => new Date().toISOString();
 const id = () => crypto.randomUUID();
+const legacyStage = (stage: ParaProject["stage"]) => stage === "review" ? "active" : stage === "stopped" ? "done" : stage;
+const STAGE_NAMES = { idea: "想法池", incubating: "准备中", active: "进行中", review: "待验收", done: "已完成", stopped: "已终止" };
 export class ParaStore {
   constructor(readonly db: AppDatabase) {}
   get sql() {
@@ -92,7 +96,7 @@ export class ParaStore {
       | (Omit<ParaProject, "brief"> & { brief: string })
       | undefined;
     if (!p) throw new ParaError(404, "项目不存在。");
-    return { ...p, brief: { ...emptyBrief(), ...JSON.parse(p.brief) } };
+    return { ...p, stage: p.workflow_stage, brief: { ...emptyBrief(), ...JSON.parse(p.brief) } };
   }
   resource(user: string, resourceId: string): ParaResource {
     const r = this.sql
@@ -100,6 +104,35 @@ export class ParaStore {
       .get(resourceId, user) as ParaResource | undefined;
     if (!r) throw new ParaError(404, "资料不存在。");
     return r;
+  }
+  preferences(user: string): KanbanPreferences {
+    return this.sql.prepare("SELECT wip_limit,revision FROM kanban_preferences WHERE user_id=?").get(user) as KanbanPreferences | undefined
+      ?? { wip_limit: 3, revision: 0 };
+  }
+  updatePreferences(user: string, revision: number, limit: number) {
+    return this.transaction(() => {
+      this.revision(this.preferences(user).revision, revision);
+      this.sql.prepare(`INSERT INTO kanban_preferences(user_id,wip_limit,revision) VALUES(?,?,1)
+        ON CONFLICT(user_id) DO UPDATE SET wip_limit=excluded.wip_limit,revision=kanban_preferences.revision+1`).run(user, limit);
+      return this.preferences(user);
+    });
+  }
+  summary(user: string): KanbanSummary {
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" });
+    const counts = this.sql.prepare(`SELECT
+      count(CASE WHEN p.workflow_stage IN ('active','review') THEN 1 END) AS wip,
+      count(CASE WHEN p.workflow_stage='review' THEN 1 END) AS review,
+      count(CASE WHEN p.waiting_for<>'' AND p.workflow_stage NOT IN ('done','stopped') THEN 1 END) AS waiting,
+      count(CASE WHEN p.paused=1 AND p.workflow_stage NOT IN ('done','stopped') THEN 1 END) AS paused,
+      count(CASE WHEN p.workflow_stage='incubating' AND p.paused=0 THEN 1 END) AS preparing,
+      count(CASE WHEN p.review_on<=? AND p.workflow_stage NOT IN ('done','stopped') THEN 1 END) AS overdue,
+      count(CASE WHEN p.workflow_stage IN ('active','review') AND (p.archived_at IS NOT NULL OR b.archived_at IS NOT NULL) THEN 1 END) AS archived_wip
+      FROM para_projects p JOIN para_boards b ON b.id=p.board_id WHERE p.user_id=?`).get(today, user) as KanbanSummary["counts"];
+    const attention = this.sql.prepare(`SELECT p.*,b.name AS board_name,b.archived_at AS board_archived_at
+      FROM para_projects p JOIN para_boards b ON b.id=p.board_id WHERE p.user_id=? AND p.workflow_stage NOT IN ('done','stopped')
+      ORDER BY CASE WHEN p.workflow_stage='review' THEN 0 WHEN p.review_on<=? THEN 1 WHEN p.waiting_for<>'' THEN 2 ELSE 3 END,
+      COALESCE(p.reviewed_at,p.created_at),p.id`).all(user, today) as (Omit<KanbanSummary["attention"][number], "brief"> & { brief: string })[];
+    return { preferences: this.preferences(user), counts, attention: attention.map(p => ({ ...p, stage: p.workflow_stage, brief: { ...emptyBrief(), ...JSON.parse(p.brief) } })) };
   }
   area(user: string, areaId: string): ParaArea {
     const r = this.sql
@@ -143,7 +176,7 @@ export class ParaStore {
     const where = `user_id=? AND board_id=? AND (? OR archived_at IS NULL) AND (? LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\')`;
     const args = [user, boardId, Number(archived), board.name, match, match];
     const { total } = this.sql.prepare(`SELECT count(*) AS total FROM para_projects WHERE ${where}`).get(...args) as { total: number };
-    const projects = this.sql.prepare(`SELECT id,board_id,title,stage,paused,revision,archived_at FROM para_projects
+    const projects = this.sql.prepare(`SELECT id,board_id,title,workflow_stage AS stage,paused,revision,archived_at FROM para_projects
       WHERE ${where} ORDER BY sidebar_order DESC,id LIMIT ? OFFSET ?`).all(...args, limit, offset) as ParaSidebarProject[];
     return { projects, total, nextOffset: offset + projects.length, hasMore: offset + projects.length < total };
   }
@@ -239,6 +272,7 @@ export class ParaStore {
       .all(user, boardId) as (Omit<ParaProject, "brief"> & { brief: string })[];
     return rows.map((p) => ({
       ...p,
+      stage: p.workflow_stage,
       brief: { ...emptyBrief(), ...JSON.parse(p.brief) },
     }));
   }
@@ -256,23 +290,28 @@ export class ParaStore {
     title: string,
     stage: ParaProject["stage"] = "idea",
   ) {
+    if (stage === "done" || stage === "stopped") throw new ParaError(400, "请先创建项目，再记录完成或终止结论。");
     const b = this.board(user, boardId);
     if (b.archived_at) throw new ParaError(409, "请先恢复看板。");
     const pid = id(),
       time = now();
     this.sql
       .prepare(
-        "INSERT INTO para_projects(id,user_id,board_id,title,stage,brief,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO para_projects(id,user_id,board_id,title,stage,workflow_stage,brief,position,created_at,updated_at,started_at,ended_at,stage_changed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
       )
       .run(
         pid,
         user,
         boardId,
         title,
+        legacyStage(stage),
         stage,
         JSON.stringify(emptyBrief()),
         Date.now(),
         time,
+        time,
+        ["active", "review"].includes(stage) ? time : null,
+        ["done", "stopped"].includes(stage) ? time : null,
         time,
       );
     this.event(user, pid, "创建项目");
@@ -293,6 +332,14 @@ export class ParaStore {
       board_id?: string;
       position?: number;
       confirm_running?: boolean;
+      hold_reason?: string;
+      waiting_for?: string;
+      review_on?: string | null;
+      reviewed?: boolean;
+      outcome?: string;
+      acceptance?: string;
+      ready?: boolean;
+      effort?: string;
     },
   ) {
     return this.transaction(() => {
@@ -329,6 +376,18 @@ export class ParaStore {
           409,
           "项目仍有运行会话或自动续跑。归档不会停止它们，请确认后归档。",
         );
+      const stage = patch.stage ?? p.stage, time = now();
+      const stageChanged = stage !== p.stage;
+      const terminal = stage === "done" || stage === "stopped";
+      const outcome = patch.outcome ?? p.outcome;
+      if (stageChanged && stage === "stopped" && !patch.outcome?.trim())
+        throw new ParaError(400, "请记录不再推进的原因。");
+      if (stageChanged && stage === "done" && !patch.outcome?.trim())
+        throw new ParaError(400, "请记录验收结论，再确认完成。");
+      if (terminal && ((patch.waiting_for?.trim()) || patch.paused === true))
+        throw new ParaError(400, "已结束的项目请先重新打开，再设置等待或暂停。");
+      const paused = terminal ? 0 : patch.paused === undefined ? p.paused : Number(patch.paused);
+      const waitingFor = terminal ? "" : patch.waiting_for ?? p.waiting_for;
       const archived =
         patch.archived === undefined
           ? p.archived_at
@@ -337,12 +396,13 @@ export class ParaStore {
             : null;
       this.sql
         .prepare(
-          "UPDATE para_projects SET title=?,stage=?,paused=?,area_id=?,brief=?,default_project_id=?,archived_at=?,board_id=?,position=?,revision=revision+1,updated_at=? WHERE id=?",
+          `UPDATE para_projects SET title=?,stage=?,paused=?,area_id=?,brief=?,default_project_id=?,archived_at=?,board_id=?,position=?,revision=revision+1,updated_at=?,
+            workflow_stage=?,hold_reason=?,waiting_for=?,review_on=?,reviewed_at=?,started_at=?,ended_at=?,stage_changed_at=?,outcome=?,acceptance=?,ready=?,effort=? WHERE id=?`,
         )
         .run(
           patch.title ?? p.title,
-          patch.stage ?? p.stage,
-          patch.paused === undefined ? p.paused : Number(patch.paused),
+          legacyStage(stage),
+          paused,
           areaId,
           JSON.stringify(patch.brief ?? p.brief),
           patch.default_project_id === undefined
@@ -351,14 +411,29 @@ export class ParaStore {
           archived,
           boardId,
           patch.position ?? p.position,
-          now(),
+          time,
+          stage,
+          patch.hold_reason ?? p.hold_reason,
+          waitingFor,
+          terminal ? null : patch.review_on === undefined ? p.review_on : patch.review_on,
+          patch.reviewed ? time : p.reviewed_at,
+          p.started_at ?? (["active", "review"].includes(stage) && stageChanged ? time : null),
+          terminal ? (stageChanged ? time : p.ended_at) : null,
+          stageChanged ? time : p.stage_changed_at,
+          outcome,
+          patch.acceptance ?? p.acceptance,
+          patch.ready === undefined ? p.ready : Number(patch.ready),
+          patch.effort ?? p.effort,
           projectId,
         );
       this.event(
         user,
         projectId,
-        patch.stage
-          ? "更改阶段"
+        stageChanged
+          ? `阶段：${STAGE_NAMES[p.stage]} → ${STAGE_NAMES[stage]}`
+          : patch.reviewed ? "完成回顾"
+          : patch.waiting_for !== undefined ? (waitingFor ? "记录等待" : "解除等待")
+          : patch.paused !== undefined ? (paused ? "暂停项目" : "恢复推进")
           : patch.archived === true
             ? "归档项目"
             : patch.archived === false
