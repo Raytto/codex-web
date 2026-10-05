@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, Clipboard, ExternalLink, FileText, Globe2, LoaderCircle, RefreshCw, Share2, X } from "lucide-react";
 import { api, type ManagedPublicShare } from "./api";
+import { handleReaderLinkClick } from "./reader/navigation";
 import { filePreviewUrl } from "./file-links";
 import { isPublicShareActive, publicShareRemaining } from "./public-share";
 import { useShareClock } from "./use-share-clock";
@@ -99,12 +100,12 @@ export function PublicSharesDialog({ onClose }: { onClose: () => void }) {
           {activeShares.map((share) => <article className="public-share-row" key={share.id}>
             <div className="public-share-icon"><FileText size={18} /></div>
             <div className="public-share-copy">
-              <a href={filePreviewUrl({ id: share.fileId })} target="_blank" rel="noreferrer" className="public-share-title">{share.fileName}</a>
+              <a href={filePreviewUrl({ id: share.fileId })} onClick={handleReaderLinkClick} className="public-share-title">{share.fileName}</a>
               <span>{share.documentKind === "html" ? "HTML" : "Markdown"} · {formatSize(share.size)} · {share.conversationTitle || "未命名任务"}</span>
               <time dateTime={share.expiresAt}>{publicShareRemaining(share.expiresAt, now)} · {formatDate(share.expiresAt)} 到期</time>
             </div>
             <div className="public-share-actions">
-              <a href={share.publicUrl} target="_blank" rel="noreferrer" title="查看公开链接"><ExternalLink size={14} /><span>公开页</span></a>
+              <a href={share.publicUrl} onClick={handleReaderLinkClick} title="查看公开链接"><ExternalLink size={14} /><span>公开页</span></a>
               <button type="button" onClick={() => void copyLink(share)} disabled={busy} title="复制公开链接">{copiedId === share.id ? <Check size={14} /> : <Clipboard size={14} />}<span>{copiedId === share.id ? "已复制" : "复制"}</span></button>
               <button type="button" className="danger" onClick={() => void closeShare(share)} disabled={busy} title="关闭公开分享"><X size={14} /><span>{closingId === share.id ? "关闭中…" : "关闭"}</span></button>
               <button type="button" onClick={() => void renewShare(share)} disabled={busy} title="从现在重新计算 30 天"><RefreshCw size={14} /><span>{renewingId === share.id ? "续期中…" : "续期 30 天"}</span></button>

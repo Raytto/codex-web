@@ -56,3 +56,7 @@ Account feature preferences use versioned compare-and-set writes and account-sco
 Share expiry is checked for every document/image request and when listing active shares. Sharing and cold-storage transitions serialize their writes. A cold conversation with expired local leftovers restores and verifies its prior generation under the same conversation lock before producing a new archive; a failed upload retains the previous verified generation.
 
 The reader extracts embedded images into revision-bound, owner-checked endpoints and caches only text plus byte offsets. Parsing is bounded to four concurrent documents, 100 MiB per document and an 8 MiB / 16-entry text cache. The browser paints text first, then loads images in order with bounded failure continuation. Anonymous image endpoints recheck the active share after reading. See [reader behavior](READER_PROGRESSIVE_LOADING.md).
+
+## Reader navigation
+
+The shared `src/reader/navigation.tsx` handler keeps reader anchors in the current tab, preserves native modified clicks, and supplies an explicit Alt-click shortcut. Both authenticated and public readers render the return control. History traversal requires a distinct same-origin referrer whose path belongs to the configured application base; direct entries and other applications fall back to `/codex-web`. Remote file buttons reserve a new tab during the Alt-click and detach its opener before awaiting transfer. See [navigation behavior](READER_NAVIGATION.md).

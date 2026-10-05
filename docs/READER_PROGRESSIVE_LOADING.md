@@ -9,3 +9,7 @@
 ## 验证
 
 `tests/reader-text-resources.test.ts` 覆盖文本/图片分离、并发缓存、文件更新、非法范围、账号隔离、公开分享关闭及到期。构建后使用已有 Playwright 与 Chromium 执行 `tests/browser/reader-progressive-images.mjs`，验证 HTML/Markdown 在桌面和手机视口下的正文首显、顺序加载、坏图继续、原生选区、标注和菜单。手机视口不能替代真机 iOS Safari 验收。
+
+## 阅读器导航
+
+阅读入口在当前标签页打开，正文加载和图片队列保持原有行为。登录阅读页与公开分享页均提供返回入口；Alt + 点击可另开标签页。直接访问的阅读页回到 `/codex-web`。完整范围及独立浏览器验收见[阅读器导航](READER_NAVIGATION.md)。

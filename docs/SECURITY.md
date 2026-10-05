@@ -53,3 +53,7 @@ Optional deployment progress accepts only known step fields. Ordinary accounts r
 Project-board visibility is an account preference, not an access-control boundary. Its API retains authentication, CSRF and owner checks even when the UI is hidden. A stale revision cannot overwrite a newer device choice. Existing board context is retained for linked conversations; hiding the feature does not revoke previously selected inputs.
 
 Expiry checks apply to anonymous document, approved asset and extracted embedded-image requests, including HEAD. Embedded-image URLs are minted only for the authorized source document and validated against a content revision; replacing a file invalidates old image revisions. Reader files must be regular files, symlinks are rejected, and size/cache/concurrency bounds limit parsing. Raw document download remains a separate authenticated route. See [sharing](PUBLIC_FILE_SHARING.md) and [reader limits](READER_PROGRESSIVE_LOADING.md).
+
+## Reader navigation boundary
+
+Reader return controls only traverse a distinct same-origin referrer within the application's base path. Other origins and other applications on the same origin fall back to `/codex-web`. Explicit Alt-click tabs use `noopener,noreferrer`; remote-transfer tabs detach their opener before awaiting the transfer and close on failure. Navigation changes do not grant file or anonymous-share access; existing ownership, session and share-expiry checks still apply.

@@ -708,6 +708,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   backdrop-filter: blur(18px);
 }
 .file-preview-header-start { min-width: 0; display: flex; align-items: center; gap: var(--file-preview-header-gap); grid-column: 1; }
+.file-preview-back,
 .file-preview-toc-toggle,
 .file-preview-share,
 .file-preview-download {
@@ -729,6 +730,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .file-preview-toc-toggle.active { background: var(--indigo-pale); }
 .file-preview-share.active { background: var(--indigo-pale); }
 @media (hover: hover) {
+  .file-preview-back:hover,
   .file-preview-toc-toggle:hover,
   .file-preview-share:hover,
   .file-preview-download:hover { background: var(--indigo-pale); }
@@ -1536,6 +1538,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
     --file-preview-header-gap: 8px;
     padding: 4px max(5px, env(safe-area-inset-right)) 4px max(5px, env(safe-area-inset-left));
   }
+  .file-preview-back,
   .file-preview-toc-toggle,
   .file-preview-share,
   .file-preview-download { width: 36px; min-height: 36px; justify-content: center; padding: 7px; }
@@ -1735,6 +1738,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .preview-button { background: rgba(185, 195, 255, .04); }
 :root[data-theme="dark"] .preview-button:hover { background: #303342; }
 :root[data-theme="dark"] .file-preview-header { border-bottom-color: #303238; background: rgba(23, 24, 27, .94); }
+:root[data-theme="dark"] .file-preview-back,
 :root[data-theme="dark"] .file-preview-share,
 :root[data-theme="dark"] .file-preview-download,
 :root[data-theme="dark"] .file-reader-settings-button { color: #b9c3ff; }
@@ -1752,6 +1756,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 :root[data-theme="dark"] .reader-ask-bubble { box-shadow: 0 22px 65px rgba(0, 0, 0, .48); }
 :root[data-theme="dark"] .reader-ask-message-quote { border-left-color: #707aa8; }
 @media (hover: hover) {
+  :root[data-theme="dark"] .file-preview-back:hover,
   :root[data-theme="dark"] .file-preview-share:hover,
   :root[data-theme="dark"] .file-preview-download:hover { background: #303342; }
 }

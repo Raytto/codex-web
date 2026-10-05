@@ -319,3 +319,7 @@ The default Compose remains a low-privilege tenant deployment with username/pass
 - [HTML/Markdown reading](docs/READER_PROGRESSIVE_LOADING.md) shows text before loading images in document order. Failed images do not block later ones; original downloads remain unchanged. Account dialogs use reusable [typography and layout guidance](docs/UI_DIALOG_GUIDELINES.md).
 
 Read the [October upgrade checks](docs/DEPLOYMENT.md#october-3-2026-upgrade-checks). Username/password login, `/codex-web`, default container capabilities and external-module opt-in remain unchanged.
+
+## Reader navigation (October 6, 2026)
+
+Reader links open in the current tab and show a **Back to workspace** control. Alt-click opens a separate tab; ordinary links retain the browser's Ctrl/Cmd-click and middle-click behavior. Remote file previews reserve an Alt-clicked tab before the transfer and close it on failure. Directly opened readers return to `/codex-web` when no previous page within the application is known. See [reader navigation](docs/READER_NAVIGATION.md) and [upgrade checks](docs/DEPLOYMENT.md#october-6-2026-reader-navigation-checks).

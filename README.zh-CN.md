@@ -214,3 +214,7 @@ stateDiagram-v2
 - [HTML/Markdown 阅读](docs/READER_PROGRESSIVE_LOADING.md)先展示正文，再依文档顺序加载图片；坏图片不阻塞后续图片，原文件下载保持原样。账号弹窗采用可复用的[字号与布局规范](docs/UI_DIALOG_GUIDELINES.md)。
 
 升级前请阅读[本轮部署检查](docs/DEPLOYMENT.md#october-3-2026-upgrade-checks)。用户名/密码登录、`/codex-web`、默认容器权限和外部模块显式配置边界保持不变。
+
+## 2026 年 10 月 6 日：阅读器导航
+
+阅读器链接默认在当前标签页打开，并提供「返回工作站」入口。Alt + 点击可在新标签页阅读，普通链接继续支持浏览器原有的 Ctrl/Cmd + 点击和鼠标中键操作。远程文件预览会先保留 Alt 点击的新标签页，传输失败后关闭空白页。直接打开阅读页或来源不属于本应用时，返回入口进入 `/codex-web`。详见[阅读器导航](docs/READER_NAVIGATION.md)和[升级验收](docs/DEPLOYMENT.md#october-6-2026-reader-navigation-checks)。

@@ -49,6 +49,7 @@ import { ReaderAnnotationPanel, ReaderNoteEditor, type ReaderAnnotationAnchor } 
 import { applyReaderTextHighlights, markReaderRange, readerAnnotationIdForRange, readerAnnotationMatchesAnchor, selectReaderAnnotation } from "./reader/annotation-dom";
 import { captureReaderTextAnchor, readerTextAnchorsEqual } from "./reader/selection-anchor";
 import type { ReaderSelection } from "./reader-ask";
+import { handleReaderLinkClick, ReaderBackLink } from "./reader/navigation";
 import { FileReaderLayout, preparedReaderDocument, useOutlineState } from "./reader/LegacyReader";
 import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
 import { useVoiceInput } from "./conversation/useVoiceInput";
@@ -765,6 +766,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <div className="file-preview-header-start">
+        <ReaderBackLink />
         {conversation && <button type="button" className={`file-reader-ask-launcher${askOpen ? " active" : ""}`} onClick={() => { if (askClosing) return; if (askOpen) closeReaderAsk(); else { setAskClosing(false); setAskOpen(true); } }} title={askOpen ? "收起询问 Agent" : "返回询问 Agent"} aria-label={askOpen ? "收起询问 Agent" : "返回询问 Agent"} aria-pressed={askOpen}><Bot size={17} />{taskRunning ? <LoaderCircle className="spin" size={10} /> : hasUnreadResult ? <i className="unread" /> : null}</button>}
         {outline.hasOutline && <button className={`file-preview-toc-toggle${outline.open ? " active" : ""}`} type="button" title={outline.open ? "收起文章目录" : "打开文章目录"} aria-label={outline.open ? "收起文章目录" : "打开文章目录"} aria-expanded={outline.open} aria-controls="file-reader-outline" onClick={() => outline.setOpen((value) => !value)}><Menu size={18} /></button>}
       </div>
@@ -830,6 +832,7 @@ function PublicFilePreviewPage({ fileId, resolvedTheme, themePreference, onTheme
   return <main className={`file-preview-page public ${readerKind ?? ""}`}>
     <header className="file-preview-header public">
       <div className="file-preview-header-start">
+        <ReaderBackLink />
         {outline.hasOutline && <button className={`file-preview-toc-toggle${outline.open ? " active" : ""}`} type="button" title={outline.open ? "收起文章目录" : "打开文章目录"} aria-label={outline.open ? "收起文章目录" : "打开文章目录"} aria-expanded={outline.open} aria-controls="file-reader-outline" onClick={() => outline.setOpen((value) => !value)}><Menu size={18} /></button>}
       </div>
       <div className="file-preview-title"><strong>{file?.original_name || "公开文件"}</strong></div>
@@ -4657,7 +4660,8 @@ function AssistantFileLink({ href, children }: { href?: string; children?: React
   const context = useContext(AssistantFileLinkContext)!;
   const { files, messageId, remoteFileFetchEnabled, onFetchRemoteFile } = context;
   const resolved = resolveMessageFileLink(href, files, remoteFileFetchEnabled);
-  if (resolved.kind === "preview" || resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
+  if (resolved.kind === "preview") return <a href={resolved.href} onClick={handleReaderLinkClick}>{children}</a>;
+  if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
   if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
   if (resolved.kind === "unavailable" && remoteFileFetchEnabled && resolved.path) return <RemoteFileInlineLink sourcePath={resolved.path} onFetch={() => onFetchRemoteFile(messageId, resolved.path!)}>{children}</RemoteFileInlineLink>;
   if (resolved.kind === "unavailable") return <span className="unavailable-file-link" title="该本机文件未登记为此消息的附件">{children}（不可下载）</span>;
@@ -4990,48 +4994,62 @@ function triggerFileDownload(file: WorkFile) {
   link.remove();
 }
 
-function openFetchedFile(file: WorkFile) {
+function openFetchedFile(file: WorkFile, newTab: Window | null = null) {
   const reader = fileReaderKind(file);
   const target = reader === "html" || reader === "pdf" || reader === "epub"
     ? filePreviewUrl(file)
     : reader === "markdown" || isBrowserPreviewable(file) ? fileUrl(file) : "";
-  if (target) window.location.assign(target);
-  else triggerFileDownload(file);
+  if (target) {
+    if (newTab) newTab.location.replace(target);
+    else window.location.assign(target);
+  } else {
+    newTab?.close();
+    triggerFileDownload(file);
+  }
+}
+
+async function fetchAndOpenFile(onFetch: () => Promise<WorkFile>, inNewTab: boolean) {
+  // Reserve the tab during the click, before the remote transfer can consume
+  // the browser's user-activation window. Never leave a blank tab on failure.
+  const newTab = inNewTab ? window.open("about:blank", "_blank") : null;
+  if (inNewTab && !newTab) throw new Error("新标签页被浏览器拦截，请允许弹出窗口后重试。");
+  if (newTab) newTab.opener = null;
+  try { openFetchedFile(await onFetch(), newTab); }
+  catch (reason) { newTab?.close(); throw reason; }
 }
 
 function RemoteFileInlineLink({ sourcePath, onFetch, children }: { sourcePath: string; onFetch: () => Promise<WorkFile>; children: ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [failure, setFailure] = useState("");
-  async function fetchFile() {
+  async function fetchFile(inNewTab: boolean) {
     if (loading) return;
     setLoading(true);
     setFailure("");
-    try { openFetchedFile(await onFetch()); }
+    try { await fetchAndOpenFile(onFetch, inNewTab); }
     catch (reason) { setFailure(reason instanceof Error ? reason.message : "文件获取失败"); }
     finally { setLoading(false); }
   }
-  return <button type="button" className={`remote-inline-file-link ${failure ? "failed" : ""}`} disabled={loading} title={failure || sourcePath} onClick={() => void fetchFile()}>{children}</button>;
+  return <button type="button" className={`remote-inline-file-link ${failure ? "failed" : ""}`} disabled={loading} title={failure || sourcePath} onClick={(event) => void fetchFile(event.altKey)}>{children}</button>;
 }
 
 function RemoteFileCard({ sourcePath, onFetch }: { sourcePath: string; onFetch: () => Promise<WorkFile> }) {
   const [loading, setLoading] = useState(false);
   const [failure, setFailure] = useState("");
   const fileName = sourcePath.split(/[\\/]/).at(-1) || "远程文件";
-  async function fetchFile(download: boolean) {
+  async function fetchFile(download: boolean, inNewTab = false) {
     if (loading) return;
     setLoading(true);
     setFailure("");
     try {
-      const file = await onFetch();
-      if (download) triggerFileDownload(file);
-      else openFetchedFile(file);
+      if (download) triggerFileDownload(await onFetch());
+      else await fetchAndOpenFile(onFetch, inNewTab);
     }
     catch (reason) { setFailure(reason instanceof Error ? reason.message : "文件获取失败"); }
     finally { setLoading(false); }
   }
   const body = <><FileIcon size={20} /><span><strong>{fileName}</strong><small>{failure || (loading ? "正在从远程电脑获取…" : "远程文件 · 点击打开")}</small></span></>;
   return <div className={`file-card remote-file-card ${failure ? "failed" : ""}`} title={sourcePath}>
-    <button type="button" className="remote-file-card-main" disabled={loading} onClick={() => void fetchFile(false)}>{body}</button>
+    <button type="button" className="remote-file-card-main" disabled={loading} onClick={(event) => void fetchFile(false, event.altKey)}>{body}</button>
     <button type="button" className="download-button" disabled={loading} title="下载" aria-label={`下载 ${fileName}`} onClick={() => void fetchFile(true)}>{loading ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}</button>
   </div>;
 }
@@ -5051,11 +5069,11 @@ function FileCard({ file }: { file: WorkFile }) {
   const opensReaderByDefault = reader === "html" || reader === "pdf" || reader === "epub";
   return <div className={`file-card ${image ? "image-file-card" : ""}`}>
     {opensReaderByDefault
-      ? <a href={filePreviewUrl(file)} target="_blank" rel="noreferrer">{body}</a>
+      ? <a href={filePreviewUrl(file)} onClick={handleReaderLinkClick}>{body}</a>
       : reader === "markdown" || previewable
       ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
-    {previewHref && <a className="preview-button" href={previewHref} target="_blank" rel="noreferrer" title="预览" aria-label={`预览 ${file.original_name}`}><Eye size={16} /></a>}
+    {previewHref && <a className="preview-button" href={previewHref} target={reader ? undefined : "_blank"} rel={reader ? undefined : "noreferrer"} onClick={reader ? handleReaderLinkClick : undefined} title={reader ? "阅读（Alt + 点击在新标签页打开）" : "预览"} aria-label={`预览 ${file.original_name}`}><Eye size={16} /></a>}
     <ParaCollectButton fileId={file.id} />
     <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>
   </div>;
