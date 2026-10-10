@@ -45,3 +45,16 @@ test("generated image collection rejects invalid threads and applies transfer li
   assert.ok(result.omitted.some((item) => item.reason === "too_large"));
   await assert.rejects(() => snapshotGeneratedImages(codexHome, "../escape"), /Invalid Codex thread id/);
 });
+
+test("generated images respect the remaining result byte budget", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-image-budget-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const threadId = crypto.randomUUID();
+  const directory = path.join(root, "generated_images", threadId);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "a.png"), "1234");
+  fs.writeFileSync(path.join(directory, "b.png"), "12");
+  const result = await collectGeneratedImages(root, threadId, new Map(), async () => {}, { maximumTotalBytes: 2 });
+  assert.equal(result.uploaded, 1);
+  assert.deepEqual(result.omitted, [{ path: "a.png", reason: "total_size_limit" }]);
+});

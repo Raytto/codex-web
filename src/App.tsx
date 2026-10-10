@@ -1,3 +1,6 @@
+import { RecurringSidebar, RecurringWorkspace } from "./recurring-tasks";
+import type { RecurringTask } from "./recurring-types";
+import { NodeTransfersDialog } from "./node-transfers-dialog";
 import { FeatureSelectionProvider, useFeatureSelection } from "./feature-selection-context";
 import { FeatureSelectionDialog } from "./feature-selection-dialog";
 import type { FeatureSelection } from "./feature-selection";
@@ -1096,6 +1099,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [paraNavigation, setParaNavigation] = useState(0);
   const [linkedProjectsConversation, setLinkedProjectsConversation] = useState<Conversation | null>(null);
   function openPara(boardId: string, projectId: string | null = null) {
+    if (!leaveRecurring()) return;
     if (!features.paraBoard) return;
     setParaBoardId(boardId); setParaProjectId(projectId); setParaNavigation(n => n + 1); setParaVisible(true); setSidebarOpen(false);
   }
@@ -1105,6 +1109,31 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       setCreateTypeOpen(false); setLinkedProjectsConversation(null);
     }
   }, [features.paraBoard]);
+  const [recurringTasks, setRecurringTasks] = useState<RecurringTask[]>([]);
+  const [recurringLoading, setRecurringLoading] = useState(true);
+  const [recurringError, setRecurringError] = useState("");
+  const [recurringView, setRecurringView] = useState<{ projectId: string; taskId: string | null } | null>(null);
+  const recurringDirty = useRef(false);
+  const markRecurringDirty = useCallback((dirty: boolean) => { recurringDirty.current = dirty; }, []);
+  function leaveRecurring() {
+    if (recurringDirty.current && !window.confirm("放弃周期任务尚未保存的修改？")) return false;
+    recurringDirty.current = false; setRecurringView(null); return true;
+  }
+  function openRecurring(projectId: string, taskId: string | null) {
+    if (recurringView?.projectId === projectId && recurringView.taskId === taskId) { setSidebarOpen(false); setProjectMenu(null); return; }
+    if (!leaveRecurring()) return;
+    setParaVisible(false); setRecurringView({ projectId, taskId }); setSidebarOpen(false); setProjectMenu(null);
+  }
+  const refreshRecurring = useCallback(async () => {
+    try { setRecurringTasks((await api.recurringTasks()).tasks); setRecurringError(""); }
+    catch (reason) { setRecurringError(reason instanceof Error ? reason.message : "定时任务读取失败"); throw reason; }
+    finally { setRecurringLoading(false); }
+  }, []);
+  useEffect(() => {
+    const load = () => { void refreshRecurring().catch(() => {}); };
+    load(); const timer = window.setInterval(load, 15000); window.addEventListener("focus", load);
+    return () => { window.clearInterval(timer); window.removeEventListener("focus", load); };
+  }, [refreshRecurring]);
   const [projectSkillsDialogProject, setProjectSkillsDialogProject] = useState<Project | null>(null);
   const [syncingProjects, setSyncingProjects] = useState<Record<string, boolean>>({});
   const [projectMenu, setProjectMenu] = useState<{ projectId: string; top: number; left: number } | null>(null);
@@ -1135,6 +1164,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [removedEditingFileIds, setRemovedEditingFileIds] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [steering, setSteering] = useState(false);
+  const steeringRef = useRef(false);
   const [job, setJob] = useState<Job | null>(null);
   const [activities, setActivities] = useState<JobEvent[]>([]);
   const [activitiesLoading, setActivitiesLoading] = useState(false);
@@ -1147,6 +1178,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
   const [selectionSaving, setSelectionSaving] = useState(false);
   const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
+  const [nodeTransfersOpen, setNodeTransfersOpen] = useState(false);
   const [displaySettingsDialogOpen, setDisplaySettingsDialogOpen] = useState(false);
   const [archivedDialogOpen, setArchivedDialogOpen] = useState(false);
   const [personalMemoryDialogOpen, setPersonalMemoryDialogOpen] = useState(false);
@@ -2043,10 +2075,6 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       window.removeEventListener("resize", closeSidebarMenus);
     };
   }, [accountSettingsOpen, projectMenu, projectSectionMenu, taskMenu]);
-  useEffect(() => {
-    const sidebarContent = accountAreaRef.current?.parentElement;
-    if (accountSettingsOpen && sidebarContent) sidebarContent.scrollTop = sidebarContent.scrollHeight;
-  }, [accountSettingsOpen]);
 
   function handleMessagesScroll(event: React.UIEvent<HTMLDivElement>) {
     const messages = event.currentTarget;
@@ -2286,6 +2314,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function selectProject(projectId: string) {
+    if (!leaveRecurring()) return;
     setParaVisible(false);
     if (projectId === activeProjectIdRef.current) return;
     acceptManualConversationSelection();
@@ -2306,6 +2335,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function selectProjectConversation(projectId: string, conversationId: string) {
+    if (!leaveRecurring()) return;
     acceptManualConversationSelection();
     setParaVisible(false);
     const conversation = projectConversationPagesRef.current[projectId]?.conversations.find((item) => item.id === conversationId);
@@ -2335,6 +2365,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   function selectConversation(conversation: Conversation) {
+    if (!leaveRecurring()) return;
     acceptManualConversationSelection();
     setParaVisible(false);
     retainedConversationRef.current = conversation;
@@ -2358,7 +2389,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setTaskMenu(null);
     const bounds = button.getBoundingClientRect();
     const width = 176;
-    const height = project.executor_id.startsWith("remote:") ? 132 : 92;
+    const height = project.executor_id.startsWith("remote:") ? 176 : 136;
     const top = bounds.bottom + 6 + height <= window.innerHeight - 8
       ? bounds.bottom + 6
       : Math.max(8, bounds.top - height - 6);
@@ -2934,6 +2965,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }, [refreshDetail, refreshList]);
 
   async function newConversation(projectId = activeProjectIdRef.current ?? undefined) {
+    if (!leaveRecurring()) return;
     setParaVisible(false);
     const creationKey = projectId ?? "__default__";
     if (creatingConversationProjectsRef.current.has(creationKey)) return;
@@ -3284,16 +3316,16 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         else if (result.externalRunning) setNotice(result.guidance || "任务正在本机客户端中执行；刷新项目确认空闲后会自动开始。");
         else if (result.maintenance) setNotice(result.guidance || MAINTENANCE_QUEUE_GUIDANCE);
         finishMutation();
-        await reconcile(conversationId);
+        void reconcile(conversationId);
       } else {
-        await refreshList(false).catch(() => undefined);
+        void refreshList(false).catch(() => undefined);
       }
     } catch (reason) {
       if (selectedIdRef.current === conversationId) setError(reason instanceof Error ? reason.message : "语音任务发送失败");
       else setNotice("原会话的语音任务发送失败；切回该会话后可以从草稿重试。");
     } finally {
       finishMutation();
-      if (selectedIdRef.current === conversationId) setSubmitting(false);
+      setSubmitting(false);
     }
   }
 
@@ -3349,7 +3381,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         setInput(""); setAskAgentQuote(""); setFiles([]);
       }
       finishMutation();
-      await reconcile(id);
+      void reconcile(id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "发送失败");
     } finally { finishMutation?.(); setSubmitting(false); }
@@ -3376,7 +3408,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         await persistAgentSelection({ model: prompt.agent_model, reasoningEffort: prompt.reasoning_effort });
       }
       finishMutation();
-      await refreshDetail(selectedId);
+      void reconcile(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "进入编辑状态失败"); }
     finally { finishMutation(); setSubmitting(false); }
   }
@@ -3394,7 +3426,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       draftLoadedConversationRef.current = null;
       setNotice("");
       finishMutation();
-      await reconcile(selectedId);
+      void reconcile(selectedId);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "取消编辑失败"); }
     finally { finishMutation(); setSubmitting(false); }
   }
@@ -3402,18 +3434,27 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   async function deletePendingPrompt(prompt: PendingPrompt) {
     if (!selectedId || submitting) return;
     setSubmitting(true); setError("");
-    try { await api.deletePendingPrompt(selectedId, prompt.id); await reconcile(selectedId); }
+    try { await api.deletePendingPrompt(selectedId, prompt.id); void reconcile(selectedId); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "删除待发送任务失败"); }
     finally { setSubmitting(false); }
   }
 
   async function steerPendingPrompt(prompt: PendingPrompt) {
-    if (!selectedId || submitting) return;
+    if (!selectedId || submitting || steeringRef.current) return;
+    const id = selectedId;
     const action = job?.status === "running" ? "引导当前任务" : "插入任务";
-    setSubmitting(true); setError("");
-    try { await api.steerPendingPrompt(selectedId, prompt.id); await reconcile(selectedId); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : `${action}失败`); }
-    finally { setSubmitting(false); }
+    steeringRef.current = true; setSteering(true); setError("");
+    try {
+      await api.steerPendingPrompt(id, prompt.id);
+      // Remove the accepted item immediately; sidebar/detail refresh is background work.
+      draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
+      setDetail((current) => current?.conversation.id === id
+        ? { ...current, pendingPrompts: current.pendingPrompts.filter((item) => item.id !== prompt.id) }
+        : current);
+      void reconcile(id);
+    } catch (reason) {
+      if (selectedIdRef.current === id) setError(reason instanceof Error ? reason.message : `${action}失败`);
+    } finally { steeringRef.current = false; setSteering(false); }
   }
 
   async function reorderPendingPrompts(ordered: PendingPrompt[]) {
@@ -3634,7 +3675,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     ? projects.find((project) => project.id === selectedConversation.project_id)
     : undefined;
   const workspaceTitle = selectedConversation?.title || "Codex Web";
-  usePageTitle(paraVisible ? null : selectedConversation?.title);
+  usePageTitle(recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
   const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || "PERSONAL AI WORKSTATION";
   const projectMenuProject = projectMenu ? projects.find((project) => project.id === projectMenu.projectId) : undefined;
   const taskMenuConversation = taskMenu
@@ -3644,7 +3685,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const account = resolveAccountIdentity(session);
   const conversationRow = (conversation: Conversation, projectId?: string) => <div
     key={conversation.id}
-    className={`conversation-row ${selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
+    className={`conversation-row ${!recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
     draggable={Boolean(projectId && !query)}
     aria-grabbed={projectId ? draggedConversation?.id === conversation.id : undefined}
     onDragStart={projectId ? (event) => beginConversationDrag(event, conversation, projectId) : undefined}
@@ -3755,7 +3796,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                 onDrop={(event) => void dropProject(event, project.id)}
               >
                 <div
-                  className={`project-row ${activeProjectId === project.id ? "active" : ""}`}
+                  className={`project-row ${(recurringView ? recurringView.projectId === project.id : activeProjectId === project.id) ? "active" : ""}`}
                   draggable
                   aria-grabbed={draggedProjectId === project.id}
                   onDragStart={(event) => beginProjectDrag(event, project.id)}
@@ -3786,6 +3827,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                   </div>
                 </div>
                 {!collapsed && <div className="project-conversations">
+                  <RecurringSidebar tasks={recurringTasks.filter(task => task.project_id === project.id)} selected={recurringView?.projectId === project.id ? recurringView.taskId : null} onOpen={id => openRecurring(project.id, id)} />
                   {page?.conversations.map((conversation) => conversationRow(conversation, project.id))}
                   {projectPageLoading[project.id] && <div className="list-loading"><LoaderCircle className="spin" size={14} /><span>正在加载…</span></div>}
                   {projectBodySearchLoading[project.id] && <div className="list-loading"><LoaderCircle className="spin" size={14} /><span>正在搜索正文…</span></div>}
@@ -3807,11 +3849,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </div></div>
         </>}
       </div>
+      </div>
       <div className="account-area" ref={accountAreaRef}>
         {accountSettingsOpen && <section className="account-settings" aria-label="个人设置">
           <div className="account-settings-heading"><Settings2 size={15} /><strong>个人设置</strong></div>
           <button className="account-settings-archive display-settings-trigger" type="button" aria-haspopup="dialog" aria-expanded={displaySettingsDialogOpen} onClick={() => { setAccountSettingsOpen(false); setDisplaySettingsDialogOpen(true); }}><Settings2 size={16} /><span>显示设置</span></button>
           <button className="account-settings-archive" type="button" aria-haspopup="dialog" aria-expanded={featureSelectionOpen} onClick={() => { setAccountSettingsOpen(false); setFeatureSelectionOpen(true); }}><LayoutDashboard size={16} /><span>功能选择</span></button>
+          {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setNodeTransfersOpen(true); }}><Share2 size={16} /><span>节点文件传输</span></button>}
           {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setAccountAuthDialogOpen(true); }}><KeyRound size={16} /><span>Codex 账号管理</span></button>}
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setPersonalMemoryDialogOpen(true); }}><BookOpen size={16} /><span>个人知识</span></button>
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setVoiceLexiconDialogOpen(true); }}><Mic size={16} /><span>语音关键词</span></button>
@@ -3824,7 +3868,6 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             <span className="avatar" aria-label={`${account.displayName} 头像`}>{account.initials}</span><span className="account-copy"><strong>{account.displayName}</strong><small>私人工作站</small></span><Settings2 size={15} />
           </button>
         </div>
-      </div>
       </div>
       {featureSelectionOpen && createPortal(<FeatureSelectionDialog onClose={closeFeatureSelection} />, document.body)}
       {displaySettingsDialogOpen && <DisplaySettingsDialog
@@ -3877,7 +3920,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         disabled={projectMenuProject.executor_status !== "online" || syncingProjects[projectMenuProject.id]}
         onClick={() => { setProjectMenu(null); void syncProject(projectMenuProject); }}
       ><RefreshCw size={16} className={syncingProjects[projectMenuProject.id] ? "spin" : ""} /><span>{syncingProjects[projectMenuProject.id] ? "正在刷新" : "刷新任务"}</span></button>}
-      <button type="button" role="menuitem" disabled={projectMenuProject.executor_id !== "tenant-local"} title={projectMenuProject.executor_id === "tenant-local" ? "管理项目级技能" : "宿主项目和远端项目暂不支持网页项目技能管理"} onClick={() => { if (projectMenuProject.executor_id !== "tenant-local") return; setProjectMenu(null); setProjectSkillsDialogProject(projectMenuProject); }}><Pencil size={16} /><span>管理项目技能{projectMenuProject.executor_id !== "tenant-local" ? "（暂不支持）" : ""}</span></button>
+      <button type="button" role="menuitem" onClick={() => openRecurring(projectMenuProject.id, null)}><Clock size={16} /><span>管理定时任务</span></button>
+      <button type="button" role="menuitem" disabled={projectMenuProject.executor_id.startsWith("remote:")} title={projectMenuProject.executor_id.startsWith("remote:") ? "远端项目暂不支持网页管理技能" : "管理项目技能"} onClick={() => { setProjectMenu(null); setProjectSkillsDialogProject(projectMenuProject); }}><Pencil size={16} /><span>管理项目技能{projectMenuProject.executor_id.startsWith("remote:") ? "（远端暂不支持）" : ""}</span></button>
       <button type="button" role="menuitem" onClick={() => { setProjectMenu(null); void renameProject(projectMenuProject); }}><Pencil size={16} /><span>改名</span></button>
       <button type="button" role="menuitem" className="danger" onClick={() => void archiveProject(projectMenuProject)}><Archive size={16} /><span>归档项目</span></button>
     </div>, document.body)}
@@ -3920,18 +3964,20 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     />}
     {archivedDialogOpen && <ArchivedConversationsDialog
       onClose={() => setArchivedDialogOpen(false)}
-      onSelect={(conversation) => { setArchivedDialogOpen(false); setAccountSettingsOpen(false); setSelectedId(conversation.id); }}
+      onSelect={(conversation) => { if (!leaveRecurring()) return; setArchivedDialogOpen(false); setAccountSettingsOpen(false); setSelectedId(conversation.id); }}
       onRestored={(conversation) => void refreshList(false, conversation.project_id).catch((reason) => setError(reason instanceof Error ? reason.message : "任务列表刷新失败"))}
     />}
     {personalMemoryDialogOpen && <PersonalMemoryDialog onClose={() => setPersonalMemoryDialogOpen(false)} />}
     {voiceLexiconDialogOpen && <VoiceLexiconDialog onClose={() => setVoiceLexiconDialogOpen(false)} />}
     {publicSharesDialogOpen && <PublicSharesDialog onClose={() => setPublicSharesDialogOpen(false)} />}
+    {nodeTransfersOpen && createPortal(<NodeTransfersDialog onClose={() => setNodeTransfersOpen(false)} />, document.body)}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
     {features.paraBoard && paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
       onMenu={() => setSidebarOpen(true)}
       onOpenConversation={(id, engineId) => { setParaVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
-    <main style={features.paraBoard && paraVisible ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+    {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
+    <main style={recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="workspace-header">
         <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
@@ -3982,7 +4028,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       {error && <div className="toast"><span>{error}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button onClick={() => { setError(""); setCleanupRetry(null); }}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
       {currentDetail?.conversation.archived_at && <div className="archived-conversation-banner"><Archive size={15} /><span>这是已归档会话，只读查看；消息、附件和 rollout 仍保存在原处。</span><button type="button" onClick={() => void restoreConversation(currentDetail.conversation)}>恢复</button></div>}
-      {conversationSelectionReady && (!selectedId || !selectedConversation?.archived_at) && <Composer accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} selectionSaving={selectionSaving}
+      {conversationSelectionReady && (!selectedId || !selectedConversation?.archived_at) && <Composer accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} pendingBusy={submitting || steering} selectionSaving={selectionSaving}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -5168,7 +5214,7 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
   </section>;
 }
 
-function Composer({ accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onCancel }: {
+function Composer({ accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onCancel }: {
   accountId: string | null;
   conversationId: string | null;
   input: string;
@@ -5183,6 +5229,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
   draftSaveState: DraftSaveState;
   sending: boolean;
   submitting: boolean;
+  pendingBusy: boolean;
   selectionSaving: boolean;
   pendingPrompts: PendingPrompt[];
   editingPending: PendingPrompt | null;
@@ -5473,7 +5520,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     ? "会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。"
     : "新内容会进入待发送队列；可选择“插入”立即发送。";
   return <div className={`composer-wrap ${compactWrap ? "compact" : ""}`}>
-    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={submitting} actionMode={pendingActionMode} waitingForWake={waitingForWake}
+    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} waitingForWake={waitingForWake}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div ref={composerRef} className={`composer ${composerExpanded ? "expanded" : "compact"}`}

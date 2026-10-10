@@ -62,3 +62,32 @@ after cancellation, audio recovery after reload and ordinary voice sending.
 Production callers must clean up the fixture's transcription/audio receipts as
 well as its dedicated conversations. Synthetic microphone input does not verify
 physical microphone permissions or iOS Safari recording behavior.
+
+## Submission liveness
+
+The composer submission lock covers writes, not subsequent detail/sidebar reads.
+After the write confirms, normal and voice sends release their mutation guard and
+start reconciliation in the background. A late or stalled GET must not prevent
+new typing or queued actions. Voice sends also release the lock if the user
+switched conversations while the request was in flight.
+
+Steering has its own in-flight guard: queue actions cannot double-submit, while
+the composer stays editable. An accepted queued item is removed immediately and
+its mutation generation advances before refreshing the conversation.
+
+Composer writes (draft save/delete, create/send, queued edit/restore/delete/steer)
+have a 45-second deadline spanning both response headers and JSON body. Multipart
+sends with new files retain a 10-minute upload budget. Abort releases the UI and
+preserves input; writes are never automatically retried because a timeout cannot
+prove whether the server accepted the mutation. The notice asks the user to check
+messages and the queue before retrying. Independent upload/ASR controls are unchanged.
+
+
+`scripts/check-composer-submission.mjs` reuses an isolated real API and tests desktop
+and mobile viewports with a stalled post-send GET, editable input during steering,
+a rejected steering request, and an aborted draft write followed by one retry.
+`--expect-bug` reproduces the former shared lock. The shared
+`scripts/composer-submission-scenario.mjs` is safe for production acceptance using
+its own wake-held conversations. Its failure/stall cases inject network behavior;
+it does not claim to verify model-side steering delivery. Request unit tests also
+cover stalls while reading the response body and caller cancellation.

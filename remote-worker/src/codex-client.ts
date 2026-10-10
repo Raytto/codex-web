@@ -1,3 +1,4 @@
+import { NODE_TRANSFER_TOOL_NAME, NODE_TRANSFER_TOOL_SPEC, callNodeTransferTool } from "./node-transfer-tool.js";
 import { normalizeResetCredits } from "./codex-reset-credits.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
@@ -131,7 +132,7 @@ export class CodexExecution {
         : await this.startupRequest("thread/start", {
             ...common,
             developerInstructions: remoteThreadInstructions(),
-            ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC] } : {}),
+            ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC, NODE_TRANSFER_TOOL_SPEC] } : {}),
           }, "正在创建远端会话");
       if (this.terminal || this.cancellationRequested) return;
       const thread = (response as { thread?: { id?: string } }).thread;
@@ -176,12 +177,12 @@ export class CodexExecution {
 
   private async handleServerRequest(id: number, method: string, params: JsonObject): Promise<void> {
     const reply = (result: unknown) => this.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
-    if (method !== "item/tool/call" || !this.options.automation?.dynamicTool || params.tool !== WAIT_DYNAMIC_TOOL_NAME) {
+    if (method !== "item/tool/call" || !this.options.automation?.dynamicTool || ![WAIT_DYNAMIC_TOOL_NAME, NODE_TRANSFER_TOOL_NAME].includes(String(params.tool))) {
       reply({ contentItems: [{ type: "inputText", text: "Unsupported dynamic tool request" }], success: false });
       return;
     }
     try {
-      const result = await callWaitDynamicTool(this.options.automation as WaitToolConfig, params.arguments);
+      const result = await (params.tool === NODE_TRANSFER_TOOL_NAME ? callNodeTransferTool(this.options.automation as WaitToolConfig, params.arguments) : callWaitDynamicTool(this.options.automation as WaitToolConfig, params.arguments));
       reply({ contentItems: [{ type: "inputText", text: result }], success: true });
     } catch (error) {
       reply({ contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });

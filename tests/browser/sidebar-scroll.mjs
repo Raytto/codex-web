@@ -39,12 +39,15 @@ export async function run({ page, context, origin, work, assert }) {
     assert.ok(Math.abs(before[".sidebar-top"] - after[".sidebar-top"]) < 1, "brand stays fixed");
     const delta = before[".search-box"] - after[".search-box"];
     assert.ok(delta > 30, "search scrolls away");
-    for (const selector of [".para-sidebar", ".conversation-section", ".account-area"]) {
+    assert.ok(Math.abs(before[".account-area"] - after[".account-area"]) < 1, "account stays fixed");
+    for (const selector of [".para-sidebar", ".conversation-section"]) {
       assert.ok(Math.abs(before[selector] - after[selector] - delta) < 2, selector + " moves with search");
     }
   };
   const assertLayout = async () => {
-    assert.deepEqual(await sidebar.evaluate(el => [...el.querySelectorAll("*")].filter(n => /auto|scroll/.test(getComputedStyle(n).overflowY) && n.scrollHeight > n.clientHeight + 1).map(n => n.className)), ["sidebar-content"]);
+    assert.deepEqual(await sidebar.evaluate(el => [...el.querySelectorAll("*")].filter(n => !n.classList.contains("account-settings") && /auto|scroll/.test(getComputedStyle(n).overflowY) && n.scrollHeight > n.clientHeight + 1).map(n => n.className)), ["sidebar-content"]);
+    const accountBox = await account.boundingBox();
+    assert.ok(accountBox.y >= 0 && accountBox.y + accountBox.height <= page.viewportSize().height);
     assert.ok(await scroll.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
     assert.equal(await page.evaluate(() => scrollY), 0);
   };
@@ -107,7 +110,7 @@ export async function run({ page, context, origin, work, assert }) {
     const logoutBox = await settings.getByRole("button", { name: "退出登录", exact: true }).boundingBox();
     assert.ok(logoutBox.y >= 0 && logoutBox.y + logoutBox.height <= 400);
     await page.keyboard.press("Escape"); await until(async () => await settings.count() === 0);
-    report.checks.push("account_settings_accessible_without_nested_scroll_on_short_screen"); save();
+    report.checks.push("fixed_account_settings_scrollable_on_short_screen"); save();
 
     report.phase = "search_and_navigation"; save();
     await page.setViewportSize({ width: 1440, height: 900 }); await wheel(-10000);
@@ -119,8 +122,8 @@ export async function run({ page, context, origin, work, assert }) {
     await page.locator(".para-workspace:not(.para-hidden)").getByRole("heading", { name, exact: true }).waitFor();
     await search.fill(name + "-没有结果"); await until(async () => await sidebar.locator(".para-sidebar-board").count() === 0);
     await account.click(); await settings.waitFor();
-    const settingsBox = await settings.boundingBox(), scrollBox = await scroll.boundingBox();
-    assert.ok(settingsBox.y >= scrollBox.y && settingsBox.y + settingsBox.height <= scrollBox.y + scrollBox.height + 1);
+    const settingsBox = await settings.boundingBox(), accountBox = await account.boundingBox();
+    assert.ok(settingsBox.y >= 0 && settingsBox.y + settingsBox.height <= accountBox.y);
     await page.keyboard.press("Escape");
     report.checks.push("search_folder_task_board_navigation_and_short_list_account_menu");
     assert.deepEqual(report.errors, []); report.phase = "passed"; save();

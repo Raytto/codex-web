@@ -38,7 +38,7 @@ test("Remote Worker edge template keeps transfer secrets out of request-target l
   assert.match(nginx, /log_format\s+codex_web_remote_worker[^;]*\$uri/s);
   const format = nginx.match(/log_format\s+codex_web_remote_worker([\s\S]*?);/)?.[1] ?? "";
   assert.doesNotMatch(format, /\$args|\$request_uri/);
-  assert.match(nginx, /client_max_body_size\s+100m/);
+  assert.match(nginx, /client_max_body_size\s+2g/);
   assert.match(nginx, /limit_conn\s+codex_web_remote_worker_connections\s+8/);
   assert.match(nginx, /limit_req\s+zone=codex_web_remote_worker_transfers/);
   assert.match(nginx, /proxy_set_header\s+Upgrade\s+""/);

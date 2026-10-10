@@ -28,7 +28,7 @@ import {
 import { loadRemoteWorkerReleaseManifest, REMOTE_WORKER_TARGET_REF, REMOTE_WORKER_TARGET_VERSION, type RemoteWorkerReleaseManifest, type RemoteWorkerReleaseArchive } from "./remote-worker-release.js";
 import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 import { isValidRemoteWorkerCapacity, normalizeRemoteWorkerCapacity, remoteWorkerHasCapacity } from "./remote-worker-capacity.js";
-import { REMOTE_TRANSFER_MAX_FILE_BYTES, RemoteTransferError } from "./remote-transfer.js";
+import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB, REMOTE_TRANSFER_TIMEOUT_MS, RemoteTransferError } from "./remote-transfer.js";
 import { cleanupOwnedStagingDirectory, ownedStagingDirectory, sweepOwnedStagingDirectories } from "./owned-staging.js";
 import { parseRemoteWorkerMessage, REMOTE_WORKER_MAX_MESSAGE_BYTES, REMOTE_WORKER_MAX_PROTOCOL_ERRORS } from "./remote-worker-message.js";
 import { ensureTenantWorkspace, resolveInside } from "./paths.js";
@@ -36,7 +36,6 @@ import type { RemoteWorkerBootstrapPlatform } from "./remote-worker-bootstrap.js
 
 const REMOTE_TRANSFER_MAX_FILES_PER_JOB = 32;
 const REMOTE_TRANSFER_MAX_ACTIVE_PER_JOB = 4;
-const REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB = 512 * 1024 * 1024;
 const REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS = 5 * 60_000;
 export const REMOTE_WORKER_UPDATE_TIMEOUT_MS = 15 * 60_000;
 const REMOTE_WORKER_AUTO_RETRY_COOLDOWN_MS = 60_000;
@@ -46,7 +45,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -167,6 +166,7 @@ export class RemoteWorkerGateway extends EventEmitter {
   private readonly bootstrapGrants = new Map<string, BootstrapGrant>();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private closing = false;
+  transferBusy: (executorId: string) => boolean = () => false;
   private readonly targetRelease: RemoteWorkerReleaseManifest | null;
 
   constructor(private readonly config: AppConfig, private readonly db: AppDatabase) {
@@ -193,7 +193,8 @@ export class RemoteWorkerGateway extends EventEmitter {
       let pathname = "";
       try { pathname = new URL(request.url ?? "/", "http://localhost").pathname; }
       catch { socket.destroy(); return; }
-      if (pathname !== "/api/remote-workers/connect") { socket.destroy(); return; }
+      if (pathname === `${this.config.basePath}/api/node-transfers/connect`) return;
+      if (pathname !== `${this.config.basePath}/api/remote-workers/connect`) { socket.destroy(); return; }
       this.server.handleUpgrade(request, socket, head, (ws) => this.server.emit("connection", ws, request));
     });
     this.heartbeatTimer = setInterval(() => this.checkHeartbeats(), 15_000);
@@ -269,6 +270,19 @@ export class RemoteWorkerGateway extends EventEmitter {
     return Boolean(match && (this.db.listRemoteWorkers().some((worker) => this.allowedLegacyMigration(worker.id, match[1]))
       || this.db.activeRemoteWorkerCredential(credentialHash(match[1]))
       || this.db.remoteWorkerEnrollment(credentialHash(match[1]))));
+  }
+
+  transferCapable(executorId: string): boolean {
+    const id = workerIdFromExecutor(executorId);
+    return Boolean(id && this.connections.get(id)?.nodeTransfers && !this.connections.get(id)?.migrationOnly);
+  }
+
+  async startNodeTransfer(executorId: string, spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec): Promise<void> {
+    const id = workerIdFromExecutor(executorId), connection = id ? this.connections.get(id) : undefined;
+    if (!connection?.nodeTransfers || connection.migrationOnly) throw new Error("TRANSFER_NODE_OFFLINE_OR_OLD");
+    const update = id ? this.db.getRemoteWorkerUpdate(id) : undefined;
+    if (update && ["queued", "dispatching", "updating"].includes(update.state)) throw new Error("TRANSFER_NODE_UPDATING");
+    this.send(connection.socket, { type: "node_transfer", spec });
   }
 
   listExecutors(): ExecutorView[] {
@@ -711,7 +725,7 @@ export class RemoteWorkerGateway extends EventEmitter {
         this.pendingFileFetches.delete(requestId);
         if (pending?.artifact) this.removeStagedArtifact(pending.artifact);
         reject(new Error("远程文件获取超时"));
-      }, 120_000);
+      }, REMOTE_TRANSFER_TIMEOUT_MS);
       this.pendingFileFetches.set(requestId, { workerId, transferToken, sourcePath, resolve, reject, timer });
       this.send(connection.socket, { type: "file_fetch", requestId, projectRoot, path: sourcePath, transferToken });
     });
@@ -785,7 +799,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     }
     const reservedBytes = [...pending.activeUploads.values()].reduce((total, upload) => total + upload.expectedSize, 0);
     if (pending.uploadedBytes + reservedBytes + expectedSize > REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB) {
-      throw new RemoteTransferError("单个任务的结果文件总量超过 512 MiB 上限。", 413, "REMOTE_JOB_BYTES_LIMIT");
+      throw new RemoteTransferError("单个任务的结果文件总量超过 8 GiB 上限。", 413, "REMOTE_JOB_BYTES_LIMIT");
     }
     const reservation = this.createUploadReservation("job", jobId, name, mimeType, expectedSize);
     pending.activeUploads.set(reservation.id, reservation);
@@ -1009,6 +1023,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       threadRolloutSize: Boolean(hello.capabilities?.threadRolloutSize),
       threadLifecycle: Boolean(hello.capabilities?.threadLifecycle),
       accountSwitching: false,
+      nodeTransfers: Boolean(hello.capabilities?.nodeTransfers),
       deviceCredentials: Boolean(hello.capabilities?.deviceCredentials),
       migrationOnly,
     });
@@ -1483,7 +1498,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     const connection = this.connections.get(workerId);
     const worker = this.db.getRemoteWorker(workerId);
     if (!connection || connection.socket.readyState !== WebSocket.OPEN || !connection.heartbeatSeen || !worker?.worker_update_capable) return;
-    if (connection.activeJobs.size > 0 || worker.active_jobs > 0) return;
+    if (connection.activeJobs.size > 0 || worker.active_jobs > 0 || this.transferBusy(remoteExecutorId(workerId))) return;
     if ([...this.pendingJobs.values()].some((job) => job.workerId === workerId)) return;
     if (this.db.countRunningJobsForExecutor(remoteExecutorId(workerId)) > 0) return;
     this.db.updateRemoteWorkerUpdate(workerId, "dispatching");

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { Readable } from "node:stream";
 import { DatabaseSync } from "node:sqlite";
 import bcrypt from "bcryptjs";
 import { createElement } from "react";
@@ -4812,7 +4813,7 @@ test("owner can fetch any readable remote file into the normal deliverable downl
   assert.equal(fetchRequests, 1);
 });
 
-test("remote Worker output uploads keep large JSON files on the raw 100 MiB path", async (context) => {
+test("remote Worker output uploads keep large JSON files on the raw streaming transfer path", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-json-output-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
   const instance = createApp({
@@ -4840,7 +4841,12 @@ test("remote Worker output uploads keep large JSON files on the raw 100 MiB path
       const message = JSON.parse(raw.toString()) as { type: string; request?: { jobId: string; transferToken: string } };
       if (message.type === "authenticated") resolve();
       if (message.type !== "run" || !message.request) return;
-      const body = JSON.stringify({ data: "x".repeat(1024 * 1024) });
+      const chunk = Buffer.alloc(1024 * 1024, 0x78);
+      const bodySize = 128 * chunk.length + 11;
+      function* chunks() { yield Buffer.from('{"data":"'); for (let i = 0; i < 128; i++) yield chunk; yield Buffer.from('"}'); }
+      const hash = crypto.createHash("sha256");
+      for (const part of chunks()) hash.update(part);
+      const expectedHash = hash.digest("hex");
       void (async () => {
         const rejected = await fetch(`${origin}/api/remote-worker-files/${message.request!.jobId}/output`, {
           method: "PUT", headers: { authorization: "Bearer invalid", "content-type": "application/json" }, body: "{",
@@ -4848,11 +4854,20 @@ test("remote Worker output uploads keep large JSON files on the raw 100 MiB path
         assert.equal(rejected.status, 404);
         assert.equal((await rejected.json() as { code: string }).code, "REMOTE_TRANSFER_UNAUTHORIZED");
         const response = await fetch(`${origin}/api/remote-worker-files/${message.request!.jobId}/output`, {
-          method: "PUT", headers: { authorization: `Bearer ${message.request!.transferToken}`, "content-type": "application/json", "x-file-name": "analysis.json" }, body,
-        });
+          method: "PUT", headers: { authorization: `Bearer ${message.request!.transferToken}`, "content-type": "application/json", "x-file-name": "analysis.json", "content-length": String(bodySize) }, body: Readable.from(chunks()) as unknown as BodyInit, duplex: "half",
+        } as RequestInit & { duplex: "half" });
         assert.equal(response.status, 201);
         const uploaded = await response.json() as { artifact: { sha256: string } };
-        assert.equal(uploaded.artifact.sha256, crypto.createHash("sha256").update(body).digest("hex"));
+        assert.equal(uploaded.artifact.sha256, expectedHash);
+        // Reserve large parallel outputs without allocating multi-GiB test files.
+        // Already uploaded bytes and in-flight bytes must share one budget.
+        const reservations = Array.from({ length: 3 }, (_, index) => instance.remoteWorkers.beginArtifactUpload(
+          message.request!.jobId, message.request!.transferToken, `large-${index}.bin`, "application/octet-stream", 2 * 1024 * 1024 * 1024,
+        )!);
+        assert.throws(() => instance.remoteWorkers.beginArtifactUpload(
+          message.request!.jobId, message.request!.transferToken, "over-budget.bin", "application/octet-stream", 2 * 1024 * 1024 * 1024,
+        ), (error: unknown) => error instanceof Error && "code" in error && error.code === "REMOTE_JOB_BYTES_LIMIT");
+        for (const reservation of reservations) await instance.remoteWorkers.abortUpload(reservation);
         socket.send(JSON.stringify({ type: "event", jobId: message.request?.jobId, event: { type: "completed", finalResponse: "done" } }));
       })().catch(reject);
     });
@@ -4884,7 +4899,7 @@ test("remote Worker output uploads keep large JSON files on the raw 100 MiB path
   assert.equal(result.finalResponse, "done");
   assert.equal(result.artifacts.length, 1);
   assert.equal(result.artifacts[0]?.name, "analysis.json");
-  assert.ok(result.artifacts[0]?.size > 1024 * 1024);
+  assert.equal(result.artifacts[0]?.size, 128 * 1024 * 1024 + 11);
   assert.match(result.artifacts[0]!.sha256, /^[0-9a-f]{64}$/);
   assert.equal(fs.statSync(result.artifacts[0]!.tempPath).size, result.artifacts[0]!.size);
   const recoveryPath = path.join(root, "data", "remote-worker-recovery", `${jobId}.json`);

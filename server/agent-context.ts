@@ -105,6 +105,7 @@ function isExcelAttachment(file: AgentAttachmentContext): boolean {
 
 export function buildHostThreadInstructions(): string {
   return [
+    "节点之间以及节点与服务器的文件互传使用 pp_agent_transfer，由 Codex Web 服务端负责调度、路由和任务状态；不要自行通过会话附件或临时分片中转。",
     "这是 CODEX_WEB 网页工作站发起的宿主 root 管理线程。严格遵守当前工作目录自动加载的 AGENTS.md。",
     "当前工作目录是用户选定的项目根；附件从 CWW_UPLOADS_DIR 读取，最终交付写入 CWW_OUTPUTS_DIR，过程文件写入 CWW_JOB_RUNTIME。不要把网页交付物写到项目根 outputs/。",
     "CODEX_WEB 宿主线程的最终回复只要用 Markdown 文件链接明确指向一个可读取的服务器本地普通文件，宿主桥就会自动复制到 CWW_OUTPUTS_DIR，并登记为当前消息的附件卡片；需要用户下载的本机文件可以直接链接绝对路径或当前项目相对路径。纯文字路径不会自动交付，不要链接用户不需要的敏感文件或过程文件。",

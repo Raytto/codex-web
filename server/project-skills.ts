@@ -64,7 +64,7 @@ export function createProjectSkill(projectRoot: string, name: string, rawContent
   const normalized = assertSkillName(name);
   const validated = validateProjectSkillContent(normalized, rawContent);
   const directory = path.join(enabled ? roots.active : roots.disabled, normalized);
-  if (fs.existsSync(directory)) throw new Error("同名项目技能已经存在。");
+  if (fs.existsSync(path.join(roots.active, normalized)) || fs.existsSync(path.join(roots.disabled, normalized))) throw new Error("同名项目技能已经存在。");
   fs.mkdirSync(directory, { recursive: false, mode: 0o770 });
   try {
     atomicWrite(path.join(directory, "SKILL.md"), validated.content);
@@ -151,5 +151,19 @@ function atomicWrite(target: string, content: string): void {
     fs.renameSync(temporary, target);
   } finally {
     try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch {}
+  }
+}
+
+export type ProjectSkillAction = "list" | "read" | "create" | "update" | "enable" | "disable" | "delete";
+export type ProjectSkillResult = { supported?: true; skills?: ProjectSkill[]; skill?: ProjectSkillDetail; ok?: true };
+export function operateProjectSkill(root: string, action: ProjectSkillAction, name = "", content = "", enabled = true): ProjectSkillResult {
+  switch (action) {
+    case "list": return { supported: true, skills: listProjectSkills(root) };
+    case "read": return { skill: readProjectSkill(root, name) };
+    case "create": return { skill: createProjectSkill(root, name, content, enabled) };
+    case "update": return { skill: updateProjectSkill(root, name, content) };
+    case "enable": case "disable": return { skill: setProjectSkillEnabled(root, name, action === "enable") };
+    case "delete": deleteProjectSkill(root, name); return { ok: true };
+    default: throw new Error("项目技能操作无效。");
   }
 }

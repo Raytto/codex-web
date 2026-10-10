@@ -177,6 +177,7 @@ async function resolveLinkedSource(
   for (const candidate of candidates) {
     try {
       const realPath = await fs.promises.realpath(candidate);
+      if (realPath.split(path.sep).some(part => part.startsWith(".ppa-transfer-"))) return null;
       const stat = await fs.promises.stat(realPath);
       if (!stat.isFile()) {
         sawNotFile = true;

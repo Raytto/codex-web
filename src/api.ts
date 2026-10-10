@@ -1,3 +1,4 @@
+import type { RecurringInput, RecurringTask, RecurringRun } from "./recurring-types";
 import type { FeatureSelection } from "./feature-selection";
 export const BASE_PATH = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
 
@@ -451,7 +452,12 @@ function isReaderRetryBody(value: unknown): value is { code?: string; restoring?
   return Boolean(value && typeof value === "object" && !("source" in value) && !("unit" in value));
 }
 
-type RequestOptions = { allowStatuses?: readonly number[] };
+type RequestOptions = { allowStatuses?: readonly number[]; timeoutMs?: number };
+
+// Composer mutations must settle even when the browser keeps a connection open.
+// Large multipart uploads retain a separate, longer budget.
+const COMPOSER_REQUEST_TIMEOUT_MS = 45_000;
+const COMPOSER_UPLOAD_TIMEOUT_MS = 600_000;
 
 export async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -460,19 +466,47 @@ export async function request<T>(path: string, init: RequestInit = {}, options: 
   // Authenticated API responses are dynamic.  Do not let a browser or an
   // intermediary turn a fresh request into a conditional GET (304), which is
   // not a JSON API response and used to be surfaced as a loading error.
-  const response = await fetch(`${BASE_PATH}/api${path}`, {
-    ...init,
-    cache: init.cache ?? "no-store",
-    headers,
-    credentials: "same-origin",
-  });
-  if (response.status === 204) return undefined as T;
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok && !options.allowStatuses?.includes(response.status)) throw new ApiError(body.error || `请求失败 (${response.status})`, response.status);
-  return body as T;
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const signal = controller
+    ? init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal
+    : init.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), options.timeoutMs) : null;
+  try {
+    const response = await fetch(`${BASE_PATH}/api${path}`, {
+      ...init,
+      signal,
+      cache: init.cache ?? "no-store",
+      headers,
+      credentials: "same-origin",
+    });
+    if (response.status === 204) return undefined as T;
+    const body = await response.json().catch((reason) => {
+      if (signal?.aborted) throw reason;
+      return {};
+    });
+    if (!response.ok && !options.allowStatuses?.includes(response.status)) throw new ApiError(body.error || `请求失败 (${response.status})`, response.status);
+    return body as T;
+  } catch (reason) {
+    if (controller?.signal.aborted && !init.signal?.aborted) {
+      const writing = init.method && !["GET", "HEAD"].includes(init.method.toUpperCase());
+      throw new Error(writing
+        ? "请求确认超时，输入已保留。请先核对消息和待发送队列，再决定是否重试；系统未自动重发。"
+        : "状态刷新超时，请稍后重试。");
+    }
+    throw reason;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
 
 export const api = {
+  setRecurringState: (id: string, revision: number, state: "active" | "paused") => request<{ task: RecurringTask }>(`/recurring-tasks/${encodeURIComponent(id)}/state`, { method: "POST", body: JSON.stringify({ revision, state }) }),
+  projectScheduledWaits: (id: string) => request<{ waits: Array<{ id: string; label: string; deadline_at: string; conversation_id: string }> }>(`/projects/${encodeURIComponent(id)}/scheduled-waits`),
+  recurringTasks: () => request<{ tasks: RecurringTask[] }>("/recurring-tasks"),
+  recurringTask: (id: string) => request<{ task: RecurringTask; runs: RecurringRun[] }>(`/recurring-tasks/${encodeURIComponent(id)}`),
+  createRecurringTask: (projectId: string, input: RecurringInput) => request<{ task: RecurringTask }>(`/projects/${encodeURIComponent(projectId)}/recurring-tasks`, { method: "POST", body: JSON.stringify(input) }),
+  updateRecurringTask: (id: string, input: RecurringInput & { revision: number; state: "active" | "paused" }) => request<{ task: RecurringTask }>(`/recurring-tasks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  deleteRecurringTask: (id: string, revision: number) => request<{ ok: true }>(`/recurring-tasks/${encodeURIComponent(id)}`, { method: "DELETE", body: JSON.stringify({ revision }) }),
   session: (signal?: AbortSignal) => request<Session>("/auth/session", { cache: "no-store", signal }),
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
@@ -580,7 +614,7 @@ export const api = {
   updateChatFontSize: (chatFontSize: number) => request<{ chatFontSize: number }>("/user-settings/chat-font-size", {
     method: "PUT", body: JSON.stringify({ chatFontSize }),
   }),
-  createConversation: (projectId?: string, reuseEmpty = true) => request<{ conversation: Conversation; agentSelection: AgentSelection; reused: boolean }>("/conversations", { method: "POST", body: JSON.stringify({ projectId, reuseEmpty }) }),
+  createConversation: (projectId?: string, reuseEmpty = true) => request<{ conversation: Conversation; agentSelection: AgentSelection; reused: boolean }>("/conversations", { method: "POST", body: JSON.stringify({ projectId, reuseEmpty }) }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS }),
   conversationRolloutSize: (id: string) => request<{ rolloutBytes: number | null }>(`/conversations/${id}/rollout-size`),
   conversation: (id: string, limit?: number) => request<ConversationDetail | ConversationRestorePending>(`/conversations/${id}${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
   conversationActivity: (id: string) => request<ConversationActivity>(`/conversations/${id}/activity`),
@@ -635,7 +669,7 @@ export const api = {
   ),
   saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft`,
-    { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive },
+    { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   uploadConversationDraftFiles: (id: string, files: File[], signal?: AbortSignal) => {
     const body = new FormData();
@@ -651,7 +685,7 @@ export const api = {
   deleteConversationDraftFile: (id: string, fileId: string) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft/files/${fileId}`, { method: "DELETE" },
   ),
-  deleteConversationDraft: (id: string) => request<void>(`/conversations/${id}/draft`, { method: "DELETE" }),
+  deleteConversationDraft: (id: string) => request<void>(`/conversations/${id}/draft`, { method: "DELETE" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS }),
   sendMessage: (id: string, message: string, files: File[], quoteExcerpt = "", useComposerDraft = false, voiceTranscriptionIds: string[] = [], selection?: AgentSelection) => {
     const body = new FormData();
     body.set("message", message);
@@ -663,7 +697,7 @@ export const api = {
       body.set("reasoningEffort", selection.reasoningEffort);
     }
     files.forEach((file) => body.append("files", file));
-    return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body });
+    return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body }, { timeoutMs: files.length ? COMPOSER_UPLOAD_TIMEOUT_MS : COMPOSER_REQUEST_TIMEOUT_MS });
   },
   transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; projectId?: string; draftText?: string; attachmentNames?: string[]; purpose?: "composer" | "search"; clientRecordingId?: string } = {}) => {
     const body = new FormData();
@@ -681,10 +715,10 @@ export const api = {
     { method: "PUT", body: JSON.stringify({ ids }) },
   ),
   editPendingPrompt: (conversationId: string, promptId: string) => request<{ editingPrompt: PendingPrompt }>(
-    `/conversations/${conversationId}/pending-prompts/${promptId}/edit`, { method: "POST" },
+    `/conversations/${conversationId}/pending-prompts/${promptId}/edit`, { method: "POST" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   restorePendingPrompt: (conversationId: string, promptId: string) => request<{ pendingPrompt: PendingPrompt | null; activeJob: Job | null }>(
-    `/conversations/${conversationId}/pending-prompts/${promptId}/restore`, { method: "POST" },
+    `/conversations/${conversationId}/pending-prompts/${promptId}/restore`, { method: "POST" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   updatePendingPrompt: (conversationId: string, promptId: string, message: string, files: File[], removedFileIds: string[], quoteExcerpt = "", voiceTranscriptionIds: string[] = []) => {
     const body = new FormData();
@@ -694,14 +728,14 @@ export const api = {
     body.set("voiceTranscriptionIds", JSON.stringify(voiceTranscriptionIds));
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(
-      `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "PUT", body },
+      `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "PUT", body }, { timeoutMs: files.length ? COMPOSER_UPLOAD_TIMEOUT_MS : COMPOSER_REQUEST_TIMEOUT_MS },
     );
   },
   deletePendingPrompt: (conversationId: string, promptId: string) => request<void>(
-    `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "DELETE" },
+    `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "DELETE" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   steerPendingPrompt: (conversationId: string, promptId: string) => request<{ ok: true; mode: "steer" | "insert"; turnId?: string; job?: Job }>(
-    `/conversations/${conversationId}/pending-prompts/${promptId}/steer`, { method: "POST" },
+    `/conversations/${conversationId}/pending-prompts/${promptId}/steer`, { method: "POST" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   cancelJob: (id: string) => request<{ ok: true }>(`/jobs/${id}/cancel`, { method: "POST" }),
   filePreview: (id: string, signal?: AbortSignal) => request<FilePreviewMetadata>(

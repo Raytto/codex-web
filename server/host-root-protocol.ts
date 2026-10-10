@@ -38,6 +38,8 @@ export type HostProjectFsResult = {
 };
 
 export type HostRootClientMessage =
+  | { type: "project_skills"; requestId: string; userId: string; projectId: string; action: import("./project-skills.js").ProjectSkillAction; name?: string; content?: string; enabled?: boolean }
+  | { type: "node_transfer"; requestId: string; userId: string; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
   | { type: "run"; request: HostRootRunRequest }
   | { type: "steer"; requestId: string; prompt: string; imageRelativePaths: string[] }
   | { type: "cancel" }
@@ -59,6 +61,8 @@ export type HostRootClientMessage =
   | { type: "codex_account_delete"; requestId: string; userId: string; accountId: string };
 
 export type HostRootServerMessage =
+  | { type: "project_skills_result"; requestId: string; result: import("./project-skills.js").ProjectSkillResult }
+  | { type: "node_transfer_started"; requestId: string }
   | { type: "event"; jobId: string; event: TenantWorkerEvent }
   | { type: "delete_thread_result"; requestId: string; removed: number }
   | { type: "thread_rollout_size_result"; requestId: string; bytes: number | null }

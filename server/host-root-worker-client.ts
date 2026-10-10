@@ -43,6 +43,12 @@ export class HostRootWorkerClient {
     });
   }
 
+  startNodeTransfer(userId: string, spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec): Promise<boolean> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({ type: "node_transfer", requestId, userId, spec },
+      message => message.type === "node_transfer_started" && message.requestId === requestId ? true : undefined);
+  }
+
   cancel(jobId: string): boolean {
     const pending = this.jobs.get(jobId);
     if (!pending || pending.socket.destroyed) return false;
@@ -284,6 +290,28 @@ export class HostRootWorkerClient {
       socket.once("connect", () => this.send(socket, message));
       socket.once("error", (error) => finish(error));
       socket.once("close", () => finish(new Error("CODEX_WEB 宿主执行服务已断开")));
+    });
+  }
+
+  projectSkills(userId: string, projectId: string, action: import("./project-skills.js").ProjectSkillAction, name?: string, content?: string, enabled = true): Promise<import("./project-skills.js").ProjectSkillResult> {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection(this.socketPath), lines = this.readLines(socket);
+      let settled = false;
+      const timer = setTimeout(() => finish(new Error("项目技能读取超时")), 30_000);
+      const finish = (error?: Error, result?: import("./project-skills.js").ProjectSkillResult) => {
+        if (settled) return; settled = true; clearTimeout(timer); lines.close(); socket.end();
+        if (error) reject(error); else resolve(result!);
+      };
+      lines.on("line", line => {
+        let message: HostRootServerMessage;
+        try { message = JSON.parse(line); } catch { return; }
+        if (message.type === "project_skills_result" && message.requestId === requestId) finish(undefined, message.result);
+        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(new Error(message.message));
+      });
+      socket.once("connect", () => this.send(socket, { type: "project_skills", requestId, userId, projectId, action, name, content, enabled }));
+      socket.once("error", error => finish(error));
+      socket.once("close", () => finish(new Error("宿主服务已断开")));
     });
   }
 

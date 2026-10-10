@@ -38,7 +38,7 @@ export type WorkerEvent =
   | { type: "steer_failed"; requestId: string; message: string }
   | { type: "completed"; finalResponse: string; omittedArtifacts?: Array<{
     path: string;
-    reason: "count_limit" | "outside_project" | "missing" | "not_file" | "too_large" | "manifest_limit";
+    reason: "count_limit" | "outside_project" | "missing" | "not_file" | "too_large" | "total_size_limit" | "manifest_limit";
   }> }
   | { type: "failed"; message: string; cancelled?: boolean };
 export type ThreadTranscriptItem = { turnId: string; itemId: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -69,6 +69,7 @@ export type ThreadSnapshot = {
   activities: ThreadActivity[];
 };
 export type ServerMessage =
+  | { type: "node_transfer"; spec: import("./node-transfer-types.js").TransferSpec }
   | { type: "credential_replace"; workerId: string; credentialId: string; token: string }
   | { type: "run_release"; jobId: string }
   | { type: "authenticated"; workerId: string; heartbeatIntervalMs: number; migrationOnly?: boolean }
@@ -93,7 +94,7 @@ export type ServerMessage =
   | { type: "heartbeat_ack"; at: string };
 export type WorkerMessage =
   | { type: "credential_saved"; credentialId: string }
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease: string | null; workerCommit: string | null; capabilities: { workerUpdate: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease: string | null; workerCommit: string | null; capabilities: { workerUpdate: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean; nodeTransfers?: boolean }; codexVersion: string; capacity: number }
   | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: ThreadSnapshot }

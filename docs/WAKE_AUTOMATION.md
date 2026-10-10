@@ -53,3 +53,7 @@ plans. It releases running occupancy and preserves same-conversation ordering
 across restarts; cancellation stays terminal. See
 [durable retries](JOB_RETRY_AND_DEVICE_CREDENTIALS.md) for accepted-input and
 artifact-retention rules.
+
+## Project recurrence
+
+Project-level [recurring tasks](PROJECT_RECURRING_TASKS.md) are managed independently of one-shot waits. Each occurrence creates its own conversation from the saved instruction/model snapshot. Cancelling a conversation or a one-shot wait does not cancel the project's future schedule. The dynamic wait tool continues to schedule one durable continuation; the browser manages recurring schedules without agents chaining new waits.

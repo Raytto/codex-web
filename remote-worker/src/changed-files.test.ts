@@ -46,3 +46,15 @@ test("changed file collection caps uploads and emits a bounded manifest summary"
   assert.equal(result.omitted.length, 3);
   assert.equal(result.omitted.at(-1)?.reason, "manifest_limit");
 });
+
+test("changed files share a byte budget and leave oversized batches available for on-demand fetch", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-worker-budget-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [name, body] of [["a.zip", "1234"], ["b.zip", "1234"], ["c.zip", "12"]]) fs.writeFileSync(path.join(root, name), body);
+  const uploaded: string[] = [];
+  const result = await collectChangedFiles(root, ["a.zip", "b.zip", "c.zip"], async (_, name) => { uploaded.push(name); }, { maximumTotalBytes: 6 });
+  assert.deepEqual(uploaded, ["a.zip", "c.zip"]);
+  assert.equal(result.uploadedBytes, 6);
+  assert.deepEqual(result.omitted, [{ path: "b.zip", reason: "total_size_limit" }]);
+  assert.equal(fs.readFileSync(path.join(root, "b.zip"), "utf8"), "1234");
+});

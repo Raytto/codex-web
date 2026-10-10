@@ -1,3 +1,5 @@
+import { operateHostProjectSkill } from "./host-project-skills.js";
+import { NodeTransferEndpoint } from "../remote-worker/src/node-transfer-endpoint.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net, { type Socket } from "node:net";
@@ -32,6 +34,7 @@ const workers = new Map<string, { child: ChildProcess; socket: Socket; workspace
 const voiceReviewWorkers = new Map<string, ChildProcess>();
 const titleAgentWorkers = new Map<string, ChildProcess>();
 let stopping = false;
+const hostDatabasePath = process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite");
 
 if (!socketPath || !process.env.CODEX_WEB_HOST_TENANT_ROOT || !process.env.CODEX_WEB_KNOWLEDGE_ROOT || !process.env.CODEX_WEB_CODEX_HOME) {
   throw new Error("Host bridge is disabled until CODEX_WEB_HOST_SOCKET_PATH, CODEX_WEB_HOST_TENANT_ROOT, CODEX_WEB_KNOWLEDGE_ROOT, and CODEX_WEB_CODEX_HOME are configured");
@@ -40,6 +43,7 @@ if (process.platform !== "win32" && process.getuid?.() !== 0) throw new Error("C
 for (const directory of [hostTenantRoot, knowledgeRoot, codexHome]) {
   if (!fs.statSync(directory).isDirectory()) throw new Error(`Required CODEX_WEB host directory is unavailable: ${directory}`);
 }
+const nodeTransfers = new NodeTransferEndpoint(path.join(path.dirname(hostDatabasePath), "host-transfer-state"), process.env.PUBLIC_BASE_URL || "");
 syncManagedSkills(codexHome);
 const hostLibraryRoot = path.join(hostTenantRoot, HOST_ROOT_USER_ID, "library");
 ensureAccountSkillLibrary(hostLibraryRoot, HOST_ROOT_USER_ID);
@@ -86,6 +90,13 @@ function handleConnection(socket: Socket): void {
       return;
     }
     try {
+      if (message.type === "node_transfer") {
+        if (message.userId !== HOST_ROOT_USER_ID || stopping) throw new Error("Unauthorized node transfer");
+        void nodeTransfers.start(message.spec).then(() => {
+          send(socket, { type: "node_transfer_started", requestId: message.requestId }); socket.end();
+        }, error => { send(socket, { type: "request_failed", requestId: message.requestId, message: String(error) }); socket.end(); });
+        return;
+      }
       if (message.type === "run") {
         if (activeJobId) throw new Error("A host job is already attached to this connection");
         activeJobId = startWorker(socket, message.request);
@@ -122,6 +133,13 @@ function handleConnection(socket: Socket): void {
           (error) => { send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "冷存储恢复失败" }); socket.end(); },
         );
         return;
+      }
+      if (message.type === "project_skills") {
+        if (activeJobId) throw new Error("Cannot manage skills through an active job connection");
+        validateHostUser(message.userId);
+        const result = operateHostProjectSkill(hostDatabasePath, message.userId, message.projectId, message.action, message.name, message.content, message.enabled !== false);
+        send(socket, { type: "project_skills_result", requestId: message.requestId, result });
+        socket.end(); return;
       }
       if (message.type === "project_fs") {
         if (activeJobId) throw new Error("Cannot browse folders through an active job connection");
@@ -681,6 +699,7 @@ function sendRequestFailure(socket: Socket, requestId: string, error: unknown): 
 function stop(): void {
   if (stopping) return;
   stopping = true;
+  void nodeTransfers.close();
   server.close();
   for (const [jobId, worker] of workers) signalWorker(jobId, worker.child, "SIGTERM");
   for (const child of voiceReviewWorkers.values()) {

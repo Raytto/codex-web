@@ -76,6 +76,7 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026093003, name: "para-default-hidden" },
     { version: 2026093004, name: "personal-kanban-lifecycle" },
     { version: 2026093005, name: "public-share-expiry" },
+    { version: 2026101001, name: "project-recurring-tasks" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);

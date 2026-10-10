@@ -60,7 +60,7 @@ trigger becomes available.
 
 The Worker opens no inbound port. Its only network paths are the outbound WSS control channel and task-scoped HTTPS file transfers. It starts a separate local app-server process for each active task (up to the configured capacity; `0` means unlimited), and new work remains queued on the server while the machine is offline. Worker 1.14.0 can persist a capacity change sent through the authenticated server control channel and apply it immediately without restarting or interrupting active tasks.
 
-Worker 1.15.0 streams task attachments and results with `Authorization: Bearer`; it never loads a whole transfer into `arrayBuffer`/`readFileSync`. Every transfer has a declared length, byte count and SHA-256 check, and every run uses a strict UUID-owned directory that is swept only after the 24-hour protection window when absent from `activeJobs`. Supplemental steer attachments are downloaded into the same run and sent to the existing turn, never a replayed turn. Automatic result collection resolves real paths beneath the project root, caps the manifest at 20 files/100 MiB, and reports every bounded omission reason in the final response.
+Worker 1.15.0 streams task attachments and results with `Authorization: Bearer`; it never loads a whole transfer into `arrayBuffer`/`readFileSync`. Every transfer has a declared length, byte count and SHA-256 check, and every run uses a strict UUID-owned directory that is swept only after the 24-hour protection window when absent from `activeJobs`. Supplemental steer attachments are downloaded into the same run and sent to the existing turn, never a replayed turn. Automatic result collection resolves real paths beneath the project root, caps the manifest at 20 files/8 GiB total (up to 2 GiB per file), and reports every bounded omission reason in the final response.
 
 Worker 1.15.1 reads the complete Codex rate-limit snapshot for quota display, prefers the explicit general `codex` bucket, and reports the tightest primary/secondary window. Sparse rate-limit notifications trigger a full refresh instead of being mistaken for a complete 100%-remaining snapshot.
 
@@ -154,7 +154,7 @@ the existing WSS connection with a one-time transfer token. Worker 1.8.0
 resolves absolute paths anywhere the current Worker account can read; relative
 paths are resolved from the project root and may traverse to another readable
 location. It still rejects directories, Windows device paths and files over
-100 MiB, then uploads the selected bytes over HTTPS. No local file is uploaded
+2 GiB, then uploads the selected bytes over HTTPS. No local file is uploaded
 merely because a task or project is refreshed.
 
 Protocol v4 also publishes the target machine's own `model/list` result. Codex
@@ -202,3 +202,9 @@ the index. The server coalesces reads for 15 seconds and preserves the last know
 value for offline/older Workers. The conversation menu refreshes every 30 seconds
 while open and visible, using a size-only endpoint; ordinary behavior sync remains
 unchanged and size queries do not change unread flags or sidebar order.
+
+## Server-coordinated transfers (1.20.0)
+
+The optional `nodeTransfer` capability allows authenticated endpoint commands for a single source/target path. Control remains outbound HTTPS/WSS; direct transfers may use short-lived ICE UDP sockets, with encrypted server memory relay as fallback. No general listening file server is exposed. Keep the configured server URL's application path (`/codex-web`); endpoints reject mismatched origins or transfer paths.
+
+Regular attachments, remote downloads and generated files use a 2 GiB per-file limit, 8 GiB aggregate result budget and 30-minute transfer deadline. Existing manifest count limits, quotas and omission reports remain. Transfer temporary objects are excluded from generated/changed-file collection. The coordinator tracks task identity, route, restart/resume, hash checks and cleanup independently of the model turn. A completed target is reported separately from cleanup completion. See [transfer protocol and deployment](../docs/NODE_TRANSFERS.md).

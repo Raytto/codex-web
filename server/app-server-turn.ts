@@ -1,3 +1,4 @@
+import { NODE_TRANSFER_TOOL_NAME, NODE_TRANSFER_TOOL_SPEC, callNodeTransferTool } from "../remote-worker/src/node-transfer-tool.js";
 import { normalizeResetCredits } from "../remote-worker/src/codex-reset-credits.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
@@ -192,7 +193,7 @@ class AppServerTurnClient {
         : await this.request("thread/start", {
             ...common,
             ...(this.options.threadInstructions ? { developerInstructions: this.options.threadInstructions } : {}),
-            ...(this.options.waitAutomation ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC] } : {}),
+            ...(this.options.waitAutomation ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC, NODE_TRANSFER_TOOL_SPEC] } : {}),
           });
       const thread = (threadResult as { thread?: { id?: string } })?.thread;
       if (!thread?.id) throw new Error("Codex app server did not return a thread id");
@@ -280,12 +281,12 @@ class AppServerTurnClient {
       return;
     }
     const params = message.params ?? {};
-    if (params.tool !== WAIT_DYNAMIC_TOOL_NAME) {
+    if (![WAIT_DYNAMIC_TOOL_NAME, NODE_TRANSFER_TOOL_NAME].includes(String(params.tool))) {
       reply({ contentItems: [{ type: "inputText", text: "Unknown dynamic tool" }], success: false });
       return;
     }
     try {
-      const result = await callWaitDynamicTool(this.options.waitAutomation, params.arguments);
+      const result = await (params.tool === NODE_TRANSFER_TOOL_NAME ? callNodeTransferTool(this.options.waitAutomation, params.arguments) : callWaitDynamicTool(this.options.waitAutomation, params.arguments));
       reply({ contentItems: [{ type: "inputText", text: result }], success: true });
     } catch (error) {
       reply({ contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });

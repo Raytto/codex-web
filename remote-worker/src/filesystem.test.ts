@@ -49,11 +49,17 @@ test("remote downloads resolve any readable regular file for the Worker account"
   }
 });
 
-test("remote downloads reject files larger than 100 MiB", () => {
+test("remote downloads allow the full 2 GiB boundary and reject larger files", (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-worker-large-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const large = path.join(root, "large.bin");
-  fs.writeFileSync(large, Buffer.alloc(1));
-  fs.truncateSync(large, 100 * 1024 * 1024 + 1);
-  try { assert.throws(() => resolveReadableFile(root, large), /100 MiB/); }
-  finally { fs.rmSync(root, { recursive: true, force: true }); }
+  fs.writeFileSync(large, "test");
+  const stat = fs.statSync(large);
+  context.mock.method(fs, "statSync", () => stat);
+  for (const size of [100 * 1024 * 1024 + 1, 2 * 1024 * 1024 * 1024]) {
+    stat.size = size;
+    assert.equal(resolveReadableFile(root, large).size, size);
+  }
+  stat.size += 1;
+  assert.throws(() => resolveReadableFile(root, large), /2 GiB/);
 });

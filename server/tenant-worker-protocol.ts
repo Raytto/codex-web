@@ -40,7 +40,7 @@ export type TenantWorkerEvent =
   | { type: "steer_failed"; requestId: string; message: string }
   | { type: "completed"; finalResponse: string; omittedArtifacts?: Array<{
     path: string;
-    reason: "count_limit" | "outside_project" | "missing" | "not_file" | "too_large" | "manifest_limit";
+    reason: "count_limit" | "outside_project" | "missing" | "not_file" | "too_large" | "total_size_limit" | "manifest_limit";
   }> }
   | { type: "failed"; message: string; cancelled?: boolean };
 

@@ -323,3 +323,13 @@ Read the [October upgrade checks](docs/DEPLOYMENT.md#october-3-2026-upgrade-chec
 ## Reader navigation (October 6, 2026)
 
 Reader links open in the current tab and show a **Back to workspace** control. Alt-click opens a separate tab; ordinary links retain the browser's Ctrl/Cmd-click and middle-click behavior. Remote file previews reserve an Alt-clicked tab before the transfer and close it on failure. Directly opened readers return to `/codex-web` when no previous page within the application is known. See [reader navigation](docs/READER_NAVIGATION.md) and [upgrade checks](docs/DEPLOYMENT.md#october-6-2026-reader-navigation-checks).
+
+## Project schedules and node transfers
+
+- [Recurring project tasks](docs/PROJECT_RECURRING_TASKS.md) support fixed intervals, daily/weekly/monthly schedules, IANA time zones, optional run limits, pause/resume, and durable run history. Each run creates a separate project conversation; stopping one conversation preserves future runs. Missed/overlapping runs do not accumulate a queue. One-shot conversation waits remain separate.
+- Project menus expose schedule management and local project skills. An explicitly configured host administrator can also manage skills in owned host projects. Remote project skills are still maintained on their own machines. The account footer stays fixed while project content scrolls.
+- [Node file transfers](docs/NODE_TRANSFERS.md) are an optional administrator capability in Worker 1.20.0: server-persisted tasks, authenticated direct connections with encrypted memory relay fallback, SHA-256 verification, atomic target publication, and explicit cleanup receipts. No endpoint is enabled by the default Compose configuration.
+- Remote file and attachment transfers now accept up to 2 GiB per file, with aligned bounded result batches and 30-minute transfer deadlines. This does not increase reader/public-share limits or disable storage quotas.
+- Composer writes release their input lock after durable confirmation, before background refresh. A timeout preserves the input and does not automatically resend it. The bundled Codex SDK is pinned to 0.162.1.
+
+Username/password login, `/codex-web`, isolated tenant workers and empty optional integrations remain the deployment defaults. See [deployment](docs/DEPLOYMENT.md) before enabling host or remote capabilities.

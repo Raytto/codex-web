@@ -86,6 +86,7 @@ export function buildRemoteSteerPrompt(
 
 export function remoteThreadInstructions(): string {
   return [
+    "Use pp_agent_transfer for node-to-node and node-to-server files; Codex Web owns coordination and durable task state. Do not relay through attachments, temporary ZIP files or a self-hosted file server.",
     "This thread is controlled by its owner through Codex Web. Treat the working directory as the project root.",
     "Keep user-visible replies concise and mention changed or generated files.",
     "Write large logs, tables, and machine-readable tool results to a runtime/artifact file; return only a summary, key lines, and its path to the model context.",

@@ -1,3 +1,4 @@
+import { REMOTE_TRANSFER_MAX_FILE_BYTES } from "./remote-transfer.js";
 import { z } from "zod";
 import type { RemoteWorkerToServer } from "./remote-worker-protocol.js";
 
@@ -68,7 +69,7 @@ const runtimeStatus = {
 
 const omittedArtifact = z.object({
   path: text(500, 1),
-  reason: z.enum(["count_limit", "outside_project", "missing", "not_file", "too_large", "manifest_limit"]),
+  reason: z.enum(["count_limit", "outside_project", "missing", "not_file", "too_large", "total_size_limit", "manifest_limit"]),
 }).strict();
 
 const resetCredits = z.object({
@@ -97,7 +98,7 @@ const artifact = z.object({
   id: uuid,
   name: text(180, 1),
   mimeType: text(200, 1),
-  size: z.number().int().nonnegative().max(100 * 1024 * 1024),
+  size: z.number().int().nonnegative().max(REMOTE_TRANSFER_MAX_FILE_BYTES),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
 
@@ -115,6 +116,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
     workerCommit: text(64, 1).nullable().optional(),
     capabilities: z.object({
       workerUpdate: z.boolean().optional(),
+      nodeTransfers: z.boolean().optional(),
       deviceCredentials: z.boolean().optional(),
       waitAutomation: z.boolean().optional(),
       capacityConfig: z.boolean().optional(),

@@ -1,3 +1,5 @@
+import { isTransferSpec } from "./node-transfer-types.js";
+import { REMOTE_TRANSFER_MAX_FILE_BYTES } from "./transfer-policy.js";
 import type { RunRequest, ServerMessage, ThreadSnapshot, WorkerMessage } from "./protocol.js";
 import { isAccountSkillBundle } from "./account-skills.js";
 
@@ -60,6 +62,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
   const allowed = SERVER_MESSAGE_KEYS[value.type];
   if (!allowed || !exactKeys(value, allowed)) return false;
   switch (value.type) {
+    case "node_transfer": return isTransferSpec(value.spec);
     case "credential_replace": return uuid(value.workerId) && uuid(value.credentialId) && secret(value.token);
     case "authenticated": return uuid(value.workerId) && integer(value.heartbeatIntervalMs, 5_000, 60_000) && (value.migrationOnly === undefined || typeof value.migrationOnly === "boolean");
     case "thread_rollout_size": return uuid(value.requestId) && threadUuid(value.threadId);
@@ -71,7 +74,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
     case "steer": return uuid(value.jobId) && uuid(value.requestId) && shortString(value.prompt, 100_000, 1)
       && secret(value.transferToken) && recordArray(value.attachments, 12, (item) => exactKeys(item, ["id", "name", "mimeType", "size", "downloadPath"])
         && uuid(item.id) && shortString(item.name, 180, 1) && shortString(item.mimeType, 200, 1)
-        && integer(item.size, 0, 100 * 1024 * 1024) && shortString(item.downloadPath, 1_000, 1))
+        && integer(item.size, 0, REMOTE_TRANSFER_MAX_FILE_BYTES) && shortString(item.downloadPath, 1_000, 1))
       && (value.turnContext === undefined || (record(value.turnContext)
         && exactKeys(value.turnContext, ["version", "userPrompt", "imageInput"])
         && value.turnContext.version === 1 && shortString(value.turnContext.userPrompt, 100_000, 1)
@@ -113,7 +116,7 @@ function runRequest(value: unknown): value is RunRequest {
     || !shortString(value.selection.reasoningEffort, 32, 1) || !booleanRecord(value.optionalCapabilities, 32)
     || (value.accountSkills !== undefined && !isAccountSkillBundle(value.accountSkills))) return false;
   if (!recordArray(value.attachments, 32, (item) => exactKeys(item, ["id", "name", "mimeType", "size", "downloadPath"]) && uuid(item.id) && shortString(item.name, 180, 1)
-    && shortString(item.mimeType, 200, 1) && integer(item.size, 0, 100 * 1024 * 1024)
+    && shortString(item.mimeType, 200, 1) && integer(item.size, 0, REMOTE_TRANSFER_MAX_FILE_BYTES)
     && shortString(item.downloadPath, 1_000, 1))) return false;
   if (value.automation !== undefined && !(record(value.automation) && exactKeys(value.automation, ["token", "dynamicTool"])
     && secret(value.automation.token) && (value.automation.dynamicTool === undefined || value.automation.dynamicTool === true))) return false;
@@ -136,7 +139,7 @@ function workerEvent(value: unknown): boolean {
   if (value.type === "steer_failed") return uuid(value.requestId) && shortString(value.message, 2_000, 1);
   if (value.type === "completed") return shortString(value.finalResponse, 2_000_000)
     && (value.omittedArtifacts === undefined || recordArray(value.omittedArtifacts, 100, (item) => shortString(item.path, 500, 1)
-      && ["count_limit", "outside_project", "missing", "not_file", "too_large", "manifest_limit"].includes(String(item.reason))));
+      && ["count_limit", "outside_project", "missing", "not_file", "too_large", "total_size_limit", "manifest_limit"].includes(String(item.reason))));
   if (value.type === "failed") return shortString(value.message, 8_000, 1) && (value.cancelled === undefined || typeof value.cancelled === "boolean");
   return false;
 }
@@ -234,6 +237,7 @@ function booleanRecord(value: unknown, maximumItems: number): boolean { return r
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean { return Object.keys(value).every((key) => allowed.includes(key)); }
 
 const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
+  node_transfer: ["type", "spec"],
   credential_replace: ["type", "workerId", "credentialId", "token"],
   run_release: ["type", "jobId"],
   authenticated: ["type", "workerId", "heartbeatIntervalMs", "migrationOnly"],

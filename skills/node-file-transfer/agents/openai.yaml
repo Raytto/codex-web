@@ -1,0 +1,4 @@
+interface:
+  display_name: "节点文件互传"
+  short_description: "由 Codex Web 服务端协调节点与服务器间传输，直连优先，并核实校验和临时数据清理结果。"
+  default_prompt: "使用 $node-file-transfer 将文件在指定节点之间复制，并核实传输和清理结果。"

@@ -85,3 +85,14 @@ test("rollout size responses accept safe byte counts only", () => {
   for (const bytes of [null, 0, 1234]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "thread_rollout_size_result", requestId, bytes })).ok, true);
   for (const bytes of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "thread_rollout_size_result", requestId, bytes })).ok, false);
 });
+
+test("artifact metadata uses the 2 GiB transfer boundary and accepts total-budget omissions", () => {
+  const jobId = crypto.randomUUID();
+  for (const size of [104857601, 2147483648, 2147483649]) {
+    const result = parseRemoteWorkerMessage(JSON.stringify({ type: "artifact_uploaded", jobId,
+      artifact: { id: crypto.randomUUID(), name: "archive.zip", mimeType: "application/zip", size, sha256: "a".repeat(64) } }));
+    assert.equal(result.ok, size <= 2147483648);
+  }
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "event", jobId, event: { type: "completed", finalResponse: "done",
+    omittedArtifacts: [{ path: "archive.zip", reason: "total_size_limit" }] } })).ok, true);
+});

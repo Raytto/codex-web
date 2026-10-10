@@ -1001,7 +1001,8 @@ function remoteOmissionReason(reason: NonNullable<Extract<TenantWorkerEvent, { t
     outside_project: "路径不在项目根目录内",
     missing: "完成时文件已不存在",
     not_file: "目标不是普通文件",
-    too_large: "超过单文件 100 MiB 上限",
+    too_large: "超过单文件 2 GiB 上限",
+    total_size_limit: "超过单轮结果累计 8 GiB 上限，可点击文件链接按需取回",
     manifest_limit: "其余省略项已合并计数",
   })[reason];
 }

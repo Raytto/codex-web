@@ -159,7 +159,10 @@ export async function run({ context, origin, assert, audioBase64, expectBug = fa
       await page.getByRole('button', { name: '重试识别语音', exact: true }).waitFor();
       await page.reload(); await page.locator('.editing-pending-banner').waitFor();
       since = writes.length;
+      const recoveredSend = page.waitForResponse((response) => response.request().method() === 'PUT'
+        && response.url().includes(`/conversations/${id}/pending-prompts/`));
       await page.getByRole('button', { name: '重试识别语音', exact: true }).click();
+      assert.equal((await recoveredSend).status(), 200);
       await idle(''); noOrdinaryWrites(since); assert.equal((await detail()).composerDraft, null);
       assert.ok(normalized((await detail()).pendingPrompts[0].content).startsWith('recover voice edit\n'));
       addCheck('retained audio restores its pending edit identity after a page reload');

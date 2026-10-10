@@ -139,6 +139,13 @@ export function ensureAccountSkillLibrary(libraryRoot: string, userId: string, s
     }
     writeFileAtomically(seedMarker, `${new Date().toISOString()}\n`);
   }
+  if (userId === HOST_ROOT_USER_ID) {
+    const transferSource = path.resolve(seedRoot, "..", "skills", "node-file-transfer");
+    const transferTarget = path.join(skillsRoot, "node-file-transfer");
+    if (fs.existsSync(path.join(transferSource, "SKILL.md")) && !fs.existsSync(transferTarget)) {
+      fs.cpSync(transferSource, transferTarget, { recursive: true, errorOnExist: true, force: false });
+    }
+  }
   return skillsRoot;
 }
 

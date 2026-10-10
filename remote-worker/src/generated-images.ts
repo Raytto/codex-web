@@ -1,3 +1,4 @@
+import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { OmittedArtifact } from "./changed-files.js";
@@ -5,7 +6,7 @@ import type { OmittedArtifact } from "./changed-files.js";
 const THREAD_ID = /^[0-9a-f-]{36}$/i;
 const IMAGE_SUFFIXES = new Set([".gif", ".jpeg", ".jpg", ".png", ".webp"]);
 
-type Options = { maximumFiles?: number; maximumFileBytes?: number };
+type Options = { maximumFiles?: number; maximumTotalBytes?: number; maximumFileBytes?: number };
 
 export async function snapshotGeneratedImages(codexHome: string, threadId: string): Promise<Map<string, string>> {
   const threadRoot = generatedImageThreadRoot(codexHome, threadId);
@@ -34,10 +35,12 @@ export async function collectGeneratedImages(
   options: Options = {},
 ): Promise<{ uploaded: number; omitted: OmittedArtifact[] }> {
   const maximumFiles = Math.max(0, options.maximumFiles ?? 20);
-  const maximumFileBytes = options.maximumFileBytes ?? 100 * 1024 * 1024;
+  const maximumFileBytes = options.maximumFileBytes ?? REMOTE_TRANSFER_MAX_FILE_BYTES;
+  const maximumTotalBytes = options.maximumTotalBytes ?? REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB;
   const after = await snapshotGeneratedImages(codexHome, threadId);
   const omitted: OmittedArtifact[] = [];
   let uploaded = 0;
+  let uploadedBytes = 0;
   for (const [fileName, fingerprint] of after) {
     if (baseline.get(fileName) === fingerprint) continue;
     if (uploaded >= maximumFiles) { omitted.push({ path: fileName, reason: "count_limit" }); continue; }
@@ -45,8 +48,10 @@ export async function collectGeneratedImages(
     const stat = await fs.promises.lstat(absolute);
     if (!stat.isFile() || stat.isSymbolicLink()) { omitted.push({ path: fileName, reason: "not_file" }); continue; }
     if (stat.size > maximumFileBytes) { omitted.push({ path: fileName, reason: "too_large" }); continue; }
+    if (uploadedBytes + stat.size > maximumTotalBytes) { omitted.push({ path: fileName, reason: "total_size_limit" }); continue; }
     await upload(absolute, fileName);
     uploaded += 1;
+    uploadedBytes += stat.size;
   }
   return { uploaded, omitted };
 }

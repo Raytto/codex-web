@@ -153,3 +153,17 @@ test("rollout size query accepts only thread UUIDs and safe byte counts", () => 
   for (const bytes of [null, 0, 1234]) assert.equal(isPersistableWorkerMessage({ type: "thread_rollout_size_result", requestId, bytes }), true);
   for (const bytes of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal(isPersistableWorkerMessage({ type: "thread_rollout_size_result", requestId, bytes }), false);
 });
+
+test("run and steer attachments accept 2 GiB and reject sizes above the transfer contract", () => {
+  const attachment = { id: crypto.randomUUID(), name: "archive.zip", mimeType: "application/zip", size: 0, downloadPath: "/api/remote-worker-files/input" };
+  const jobId = crypto.randomUUID();
+  const base = { jobId, prompt: "test", transferToken: "x".repeat(43), attachments: [attachment] };
+  for (const size of [104857601, 2147483648, 2147483649, -1]) {
+    attachment.size = size;
+    const expected = size >= 0 && size <= 2147483648;
+    assert.equal(parseServerMessage(JSON.stringify({ type: "steer", ...base, requestId: crypto.randomUUID() })).ok, expected);
+    assert.equal(parseServerMessage(JSON.stringify({ type: "run", request: { ...base, conversationId: crypto.randomUUID(), projectRoot: "C:\\work", codexThreadId: null,
+      selection: { model: "gpt-test", reasoningEffort: "high" }, optionalCapabilities: {} } })).ok, expected);
+  }
+  assert.equal(isPersistableWorkerMessage({ type: "event", jobId, event: { type: "completed", finalResponse: "done", omittedArtifacts: [{ path: "archive.zip", reason: "total_size_limit" }] } }), true);
+});

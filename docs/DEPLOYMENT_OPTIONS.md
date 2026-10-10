@@ -354,3 +354,9 @@ Project boards are an authenticated local product feature. They start empty and 
 Voice now permits ten-minute recordings and 30 MiB requests; keep reverse-proxy limits at least as large as the application ceiling. Configure your own compatible HTTPS endpoint/model. No private model switch is applied. Keywords can be suppressed/restored per account; no keyword content ships with the application.
 
 Configured account-management deployments may inspect reset credits without spending them. Redemption is explicit and requires a compatible Codex runtime plus Worker 1.19.6 or newer on a remote machine. Worker 1.19.7 additionally supports size-only rollout reads. The public edition does not provide real account balances, credentials or acceptance sessions. Optional deployment details show only fields emitted by an operator-configured coordinator; configuring the display does not install or run backup/deploy services.
+
+## Optional node transfers and project skills
+
+Node-to-node and node-to-server transfers require an explicitly configured administrator, matching Worker 1.20.0 endpoints and an operator-configured host bridge for the server endpoint. `PUBLIC_BASE_URL` includes the deployment subpath; configure the dedicated WSS proxy route from the generic template. Keep host socket and roots empty when not needed. This feature never mounts the Docker socket or host filesystem in the default Compose configuration. See [node transfers](NODE_TRANSFERS.md) for trust, quotas, receipt semantics and deployment checks.
+
+Recurring tasks need no external integration and persist in the application's database. Host project-skill editing uses the same optional bridge and independent ownership checks; ordinary local project skills keep tenant root validation. Remote skill editing through the web is not supported. See [schedules and project skills](PROJECT_RECURRING_TASKS.md).

@@ -3,7 +3,10 @@ import fs from "node:fs";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-export const REMOTE_TRANSFER_MAX_FILE_BYTES = 100 * 1024 * 1024;
+// Keep the server and standalone Worker limits aligned (covered by contract tests).
+export const REMOTE_TRANSFER_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+export const REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB = 8 * 1024 * 1024 * 1024;
+export const REMOTE_TRANSFER_TIMEOUT_MS = 30 * 60_000;
 
 export class RemoteTransferError extends Error {
   constructor(
@@ -25,7 +28,7 @@ export function parseRemoteContentLength(value: string | string[] | undefined): 
     throw new RemoteTransferError("Content-Length 无效。", 400, "REMOTE_CONTENT_LENGTH_INVALID");
   }
   if (size > REMOTE_TRANSFER_MAX_FILE_BYTES) {
-    throw new RemoteTransferError("远程文件超过 100 MiB 上限。", 413, "REMOTE_FILE_TOO_LARGE");
+    throw new RemoteTransferError("远程文件超过 2 GiB 上限。", 413, "REMOTE_FILE_TOO_LARGE");
   }
   return size;
 }

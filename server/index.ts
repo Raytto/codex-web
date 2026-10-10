@@ -2,12 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import pino from "pino";
 import { createApp } from "./app.js";
+import { REMOTE_TRANSFER_TIMEOUT_MS } from "./remote-transfer.js";
 import { loadProductionConfig } from "./config.js";
 
 // Configuration must fail closed before createApp creates directories, opens
 // SQLite, performs migrations, or starts any background refresh.
 const startupConfig = loadProductionConfig();
-const { app, db, config, remoteWorkers, runner, resumableUploads, beginShutdown, waitForBackgroundTasks } = createApp(startupConfig);
+const { app, db, config, remoteWorkers, nodeTransfers, runner, resumableUploads, beginShutdown, waitForBackgroundTasks } = createApp(startupConfig);
 fs.mkdirSync(path.join(config.dataRoot, "logs"), { recursive: true });
 const logger = pino(pino.destination({ dest: path.join(config.dataRoot, "logs", "app.log"), sync: false }));
 
@@ -26,7 +27,10 @@ const server = app.listen(config.port, config.host, () => {
   logger.info({ host: config.host, port: config.port, basePath: config.basePath }, "Codex Web started");
   void cleanupTerminalRuntimes();
 });
+// The default five-minute request deadline is too short for large uploads.
+server.requestTimeout = REMOTE_TRANSFER_TIMEOUT_MS;
 remoteWorkers.attach(server);
+nodeTransfers.attach(server);
 
 // Child attempts do not own runtime cleanup. Retryable Jobs remain protected
 // by their queued state; terminal leftovers (including root-owned files) are retried.

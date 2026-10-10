@@ -57,3 +57,11 @@ Expiry checks apply to anonymous document, approved asset and extracted embedded
 ## Reader navigation boundary
 
 Reader return controls only traverse a distinct same-origin referrer within the application's base path. Other origins and other applications on the same origin fall back to `/codex-web`. Explicit Alt-click tabs use `noopener,noreferrer`; remote-transfer tabs detach their opener before awaiting the transfer and close on failure. Navigation changes do not grant file or anonymous-share access; existing ownership, session and share-expiry checks still apply.
+
+## Transfer and recurring-task boundaries
+
+Node transfer management requires the configured host-administrator identity. Ordinary tenant accounts receive 403; automation requires a live job token belonging to that administrator. Empty host-socket configuration reports no host transfer capability. Each transfer connection uses a short-lived role token and a fenced epoch, with strict server origin **and application subpath** validation. The coordinator persists metadata, never file bodies or ephemeral encryption keys. Direct ICE UDP sockets are short-lived; there is no general file server, UPnP or router port-forwarding requirement. The trusted coordinator distributes peer keys; encryption does not protect against a malicious coordinator. See [full lifecycle and limits](NODE_TRANSFERS.md).
+
+Recurring routes retain session, CSRF, account/project ownership checks and revision conflicts. One SQLite transaction creates a conversation, queued prompt and unique run record and advances the schedule. The queue retains its existing execution isolation and capacity checks. Active schedules block project archival; pausing/deleting a schedule does not cancel a previously created conversation. Host skill operations resolve project roots from their own read-only database, not a browser-supplied filesystem path.
+
+Dependency locks include fixes for shell-quote, proxy-addr, sharp, source-map-js and KaTeX. KaTeX 0.18.2 is shared by direct rendering and Markdown math dependencies through an explicit override; render trust remains disabled. Operators should rerun the complete application and Worker audits when building, since advisory results change over time.

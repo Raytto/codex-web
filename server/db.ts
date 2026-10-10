@@ -1,3 +1,4 @@
+import { migrateRecurring } from "./recurring-store.js";
 import { DEFAULT_FEATURE_SELECTION, isFeatureSelection, type FeatureSelection } from "../src/feature-selection.js";
 import { migratePara, migrateParaSidebar, migratePersonalKanban } from "./para-schema.js";
 import { mergeResetCredits, type CodexResetCredits } from "../remote-worker/src/codex-reset-credits.js";
@@ -785,6 +786,7 @@ export class AppDatabase {
       this.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE enabled=1").run(expiresAt);
       this.sqlite.exec("CREATE INDEX public_file_shares_expiry_idx ON public_file_shares(enabled,expires_at)");
     });
+    this.applyMigration(2026101001, "project-recurring-tasks", () => migrateRecurring(this.sqlite));
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain
@@ -5487,7 +5489,8 @@ export class AppDatabase {
       const scheduled = this.sqlite.prepare(`
         SELECT 1 AS value FROM wake_plans
         WHERE pending_prompt_id=? AND state='triggered'
-      `).get(pendingId) as { value: number } | undefined;
+        UNION ALL SELECT 1 AS value FROM recurring_runs WHERE pending_prompt_id=?
+      `).get(pendingId, pendingId) as { value: number } | undefined;
       this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,is_scheduled,created_at) VALUES(?,?,'user',?,?,?,?)")
         .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, scheduled ? 1 : 0, now);
       this.sqlite.prepare("UPDATE files SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);

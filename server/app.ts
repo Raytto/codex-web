@@ -1,3 +1,5 @@
+import { RecurringStore } from "./recurring-store.js";
+import { mountRecurringRoutes } from "./recurring-routes.js";
 import { isFeatureSelection } from "../src/feature-selection.js";
 import { mountParaRoutes } from "./para-routes.js";
 import { parseDeploymentSteps, type DeploymentStepStatus, type DeploymentBlocker } from "./deployment-progress.js";
@@ -31,11 +33,13 @@ import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from ".
 import { parseRemoteContentLength, RemoteTransferError, streamRemoteUpload } from "./remote-transfer.js";
 import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
 import { sweepUploadOrphans, uploadOwnershipKey } from "./upload-orphans.js";
+import { NodeTransferCoordinator } from "./node-transfer-coordinator.js";
+import { HostRootWorkerClient } from "./host-root-worker-client.js";
 import { ResumableUploadService } from "./resumable-upload.js";
 import { ImageThumbnailService } from "./image-thumbnail.js";
 import { PublicShareAssetError, isPublicShareImage, publicShareDocumentKind, resolvePublicShareAssets, rewritePublicShareDocument } from "./public-file-share.js";
 import { TENANT_LOCAL_EXECUTOR_ID, assertTenantProjectRoot, ensureTenantProjectLayout } from "./tenant-projects.js";
-import { createProjectSkill, deleteProjectSkill, listProjectSkills, readProjectSkill, setProjectSkillEnabled, updateProjectSkill } from "./project-skills.js";
+import { operateProjectSkill, type ProjectSkillAction } from "./project-skills.js";
 import { containsPersonalContext } from "./personal-context.js";
 import { PersonalMemoryService } from "./personal-memory.js";
 import { ensurePersonalMemoryLibrary, isPersonalMemoryEditableFileName, personalMemoryEnabled, readPersonalMemoryManagedFiles, writePersonalMemoryManagedFile } from "./personal-memory-files.js";
@@ -93,6 +97,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: "Codex" });
   db.recoverVoiceTranscriptionReceipts();
   const remoteWorkers = new RemoteWorkerGateway(config, db);
+  const transferHost = new HostRootWorkerClient(config.hostRootSocketPath);
+  const nodeTransfers = new NodeTransferCoordinator(db.sqlite,
+    async (executor, spec) => {
+      if (executor === HOST_EXECUTOR_ID) await transferHost.startNodeTransfer(HOST_ROOT_USER_ID, spec);
+      else await remoteWorkers.startNodeTransfer(executor, spec);
+    }, `${(config.publicBaseUrl || `http://127.0.0.1:${config.port}${config.basePath}`).replace(/^http/, "ws").replace(/\/$/, "")}/api/node-transfers/connect`,
+    executor => executor === HOST_EXECUTOR_ID ? Boolean(config.hostRootSocketPath) : remoteWorkers.transferCapable(executor));
+  remoteWorkers.transferBusy = executor => nodeTransfers.isBusy(executor);
   function tenantExecutorView(): ExecutorView {
     return {
       id: TENANT_LOCAL_EXECUTOR_ID,
@@ -668,6 +680,16 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (wakeSchedulerBusy || shuttingDown) return;
     wakeSchedulerBusy = true;
     try {
+      const recurring = new RecurringStore(db);
+      for (const task of recurring.due(Date.now())) {
+        try {
+          const conversationId = recurring.fire(task.user_id, task.id);
+          if (conversationId) {
+            publishConversationChanged(db.getConversation(conversationId)!);
+            if (config.queueAutoStart) scheduleQueuePump();
+          }
+        } catch (error) { console.error("Recurring scheduler failed", task.id, error instanceof Error ? error.message : "unknown error"); }
+      }
       for (const plan of db.listDueWakePlans(new Date().toISOString())) {
         recordWakeEvent(plan.id, `deadline:${plan.deadline_at}`, "deadline", null);
       }
@@ -1443,6 +1465,27 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return job;
   }
 
+  api.all("/automation/jobs/:jobId/transfers{/:transferId}{/:action}", automationLimiter, (req, res) => {
+    const job = authenticatedAutomationJob(req);
+    if (!job) return res.status(401).json({ error: "任务凭据无效或已经结束" });
+    const owner = db.getConversation(job.conversation_id)?.user_id;
+    if (!owner || !isHostRootUser(owner)) return res.status(403).json({ error: "节点互传仅对宿主管理账号开放" });
+    return handleTransferRequest(req, res, owner, job.conversation_id);
+  });
+
+  function handleTransferRequest(req: Request, res: Response, userId: string, conversationId: string | null = null) {
+    res.setHeader("Cache-Control", "private, no-store");
+    const id = String(req.params.transferId ?? "");
+    try {
+      if (req.method === "GET" && id === "nodes") return res.json({ nodes: remoteWorkers.listExecutors().map(e => ({ id: e.id, name: e.machineName, status: e.status, capable: e.id === HOST_EXECUTOR_ID ? Boolean(config.hostRootSocketPath) : remoteWorkers.transferCapable(e.id) })) });
+      if (req.method === "GET" && !id) return res.json({ transfers: nodeTransfers.list(userId) });
+      if (req.method === "POST" && !id) return res.status(201).json({ transfer: nodeTransfers.create(userId, conversationId, req.body) });
+      if (req.method === "POST" && req.params.action === "cancel") return res.json({ transfer: nodeTransfers.cancel(id, userId) });
+      if (req.method === "GET" && id) { const transfer = nodeTransfers.get(id, userId); return transfer ? res.json({ transfer }) : res.status(404).json({ error: "传输不存在" }); }
+      return res.status(405).json({ error: "不支持的传输操作" });
+    } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  }
+
   function wakeDeadline(value: unknown): string | null {
     const seconds = Number(value);
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 365 * 24 * 60 * 60) return null;
@@ -1661,6 +1704,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
+  mountRecurringRoutes(api, db, (user, executor, model, effort) => resolveAgentSelection(optionsForExecutor(user, executor), model, effort));
+
   mountParaRoutes(api, { db, config, resolveFile: resolveExistingFilePath,
     restore: (id) => { const c = db.getConversation(id); if (c) activateConversation(c); },
     selection: (user, executor) => userAgentSelection(user, optionsForExecutor(user, executor)),
@@ -1698,6 +1743,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     // still have rows during GC, but it must not accept new reader writes.
     return db.getFileForUser(version.file_id, session.user_id) ? version : undefined;
   }
+
+  api.all("/transfers{/:transferId}{/:action}", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    if (!isHostRootUser(session.user_id)) return res.status(403).json({ error: "节点互传仅对宿主管理账号开放" });
+    return handleTransferRequest(req, res, session.user_id);
+  });
 
   api.get("/reader/files/:id/manifest", async (req, res) => {
     const session = res.locals.session as SessionRow;
@@ -2201,7 +2252,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const executor = remoteWorkers.executor(executorId);
     if (!executor) return res.status(404).json({ error: "执行机器不存在。" });
     if (executor.status !== "online") return res.status(409).json({ error: `${executor.machineName} 当前离线。` });
-    if (executor.activeJobs > 0 || db.countRunningJobsForExecutor(executorId) > 0) return res.status(409).json({ error: "目标机器仍有任务执行，暂不能升级 Codex。" });
+    if (executor.activeJobs > 0 || db.countRunningJobsForExecutor(executorId) > 0 || nodeTransfers.isBusy(executorId)) return res.status(409).json({ error: "目标机器仍有任务执行，暂不能升级 Codex。" });
     const current = db.getExecutorRuntime(executorId);
     const version = current?.latestVersion;
     if (!version || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) return res.status(409).json({ error: "请先检查 Codex 最新版本。" });
@@ -2336,80 +2387,29 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   });
 
-  function projectForSkillManagement(response: Response, session: SessionRow, projectId: string): { project: ProjectRow; rootPath: string } | { response: Response } {
-    const project = db.getActiveProjectForUser(projectId, session.user_id);
-    if (!project) return { response: response.status(404).json({ error: "项目不存在。" }) };
-    if (project.executor_id !== TENANT_LOCAL_EXECUTOR_ID) {
-      return { response: response.status(409).json({ code: "project_skills_unsupported", error: "宿主项目和远端项目暂不支持网页管理项目技能；请在对应执行机的项目目录中维护。" }) };
-    }
-    try {
-      const tenant = ensureTenant(config.tenantRoot, session.user_id);
-      return { project, rootPath: assertTenantProjectRoot(tenant, project.root_path) };
-    } catch (error) {
-      return { response: response.status(409).json({ error: error instanceof Error ? error.message : "项目路径无效。" }) };
-    }
+  function projectSkillRoute(action: ProjectSkillAction) {
+    return async (req: Request, res: Response) => {
+      const session = res.locals.session as SessionRow;
+      const project = db.getActiveProjectForUser(String(req.params.id), session.user_id);
+      if (!project) return res.status(404).json({ error: "项目不存在。" });
+      if (project.executor_id !== TENANT_LOCAL_EXECUTOR_ID && !(project.executor_id === HOST_EXECUTOR_ID && isHostRootUser(session.user_id))) return res.status(409).json({ code: "project_skills_unsupported", error: "远端项目暂不支持网页管理技能，请在对应机器的项目目录中维护。" });
+      try {
+        const name = typeof req.body?.name === "string" && action === "create" ? req.body.name : String(req.params.name ?? "");
+        const content = typeof req.body?.content === "string" ? req.body.content : "";
+        const result = project.executor_id === HOST_EXECUTOR_ID
+          ? await transferHost.projectSkills(session.user_id, project.id, action, name, content, req.body?.enabled !== false)
+          : operateProjectSkill(assertTenantProjectRoot(ensureTenant(config.tenantRoot, session.user_id), project.root_path), action, name, content, req.body?.enabled !== false);
+        return res.status(action === "create" ? 201 : 200).json(result);
+      } catch (error) { return res.status(action === "read" ? 404 : 400).json({ error: error instanceof Error ? error.message : "项目技能操作失败。" }); }
+    };
   }
-
-  api.get("/projects/:id/skills", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try { return res.json({ supported: true, skills: listProjectSkills(selected.rootPath) }); }
-    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "项目技能读取失败。" }); }
-  });
-
-  api.get("/projects/:id/skills/:name", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try { return res.json({ skill: readProjectSkill(selected.rootPath, String(req.params.name)) }); }
-    catch (error) { return res.status(404).json({ error: error instanceof Error ? error.message : "项目技能不存在。" }); }
-  });
-
-  api.post("/projects/:id/skills", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try {
-      const name = typeof req.body?.name === "string" ? req.body.name : "";
-      const content = typeof req.body?.content === "string" ? req.body.content : "";
-      return res.status(201).json({ skill: createProjectSkill(selected.rootPath, name, content, req.body?.enabled !== false) });
-    } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "项目技能创建失败。" }); }
-  });
-
-  api.put("/projects/:id/skills/:name", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try {
-      const content = typeof req.body?.content === "string" ? req.body.content : "";
-      return res.json({ skill: updateProjectSkill(selected.rootPath, String(req.params.name), content) });
-    } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "项目技能保存失败。" }); }
-  });
-
-  api.post("/projects/:id/skills/:name/enable", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try { return res.json({ skill: setProjectSkillEnabled(selected.rootPath, String(req.params.name), true) }); }
-    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "项目技能启用失败。" }); }
-  });
-
-  api.post("/projects/:id/skills/:name/disable", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try { return res.json({ skill: setProjectSkillEnabled(selected.rootPath, String(req.params.name), false) }); }
-    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "项目技能停用失败。" }); }
-  });
-
-  api.delete("/projects/:id/skills/:name", (req, res) => {
-    const session = res.locals.session as SessionRow;
-    const selected = projectForSkillManagement(res, session, String(req.params.id));
-    if ("response" in selected) return selected.response;
-    try { deleteProjectSkill(selected.rootPath, String(req.params.name)); return res.json({ ok: true }); }
-    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "项目技能删除失败。" }); }
-  });
+  api.get("/projects/:id/skills", projectSkillRoute("list"));
+  api.get("/projects/:id/skills/:name", projectSkillRoute("read"));
+  api.post("/projects/:id/skills", projectSkillRoute("create"));
+  api.put("/projects/:id/skills/:name", projectSkillRoute("update"));
+  api.post("/projects/:id/skills/:name/enable", projectSkillRoute("enable"));
+  api.post("/projects/:id/skills/:name/disable", projectSkillRoute("disable"));
+  api.delete("/projects/:id/skills/:name", projectSkillRoute("delete"));
 
   api.patch("/projects/:id", (req, res) => {
     const session = res.locals.session as SessionRow;
@@ -2424,6 +2424,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const projectId = String(req.params.id);
     const current = db.getActiveProjectForUser(projectId, session.user_id);
     if (current?.is_default) return res.status(409).json({ error: "默认项目不能归档。" });
+    if (new RecurringStore(db).list(session.user_id).some(task => task.project_id === projectId && task.state === "active")) return res.status(409).json({ error: "请先暂停项目内的周期任务，再归档项目。" });
     if (syncingProjects.has(projectId)) return res.status(409).json({ error: "项目正在同步，请稍后再归档。" });
     if (db.listConversations(session.user_id).some((conversation) => conversation.project_id === projectId && conversation.project_move_blocked)) {
       return res.status(409).json({ error: "项目内仍有运行、排队或等待唤醒的任务，请先处理完成。" });
@@ -3923,9 +3924,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
   if (config.queueAutoStart) resumableUploads.start();
   return {
-    app, db, runner, conversationTitles, personalMemory, voiceLexicon, config, pumpQueue, remoteWorkers, resumableUploads, waitForBackgroundTasks,
+    app, db, runner, conversationTitles, personalMemory, voiceLexicon, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
+      nodeTransfers.close();
       reader.stop();
       personalMemory.stop();
       voiceLexicon.stop();

@@ -60,3 +60,11 @@ The reader extracts embedded images into revision-bound, owner-checked endpoints
 ## Reader navigation
 
 The shared `src/reader/navigation.tsx` handler keeps reader anchors in the current tab, preserves native modified clicks, and supplies an explicit Alt-click shortcut. Both authenticated and public readers render the return control. History traversal requires a distinct same-origin referrer whose path belongs to the configured application base; direct entries and other applications fall back to `/codex-web`. Remote file buttons reserve a new tab during the Alt-click and detach its opener before awaiting transfer. See [navigation behavior](READER_NAVIGATION.md).
+
+## Durable schedules and transfer coordination
+
+`recurring_tasks` and `recurring_runs` hold project schedules, revisioned edits, bounded history and unique scheduled occurrences. The existing timer scans due tasks; `BEGIN IMMEDIATE` commits the new conversation, pending input and next occurrence atomically. One outstanding execution per schedule includes queued/offline and one-shot-waiting conversations. Daily/weekly/monthly rules use IANA wall time; fixed intervals retain their schedule anchor. The UI exposes schedules at the start of project content, with a fixed account footer.
+
+`node_transfers` stores coordinator metadata separately from conversation attachments. Worker 1.20.0 and the optional host bridge execute scoped endpoint commands; the server owns retry, epoch changes, route selection and cleanup state. The data path uses authenticated WebRTC or encrypted WSS memory relay under the configured application base path. Endpoint confirmation, final SHA-256, atomic publication and separate source/target cleanup receipts determine completion. Normal tenants cannot use the host transfer path as an alternative execution boundary.
+
+Composer writes use a 45-second ordinary-write budget and a 10-minute new-file form budget; durable confirmation releases input before background refresh. Remote byte streams use independent 30-minute limits, up to 2 GiB per file and a bounded aggregate result budget.

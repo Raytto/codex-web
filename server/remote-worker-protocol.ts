@@ -121,6 +121,7 @@ export type RemoteWorkerUpdateResult = {
 export type RemoteCodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 
 export type ServerToRemoteWorker =
+  | { type: "node_transfer"; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
   | { type: "credential_replace"; workerId: string; credentialId: string; token: string }
   | { type: "run_release"; jobId: string }
   | { type: "authenticated"; workerId: string; heartbeatIntervalMs: number; migrationOnly?: boolean }
@@ -146,7 +147,7 @@ export type ServerToRemoteWorker =
 
 export type RemoteWorkerToServer =
   | { type: "credential_saved"; credentialId: string }
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean }; codexVersion: string; capacity: number }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean; nodeTransfers?: boolean }; codexVersion: string; capacity: number }
   | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: RemoteThreadSnapshot }

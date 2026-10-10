@@ -1,0 +1,66 @@
+.recurring-sidebar { margin: 1px 0; }
+.recurring-sidebar button { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; border-radius: 8px; padding: 7px 10px 7px var(--project-content-left, 34px); background: transparent; color: inherit; font-size: 13.5px; font-weight: 500; text-align: left; cursor: pointer; }
+.recurring-sidebar button > svg { flex-shrink: 0; }
+.recurring-sidebar button:hover, .recurring-sidebar button.selected { background: #ffffff15; }
+.recurring-sidebar button > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recurring-group { color: #c8c3ff !important; }
+.recurring-children { padding-left: 14px; }
+.recurring-manage { font-size: .8125rem; opacity: .8; }
+@media (hover: none), (pointer: coarse) {
+  .recurring-sidebar { --project-content-left: 54px; }
+}
+.recurring-workspace { min-width: 0; color: var(--ink); background: var(--paper); }
+.recurring-workspace button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); color: var(--ink); cursor: pointer; }
+.recurring-workspace button.primary-button { color: var(--dialog-primary-ink); background: var(--indigo); border-color: var(--indigo); }
+.recurring-workspace button.danger { color: #dc5555; }
+.recurring-workspace button:disabled { opacity: .55; cursor: default; }
+.recurring-heading { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.recurring-heading h1 { margin: 0; font-size: var(--dialog-font-title); }
+.recurring-heading p { margin: 2px 0 0; color: var(--dialog-text-secondary); font-size: var(--dialog-font-secondary); overflow-wrap: anywhere; }
+.recurring-content { overflow-y: auto; padding: 32px; flex: 1; min-height: 0; }
+.recurring-content > * { max-width: 920px; margin-inline: auto; }
+.recurring-content h2 { font-size: var(--dialog-font-title); margin: 0 0 8px; overflow-wrap: anywhere; }
+.recurring-content h3 { font-size: var(--dialog-font-heading); margin: 12px 0; }
+.recurring-content p, .recurring-content small { color: var(--dialog-text-secondary); font-size: var(--dialog-font-secondary); line-height: 1.6; }
+.recurring-section-title { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; }
+.recurring-section-title p { margin: 0; }
+.recurring-empty { display: grid; justify-items: center; padding: 40px 20px; border: 1px dashed var(--line); border-radius: 16px; text-align: center; }
+.recurring-list { display: grid; gap: 12px; }
+.recurring-workspace .recurring-card { display: grid; justify-content: stretch; gap: 8px; text-align: left; padding: 20px; border-radius: 14px; }
+.recurring-card > span:not(.recurring-card-title) { color: var(--dialog-text-secondary); font-size: var(--dialog-font-secondary); }
+.recurring-card-title { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.recurring-card-title strong { flex: 1; overflow-wrap: anywhere; }
+.recurring-status { flex-shrink: 0; padding: 3px 10px; border-radius: 20px; background: var(--surface); font-size: var(--dialog-font-caption); }
+.recurring-status.active { color: #258161; background: #31926c15; }
+.recurring-waits { margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--line); }
+.recurring-waits button { width: 100%; margin-bottom: 8px; justify-content: flex-start; flex-wrap: wrap; }
+.recurring-waits button span { flex: 1; }
+.recurring-editor fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 20px; min-width: 0; }
+.recurring-editor label { display: grid; gap: 8px; font-size: var(--dialog-font-secondary); font-weight: 600; min-width: 0; }
+.recurring-editor input, .recurring-editor select, .recurring-editor textarea { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--paper); color: var(--ink); box-sizing: border-box; }
+.recurring-editor textarea { resize: vertical; line-height: 1.6; }
+.recurring-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 20px; }
+.recurring-weekdays { display: flex; flex-wrap: wrap; gap: 8px; }
+.recurring-weekdays label { display: flex; align-items: center; padding: 6px 10px; border: 1px solid var(--line); border-radius: 10px; }
+.recurring-weekdays input { width: 18px; min-height: 18px; }
+.recurring-policy { margin: 0; padding: 16px; background: var(--surface); border-radius: 12px; }
+.recurring-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+.recurring-summary { display: flex; gap: 32px; flex-wrap: wrap; }
+.recurring-summary span { display: grid; gap: 4px; font-size: var(--dialog-font-secondary); }
+.recurring-back { margin-bottom: 24px; }
+.recurring-history { margin-top: 32px; border-top: 1px solid var(--line); padding-top: 16px; }
+.recurring-history > div { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.recurring-history time { flex: 1; font-size: var(--dialog-font-secondary); }
+.recurring-content .recurring-error { color: #dc5555; }
+@media(max-width: 720px) { .recurring-content { padding: 20px 16px; } .recurring-workspace .workspace-header { flex-wrap: wrap; height: auto; gap: 12px; padding: 16px; } .recurring-grid { grid-template-columns: 1fr; } }
+.project-skills-dialog.ui-dialog { width: min(1080px, calc(100vw - 32px)); max-height: 90dvh; padding: 24px; }
+.project-skills-dialog.ui-dialog header p, .project-skills-dialog.ui-dialog footer, .project-skills-dialog.ui-dialog .project-skills-empty, .project-skills-dialog.ui-dialog .project-skills-list small { font-size: var(--dialog-font-secondary); color: var(--dialog-text-secondary); line-height: 1.6; }
+.project-skills-dialog.ui-dialog .project-skills-editor > label { font-size: var(--dialog-font-secondary); }
+.project-skills-dialog.ui-dialog .project-skills-editor input, .project-skills-dialog.ui-dialog .project-skills-editor textarea { font-size: var(--dialog-font-input); }
+.project-skills-dialog.ui-dialog .project-skills-editor textarea { min-height: 360px; }
+.project-skills-dialog.ui-dialog button { min-height: 44px; min-width: 44px; font-size: var(--dialog-font-control); }
+.project-skills-dialog.ui-dialog .project-skills-list button span { overflow-wrap: anywhere; }
+.project-skills-dialog.ui-dialog header { gap: 16px; }
+.project-skills-dialog.ui-dialog footer { gap: 16px; }
+@media (max-width: 720px) { .project-skills-dialog.ui-dialog { width: 100%; max-height: 94dvh; padding: 16px; border-radius: 20px 20px 0 0; } .project-skills-body { grid-template-columns: minmax(0,1fr); } .project-skills-list { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 12px; max-height: 190px; overflow-y: auto; } .project-skills-dialog.ui-dialog footer { flex-wrap: wrap; } }
+@media (min-width: 721px) { .recurring-workspace button.mobile-only { display: none; } }

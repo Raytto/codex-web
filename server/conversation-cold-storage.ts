@@ -276,6 +276,7 @@ function workspaceFileSources(roots: ColdStorageRoots, row: StorageDbRow, protec
     try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
     catch { reasons.push("workspace_scan_failed"); return; }
     for (const entry of entries) {
+      if (entry.name.startsWith(".ppa-transfer-")) continue;
       if (topLevel && WORKSPACE_CONTROL_ENTRIES.has(entry.name)) continue;
       const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
       const absolute = path.resolve(directory, entry.name);
@@ -557,6 +558,7 @@ export function findDownloadedFile(root: string, name: string, fallbackRoots: st
     if (visited.has(resolved) || !fs.existsSync(resolved)) return;
     visited.add(resolved);
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name.startsWith(".ppa-transfer-")) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) visit(absolute);
       else if (entry.isFile() && entry.name === name) matches.push(absolute);

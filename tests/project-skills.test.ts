@@ -1,3 +1,6 @@
+import crypto from "node:crypto";
+import { operateHostProjectSkill } from "../server/host-project-skills.js";
+import { HOST_ROOT_USER_ID } from "../server/host-root-user.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -6,7 +9,7 @@ import test from "node:test";
 import bcrypt from "bcryptjs";
 import request from "supertest";
 import { createApp } from "../server/app.js";
-import { LEGACY_USER_ID } from "../server/db.js";
+import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
 import { ensureTenant } from "../server/paths.js";
 import { ensureTenantProjectLayout } from "../server/tenant-projects.js";
 import { createProjectSkill, deleteProjectSkill, listProjectSkills, readProjectSkill, setProjectSkillEnabled, updateProjectSkill } from "../server/project-skills.js";
@@ -45,6 +48,7 @@ test("project skills CRUD stays inside a tenant project and rejects symlinks", (
   assert.match(updated.content, /Updated/);
   const disabled = setProjectSkillEnabled(project, "release-check", false);
   assert.equal(disabled.enabled, false);
+  assert.throws(() => createProjectSkill(project, "release-check", skill("release-check")), /已经存在/);
   assert.equal(fs.existsSync(path.join(project, ".agents", "skills", ".disabled", "release-check", "SKILL.md")), true);
   assert.equal(setProjectSkillEnabled(project, "release-check", true).enabled, true);
   assert.throws(() => createProjectSkill(project, "../escape", skill("../escape")), /技能名称/);
@@ -82,4 +86,25 @@ test("project skill API is owner-scoped and rejects host/remote semantics", asyn
   await ownerAgent.get(`/api/projects/${project.id}/skills`).expect(200);
   await ownerAgent.delete(`/api/projects/${project.id}/skills/api-check`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
   assert.ok(memberLogin.body.csrfToken);
+});
+
+test("host skill bridge independently checks project owner, executor and archive before filesystem access", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "host-project-skills-"));
+  const db = new AppDatabase(path.join(root, "data")), file = path.join(root,"data","codex-web.sqlite");
+  t.after(() => { db.close(); fs.rmSync(root,{recursive:true,force:true}); });
+  const now = new Date().toISOString();
+  db.createUser({id:HOST_ROOT_USER_ID,username:"host-fixture",display_name:"Host",role:"owner",status:"active",password_hash:"",created_at:now,updated_at:now});
+  const project = db.createProject(crypto.randomUUID(),HOST_ROOT_USER_ID,"Host test",root,"local-host");
+  const result = operateHostProjectSkill(file,HOST_ROOT_USER_ID,project.id,"create","host-test",skill("host-test"),false);
+  assert.equal(result.skill?.enabled,false);
+  assert.equal(operateHostProjectSkill(file,HOST_ROOT_USER_ID,project.id,"enable","host-test").skill?.enabled,true);
+  assert.match(operateHostProjectSkill(file,HOST_ROOT_USER_ID,project.id,"read","host-test").skill!.content,/Do the project thing/);
+  assert.throws(() => operateHostProjectSkill(file,LEGACY_USER_ID,project.id,"list"),/not allowed/);
+  const other=db.createProject(crypto.randomUUID(),LEGACY_USER_ID,"Other",path.join(root,"other"),"local-host");
+  assert.throws(() => operateHostProjectSkill(file,HOST_ROOT_USER_ID,other.id,"list"),/不属于/);
+  const remote=db.createProject(crypto.randomUUID(),HOST_ROOT_USER_ID,"Remote",root,"remote:fixture");
+  assert.throws(() => operateHostProjectSkill(file,HOST_ROOT_USER_ID,remote.id,"list"),/不属于/);
+  operateHostProjectSkill(file,HOST_ROOT_USER_ID,project.id,"delete","host-test");
+  db.archiveProjectForUser(project.id,HOST_ROOT_USER_ID);
+  assert.throws(() => operateHostProjectSkill(file,HOST_ROOT_USER_ID,project.id,"list"),/不属于/);
 });

@@ -1,3 +1,4 @@
+import { REMOTE_TRANSFER_MAX_FILE_BYTES } from "./transfer-policy.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -43,7 +44,7 @@ export function resolveReadableFile(projectRoot: string, requestedPath: string):
   catch { throw new Error("文件不存在或无法访问"); }
   const stat = fs.statSync(canonical);
   if (!stat.isFile()) throw new Error("所选路径不是普通文件");
-  if (stat.size > 100 * 1024 * 1024) throw new Error("文件超过 100 MiB，暂不支持下载");
+  if (stat.size > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("文件超过 2 GiB，暂不支持下载");
   return { path: canonical, name: path.basename(canonical), size: stat.size };
 }
 

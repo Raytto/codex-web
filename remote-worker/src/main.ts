@@ -1,3 +1,4 @@
+import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -24,6 +25,7 @@ import { syncAccountSkills } from "./account-skills.js";
 import { runConversationTitleAgent } from "./conversation-title-agent.js";
 import { RolloutSizes } from "./rollout-sizes.js";
 import { localThreadLifecycles } from "./rollout-lifecycle.js";
+import { NodeTransferEndpoint } from "./node-transfer-endpoint.js";
 import { RemoteCodexAccountManager } from "./codex-accounts.js";
 
 type Config = { serverWsUrl: string; serverHttpUrl: string; enrollmentToken: string; machineName: string; workerId: string; capacity: number; stateRoot?: string; codexRuntimePath?: string; sourceRoot?: string; workerUpdateTaskName?: string };
@@ -46,6 +48,7 @@ const workerUpdateResultPath = path.join(stateRoot, "worker-update-result.json")
 const workerOnlinePath = path.join(stateRoot, "worker-online.json");
 const outboxPath = path.join(stateRoot, "worker-outbox-v1.json");
 const lock = acquireLock(lockPath);
+const nodeTransfers = new NodeTransferEndpoint(stateRoot, config.serverHttpUrl);
 const rolloutSizes = new RolloutSizes(codexHome);
 const activeRuns = new Map<string, ActiveRun>();
 const activeTitleAgents = new Map<string, AbortController>();
@@ -87,7 +90,7 @@ function connect(): void {
     type: "hello", protocolVersion: PROTOCOL_VERSION, workerId: config.workerId, machineName: config.machineName,
     enrollmentToken: config.enrollmentToken, platform: `${process.platform}-${process.arch}`,
     workerVersion: WORKER_VERSION, workerRelease: workerRelease().ref, workerCommit: workerRelease().commit,
-    capabilities: { deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
+    capabilities: { nodeTransfers: true, deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
     codexVersion: runtimeManager.snapshot().installedVersion, capacity: config.capacity,
   }));
   socket.on("message", (data, isBinary) => {
@@ -118,6 +121,11 @@ function connect(): void {
 }
 
 async function handle(message: ServerMessage): Promise<void> {
+  if (message.type === "node_transfer") {
+    if (!authenticated || workerUpdateStarting) return;
+    void nodeTransfers.start(message.spec).catch(error => log(`node transfer start failed: ${error instanceof Error ? error.message : String(error)}`));
+    return;
+  }
   if (message.type === "credential_replace") {
     if (!authenticated || message.workerId !== config.workerId) return;
     // Preserve installer-owned fields (nodePath, etc). Never put secrets in the outbox.
@@ -217,7 +225,7 @@ async function handle(message: ServerMessage): Promise<void> {
     return;
   }
   if (message.type === "codex_upgrade") {
-    if (activeRuns.size > 0 || activeTitleAgents.size > 0) {
+    if (activeRuns.size > 0 || activeTitleAgents.size > 0 || nodeTransfers.activeCount > 0) {
       send({ type: "codex_upgrade_result", requestId: message.requestId, ok: false, message: "目标机器仍有任务执行，暂不能升级 Codex" });
       return;
     }
@@ -399,7 +407,7 @@ async function startRun(request: RunRequest): Promise<void> {
         generatedImageThreadId,
         generatedImagesBeforeThreadId === generatedImageThreadId ? generatedImagesBefore : new Map(),
         async (realPath, name) => uploadResultFile(run, realPath, name),
-        { maximumFiles: Math.max(0, 20 - changed.uploaded) },
+        { maximumFiles: Math.max(0, 20 - changed.uploaded), maximumTotalBytes: Math.max(0, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB - changed.uploadedBytes) },
       )
       : { uploaded: 0, omitted: [] };
     const omittedArtifacts = [...changed.omitted, ...generated.omitted].slice(0, 100);
@@ -418,7 +426,7 @@ async function startRun(request: RunRequest): Promise<void> {
   }
 }
 
-async function uploadChangedFiles(run: ActiveRun, projectRoot: string): Promise<{ uploaded: number; hasUploadedImage: boolean; omitted: OmittedArtifact[] }> {
+async function uploadChangedFiles(run: ActiveRun, projectRoot: string): Promise<{ uploaded: number; uploadedBytes: number; hasUploadedImage: boolean; omitted: OmittedArtifact[] }> {
   const result = await collectChangedFiles(projectRoot, run.changedFiles, async (realPath, name) => {
     await uploadResultFile(run, realPath, name);
   });
@@ -437,7 +445,7 @@ async function uploadResultFile(run: ActiveRun, realPath: string, name: string):
 
 async function uploadFile(url: string, transferToken: string, filePath: string, name: string): Promise<Response> {
   const stat = await fs.promises.stat(filePath);
-  if (!stat.isFile() || stat.size < 0 || stat.size > 100 * 1024 * 1024) throw new Error("文件大小不符合远程传输限制");
+  if (!stat.isFile() || stat.size < 0 || stat.size > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("文件大小不符合远程传输限制");
   const body = fs.createReadStream(filePath);
   try {
     return await fetch(url, {
@@ -457,7 +465,7 @@ async function uploadFile(url: string, transferToken: string, filePath: string, 
 }
 
 async function downloadFile(url: string, transferToken: string, destination: string, expectedSize: number, signal: AbortSignal): Promise<{ size: number; sha256: string }> {
-  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > 100 * 1024 * 1024) throw new Error("附件声明大小无效");
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("附件声明大小无效");
   const response = await fetch(url, {
     headers: { authorization: `Bearer ${transferToken}`, "accept-encoding": "identity" },
     signal,
@@ -588,7 +596,7 @@ async function beginWorkerUpdate(message: Extract<ServerMessage, { type: "worker
     send({ type: "worker_update_ack", requestId: message.requestId, accepted: false, message: "节点尚未安装独立更新计划任务" });
     return;
   }
-  if (workerUpdateStarting || activeRuns.size > 0 || activeTitleAgents.size > 0) {
+  if (workerUpdateStarting || activeRuns.size > 0 || activeTitleAgents.size > 0 || nodeTransfers.activeCount > 0) {
     send({ type: "worker_update_ack", requestId: message.requestId, accepted: false, message: "节点仍有任务执行或升级已经开始" });
     return;
   }
@@ -675,7 +683,7 @@ function argument(name: string): string | undefined { const index = process.argv
 function safeFileName(value: string): string { return path.basename(value).replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_").slice(0, 160) || "attachment.bin"; }
 function mimeType(name: string): string { const ext = path.extname(name).toLowerCase(); return ({ ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json", ".csv": "text/csv", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".pdf": "application/pdf", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".zip": "application/zip" } as Record<string, string>)[ext] || "application/octet-stream"; }
 function log(message: string): void { process.stdout.write(`[${new Date().toISOString()}] ${message}\n`); }
-function shutdown(exitCode = 0): void { if (shuttingDown) return; shuttingDown = true; if (heartbeat) clearInterval(heartbeat); if (projectSyncRestartTimer) clearTimeout(projectSyncRestartTimer); projectSyncMonitor?.close(); codexAccounts.close(); for (const run of activeRuns.values()) { run.controller.abort(); run.execution?.interrupt(); } for (const controller of activeTitleAgents.values()) controller.abort(); try { outbox.persist(); } catch (error) { log(`durable outbox persist failed during shutdown: ${error instanceof Error ? error.message : String(error)}`); } socket?.close(1000, "shutdown"); fs.closeSync(lock); fs.rmSync(lockPath, { force: true }); setTimeout(() => process.exit(exitCode), 500).unref(); }
+function shutdown(exitCode = 0): void { if (shuttingDown) return; shuttingDown = true; void nodeTransfers.close(); if (heartbeat) clearInterval(heartbeat); if (projectSyncRestartTimer) clearTimeout(projectSyncRestartTimer); projectSyncMonitor?.close(); codexAccounts.close(); for (const run of activeRuns.values()) { run.controller.abort(); run.execution?.interrupt(); } for (const controller of activeTitleAgents.values()) controller.abort(); try { outbox.persist(); } catch (error) { log(`durable outbox persist failed during shutdown: ${error instanceof Error ? error.message : String(error)}`); } socket?.close(1000, "shutdown"); fs.closeSync(lock); fs.rmSync(lockPath, { force: true }); setTimeout(() => process.exit(exitCode), 500).unref(); }
 process.on("SIGINT", () => shutdown());
 process.on("SIGTERM", () => shutdown());
 process.on("exit", () => { try { fs.closeSync(lock); } catch { /* already closed */ } try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ } });
