@@ -52,7 +52,11 @@ test("archived conversations bypass inactivity and round-trip every unshared reg
   const cloud = path.join(root, "cloud");
   fs.mkdirSync(tools, { recursive: true }); fs.mkdirSync(cloud, { recursive: true });
   const originalPath = process.env.PATH;
-  executable(tools, "id", `console.log("0");`);
+  // Keep the fake provider identity equal to the test process, so the same
+  // ownership round trip works on both root containers and hosted CI runners.
+  const fixtureUid = process.getuid?.() ?? 0;
+  const fixtureGid = process.getgid?.() ?? 0;
+  executable(tools, "id", `console.log(process.argv.includes("-g") ? ${fixtureGid} : ${fixtureUid});`);
   process.env.PATH = `${tools}${path.delimiter}${originalPath ?? ""}`;
   t.after(() => { process.env.PATH = originalPath; });
 

@@ -66,16 +66,18 @@ try {
   if ($env:OS -eq "Windows_NT") {
     $processRoot = Join-Path $temporaryRoot "process-identity"
     $mainPath = Join-Path $processRoot "dist\src\main.js"
-    $configPath = Join-Path $processRoot "config.json"
+    # Keep fixture locals distinct from the globals used by the imported updater.
+    # A child-script scope would otherwise shadow changes to $global:ConfigPath.
+    $fixtureConfigPath = Join-Path $processRoot "config.json"
     $pointerPath = Join-Path $processRoot "worker-current.json"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $mainPath) | Out-Null
     [System.IO.File]::WriteAllText($mainPath, "setInterval(() => {}, 1000);`n", (New-Object System.Text.UTF8Encoding($false)))
-    [System.IO.File]::WriteAllText($configPath, "{}`n", (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($fixtureConfigPath, "{}`n", (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText($pointerPath, (([ordered]@{ root = $processRoot }) | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
     $global:nodePath = (Get-Command node.exe -ErrorAction Stop).Source
     $global:currentPath = $pointerPath
-    $global:ConfigPath = $configPath
-    $testProcess = Start-Process -FilePath $global:nodePath -ArgumentList @($mainPath, "--config", $configPath) -PassThru -WindowStyle Hidden
+    $global:ConfigPath = $fixtureConfigPath
+    $testProcess = Start-Process -FilePath $global:nodePath -ArgumentList @($mainPath, "--config", $fixtureConfigPath) -PassThru -WindowStyle Hidden
     try {
       for ($attempt = 0; $attempt -lt 20 -and -not (Get-WorkerProcess $testProcess.Id); $attempt++) { Start-Sleep -Milliseconds 100 }
       [void](Assert-WorkerProcessIdentity $testProcess.Id)
@@ -85,7 +87,7 @@ try {
       catch { $wrongProcessRejected = $_.Exception.Message -match "refusing to terminate" }
       if (-not $wrongProcessRejected) { throw "The updater process guard accepted a different command line" }
     } finally {
-      $global:ConfigPath = $configPath
+      $global:ConfigPath = $fixtureConfigPath
       Stop-Process -Id $testProcess.Id -Force -ErrorAction SilentlyContinue
     }
   }

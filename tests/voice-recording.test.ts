@@ -43,7 +43,9 @@ test("voice audio persists with ownership metadata and round-trips through encry
   const cloud = path.join(root, "cloud");
   fs.mkdirSync(tools, { recursive: true }); fs.mkdirSync(cloud, { recursive: true });
   const originalPath = process.env.PATH;
-  executable(tools, "id", `const args = process.argv.slice(2); if (args[1] !== "aliyunpan") process.exit(1); console.log(args[0] === "-u" ? "0" : "0");`);
+  const fixtureUid = process.getuid?.() ?? 0;
+  const fixtureGid = process.getgid?.() ?? 0;
+  executable(tools, "id", `const args = process.argv.slice(2); if (args[1] !== "aliyunpan") process.exit(1); console.log(args[0] === "-u" ? ${fixtureUid} : ${fixtureGid});`);
   process.env.PATH = `${tools}${path.delimiter}${originalPath ?? ""}`;
   t.after(() => { process.env.PATH = originalPath; });
   const ageRecipient = path.join(root, "recipient"); const ageIdentity = path.join(root, "identity");

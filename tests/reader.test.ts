@@ -503,7 +503,9 @@ test("reader normalized resources round-trip through the encrypted cold-storage 
   const cloud = path.join(root, "cloud");
   fs.mkdirSync(tools, { recursive: true }); fs.mkdirSync(cloud, { recursive: true });
   const originalPath = process.env.PATH;
-  executable(tools, "id", `console.log("0");`);
+  const fixtureUid = process.getuid?.() ?? 0;
+  const fixtureGid = process.getgid?.() ?? 0;
+  executable(tools, "id", `console.log(process.argv.includes("-g") ? ${fixtureGid} : ${fixtureUid});`);
   process.env.PATH = `${tools}${path.delimiter}${originalPath ?? ""}`;
   context.after(() => { process.env.PATH = originalPath; });
   const ageRecipient = path.join(root, "recipient"); const ageIdentity = path.join(root, "identity");
