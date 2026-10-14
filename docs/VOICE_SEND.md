@@ -3,8 +3,8 @@
 The main task composer sends a recording immediately when its Send button is
 pressed. Recording audio, typed text, quote and already-uploaded draft attachments
 are durably accepted before ASR runs. Only after HTTP 202 does the composer clear;
-the chat shows “已发送，正在云识别，可离开此页面”. Uploading still requires the page
-and connection. A failed upload keeps the existing IndexedDB recording for retry.
+the pending-task queue shows “正在进行语音识别…”. Uploading still requires the
+page and connection. A failed upload keeps the existing IndexedDB recording for retry.
 
 `POST /conversations/:id/voice-messages` accepts one audio file and consumes that
 conversation's server draft attachments in the same SQLite transaction as its
@@ -23,13 +23,13 @@ The existing queue ordering, model choice, quotes, files, prior voice references
 and accepted project context are preserved. The unrecognized item and later items
 in its queue cannot dispatch. Completion atomically stores the transcript and
 releases the pending item to the usual queue; registered audio follows existing
-voice recording retention. SSE updates the chat, with a bounded 3-second fallback
+voice recording retention. SSE updates the queue, with a bounded 3-second fallback
 refresh while recognition is pending. Closing or switching the page after
 acceptance does not stop recognition or later execution.
 
 Migration `2026101401` is additive. Unrecognized prompts use the pre-existing
 non-dispatchable `editing` database state and are distinguished by their receipt;
-the new UI presents them as sent voice messages. This also prevents an older
+the UI presents them only in the pending-task queue. This also prevents an older
 binary from automatically running incomplete text after rollback. Upgrade again
 to resume recognition; do not manually convert these rows to queued. Files live
 in the existing protected `voice-recordings` namespace, not a temporary ASR cache.
@@ -39,6 +39,31 @@ an existing pending task, reader dialogs, search and other voice fields retain
 their existing proofreading workflow. The ASR provider/model and microphone
 permissions are unchanged. Browser automation uses a synthetic microphone fixture;
 real iOS audio capture and background-tab upload suspension still need device tests.
+
+## One queue item until execution
+
+An accepted recording appears only in the pending-task queue. Recognition shows
+its spinner/status there; editing and immediate insertion remain disabled until
+recognition completes. The result replaces the text of the same queue item, which
+can then be edited normally. A failure shows its error and explicit retry action
+in that item, preserving the recording and attachments. Retrying updates the same
+item rather than creating another task.
+
+Refreshing the page preserves the pending status or recognized text without a
+chat placeholder. Only when the scheduler materializes the pending prompt for
+execution does it become one ordinary user message in the chat. Queue and chat
+must not both display the same pending recording. This presentation update adds
+no migration, provider setting, dependency or Worker protocol change.
+
+After building, run `node tests/browser/voice-queue.mjs` with an installed
+Playwright Chromium. The runner accepts the same optional environment variables
+as the composer regression below. It uses an isolated app/database, public
+username/password login and `/codex-web` routing. It covers recognizing and
+completed states across refresh, editing, mobile failure/retry, deletion, and one
+chat message after the real scheduler enters the running state. It also checks
+that pumping the queue again cannot dispatch the same item twice. Transcription,
+microphone input and the model runner are controlled fixtures: this is not real
+ASR, cloud model execution or physical-device microphone acceptance.
 
 ## Concurrent composers and latency diagnostics
 

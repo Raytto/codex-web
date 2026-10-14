@@ -256,7 +256,9 @@ Set your own `DASHSCOPE_API_KEY`, HTTPS `DASHSCOPE_BASE_URL` and HTTPS `PUBLIC_B
 
 Audio is uploaded to your server first and then sent to the DashScope endpoint configured by `DASHSCOPE_BASE_URL`. Leave the key empty to disable the feature completely.
 
-Before an upload starts, the browser stores the complete recording in a per-user, per-conversation IndexedDB draft. If the network disappears while the request is in flight, the composer keeps the recording and shows a retry action instead of discarding it. A retry reuses the same client recording UUID; the server records the audio hash/size and returns the original transcription when the first request already completed. Receipts and browser drafts are pruned after 24 hours; deleting the draft is always available locally.
+Sending a recording from the main task composer durably accepts it before cloud recognition. Progress, transcript and failure/retry stay in one pending-task queue item, including after refresh; a single ordinary chat message appears only when the task is dispatched. See [durable voice submission](docs/VOICE_SEND.md).
+
+For the stop-and-proofread workflow, before an upload starts, the browser stores the complete recording in a per-user, per-conversation IndexedDB draft. If the network disappears while the request is in flight, the composer keeps the recording and shows a retry action instead of discarding it. A retry reuses the same client recording UUID; the server records the audio hash/size and returns the original transcription when the first request already completed. Receipts and browser drafts are pruned after 24 hours; deleting the draft is always available locally.
 
 The optional spelling/topic context is bounded to about 500 tokens by default and shared across the draft, attachment names, the first 16 KiB of text attachments, recent messages, fixed technical terms, and up to two small images. Large unsent files are never copied wholesale into the transcription request. Tune the limits with `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`, `TRANSCRIPTION_CONTEXT_MAX_IMAGES`, and `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES`.
 
@@ -336,7 +338,7 @@ Username/password login, `/codex-web`, isolated tenant workers and empty optiona
 
 ## Recent product updates / 近期更新
 
-- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription, survive restart, and use idempotent retries. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
+- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription and use idempotent retries. Recognition, results and failure/retry stay in one queue item across refresh; dispatch creates one chat message. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
 - [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. No private business topics, credentials or pre-created schedules are shipped.
 - Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
 - [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.

@@ -178,7 +178,9 @@ stateDiagram-v2
 
 在 `.env` 中设置你自己的 `DASHSCOPE_API_KEY`、HTTPS `DASHSCOPE_BASE_URL` 和 HTTPS `PUBLIC_BASE_URL`，并通过 `DASHSCOPE_ASR_MODEL` 选择兼容模型。凭据或端点未配置时语音关闭。
 
-录音上传前，浏览器会按账号和会话把完整音频保存到 IndexedDB，保留 24 小时。若电梯等场景导致网络在发送中断，输入框会保留“语音未发送，音频已保留”的状态，可重试识别或删除，不会丢失原始音频。重试沿用同一个客户端录音 UUID；服务端记录音频大小和哈希，若第一次请求其实已经完成，会直接返回原转写结果而不会重复调用模型。浏览器草稿和服务端回执都会在 24 小时后清理。
+在主任务输入框直接发送录音时，服务器先持久接收，再进行云端识别。识别进度、结果和失败重试都留在同一条待发送任务中，刷新后仍可恢复；实际派发执行后才成为一条普通聊天消息。详见[语音先发送](docs/VOICE_SEND.md)。
+
+使用“停止录音后校对”流程时，录音上传前，浏览器会按账号和会话把完整音频保存到 IndexedDB，保留 24 小时。若电梯等场景导致网络在发送中断，输入框会保留“语音未发送，音频已保留”的状态，可重试识别或删除，不会丢失原始音频。重试沿用同一个客户端录音 UUID；服务端记录音频大小和哈希，若第一次请求其实已经完成，会直接返回原转写结果而不会重复调用模型。浏览器草稿和服务端回执都会在 24 小时后清理。
 
 语音模型使用的额外拼写/话题上下文默认限制为约 500 token，由草稿、附件名、文本附件开头 16 KiB、最近对话、固定技术词和最多两张小图片共同分配；未发送的大文件不会整份进入转写请求。可通过 `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`、`TRANSCRIPTION_CONTEXT_MAX_IMAGES` 和 `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES` 调整。
 
@@ -234,7 +236,7 @@ stateDiagram-v2
 
 ## Recent product updates / 近期更新
 
-- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription, survive restart, and use idempotent retries. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
+- [语音先发送](docs/VOICE_SEND.md)：录音先持久接收，再云端识别；识别进度、结果和失败重试只显示在同一条待发送任务中，刷新后保留，派发执行后只生成一条聊天消息。重试保持幂等，各会话保留独立录音与上传状态。服务商密钥和 HTTPS 端点仍为可选项，默认留空。
 - [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. No private business topics, credentials or pre-created schedules are shipped.
 - Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
 - [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.

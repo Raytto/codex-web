@@ -4108,7 +4108,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </details> : <button className="icon-button" aria-label="会话操作" title="请先选择会话" disabled><MoreHorizontal size={21} /></button>}
         </div>
       </header>
-      {currentDetail ? <Chat onRetryVoice={async (prompt) => { await api.retryVoiceMessage(prompt.conversation_id, prompt.id); await reconcile(prompt.conversation_id); }} detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
+      {currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
         : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {(error || composerError) && <div className="toast"><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></div>}
@@ -4121,6 +4121,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onModelChange={changeModel} onReasoningChange={changeReasoning}
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
+        onRetryVoice={async (prompt) => { await api.retryVoiceMessage(prompt.conversation_id, prompt.id); await reconcile(prompt.conversation_id); }}
         pendingActionMode={job?.status === "running" ? "steer" : "insert"} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
         onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onPauseDraftUpload={pauseComposerDraftUpload} onResumeDraftUpload={resumeComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
@@ -4883,7 +4884,7 @@ function ErrorBubble({ content }: { content: string }) {
   </div>;
 }
 
-function Chat({ onRetryVoice, detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { onRetryVoice: (prompt: PendingPrompt) => Promise<void>; detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
+function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const latestJobError = detail.latestJob && ["failed", "interrupted"].includes(detail.latestJob.status)
     ? detail.latestJob.error?.trim() ?? ""
@@ -4985,8 +4986,6 @@ function Chat({ onRetryVoice, detail, activities, activitiesLoading, sending, lo
         };
       }}
       afterMessages={<>
-        {detail.pendingPrompts.filter(prompt => prompt.voiceSubmission).map(prompt => <VoiceMessage key={prompt.id} prompt={prompt} userInitials={userInitials} onRetry={onRetryVoice} />)}
-
         {latestJobError && !hasPersistedErrorNotice && <article className="message system error" data-message-id={`job-error-${detail.latestJob?.id}`}>
           <div className="message-avatar"><CircleAlert size={16} /></div>
           <div className="message-body"><div className="message-meta"><span className="message-name">任务错误</span>{detail.latestJob?.updated_at && <time dateTime={detail.latestJob.updated_at} title={formatFullDateTime(detail.latestJob.updated_at)}>{formatMessageDateTime(detail.latestJob.updated_at)}</time>}</div><ErrorBubble content={latestJobError} /></div>
@@ -4999,25 +4998,20 @@ function Chat({ onRetryVoice, detail, activities, activitiesLoading, sending, lo
   </section>;
 }
 
-function VoiceMessage({ prompt, userInitials, onRetry }: { prompt: PendingPrompt; userInitials: string; onRetry: (prompt: PendingPrompt) => Promise<void> }) {
-  const [busy, setBusy] = useState(false);
+function PendingVoiceStatus({ prompt, disabled, onRetry }: { prompt: PendingPrompt; disabled: boolean; onRetry: (prompt: PendingPrompt) => Promise<void> }) {
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
   const voice = prompt.voiceSubmission!;
   const failed = voice.state === "failed";
-  const complete = voice.state === "completed";
-  return <article className="message user voice-message" data-voice-submission-id={voice.id}>
-    <div className="message-avatar">{userInitials}</div><div className="message-body">
-      <div className="message-meta"><span className="message-name">你</span><time>{formatMessageDateTime(prompt.created_at)}</time></div>
-      {prompt.quote_excerpt && <blockquote>{prompt.quote_excerpt}</blockquote>}
-      {prompt.content && <p data-agent-selectable="true">{prompt.content}</p>}
-      {prompt.files.length > 0 && <div className="voice-message-files">{prompt.files.map(file => <a key={file.id} href={`${BASE_PATH}/api/files/${file.id}`} target="_blank" rel="noreferrer"><Paperclip size={13} />{file.original_name}</a>)}</div>}
-      <div className={`voice-message-status ${failed ? "failed" : ""}`} role="status" aria-live="polite">
-        {failed ? <CircleAlert size={15} /> : complete ? <Check size={15} /> : <LoaderCircle className="spin" size={15} />}
-        <span>{failed ? "语音识别失败，音频和附件已保留" : complete ? "已识别，等待执行" : "已发送，正在云识别，可离开此页面"}</span>
-        {failed && <button type="button" disabled={busy} onClick={() => { setBusy(true); setError(""); void onRetry(prompt).catch(reason => setError(reason instanceof Error ? reason.message : "重试失败")).finally(() => setBusy(false)); }}>重试识别</button>}
-      </div>{(error || (failed && voice.error)) && <small className="voice-error">{error || voice.error}</small>}
-    </div>
-  </article>;
+  return <div className={`pending-voice-status ${failed ? "failed" : ""}`} role="status" aria-live="polite">
+    {failed ? <CircleAlert size={13} /> : <LoaderCircle className="spin" size={13} />}
+    <span>{failed ? "识别失败，音频和附件已保留" : "正在进行语音识别…"}</span>
+    {failed && <button type="button" disabled={disabled || retrying} onClick={() => {
+      setRetrying(true); setError("");
+      void onRetry(prompt).catch(reason => setError(reason instanceof Error ? reason.message : "重试失败")).finally(() => setRetrying(false));
+    }}>重试识别</button>}
+    {(error || (failed && voice.error)) && <span className="pending-voice-error">{error || voice.error}</span>}
+  </div>;
 }
 
 function WakePlanCard({ plan, onCancel, onPostpone, onTrigger, onEdit }: { plan: WakePlan; onCancel: (plan: WakePlan) => Promise<void>; onPostpone: (plan: WakePlan) => Promise<void>; onTrigger: (plan: WakePlan) => Promise<void>; onEdit: () => void }) {
@@ -5235,7 +5229,7 @@ function FileCard({ file }: { file: WorkFile }) {
   </div>;
 }
 
-function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, onEdit, onDelete, onSteer }: {
+function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, onEdit, onDelete, onSteer, onRetryVoice }: {
   prompts: PendingPrompt[];
   busy: boolean;
   actionMode: "steer" | "insert";
@@ -5244,6 +5238,7 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
   onEdit: (prompt: PendingPrompt) => void;
   onDelete: (prompt: PendingPrompt) => void;
   onSteer: (prompt: PendingPrompt) => void;
+  onRetryVoice: (prompt: PendingPrompt) => Promise<void>;
 }) {
   const actionLabel = actionMode === "steer" ? "引导" : "插入";
   const queueSummary = waitingForWake
@@ -5311,10 +5306,10 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
           title="按住并上下拖动调整顺序" aria-label="按住并上下拖动调整顺序" aria-grabbed={draggingId === prompt.id}><GripVertical size={17} /></button>
         <div className="pending-queue-copy" title={prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、")}>
           <span>{prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、") || (prompt.voiceSubmission ? "语音消息" : "附件任务")}</span>
-          {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <small><Mic size={11} />{prompt.voiceSubmission.state === "failed" ? "识别失败，可在聊天中重试" : "正在云识别"}</small>}
           {prompt.quote_excerpt && <small><CornerUpLeft size={11} />含引用</small>}
           {prompt.files.length > 0 && <small><Paperclip size={11} />{prompt.files.length} 个附件</small>}
         </div>
+        {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
         <div className="pending-queue-actions">
           <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>
           <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
@@ -5353,7 +5348,7 @@ function ComposerSessions({ sessionKey, onTransfersChange, ...props }: Component
   </div>)}</>;
 }
 
-function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
+function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, onRetryVoice, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
   active?: boolean;
   accountId: string | null;
   conversationId: string | null;
@@ -5383,6 +5378,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   onEditPending: (prompt: PendingPrompt) => void;
   onDeletePending: (prompt: PendingPrompt) => void;
   onSteerPending: (prompt: PendingPrompt) => void;
+  onRetryVoice: (prompt: PendingPrompt) => Promise<void>;
   pendingActionMode: "steer" | "insert";
   waitingForWake: boolean;
   onCancelPendingEdit: () => void;
@@ -5668,7 +5664,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     : "新内容会进入待发送队列；可选择“插入”立即发送。";
   return <div className={`composer-wrap ${compactWrap ? "compact" : ""}`}>
     {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} waitingForWake={waitingForWake}
-      onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} />}
+      onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} onRetryVoice={onRetryVoice} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div ref={composerRef} className={`composer ${composerExpanded ? "expanded" : "compact"}`}
       onBlurCapture={(event) => {

@@ -164,3 +164,21 @@ Build the matching Worker 1.20.0 release from this public checkout. Optional hos
 The generic [Nginx template](../deploy/nginx/codex-web.conf) includes the dedicated `/codex-web/api/node-transfers/connect` WebSocket route, a 2 GiB body limit and 30-minute proxy/body budgets. Preserve the subpath when proxying. Application quotas and smaller reader/share limits still apply. Check both small direct and forced-relay test transfers in your own network, target SHA-256, `committed`, and both cleanup receipts. Local loopback tests do not establish NAT connectivity or Windows behavior.
 
 [Project skills](PROJECT_RECURRING_TASKS.md#项目技能) remain scoped to the selected project. Host operations independently verify project ownership in the bridge database. No account credentials or personal skills are provided. Codex SDK 0.162.1 is pinned; the separately installed Codex CLI/runtime still follows the operator's configured update policy.
+
+## October 14, 2026 voice queue checks
+
+The incremental voice queue presentation update adds no database migration,
+environment setting, dependency or Worker protocol change. The slim default
+image, optional `documents` target, isolated build/cleanup workflow and normal
+upgrade commands above remain unchanged. Keep username/password login,
+`/codex-web`, low-privilege tenants and disabled optional providers as configured.
+
+For an installation with voice enabled, verify recognition only in the pending
+queue; refresh during recognition and after completion, and confirm the same
+item remains. Check a failed recognition and explicit retry, then confirm that
+dispatch creates exactly one ordinary user message and removes the queue item.
+See [voice queue behavior and the isolated browser regression](VOICE_SEND.md#one-queue-item-until-execution).
+The regression uses synthetic audio/transcription and a controlled model runner
+with actual scheduler/database transitions; real provider/model and microphone checks
+remain separate operator acceptance. An installation with voice disabled does
+not need provider credentials merely to upgrade.
