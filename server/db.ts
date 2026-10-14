@@ -1,3 +1,4 @@
+import { migrateOpportunities } from "./opportunity-schema.js";
 import { migrateRecurring } from "./recurring-store.js";
 import { DEFAULT_FEATURE_SELECTION, isFeatureSelection, type FeatureSelection } from "../src/feature-selection.js";
 import { migratePara, migrateParaSidebar, migratePersonalKanban } from "./para-schema.js";
@@ -536,7 +537,7 @@ export type PendingPromptRow = {
   updated_at: string;
 };
 
-export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[] };
+export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[]; voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null } };
 
 export type WakePlanMode = "time" | "event_or_deadline";
 export type WakePlanState = "armed" | "triggered" | "cancelled";
@@ -740,6 +741,7 @@ const conversationSelect = `
   CASE WHEN
     EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id AND jobs.status='queued')
     OR EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id AND pending_prompts.status='queued')
+    OR EXISTS (SELECT 1 FROM voice_submissions WHERE voice_submissions.conversation_id=conversations.id AND voice_submissions.state IN ('queued','processing','failed'))
   THEN 1 ELSE 0 END AS has_pending_work,
   (SELECT count(1) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS active_wake_count,
   (SELECT min(deadline_at) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS next_wake_at,
@@ -787,6 +789,7 @@ export class AppDatabase {
       this.sqlite.exec("CREATE INDEX public_file_shares_expiry_idx ON public_file_shares(enabled,expires_at)");
     });
     this.applyMigration(2026101001, "project-recurring-tasks", () => migrateRecurring(this.sqlite));
+    this.applyMigration(2026101402, "opportunity-cards", () => migrateOpportunities(this.sqlite));
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain
@@ -1771,6 +1774,17 @@ export class AppDatabase {
         );
         CREATE INDEX IF NOT EXISTS voice_transcription_receipts_retention_idx ON voice_transcription_receipts(state,updated_at);
       `);
+    });
+    this.applyMigration(2026101401, "durable-voice-submissions", () => {
+      this.sqlite.exec(`CREATE TABLE voice_submissions (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        pending_prompt_id TEXT UNIQUE REFERENCES pending_prompts(id) ON DELETE SET NULL,
+        client_recording_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
+        audio_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','processing','failed','completed','cancelled')),
+        error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(user_id,client_recording_id)
+      ); CREATE INDEX voice_submissions_queue_idx ON voice_submissions(state,created_at);`);
     });
     this.applyMigration(2026082602, "reader-sources-and-annotations", () => {
       this.sqlite.exec(`
@@ -3593,6 +3607,13 @@ export class AppDatabase {
       .get(conversationId) as ConversationTitleAuditRow | undefined;
   }
 
+  hasConversationTitleAttemptForMessage(conversationId: string, messageId: string): boolean {
+    return Boolean(this.sqlite.prepare(`
+      SELECT 1 FROM conversation_title_audits
+      WHERE conversation_id=? AND json_extract(context_json,'$.triggerMessageId')=? LIMIT 1
+    `).get(conversationId, messageId));
+  }
+
   isFirstUserMessage(conversationId: string, messageId: string): boolean {
     const first = this.sqlite.prepare("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND is_internal=0 ORDER BY created_at,id LIMIT 1")
       .get(conversationId) as { id: string } | undefined;
@@ -4976,7 +4997,7 @@ export class AppDatabase {
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND status='queued'").get(conversationId) as { value: number };
+      const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND (status='queued' OR EXISTS (SELECT 1 FROM voice_submissions voice WHERE voice.pending_prompt_id=pending_prompts.id AND voice.state<>'completed'))").get(conversationId) as { value: number };
       this.sqlite.prepare(`
         INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -5033,7 +5054,7 @@ export class AppDatabase {
 
   createPendingPrompt(id: string, conversationId: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles {
     const now = new Date().toISOString();
-    const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND status='queued'").get(conversationId) as { value: number };
+    const next = this.sqlite.prepare("SELECT COALESCE(MAX(position),0)+1 AS value FROM pending_prompts WHERE conversation_id=? AND (status='queued' OR EXISTS (SELECT 1 FROM voice_submissions voice WHERE voice.pending_prompt_id=pending_prompts.id AND voice.state<>'completed'))").get(conversationId) as { value: number };
     this.sqlite.prepare(`
       INSERT INTO pending_prompts(id,conversation_id,content,quote_excerpt,agent_model,reasoning_effort,position,status,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,'queued',?,?)
@@ -5043,11 +5064,20 @@ export class AppDatabase {
     return this.getPendingPrompt(id)!;
   }
 
+  private pendingVoice(id: string): PendingPromptWithFiles["voiceSubmission"] {
+    return this.sqlite.prepare("SELECT id,state,error FROM voice_submissions WHERE pending_prompt_id=?").get(id) as PendingPromptWithFiles["voiceSubmission"];
+  }
+
+  pendingVoiceReady(id: string): boolean {
+    const voice = this.pendingVoice(id);
+    return !voice || voice.state === "completed";
+  }
+
   getPendingPrompt(id: string): PendingPromptWithFiles | undefined {
     const prompt = this.sqlite.prepare("SELECT * FROM pending_prompts WHERE id=?").get(id) as PendingPromptRow | undefined;
     if (!prompt) return undefined;
     const files = this.sqlite.prepare("SELECT * FROM files WHERE pending_prompt_id=? ORDER BY created_at,id").all(id) as FileRow[];
-    return { ...prompt, files };
+    return { ...prompt, files, voiceSubmission: this.pendingVoice(prompt.id) };
   }
 
   getPendingPromptForUser(id: string, userId: string): PendingPromptWithFiles | undefined {
@@ -5057,29 +5087,34 @@ export class AppDatabase {
       WHERE pending.id=? AND conversation.user_id=? AND conversation.deleted_at IS NULL
     `).get(id, userId) as PendingPromptRow | undefined;
     if (!prompt) return undefined;
-    return { ...prompt, files: this.sqlite.prepare("SELECT * FROM files WHERE pending_prompt_id=? ORDER BY created_at,id").all(id) as FileRow[] };
+    return { ...prompt, voiceSubmission: this.pendingVoice(prompt.id), files: this.sqlite.prepare("SELECT * FROM files WHERE pending_prompt_id=? ORDER BY created_at,id").all(id) as FileRow[] };
   }
 
   listPendingPrompts(conversationId: string, status: PendingPromptRow["status"] = "queued"): PendingPromptWithFiles[] {
-    const prompts = this.sqlite.prepare("SELECT * FROM pending_prompts WHERE conversation_id=? AND status=? ORDER BY position,id").all(conversationId, status) as PendingPromptRow[];
+    const prompts = this.sqlite.prepare(`SELECT * FROM pending_prompts WHERE conversation_id=? AND (
+      (?='queued' AND (status='queued' OR EXISTS (SELECT 1 FROM voice_submissions voice WHERE voice.pending_prompt_id=pending_prompts.id AND voice.state IN ('queued','processing','failed'))))
+      OR (?='editing' AND status='editing' AND NOT EXISTS (SELECT 1 FROM voice_submissions voice WHERE voice.pending_prompt_id=pending_prompts.id AND voice.state IN ('queued','processing','failed')))
+    ) ORDER BY position,id`).all(conversationId, status, status) as PendingPromptRow[];
     const files = this.sqlite.prepare("SELECT * FROM files WHERE conversation_id=? AND pending_prompt_id IS NOT NULL ORDER BY created_at,id").all(conversationId) as FileRow[];
-    return prompts.map((prompt) => ({ ...prompt, files: files.filter((file) => file.pending_prompt_id === prompt.id) }));
+    return prompts.map((prompt) => ({ ...prompt, voiceSubmission: this.pendingVoice(prompt.id), files: files.filter((file) => file.pending_prompt_id === prompt.id) }));
   }
 
   beginEditingPendingPrompt(id: string): PendingPromptWithFiles | undefined {
     const prompt = this.getPendingPrompt(id);
-    if (!prompt || prompt.status !== "queued") return undefined;
+    if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(id)) return undefined;
     this.sqlite.prepare("UPDATE pending_prompts SET status='editing',updated_at=? WHERE id=? AND status='queued'").run(new Date().toISOString(), id);
     return this.getPendingPrompt(id);
   }
 
   restorePendingPrompt(id: string): PendingPromptWithFiles | undefined {
+    if (!this.pendingVoiceReady(id)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.prepare("UPDATE pending_prompts SET status='queued',updated_at=? WHERE id=? AND status='editing'").run(now, id);
     return this.getPendingPrompt(id);
   }
 
   updatePendingPrompt(id: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles | undefined {
+    if (!this.pendingVoiceReady(id)) return undefined;
     const result = this.sqlite.prepare(`
       UPDATE pending_prompts SET content=?,quote_excerpt=?,agent_model=?,reasoning_effort=?,status='queued',updated_at=? WHERE id=?
     `).run(content, quoteExcerpt, selection.model, selection.reasoningEffort, new Date().toISOString(), id);
@@ -5087,6 +5122,7 @@ export class AppDatabase {
   }
 
   updateEditingPendingPrompt(id: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles | undefined {
+    if (!this.pendingVoiceReady(id)) return undefined;
     const result = this.sqlite.prepare(`
       UPDATE pending_prompts SET content=?,quote_excerpt=?,agent_model=?,reasoning_effort=?,updated_at=? WHERE id=? AND status='editing'
     `).run(content, quoteExcerpt, selection.model, selection.reasoningEffort, new Date().toISOString(), id);
@@ -5105,6 +5141,7 @@ export class AppDatabase {
     userId?: string;
     maximumStoredBytes?: number;
   }): PendingPromptWithFiles | undefined {
+    if (!this.pendingVoiceReady(input.id)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -5161,7 +5198,7 @@ export class AppDatabase {
     }
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      const update = this.sqlite.prepare("UPDATE pending_prompts SET position=?,updated_at=? WHERE id=? AND conversation_id=? AND status='queued'");
+      const update = this.sqlite.prepare("UPDATE pending_prompts SET position=?,updated_at=? WHERE id=? AND conversation_id=? AND (status='queued' OR EXISTS (SELECT 1 FROM voice_submissions voice WHERE voice.pending_prompt_id=pending_prompts.id AND voice.state IN ('queued','processing','failed')))");
       const now = new Date().toISOString();
       orderedIds.forEach((id, index) => update.run(index + 1, now, id, conversationId));
       this.sqlite.exec("COMMIT");
@@ -5466,6 +5503,9 @@ export class AppDatabase {
       SELECT pending.* FROM pending_prompts pending
       JOIN conversations conversation ON conversation.id=pending.conversation_id
       WHERE pending.status='queued' AND conversation.deleted_at IS NULL AND conversation.external_status<>'running'
+        AND NOT EXISTS (SELECT 1 FROM voice_submissions voice JOIN pending_prompts blocked ON blocked.id=voice.pending_prompt_id
+          WHERE blocked.conversation_id=pending.conversation_id AND blocked.status IN ('queued','editing')
+          AND blocked.position<=pending.position AND voice.state<>'completed')
         AND NOT EXISTS (
           SELECT 1 FROM jobs active
           WHERE active.conversation_id=pending.conversation_id AND active.status IN ('queued','running')
@@ -5482,7 +5522,7 @@ export class AppDatabase {
 
   materializePendingPrompt(pendingId: string, messageId: string, jobId: string): JobRow | undefined {
     const prompt = this.getPendingPrompt(pendingId);
-    if (!prompt || prompt.status !== "queued") return undefined;
+    if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(pendingId)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -5517,7 +5557,7 @@ export class AppDatabase {
 
   materializeSteeredPrompt(pendingId: string, messageId: string): MessageRow | undefined {
     const prompt = this.getPendingPrompt(pendingId);
-    if (!prompt || prompt.status !== "queued") return undefined;
+    if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(pendingId)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -5558,7 +5598,7 @@ export class AppDatabase {
     const row = this.sqlite.prepare("SELECT value FROM user_settings WHERE user_id=? AND key='feature_selection'").get(userId) as { value: string } | undefined;
     try {
       const value: unknown = JSON.parse(row?.value ?? "null");
-      if (isFeatureSelection(value)) return value;
+      if (isFeatureSelection(value)) return { ...value, opportunityCards: value.opportunityCards === true };
     } catch { /* An absent or invalid preference keeps optional features hidden. */ }
     return { ...DEFAULT_FEATURE_SELECTION };
   }
@@ -5573,7 +5613,7 @@ export class AppDatabase {
         this.sqlite.exec("ROLLBACK");
         return null;
       }
-      const next = { paraBoard: value.paraBoard, revision: current.revision + 1 };
+      const next = { paraBoard: value.paraBoard, opportunityCards: value.opportunityCards ?? current.opportunityCards ?? false, revision: current.revision + 1 };
       this.sqlite.prepare(`
         INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'feature_selection',?,?)
         ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at

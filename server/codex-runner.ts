@@ -997,7 +997,7 @@ function commandProgressLabel(command: string, status: "in_progress" | "complete
 
 function remoteOmissionReason(reason: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]>[number]["reason"]): string {
   return ({
-    count_limit: "超过单轮 20 个文件上限",
+    count_limit: "超过本轮自动回传数量上限，不限制本机生成或保存文件",
     outside_project: "路径不在项目根目录内",
     missing: "完成时文件已不存在",
     not_file: "目标不是普通文件",

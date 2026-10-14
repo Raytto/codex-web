@@ -203,39 +203,38 @@ The default Compose file has no host bridge mount, Remote Worker enrollment toke
 - Docker Engine with Docker Compose v2
 - At least 4 GB RAM; 8 GB is recommended for document-heavy tasks
 - A Codex account that can sign in through the Codex CLI
-- Node.js 22+ only if you want to run the test suite or password helper locally
+- Git and Docker Buildx; Node.js 22+ only for local development/tests
+
+The measured Linux amd64 base image is about 1.53 GB; a clean installation after build cleanup is about 1.87 GB, including retained build tooling. The observed Docker build peak was 6.01 GB. These figures exclude OS/Docker installation, swap, backups and user data; see [measurement boundaries and closeout](docs/BUILD_AND_STORAGE.md#measured-clean-install-example-2026-10-14).
 
 ## Quick start
 
 > Deploying Codex Web on a new cloud server? Follow the [AI cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md) and its [deployment options guide](docs/DEPLOYMENT_OPTIONS.md). They cover SSH administration, the base owner account, Codex authentication, Docker, Nginx, optional domain/TLS, backups, updates, and the yes/no flow for each extension. The steps below are the minimal local quick start.
 
-1. Copy the configuration template:
+1. Build the reviewed `main` commit with a temporary, isolated builder:
 
    ```bash
+   ./scripts/build-image.sh
    cp .env.example .env
+   chmod 600 .env
    ```
 
-2. Install development dependencies and generate a password hash:
+2. Generate the password hash from this image using the [stdin password command](docs/BUILD_AND_STORAGE.md#new-production-installation). No host `npm ci` is needed. Store it in `APP_PASSWORD_HASH`, set a random `SESSION_SECRET` of at least 32 characters, and set `APP_USERNAME`/`APP_DISPLAY_NAME` in `.env`.
 
-   ```bash
-   npm ci
-   npm run hash-password -- 'choose-a-long-unique-password'
-   ```
-
-3. Put the generated hash in `APP_PASSWORD_HASH`, set a random `SESSION_SECRET` of at least 32 characters, and adjust `APP_USERNAME` and `APP_DISPLAY_NAME` in `.env`.
-
-4. Build and start the service:
+3. After editing `.env`, run `sudo chown 10001:10001 .env && sudo chmod 600 .env` so only the web UID can read it. Create the network and start the image:
 
    ```bash
    docker network inspect codex-web-egress >/dev/null 2>&1 \
      || docker network create codex-web-egress
-   docker compose up -d
+   sudo docker compose up -d --no-build
    ```
+
+4. Follow the [build, optional tools, capacity and cleanup guide](docs/BUILD_AND_STORAGE.md). The default base image excludes office tools; choose `documents` if needed. The build helper removes its own build/test cache. Application footprint, build peak, OS, swap and user data are separate budgets.
 
 5. Sign the isolated owner worker into Codex:
 
    ```bash
-   docker compose exec --user 11001:11001 \
+   sudo docker compose exec --user 11001:11001 \
      -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
      -e CODEX_HOME=/app/tenants/00000000-0000-4000-8000-000000000001/codex-home \
      app codex login --device-auth
@@ -243,7 +242,7 @@ The default Compose file has no host bridge mount, Remote Worker enrollment toke
 
 6. Open [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/).
 
-State is stored in Docker named volumes. Closing the browser does not remove queued work, attachments, unsent composer drafts, or archived conversations.
+State is stored in bind-mounted directories under `.state/` by default. Closing the browser does not remove queued work, attachments, unsent composer drafts, or archived conversations.
 
 For an auditable source-based publish, enqueue a clean commit with
 `deploy/codex-web-request-rebuild` and let `deploy/codex-web-rebuild-coordinator`
@@ -333,3 +332,12 @@ Reader links open in the current tab and show a **Back to workspace** control. A
 - Composer writes release their input lock after durable confirmation, before background refresh. A timeout preserves the input and does not automatically resend it. The bundled Codex SDK is pinned to 0.162.1.
 
 Username/password login, `/codex-web`, isolated tenant workers and empty optional integrations remain the deployment defaults. See [deployment](docs/DEPLOYMENT.md) before enabling host or remote capabilities.
+
+
+## Recent product updates / 近期更新
+
+- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription, survive restart, and use idempotent retries. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
+- [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. No private business topics, credentials or pre-created schedules are shipped.
+- Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
+- [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
+- Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.

@@ -53,8 +53,8 @@ the operator changes their mind.
      || sudo docker network create codex-web-egress
    ```
 
-3. Run `sudo docker compose config --quiet`, `sudo docker compose build --pull`,
-   and `sudo docker compose up -d`. The published port must remain bound to
+3. Follow the [clean build and stdin password steps](BUILD_AND_STORAGE.md#new-production-installation): run `sudo ./scripts/build-image.sh`, give the private `.env` to UID/GID 10001 with mode 600, then run `sudo docker compose config --quiet`
+   and `sudo docker compose up -d --no-build`. The published port must remain bound to
    `127.0.0.1`; put TLS and the `/codex-web/` path at the reverse proxy.
 4. Check `docker compose ps`, the container health check, and
    `curl --fail http://127.0.0.1:37821/codex-web/api/health` (adjust the path
@@ -360,3 +360,10 @@ Configured account-management deployments may inspect reset credits without spen
 Node-to-node and node-to-server transfers require an explicitly configured administrator, matching Worker 1.20.0 endpoints and an operator-configured host bridge for the server endpoint. `PUBLIC_BASE_URL` includes the deployment subpath; configure the dedicated WSS proxy route from the generic template. Keep host socket and roots empty when not needed. This feature never mounts the Docker socket or host filesystem in the default Compose configuration. See [node transfers](NODE_TRANSFERS.md) for trust, quotas, receipt semantics and deployment checks.
 
 Recurring tasks need no external integration and persist in the application's database. Host project-skill editing uses the same optional bridge and independent ownership checks; ordinary local project skills keep tenant root validation. Remote skill editing through the web is not supported. See [schedules and project skills](PROJECT_RECURRING_TASKS.md).
+
+
+## Base image and October updates
+
+The [build and capacity guide](BUILD_AND_STORAGE.md) defines the base/document profiles, isolated build cleanup, direct bundled Codex runtime and upgrade migration. Default Compose retains read-only application layers, separate web/tenant UIDs, no Docker socket and empty optional host/Worker/model configuration. `documents` only adds office tools; it grants no host capability. Runtime state is created after installation under the configured state root and is excluded from build context.
+
+[Voice submissions](VOICE_SEND.md) add durable accepted/processing/failed states and restart recovery; [opportunity cards](OPPORTUNITY_CARDS.md) start empty and disabled, enforce account/project ownership, CSRF on browser writes and scoped live-Job authorization on automation writes. These changes do not introduce phone/SMS login or production provider defaults. Migrations `2026101401` and `2026101402` require the usual pre-upgrade state backup. Worker 1.20.2 permits 256 automatic results per batch without raising byte/time limits.

@@ -1,3 +1,4 @@
+import { OpportunitySidebar, OpportunityWorkspace } from "./opportunities";
 import { RecurringSidebar, RecurringWorkspace } from "./recurring-tasks";
 import type { RecurringTask } from "./recurring-types";
 import { NodeTransfersDialog } from "./node-transfers-dialog";
@@ -6,7 +7,7 @@ import { FeatureSelectionDialog } from "./feature-selection-dialog";
 import type { FeatureSelection } from "./feature-selection";
 import { ParaSidebar, ParaWorkspace, NewProjectChoice, ParaConversationProjectsDialog, ParaCollectButton } from "./para";
 import { DeploymentDetails, deploymentStepLabel } from "./deployment-progress";
-import { createContext, useContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
+import { createContext, useContext, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ClipboardEvent, type CSSProperties, type Dispatch, type DragEvent, type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -55,7 +56,9 @@ import type { ReaderSelection } from "./reader-ask";
 import { handleReaderLinkClick, ReaderBackLink } from "./reader/navigation";
 import { FileReaderLayout, preparedReaderDocument, useOutlineState } from "./reader/LegacyReader";
 import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
+import { useConversationState } from "./conversation/useConversationState";
 import { useVoiceInput } from "./conversation/useVoiceInput";
+import type { VoiceInputContext } from "./conversation/useVoiceInput";
 import { ConversationMessageList } from "./conversation/ConversationMessageList";
 import { ConversationComposerReference } from "./conversation/ConversationComposer";
 import { SettingMenu } from "./conversation/SettingMenu";
@@ -1078,6 +1081,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [conversationBodySearchLoading, setConversationBodySearchLoading] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [createTypeOpen, setCreateTypeOpen] = useState(false);
+  const [opportunityVisible, setOpportunityVisible] = useState(false);
+  const [opportunityTopic, setOpportunityTopic] = useState<string | null>(null);
+  const [opportunityNavigation, setOpportunityNavigation] = useState(0);
+  const [opportunityReturn, setOpportunityReturn] = useState(false);
+  function openOpportunities(topicId?: string) {
+    if (!leaveRecurring() || !features.opportunityCards) return;
+    setParaVisible(false); setOpportunityVisible(true); setSidebarOpen(false);
+    if (topicId) setOpportunityTopic(topicId);
+    setOpportunityNavigation(n => n + 1);
+  }
+  useEffect(() => { if (!features.opportunityCards) { setOpportunityVisible(false); setOpportunityReturn(false); } }, [features.opportunityCards]);
   const kanbanLocationKey = `codex-web:${session.accountId}:kanban-location`;
   const [initialKanbanLocation] = useState(() => {
     try {
@@ -1101,7 +1115,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function openPara(boardId: string, projectId: string | null = null) {
     if (!leaveRecurring()) return;
     if (!features.paraBoard) return;
-    setParaBoardId(boardId); setParaProjectId(projectId); setParaNavigation(n => n + 1); setParaVisible(true); setSidebarOpen(false);
+    setParaBoardId(boardId); setParaProjectId(projectId); setParaNavigation(n => n + 1); setParaVisible(true); setOpportunityVisible(false); setSidebarOpen(false);
   }
   useEffect(() => {
     if (!features.paraBoard) {
@@ -1122,7 +1136,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function openRecurring(projectId: string, taskId: string | null) {
     if (recurringView?.projectId === projectId && recurringView.taskId === taskId) { setSidebarOpen(false); setProjectMenu(null); return; }
     if (!leaveRecurring()) return;
-    setParaVisible(false); setRecurringView({ projectId, taskId }); setSidebarOpen(false); setProjectMenu(null);
+    setParaVisible(false); setOpportunityVisible(false); setRecurringView({ projectId, taskId }); setSidebarOpen(false); setProjectMenu(null);
   }
   const refreshRecurring = useCallback(async () => {
     try { setRecurringTasks((await api.recurringTasks()).tasks); setRecurringError(""); }
@@ -1145,27 +1159,30 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [conversationDropTarget, setConversationDropTarget] = useState<{ id: string; placement: DropPlacement } | null>(null);
   const [conversationProjectDropTarget, setConversationProjectDropTarget] = useState<ConversationProjectDropTarget | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const composerScope = selectedId ?? `new:${activeProjectId ?? "default"}`;
   const [conversationSelectionReady, setConversationSelectionReady] = useState(false);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth);
   const [query, setQuery] = useState("");
-  const [input, setInput] = useState("");
-  const [askAgentQuote, setAskAgentQuote] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
-  const [composerDraft, setComposerDraft] = useState<ComposerDraft | null>(null);
-  const [draftUploads, setDraftUploads] = useState<DraftUpload[]>([]);
-  const [draftSaveState, setDraftSaveState] = useState<DraftSaveState>("idle");
+  const [input, setInput] = useConversationState(composerScope, "");
+  const [askAgentQuote, setAskAgentQuote] = useConversationState(composerScope, "");
+  const [files, setFiles] = useConversationState<File[]>(composerScope, []);
+  const [composerDraft, setComposerDraft] = useConversationState<ComposerDraft | null>(composerScope, null);
+  const [draftUploads, setDraftUploads] = useConversationState<DraftUpload[]>(composerScope, []);
+  const [draftSaveState, setDraftSaveState] = useConversationState<DraftSaveState>(composerScope, "idle");
   const [maintenancePhase, setMaintenancePhase] = useState<MaintenancePhase>(() => normalizedMaintenancePhase(session.maintenancePhase, session.maintenance));
   const [maintenanceStatus, setMaintenanceStatus] = useState<SystemStatus | null>(null);
   const [voiceInputActive, setVoiceInputActive] = useState(false);
+  const [voiceTransfers, setVoiceTransfers] = useState<Record<string, boolean>>({});
   const [instanceReloadDeferred, setInstanceReloadDeferred] = useState(false);
-  const [editingPending, setEditingPending] = useState<PendingPrompt | null>(null);
-  const [removedEditingFileIds, setRemovedEditingFileIds] = useState<string[]>([]);
+  const [editingPending, setEditingPending] = useConversationState<PendingPrompt | null>(composerScope, null);
+  const [removedEditingFileIds, setRemovedEditingFileIds] = useConversationState<string[]>(composerScope, []);
   const [sending, setSending] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [steering, setSteering] = useState(false);
-  const steeringRef = useRef(false);
+  const [submitting, setSubmitting] = useConversationState(composerScope, false);
+  const [composerError, setComposerError] = useConversationState(composerScope, "");
+  const [steering, setSteering] = useConversationState(composerScope, false);
+  const steeringRef = useRef(new Set<string>());
   const [job, setJob] = useState<Job | null>(null);
   const [activities, setActivities] = useState<JobEvent[]>([]);
   const [activitiesLoading, setActivitiesLoading] = useState(false);
@@ -1234,7 +1251,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const draftMutationGenerationRef = useRef(new Map<string, number>());
   const composerMutationsRef = useRef(new Map<string, number>());
   const draftSaveTimerRef = useRef<number | null>(null);
-  const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const draftSaveQueuesRef = useRef(new Map<string, Promise<void>>());
+  const draftSaveQueue = (id: string) => draftSaveQueuesRef.current.get(id) ?? Promise.resolve();
   const touchDragRef = useRef<TouchDrag | null>(null);
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const executorCatalogTimesRef = useRef(new Map<string, string | null>());
@@ -1277,7 +1295,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const applySystemStatus = (status: SystemStatus): boolean => {
       if (serverInstanceIdRef.current && status.instanceId && serverInstanceIdRef.current !== status.instanceId) {
         serverInstanceIdRef.current = status.instanceId;
-        if (voiceInputActiveRef.current || instanceReloadDeferredRef.current) {
+        if (voiceInputActiveRef.current || instanceReloadDeferredRef.current || [...setSubmitting.entries()].some(([, busy]) => busy) || [...setDraftUploads.entries()].some(([, uploads]) => uploads.length > 0)) {
           instanceReloadDeferredRef.current = true;
           setInstanceReloadDeferred(true);
         } else {
@@ -1458,8 +1476,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   const persistComposerDraft = useCallback((conversationId: string, content: string, quoteExcerpt: string, keepalive = false) => {
     const signature = composerDraftSignature(content, quoteExcerpt);
-    const operation = draftSaveQueueRef.current.catch(() => undefined).then(async () => {
-      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState("saving");
+    const operation = (draftSaveQueuesRef.current.get(conversationId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState.for(conversationId, "saving");
       const result = await api.saveConversationDraft(conversationId, content, quoteExcerpt, keepalive && new Blob([content, quoteExcerpt]).size < 60_000);
       draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
       draftSyncedSignaturesRef.current.set(conversationId, signature);
@@ -1467,14 +1485,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (cached) draftCacheRef.current.set(conversationId, { ...cached, composerDraft: result.composerDraft });
       if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
         composerDraftRef.current = result.composerDraft;
-        setComposerDraft(result.composerDraft);
-        setDraftSaveState(composerDraftSignature(inputRef.current, askAgentQuoteRef.current) === signature ? "saved" : "unsaved");
+        setComposerDraft.for(conversationId, result.composerDraft);
+        setDraftSaveState.for(conversationId, composerDraftSignature(inputRef.current, askAgentQuoteRef.current) === signature ? "saved" : "unsaved");
       }
     }).catch((reason) => {
-      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState("error");
+      if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState.for(conversationId, "error");
       throw reason;
     });
-    draftSaveQueueRef.current = operation.catch(() => undefined);
+    draftSaveQueuesRef.current.set(conversationId, operation.catch(() => undefined));
     return operation;
   }, []);
 
@@ -1594,26 +1612,30 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
     if (canRestoreComposer && result.editingPrompt) {
       composerDraftRef.current = result.composerDraft;
-      setComposerDraft(result.composerDraft);
+      setComposerDraft.for(id, result.composerDraft);
       const cachedDraft = draftCacheRef.current.get(id);
       if (cachedDraft) draftCacheRef.current.set(id, { ...cachedDraft, composerDraft: result.composerDraft });
       if (editingPendingRef.current?.id !== result.editingPrompt.id) {
         editingPendingRef.current = result.editingPrompt;
-        setEditingPending(result.editingPrompt);
-        setRemovedEditingFileIds([]);
-        setFiles([]);
-        setInput(result.editingPrompt.content);
-        setAskAgentQuote(result.editingPrompt.quote_excerpt ?? "");
+        setEditingPending.for(id, result.editingPrompt);
+        setRemovedEditingFileIds.for(id, []);
+        setFiles.for(id, []);
+        setInput.for(id, result.editingPrompt.content);
+        setAskAgentQuote.for(id, result.editingPrompt.quote_excerpt ?? "");
       }
     } else if (canRestoreComposer) {
       const wasEditing = Boolean(editingPendingRef.current);
       if (wasEditing) {
         editingPendingRef.current = null;
-        setEditingPending(null);
-        setRemovedEditingFileIds([]);
+        setEditingPending.for(id, null);
+        setRemovedEditingFileIds.for(id, []);
         draftLoadedConversationRef.current = null;
       }
-      const cached = draftCacheRef.current.get(id);
+      const saved = draftCacheRef.current.get(id);
+      const localContent = setInput.get(id);
+      const localQuote = setAskAgentQuote.get(id);
+      const cached = saved ?? (localContent || localQuote || setFiles.get(id).length
+        ? { content: localContent, quoteExcerpt: localQuote, composerDraft: setComposerDraft.get(id) } : undefined);
       const shouldRestore = wasEditing || draftLoadedConversationRef.current !== id;
       if (shouldRestore) {
         const cachedSignature = cached ? composerDraftSignature(cached.content, cached.quoteExcerpt) : undefined;
@@ -1625,13 +1647,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         };
         draftLoadedConversationRef.current = id;
         composerDraftRef.current = restored.composerDraft;
-        setComposerDraft(restored.composerDraft);
-        setInput(restored.content);
-        setAskAgentQuote(restored.quoteExcerpt);
-        setFiles([]);
+        setComposerDraft.for(id, restored.composerDraft);
+        setInput.for(id, restored.content);
+        setAskAgentQuote.for(id, restored.quoteExcerpt);
+        if (!cached) setFiles.for(id, []);
         draftCacheRef.current.set(id, restored);
         if (!cachedIsDirty) draftSyncedSignaturesRef.current.set(id, composerDraftSignature(restored.content, restored.quoteExcerpt));
-        setDraftSaveState(cachedIsDirty ? "unsaved" : restored.composerDraft ? "saved" : "idle");
+        setDraftSaveState.for(id, cachedIsDirty ? "unsaved" : restored.composerDraft ? "saved" : "idle");
       } else {
         const localSignature = composerDraftSignature(inputRef.current, askAgentQuoteRef.current);
         const syncedSignature = draftSyncedSignaturesRef.current.get(id);
@@ -1640,13 +1662,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         const serverSignature = composerDraftSignature(serverContent, serverQuote);
         const serverDraft = result.composerDraft;
         composerDraftRef.current = serverDraft;
-        setComposerDraft(serverDraft);
+        setComposerDraft.for(id, serverDraft);
         if (localSignature === syncedSignature && serverSignature !== syncedSignature) {
-          setInput(serverContent);
-          setAskAgentQuote(serverQuote);
+          setInput.for(id, serverContent);
+          setAskAgentQuote.for(id, serverQuote);
           draftSyncedSignaturesRef.current.set(id, serverSignature);
           draftCacheRef.current.set(id, { content: serverContent, quoteExcerpt: serverQuote, composerDraft: serverDraft });
-          setDraftSaveState(serverDraft ? "saved" : "idle");
+          setDraftSaveState.for(id, serverDraft ? "saved" : "idle");
         } else {
           const current = draftCacheRef.current.get(id);
           if (current) draftCacheRef.current.set(id, { ...current, composerDraft: serverDraft });
@@ -1782,8 +1804,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     // Search includes collapsed folders without overwriting their saved expansion.
     searchProjectCollapseRef.current = { query, values: {} };
     setSearchProjectCollapse(searchProjectCollapseRef.current);
-    const snapshot = projects.filter((project) => !isProjectCollapsed(project.id)
-      && (Boolean(query) || project.id === activeProjectIdRef.current || Boolean(projectConversationPagesRef.current[project.id])));
+    // Every expanded folder needs a first page, including inactive projects.
+    const snapshot = projects.filter((project) => !isProjectCollapsed(project.id));
     const snapshotIds = snapshot.map((project) => project.id);
     const clearedPages = { ...projectConversationPagesRef.current };
     for (const projectId of snapshotIds) delete clearedPages[projectId];
@@ -1877,7 +1899,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       }
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "模型选项加载失败"));
   }, [activeProjectId, executorCatalogEpoch, projectsLoaded]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!conversationSelectionReady) return;
     autoFollowRef.current = true;
     lastScrollTopRef.current = 0;
@@ -1890,7 +1912,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       eventSourceRef.current?.close(); connectedJobRef.current = null;
       setDetail(null); setJob(null); setSending(false); setActivities([]); setActivitiesLoading(false);
       setEditingPending(null); setRemovedEditingFileIds([]); setAskAgentQuote("");
-      composerDraftRef.current = null; setComposerDraft(null); setDraftUploads([]); setDraftSaveState("idle");
+      composerDraftRef.current = null; setComposerDraft(null); setDraftSaveState("idle");
       draftLoadedConversationRef.current = null;
       if (agentOptions) {
         setSelectedModel(agentOptions.selection.model);
@@ -1899,14 +1921,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       return;
     }
     writeStoredSelection(window.localStorage, selectionStorageKeys.conversation, selectedId);
-    eventSourceRef.current?.close(); connectedJobRef.current = null; lastEventJobRef.current = null; lastEventIdRef.current = 0; setActivities([]); setActivitiesLoading(true);
-    editingPendingRef.current = null; setEditingPending(null); setRemovedEditingFileIds([]); setFiles([]); setDraftUploads([]);
+    eventSourceRef.current?.close(); connectedJobRef.current = null; lastEventJobRef.current = null; lastEventIdRef.current = 0; setJob(null); setSending(false); setActivities([]); setActivitiesLoading(true);
+    editingPendingRef.current = editingPending;
     const cached = draftCacheRef.current.get(selectedId);
     draftLoadedConversationRef.current = cached ? selectedId : null;
-    composerDraftRef.current = cached?.composerDraft ?? null;
-    setComposerDraft(cached?.composerDraft ?? null);
-    setInput(cached?.content ?? "");
-    setAskAgentQuote(cached?.quoteExcerpt ?? "");
+    composerDraftRef.current = cached?.composerDraft ?? setComposerDraft.get(selectedId);
+    setComposerDraft(composerDraftRef.current);
+    setInput(cached?.content ?? setInput.get(selectedId));
+    setAskAgentQuote(cached?.quoteExcerpt ?? setAskAgentQuote.get(selectedId));
     setDraftSaveState(cached ? "unsaved" : "idle");
     void reconcile(selectedId, true);
     setSidebarOpen(false);
@@ -1936,13 +1958,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const currentDraftSignature = composerDraftSignature(input, askAgentQuote);
     if (!canApplyDeferredInstanceReload({
       voiceActive: voiceInputActive,
-      submitting,
+      submitting: [...setSubmitting.entries()].some(([, busy]) => busy),
       conversationId: selectedId,
       editingPending: Boolean(editingPending),
       input,
       quoteExcerpt: askAgentQuote,
       looseFileCount: files.length,
-      uploadCount: draftUploads.length,
+      uploadCount: [...setDraftUploads.entries()].reduce((count, [, uploads]) => count + uploads.length, 0),
       draftLoaded: Boolean(selectedId && draftLoadedConversationRef.current === selectedId),
       currentDraftSignature,
       syncedDraftSignature: selectedId ? draftSyncedSignaturesRef.current.get(selectedId) : undefined,
@@ -1954,9 +1976,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   useEffect(() => () => {
     if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
     const conversationId = selectedId;
-    if (!conversationId || editingPendingRef.current || composerMutationsRef.current.has(conversationId) || draftLoadedConversationRef.current !== conversationId) return;
-    const content = inputRef.current;
-    const quoteExcerpt = askAgentQuoteRef.current;
+    if (!conversationId || setEditingPending.get(conversationId) || composerMutationsRef.current.has(conversationId) || !draftCacheRef.current.has(conversationId)) return;
+    // Cleanup runs after selection changes; global refs already belong to the
+    // next task. Flush the departing task's own unsent text instead.
+    const content = setInput.get(conversationId);
+    const quoteExcerpt = setAskAgentQuote.get(conversationId);
     if (composerDraftSignature(content, quoteExcerpt) !== draftSyncedSignaturesRef.current.get(conversationId)) {
       void persistComposerDraft(conversationId, content, quoteExcerpt, true).catch(() => undefined);
     }
@@ -2315,7 +2339,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   function selectProject(projectId: string) {
     if (!leaveRecurring()) return;
-    setParaVisible(false);
+    setParaVisible(false); setOpportunityVisible(false);
     if (projectId === activeProjectIdRef.current) return;
     acceptManualConversationSelection();
     writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
@@ -2337,7 +2361,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function selectProjectConversation(projectId: string, conversationId: string) {
     if (!leaveRecurring()) return;
     acceptManualConversationSelection();
-    setParaVisible(false);
+    setParaVisible(false); setOpportunityVisible(false);
     const conversation = projectConversationPagesRef.current[projectId]?.conversations.find((item) => item.id === conversationId);
     if (conversation) {
       retainedConversationRef.current = conversation;
@@ -2367,7 +2391,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function selectConversation(conversation: Conversation) {
     if (!leaveRecurring()) return;
     acceptManualConversationSelection();
-    setParaVisible(false);
+    setParaVisible(false); setOpportunityVisible(false);
     retainedConversationRef.current = conversation;
     retainedConversationNeedsNaturalPageRef.current = null;
     selectedIdRef.current = conversation.id;
@@ -2901,6 +2925,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }, [job?.id, refreshActivity, selectedId, sending]);
 
   useEffect(() => {
+    if (!selectedId || detail?.conversation.id !== selectedId || !detail.pendingPrompts.some(prompt =>
+      prompt.voiceSubmission && ["queued", "processing"].includes(prompt.voiceSubmission.state))) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && selectedIdRef.current === selectedId) void reconcile(selectedId);
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  // SSE is primary; this bounded refresh recovers a missed completion event.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, detail?.pendingPrompts]);
+
+  useEffect(() => {
     const timers = new Map<string, number>();
     const conversations = new Map<string, Set<string>>();
     const changed = (event: Event) => {
@@ -2966,7 +3001,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   async function newConversation(projectId = activeProjectIdRef.current ?? undefined) {
     if (!leaveRecurring()) return;
-    setParaVisible(false);
+    setParaVisible(false); setOpportunityVisible(false);
     const creationKey = projectId ?? "__default__";
     if (creatingConversationProjectsRef.current.has(creationKey)) return;
     creatingConversationProjectsRef.current.add(creationKey);
@@ -3072,6 +3107,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       files: [...current.files, ...result.uploadedFiles.filter((uploadedFile) => !current.files.some((file) => file.id === uploadedFile.id))],
       updated_at: result.composerDraft.updated_at,
     } : result.composerDraft;
+    setComposerDraft.for(conversationId, mergeUpload(setComposerDraft.get(conversationId)));
     if (selectedIdRef.current === conversationId && !editingPendingRef.current) {
       const merged = mergeUpload(composerDraftRef.current);
       composerDraftRef.current = merged;
@@ -3097,7 +3133,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       ({ Upload: TusUpload } = await import("tus-js-client"));
     } catch (reason) {
       setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
-      setError(reason instanceof Error ? reason.message : "无法加载断点续传组件，请检查网络后重试");
+      setComposerError(reason instanceof Error ? reason.message : "无法加载断点续传组件，请检查网络后重试");
       return;
     }
     const client = new TusUpload(file, {
@@ -3123,7 +3159,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       onError(reason) {
         if (cancelledDraftUploadIdsRef.current.has(upload.id)) return;
         setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
-        setError(reason instanceof Error ? reason.message : "草稿附件断点续传失败，可点击继续重试");
+        setComposerError(reason instanceof Error ? reason.message : "草稿附件断点续传失败，可点击继续重试");
       },
       onSuccess() {
         void (async () => {
@@ -3136,7 +3172,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             setDraftUploads((current) => current.filter((item) => item.id !== upload.id));
           } catch (reason) {
             setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
-            setError(reason instanceof Error ? reason.message : "上传完成登记失败，可点击继续恢复");
+            setComposerError(reason instanceof Error ? reason.message : "上传完成登记失败，可点击继续恢复");
           }
         })();
       },
@@ -3148,7 +3184,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       client.start();
     } catch (reason) {
       setDraftUploads((current) => current.map((item) => item.id === upload.id ? { ...item, status: "error" } : item));
-      setError(reason instanceof Error ? reason.message : "无法启动断点续传");
+      setComposerError(reason instanceof Error ? reason.message : "无法启动断点续传");
     }
   }
 
@@ -3166,7 +3202,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       id: crypto.randomUUID(), name: file.name, resumable: file.size >= RESUMABLE_UPLOAD_THRESHOLD_BYTES, progress: 0, status: "uploading",
     }));
     setDraftUploads((current) => [...current, ...uploads]);
-    setError("");
+    setComposerError("");
     await Promise.all(accepted.map(async (file, index) => {
       const upload = uploads[index];
       if (upload.resumable) {
@@ -3179,7 +3215,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         const result = await api.uploadConversationDraftFiles(conversationId, [file], controller.signal);
         await mergeCompletedDraftUpload(conversationId, upload, result);
       } catch (reason) {
-        if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "草稿附件上传失败");
+        if (!controller.signal.aborted) setComposerError(reason instanceof Error ? reason.message : "草稿附件上传失败");
       } finally {
         draftUploadControllersRef.current.delete(upload.id);
         cancelledDraftUploadIdsRef.current.delete(upload.id);
@@ -3259,10 +3295,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setSubmitting(true);
     const finishMutation = beginComposerMutation(conversationId);
     try {
-      await draftSaveQueueRef.current;
+      await draftSaveQueue(conversationId);
       await api.deleteConversationDraft(conversationId);
       draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
       draftCacheRef.current.delete(conversationId);
+      setComposerDraft.for(conversationId, null); setInput.for(conversationId, ""); setAskAgentQuote.for(conversationId, ""); setFiles.for(conversationId, []);
       draftSyncedSignaturesRef.current.set(conversationId, composerDraftSignature("", ""));
       if (selectedIdRef.current === conversationId) {
         composerDraftRef.current = null; inputRef.current = ""; askAgentQuoteRef.current = "";
@@ -3278,6 +3315,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const cached = draftCacheRef.current.get(conversationId);
     const cachedDraft = selected ? composerDraftRef.current : cached?.composerDraft ?? null;
     draftCacheRef.current.set(conversationId, { content, quoteExcerpt, composerDraft: cachedDraft });
+    setInput.for(conversationId, content); setAskAgentQuote.for(conversationId, quoteExcerpt);
     if (selected && !editingPendingRef.current) {
       inputRef.current = content;
       askAgentQuoteRef.current = quoteExcerpt;
@@ -3301,11 +3339,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (!sending) setActivities([{ kind: "status", label: "正在提交语音任务" }]);
     }
     try {
-      await draftSaveQueueRef.current;
+      await draftSaveQueue(conversationId);
       await persistComposerDraft(conversationId, content, quoteExcerpt);
       const result = await api.sendMessage(conversationId, content, [], quoteExcerpt, true, voiceTranscriptionIds);
       draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
       draftCacheRef.current.delete(conversationId);
+      setComposerDraft.for(conversationId, null); setInput.for(conversationId, ""); setAskAgentQuote.for(conversationId, ""); setFiles.for(conversationId, []);
       draftSyncedSignaturesRef.current.set(conversationId, composerDraftSignature("", ""));
       if (selectedIdRef.current === conversationId) {
         composerDraftRef.current = null;
@@ -3329,25 +3368,59 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
   }
 
+  async function sendVoiceRecording(audio: Blob, fileName: string, context: VoiceInputContext, voiceTranscriptionIds: string[]) {
+    setError(""); setNotice(""); setSubmitting(true);
+    let finishMutation: (() => void) | undefined;
+    let targetId = context.conversationId;
+    try {
+      let id = context.conversationId;
+      if (!id) {
+        const created = await api.createConversation(activeProjectId ?? undefined);
+        id = created.conversation.id; context.conversationId = id; targetId = id; setSubmitting.for(id, true);
+        if (selectedIdRef.current === null && activeProjectIdRef.current === activeProjectId) { selectedIdRef.current = id; setSelectedId(id); }
+      }
+      finishMutation = beginComposerMutation(id);
+      if (selectedIdRef.current === id && draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
+      await draftSaveQueue(id);
+      if (files.length) {
+        await api.uploadConversationDraftFiles(id, files);
+        setFiles([]);
+      }
+      await api.sendVoiceMessage(id, audio, fileName, context.clientRecordingId, context.draftText, context.quoteExcerpt, voiceTranscriptionIds);
+      draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
+      draftCacheRef.current.delete(id);
+      setComposerDraft.for(id, null); setInput.for(id, ""); setAskAgentQuote.for(id, ""); setFiles.for(id, []);
+      draftSyncedSignaturesRef.current.set(id, composerDraftSignature("", ""));
+      if (selectedIdRef.current === id) {
+        composerDraftRef.current = null; inputRef.current = ""; askAgentQuoteRef.current = "";
+        setComposerDraft(null); setInput(""); setAskAgentQuote(""); setFiles([]); setDraftSaveState("idle");
+      }
+      finishMutation();
+      void reconcile(id);
+    } finally { finishMutation?.(); if (targetId) setSubmitting.for(targetId, false); setSubmitting(false); }
+  }
+
   async function send(message = input, voiceTranscriptionIds: string[] = []) {
     const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
     const hasComposerDraftFile = Boolean(!editingPending && composerDraft?.files.length);
     if ((!message.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile && !hasComposerDraftFile) || submitting || selectionSaving) return;
     if (draftUploads.length > 0) { setNotice("请等待草稿附件上传完成后再发送。"); return; }
-    setError(""); setNotice(""); setSubmitting(true);
+    setComposerError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
     let finishMutation: (() => void) | undefined;
+    let targetId = selectedId;
     try {
       let id = selectedId;
       const useComposerDraft = Boolean(id && !editingPending);
       if (!id) {
-        const created = await api.createConversation(activeProjectIdRef.current ?? undefined); id = created.conversation.id;
-        setSelectedModel(created.agentSelection.model); setReasoningEffort(created.agentSelection.reasoningEffort);
-        selectedIdRef.current = id; setSelectedId(id);
+        const created = await api.createConversation(activeProjectId ?? undefined); id = created.conversation.id; targetId = id; setSubmitting.for(id, true);
+        if (selectedIdRef.current === null && activeProjectIdRef.current === activeProjectId) { setSelectedModel(created.agentSelection.model); setReasoningEffort(created.agentSelection.reasoningEffort); }
+        if (selectedIdRef.current === null && activeProjectIdRef.current === activeProjectId) { selectedIdRef.current = id; setSelectedId(id); }
       }
       finishMutation = beginComposerMutation(id);
       if (editingPending) {
         const result = await api.updatePendingPrompt(id, editingPending.id, message, files, removedEditingFileIds, askAgentQuote, voiceTranscriptionIds);
+        if (!result.needsInstruction) { setEditingPending.for(id, null); setRemovedEditingFileIds.for(id, []); }
         if (selectedIdRef.current === id && result.needsInstruction) {
           const persisted = result.editingPrompt ?? result.pendingPrompt ?? editingPending;
           editingPendingRef.current = persisted; setEditingPending(persisted); setRemovedEditingFileIds([]);
@@ -3360,7 +3433,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       } else {
         if (useComposerDraft) {
           if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
-          await draftSaveQueueRef.current;
+          await draftSaveQueue(id);
           await persistComposerDraft(id, message, askAgentQuote);
         }
         const result = await api.sendMessage(id, message, useComposerDraft ? [] : files, askAgentQuote, useComposerDraft, voiceTranscriptionIds);
@@ -3370,12 +3443,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         if (useComposerDraft) {
           draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
           draftCacheRef.current.delete(id);
+          setComposerDraft.for(id, null); setDraftSaveState.for(id, "idle");
           draftSyncedSignaturesRef.current.set(id, composerDraftSignature("", ""));
           if (selectedIdRef.current === id) {
             composerDraftRef.current = null; setComposerDraft(null); setDraftSaveState("idle");
           }
         }
       }
+      setInput.for(id, ""); setAskAgentQuote.for(id, ""); setFiles.for(id, []);
       if (selectedIdRef.current === id) {
         inputRef.current = ""; askAgentQuoteRef.current = "";
         setInput(""); setAskAgentQuote(""); setFiles([]);
@@ -3383,8 +3458,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       finishMutation();
       void reconcile(id);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "发送失败");
-    } finally { finishMutation?.(); setSubmitting(false); }
+      setComposerError(reason instanceof Error ? reason.message : "发送失败");
+    } finally { finishMutation?.(); if (targetId) setSubmitting.for(targetId, false); setSubmitting(false); }
   }
 
   async function beginPendingEdit(prompt: PendingPrompt) {
@@ -3394,7 +3469,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     try {
       if (draftLoadedConversationRef.current === selectedId) {
         if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
-        await draftSaveQueueRef.current;
+        await draftSaveQueue(selectedId);
         await persistComposerDraft(selectedId, inputRef.current, askAgentQuoteRef.current);
       }
       const result = await api.editPendingPrompt(selectedId, prompt.id);
@@ -3440,10 +3515,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function steerPendingPrompt(prompt: PendingPrompt) {
-    if (!selectedId || submitting || steeringRef.current) return;
+    if (!selectedId || submitting || steeringRef.current.has(selectedId)) return;
     const id = selectedId;
     const action = job?.status === "running" ? "引导当前任务" : "插入任务";
-    steeringRef.current = true; setSteering(true); setError("");
+    steeringRef.current.add(id); setSteering(true); setError("");
     try {
       await api.steerPendingPrompt(id, prompt.id);
       // Remove the accepted item immediately; sidebar/detail refresh is background work.
@@ -3454,7 +3529,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       void reconcile(id);
     } catch (reason) {
       if (selectedIdRef.current === id) setError(reason instanceof Error ? reason.message : `${action}失败`);
-    } finally { steeringRef.current = false; setSteering(false); }
+    } finally { steeringRef.current.delete(id); setSteering(false); }
   }
 
   async function reorderPendingPrompts(ordered: PendingPrompt[]) {
@@ -3463,9 +3538,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setDetail({ ...detail, pendingPrompts: ordered });
     try {
       const result = await api.reorderPendingPrompts(selectedId, ordered.map((prompt) => prompt.id));
-      setDetail((current) => current ? { ...current, pendingPrompts: result.pendingPrompts } : current);
+      setDetail((current) => current?.conversation.id === selectedId ? { ...current, pendingPrompts: result.pendingPrompts } : current);
     } catch (reason) {
-      setDetail((current) => current ? { ...current, pendingPrompts: previous } : current);
+      setDetail((current) => current?.conversation.id === selectedId ? { ...current, pendingPrompts: previous } : current);
       setError(reason instanceof Error ? reason.message : "调整待发送顺序失败");
       await refreshDetail(selectedId).catch(() => undefined);
     }
@@ -3675,7 +3750,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     ? projects.find((project) => project.id === selectedConversation.project_id)
     : undefined;
   const workspaceTitle = selectedConversation?.title || "Codex Web";
-  usePageTitle(recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
+  usePageTitle(opportunityVisible ? "机会卡片" : recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
   const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || "PERSONAL AI WORKSTATION";
   const projectMenuProject = projectMenu ? projects.find((project) => project.id === projectMenu.projectId) : undefined;
   const taskMenuConversation = taskMenu
@@ -3683,9 +3758,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       .find((conversation) => conversation.id === taskMenu.conversationId)
     : undefined;
   const account = resolveAccountIdentity(session);
+  const isConversationUploading = (id: string) => Boolean(setSubmitting.get(id) || setSteering.get(id) || voiceTransfers[id] || setDraftUploads.get(id).some((upload) => upload.status === "uploading" || upload.status === "retrying"));
   const conversationRow = (conversation: Conversation, projectId?: string) => <div
     key={conversation.id}
-    className={`conversation-row ${!recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
+    className={`conversation-row ${!opportunityVisible && !recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
     draggable={Boolean(projectId && !query)}
     aria-grabbed={projectId ? draggedConversation?.id === conversation.id : undefined}
     onDragStart={projectId ? (event) => beginConversationDrag(event, conversation, projectId) : undefined}
@@ -3714,7 +3790,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     <button className="conversation-select" onClick={() => projectId ? selectProjectConversation(projectId, conversation.id) : selectConversation(conversation)}>
       <span>{conversation.title}</span>
       {conversation.pinned_at && <Pin className="conversation-pin-icon" size={14} strokeWidth={2.4} role="img" aria-label="已置顶" />}
-      {conversation.cold_storage_state === "restoring"
+      {isConversationUploading(conversation.id)
+        ? <span className="conversation-upload-icon" role="img" aria-label="正在上传到服务器" title="正在上传到服务器"><ArrowUp size={10} aria-hidden="true" /><LoaderCircle size={16} className="spin" aria-hidden="true" /></span>
+        : conversation.cold_storage_state === "restoring"
         ? <span className="conversation-cold-icon" role="img" aria-label="正在恢复历史" title="正在恢复历史"><LoaderCircle size={14} className="spin" aria-hidden="true" /></span>
         : conversation.cold_storage_state === "cold"
         ? <span className="conversation-cold-icon" role="img" aria-label="已冷存储" title="已冷存储"><FolderArchive size={14} aria-hidden="true" /></span>
@@ -3724,7 +3802,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           ? <CircleDashed size={14} className="conversation-waiting" role="img" aria-label={maintenancePhase === "idle" ? "等待发送" : "等待维护结束后发送"} />
           : null}
     </button>
-    {Boolean(conversation.active_wake_count) && conversation.status !== "running" && conversation.external_status !== "running" && <button
+    {!isConversationUploading(conversation.id) && Boolean(conversation.active_wake_count) && conversation.status !== "running" && conversation.external_status !== "running" && <button
       type="button"
       className="conversation-wake-trigger"
       aria-label={`查看 ${conversation.title} 的自动续跑详情`}
@@ -3773,7 +3851,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
-      {features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />}
+      {features.opportunityCards && <OpportunitySidebar selected={opportunityVisible} onOpen={() => openOpportunities()} />}
+      {features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />}
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
           <div className="section-label project-label"><span>文件夹工程</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
@@ -3781,6 +3860,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             {projects.map((project) => {
               const collapsed = query ? searchProjectCollapse.query === query && Boolean(searchProjectCollapse.values[project.id]) : Boolean(collapsedProjects[project.id]);
               const page = projectConversationPages[project.id];
+              const initialTasksLoading = recurringLoading || (!page && projectPageLoading[project.id] !== false);
               const conversationMoveCandidate = Boolean(draggedConversation && draggedConversation.projectId !== project.id);
               const conversationMoveReason = draggedConversation && conversationMoveCandidate
                 ? conversationProjectMoveBlockReason(draggedConversation, project, projects)
@@ -3826,13 +3906,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                     <button type="button" onClick={() => void newConversation(project.id)} aria-label={`在项目 ${project.name} 中新建对话`} title="在此项目中新建对话"><SquarePen size={14} /></button>
                   </div>
                 </div>
-                {!collapsed && <div className="project-conversations">
+                {!collapsed && <div className="project-conversations" aria-busy={initialTasksLoading || Boolean(projectPageLoading[project.id])}>
+                  {initialTasksLoading ? <div className="list-loading" role="status"><LoaderCircle className="spin" size={14} /><span>{query ? "正在搜索…" : "正在加载…"}</span></div> : !page ? <div className="project-empty" role="status">任务加载失败<button type="button" className="project-show-more" onClick={() => void loadProjectPage(project.id)}>重试</button></div> : <>
                   <RecurringSidebar tasks={recurringTasks.filter(task => task.project_id === project.id)} selected={recurringView?.projectId === project.id ? recurringView.taskId : null} onOpen={id => openRecurring(project.id, id)} />
                   {page?.conversations.map((conversation) => conversationRow(conversation, project.id))}
                   {projectPageLoading[project.id] && <div className="list-loading"><LoaderCircle className="spin" size={14} /><span>正在加载…</span></div>}
                   {projectBodySearchLoading[project.id] && <div className="list-loading"><LoaderCircle className="spin" size={14} /><span>正在搜索正文…</span></div>}
                   {!projectPageLoading[project.id] && !projectBodySearchLoading[project.id] && page && page.conversations.length === 0 && <div className="project-empty">{query ? "没有匹配任务" : "还没有任务"}</div>}
                   {page?.hasMore && <button type="button" className="project-show-more" disabled={projectPageLoading[project.id]} onClick={() => void loadMoreProjectConversations(project.id)}>展开显示</button>}
+                  </>}
                 </div>}
               </div>;
             })}
@@ -3973,11 +4055,15 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {nodeTransfersOpen && createPortal(<NodeTransfersDialog onClose={() => setNodeTransfersOpen(false)} />, document.body)}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
+    {features.opportunityCards && <OpportunityWorkspace accountId={session.accountId!} projects={projects} visible={opportunityVisible} openTopicId={opportunityTopic} navigation={opportunityNavigation} onMenu={() => setSidebarOpen(true)} onCreateProject={() => setProjectDialogOpen(true)}
+      onConversation={(pid, cid) => { setOpportunityReturn(true); selectProjectConversation(pid, cid); void refreshList(false, pid); }}
+      onRecurring={(pid, tid) => { setOpportunityReturn(true); openRecurring(pid, tid); }} onProject={(bid, pid) => openPara(bid, pid)} />}
     {features.paraBoard && paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
       onMenu={() => setSidebarOpen(true)}
-      onOpenConversation={(id, engineId) => { setParaVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
-    {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
-    <main style={recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+      onOpenConversation={(id, engineId) => { setParaVisible(false); setOpportunityVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
+    {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace onOpportunity={features.opportunityCards ? id => openOpportunities(id) : undefined} onReturnOpportunity={opportunityReturn && features.opportunityCards ? () => openOpportunities() : undefined} loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
+    <main style={opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+      {opportunityReturn && features.opportunityCards && <button className="opportunity-return" onClick={() => openOpportunities()}><CornerUpLeft size={15} />返回机会卡片</button>}
       <header className="workspace-header">
         <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
@@ -4022,13 +4108,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </details> : <button className="icon-button" aria-label="会话操作" title="请先选择会话" disabled><MoreHorizontal size={21} /></button>}
         </div>
       </header>
-      {currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
+      {currentDetail ? <Chat onRetryVoice={async (prompt) => { await api.retryVoiceMessage(prompt.conversation_id, prompt.id); await reconcile(prompt.conversation_id); }} detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
         : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
-      {error && <div className="toast"><span>{error}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button onClick={() => { setError(""); setCleanupRetry(null); }}><X size={16} /></button></div>}
+      {(error || composerError) && <div className="toast"><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></div>}
       {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
       {currentDetail?.conversation.archived_at && <div className="archived-conversation-banner"><Archive size={15} /><span>这是已归档会话，只读查看；消息、附件和 rollout 仍保存在原处。</span><button type="button" onClick={() => void restoreConversation(currentDetail.conversation)}>恢复</button></div>}
-      {conversationSelectionReady && (!selectedId || !selectedConversation?.archived_at) && <Composer accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} pendingBusy={submitting || steering} selectionSaving={selectionSaving}
+      {conversationSelectionReady && (!selectedId || !selectedConversation?.archived_at) && <ComposerSessions sessionKey={composerScope} onTransfersChange={setVoiceTransfers} accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} pendingBusy={submitting || steering} selectionSaving={selectionSaving}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -4041,6 +4127,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
         onVoiceActivityChange={(active) => { voiceInputActiveRef.current = active; setVoiceInputActive(active); }}
         onVoiceTranscript={(conversationId, content, quoteExcerpt) => { void persistVoiceDraft(conversationId, content, quoteExcerpt); }}
+        onVoiceSendRecording={sendVoiceRecording}
         onVoiceSendAfterTranscription={(conversationId, content, quoteExcerpt, voiceTranscriptionIds) => { void sendVoiceTranscription(conversationId, content, quoteExcerpt, voiceTranscriptionIds); }}
         onSend={(message, voiceTranscriptionIds) => void send(message, voiceTranscriptionIds)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
     </main>
@@ -4796,7 +4883,7 @@ function ErrorBubble({ content }: { content: string }) {
   </div>;
 }
 
-function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
+function Chat({ onRetryVoice, detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { onRetryVoice: (prompt: PendingPrompt) => Promise<void>; detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const latestJobError = detail.latestJob && ["failed", "interrupted"].includes(detail.latestJob.status)
     ? detail.latestJob.error?.trim() ?? ""
@@ -4898,6 +4985,8 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
         };
       }}
       afterMessages={<>
+        {detail.pendingPrompts.filter(prompt => prompt.voiceSubmission).map(prompt => <VoiceMessage key={prompt.id} prompt={prompt} userInitials={userInitials} onRetry={onRetryVoice} />)}
+
         {latestJobError && !hasPersistedErrorNotice && <article className="message system error" data-message-id={`job-error-${detail.latestJob?.id}`}>
           <div className="message-avatar"><CircleAlert size={16} /></div>
           <div className="message-body"><div className="message-meta"><span className="message-name">任务错误</span>{detail.latestJob?.updated_at && <time dateTime={detail.latestJob.updated_at} title={formatFullDateTime(detail.latestJob.updated_at)}>{formatMessageDateTime(detail.latestJob.updated_at)}</time>}</div><ErrorBubble content={latestJobError} /></div>
@@ -4908,6 +4997,27 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
       </>}
     />{askSelection && <button type="button" className={`ask-agent-selection ${askSelection.below ? "below" : "above"}`} style={{ left: askSelection.left, top: askSelection.top }} onPointerDown={(event) => { event.preventDefault(); useSelectedText(); }} onClick={(event) => { if (event.detail === 0) useSelectedText(); }} title="询问 Agent" aria-label="询问 Agent"><Bot size={14} /></button>}
   </section>;
+}
+
+function VoiceMessage({ prompt, userInitials, onRetry }: { prompt: PendingPrompt; userInitials: string; onRetry: (prompt: PendingPrompt) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const voice = prompt.voiceSubmission!;
+  const failed = voice.state === "failed";
+  const complete = voice.state === "completed";
+  return <article className="message user voice-message" data-voice-submission-id={voice.id}>
+    <div className="message-avatar">{userInitials}</div><div className="message-body">
+      <div className="message-meta"><span className="message-name">你</span><time>{formatMessageDateTime(prompt.created_at)}</time></div>
+      {prompt.quote_excerpt && <blockquote>{prompt.quote_excerpt}</blockquote>}
+      {prompt.content && <p data-agent-selectable="true">{prompt.content}</p>}
+      {prompt.files.length > 0 && <div className="voice-message-files">{prompt.files.map(file => <a key={file.id} href={`${BASE_PATH}/api/files/${file.id}`} target="_blank" rel="noreferrer"><Paperclip size={13} />{file.original_name}</a>)}</div>}
+      <div className={`voice-message-status ${failed ? "failed" : ""}`} role="status" aria-live="polite">
+        {failed ? <CircleAlert size={15} /> : complete ? <Check size={15} /> : <LoaderCircle className="spin" size={15} />}
+        <span>{failed ? "语音识别失败，音频和附件已保留" : complete ? "已识别，等待执行" : "已发送，正在云识别，可离开此页面"}</span>
+        {failed && <button type="button" disabled={busy} onClick={() => { setBusy(true); setError(""); void onRetry(prompt).catch(reason => setError(reason instanceof Error ? reason.message : "重试失败")).finally(() => setBusy(false)); }}>重试识别</button>}
+      </div>{(error || (failed && voice.error)) && <small className="voice-error">{error || voice.error}</small>}
+    </div>
+  </article>;
 }
 
 function WakePlanCard({ plan, onCancel, onPostpone, onTrigger, onEdit }: { plan: WakePlan; onCancel: (plan: WakePlan) => Promise<void>; onPostpone: (plan: WakePlan) => Promise<void>; onTrigger: (plan: WakePlan) => Promise<void>; onEdit: () => void }) {
@@ -5200,13 +5310,14 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
           onPointerUp={endTouchDrag} onPointerCancel={cancelTouchDrag}
           title="按住并上下拖动调整顺序" aria-label="按住并上下拖动调整顺序" aria-grabbed={draggingId === prompt.id}><GripVertical size={17} /></button>
         <div className="pending-queue-copy" title={prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、")}>
-          <span>{prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、") || "附件任务"}</span>
+          <span>{prompt.content || prompt.quote_excerpt || prompt.files.map((file) => file.original_name).join("、") || (prompt.voiceSubmission ? "语音消息" : "附件任务")}</span>
+          {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <small><Mic size={11} />{prompt.voiceSubmission.state === "failed" ? "识别失败，可在聊天中重试" : "正在云识别"}</small>}
           {prompt.quote_excerpt && <small><CornerUpLeft size={11} />含引用</small>}
           {prompt.files.length > 0 && <small><Paperclip size={11} />{prompt.files.length} 个附件</small>}
         </div>
         <div className="pending-queue-actions">
-          <button type="button" className="steer-action" disabled={busy} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>
-          <button type="button" disabled={busy} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
+          <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>
+          <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
           <button type="button" disabled={busy} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
       </article>)}
@@ -5214,7 +5325,36 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
   </section>;
 }
 
-function Composer({ accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onCancel }: {
+// Keep only active/retryable voice sessions mounted when changing conversations.
+// A new visible composer gets its own recorder; background callbacks retain their owner.
+function ComposerSessions({ sessionKey, onTransfersChange, ...props }: ComponentProps<typeof Composer> & {
+  sessionKey: string;
+  onTransfersChange: (transfers: Record<string, boolean>) => void;
+}) {
+  const key = sessionKey;
+  const retained = useRef(new Map<string, ComponentProps<typeof Composer>>());
+  const [sessions, setSessions] = useState<Record<string, { active: boolean; retained: boolean; uploading: boolean }>>({});
+  retained.current.set(key, props);
+  for (const id of retained.current.keys()) if (id !== key && !sessions[id]?.retained) retained.current.delete(id);
+  useEffect(() => {
+    props.onVoiceActivityChange(Object.values(sessions).some((session) => session.active));
+    onTransfersChange(Object.fromEntries(Object.entries(sessions).filter(([, session]) => session.uploading).map(([id]) => [id, true])));
+  // callbacks address Workspace state and do not depend on the visible conversation.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, onTransfersChange]);
+  return <>{[...retained.current].map(([id, saved]) => <div key={id} style={{ display: id === key ? "contents" : "none" }} aria-hidden={id !== key || undefined}>
+    <Composer {...saved} active={id === key} onVoiceActivityChange={(active, keep = active, uploading = false) => {
+      setSessions((current) => {
+        const previous = current[id];
+        if (previous?.active === active && previous.retained === keep && previous.uploading === uploading) return current;
+        return { ...current, [id]: { active, retained: keep, uploading } };
+      });
+    }} />
+  </div>)}</>;
+}
+
+function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
+  active?: boolean;
   accountId: string | null;
   conversationId: string | null;
   input: string;
@@ -5254,9 +5394,10 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
   onClearDraft: () => void;
   onRemoveEditingFile: (fileId: string) => void;
   onRestoreEditingFile: (fileId: string) => void;
-  onVoiceActivityChange: (active: boolean) => void;
+  onVoiceActivityChange: (active: boolean, retained?: boolean, uploading?: boolean) => void;
   onSend: (message?: string, voiceTranscriptionIds?: string[]) => void;
   onVoiceTranscript: (conversationId: string | null, content: string, quoteExcerpt: string, transcriptionId: string) => void;
+  onVoiceSendRecording: (audio: Blob, fileName: string, context: VoiceInputContext, ids: string[]) => Promise<void>;
   onVoiceSendAfterTranscription: (conversationId: string | null, content: string, quoteExcerpt: string, transcriptionIds: string[]) => void;
   onCancel?: () => void;
 }) {
@@ -5307,6 +5448,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     maxDurationMs: 10 * 60 * 1000,
     unsupportedMessage: "当前浏览器不支持录音，请改用最新版 Chrome、Edge 或 Safari。",
     fileNamePrefix: "recording",
+    onSendRecording: onVoiceSendRecording,
     onTranscript: (text, transcriptionId, context) => {
       const sourceConversationId = context?.conversationId ?? conversationIdRef.current;
       // A queued edit is a separate draft. Never persist its transcription as
@@ -5344,8 +5486,13 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
   }, [conversationId, voice.finish, voice.state]);
 
   useEffect(() => {
-    onVoiceActivityChange(voice.state !== "idle");
-  }, [onVoiceActivityChange, voice.state]);
+    onVoiceActivityChange(voice.state !== "idle" || voice.starting, voice.state !== "idle" || voice.starting || Boolean(voice.pendingDraft) || voice.transcriptionIds.length > 0, voice.uploading);
+  }, [onVoiceActivityChange, voice.state, voice.starting, voice.pendingDraft, voice.transcriptionIds.length, voice.uploading]);
+
+  useEffect(() => {
+    if (!active && voice.state === "recording") voice.finish(false);
+    if (!active && voice.starting) voice.cancel();
+  }, [active, voice.state, voice.starting, voice.finish, voice.cancel]);
 
   function resetLongPress(pointerId?: number) {
     if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
@@ -5545,7 +5692,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
     </span>)}</div>}
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
-    <textarea ref={textareaRef} className={longPressArmed ? "long-press-armed" : undefined} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} onPointerDown={beginLongPress} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={(event) => resetLongPress(event.pointerId)} onBlur={() => resetLongPress()} placeholder={voice.state === "recording" ? "可以继续输入文字；点击发送会先转写语音…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
+    <textarea ref={textareaRef} className={longPressArmed ? "long-press-armed" : undefined} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} onPointerDown={beginLongPress} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={(event) => resetLongPress(event.pointerId)} onBlur={() => resetLongPress()} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
     <ConversationVoicePanel voice={voice} />
     <div className="composer-actions"><div className="composer-primary-actions"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button><input ref={fileInput} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.currentTarget.value = ""; }} />
       <SettingMenu className="model" label="模型" value={selectedModel} options={modelOptions} placeholder="加载中" title={selectedModelOption?.description || "选择任务使用的模型"} disabled={submitting || selectionSaving || !agentOptions} open={openSettingMenu === "model"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {
@@ -5559,7 +5706,7 @@ function Composer({ accountId, conversationId, input, setInput, askAgentQuote, o
         {voice.state === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving} title="录音输入" aria-label="录音输入"><Mic size={18} /></button>}
         {primaryAction === "stop" && onCancel
           ? <button type="button" className="send-button stop" onClick={onCancel} title="停止当前显示的任务" aria-label="停止当前显示的任务"><Square size={15} fill="currentColor" /></button>
-          : <button type="button" className="send-button" onClick={() => voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds())} disabled={submitting || selectionSaving || draftUploads.length > 0 || voice.state === "transcribing" || (voice.state !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voice.state === "recording" ? "识别语音并发送" : "发送"} aria-label={voice.state === "recording" ? "识别语音并发送" : "发送"}>{submitting || voice.state === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
+          : <button type="button" className="send-button" onClick={() => voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds())} disabled={submitting || selectionSaving || draftUploads.length > 0 || voice.state === "transcribing" || (voice.state !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voice.state === "recording" ? "发送语音" : "发送"} aria-label={voice.state === "recording" ? "发送语音" : "发送"}>{submitting || voice.state === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
   </div>{composerExpanded && <p className="composer-note"><span>{draftStatusLabel || pendingQueueGuidance}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p>}</div>;

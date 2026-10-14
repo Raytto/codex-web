@@ -18,3 +18,7 @@ coverage/
 tmp/
 *.bak
 *.backup
+.state/
+.runtime/
+outputs/
+uploads/

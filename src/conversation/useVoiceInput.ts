@@ -17,6 +17,7 @@ export type UseVoiceInputOptions = {
   maxDurationMs?: number;
   fileNamePrefix?: string;
   unsupportedMessage?: string;
+  onSendRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, transcriptionIds: string[]) => Promise<void>;
   onTranscript?: (text: string, transcriptionId: string, context?: VoiceInputContext) => void;
   onSendAfterTranscription?: (text: string, transcriptionIds: string[], context?: VoiceInputContext) => void;
 };
@@ -33,6 +34,7 @@ export type VoiceInputContext = {
 export type VoiceInputController = {
   state: ConversationVoiceState;
   starting: boolean;
+  uploading: boolean;
   elapsed: number;
   error: string;
   notice: string;
@@ -68,6 +70,7 @@ export function formatVoiceDuration(seconds: number): string {
 }
 
 export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputController {
+  const [uploading, setUploading] = useState(false);
   const [state, setState] = useState<ConversationVoiceState>("idle");
   const [starting, setStarting] = useState(false);
   const acquiringRef = useRef(false);
@@ -97,7 +100,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const attachmentNamesRef = useRef(options.attachmentNames ?? []);
   const optionsRef = useRef(options);
   const sessionRef = useRef<VoiceInputContext | null>(null);
-  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription"> | null>(null);
+  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription" | "onSendRecording"> | null>(null);
   const pendingDraftRef = useRef<VoiceDraftRecord | null>(null);
   const activeDraftRef = useRef<VoiceDraftRecord | null>(null);
   const recordingStartedAtRef = useRef<number | null>(null);
@@ -203,27 +206,36 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const submitDraft = useCallback(async (draft: VoiceDraftRecord, session: VoiceInputContext) => {
     const current = optionsRef.current;
     try {
-      const result = await api.transcribeAudio(draft.blob, draft.fileName, {
-        conversationId: session.conversationId ?? undefined,
-        draftText: session.draftText,
-        attachmentNames: session.attachmentNames,
-        clientRecordingId: draft.id,
-      });
-      const sameTarget = transcriptionConversationIdRef.current === session.conversationId
-        && transcriptionPendingPromptIdRef.current === (session.pendingPromptId ?? null);
-      const nextIds = [...new Set([...(sameTarget ? transcriptionIdsRef.current : []), result.transcriptionId])].slice(-20);
-      transcriptionIdsRef.current = nextIds;
-      setTranscriptionIds(nextIds);
-      transcriptionConversationIdRef.current = session.conversationId;
-      setTranscriptionConversationId(session.conversationId);
-      transcriptionPendingPromptIdRef.current = session.pendingPromptId ?? null;
-      setTranscriptionPendingPromptId(session.pendingPromptId ?? null);
-      const text = appendTranscript(session.draftText, result.text);
       const callbacks = sessionCallbacksRef.current ?? current;
-      callbacks.onTranscript?.(result.text, result.transcriptionId, session);
-      if (draft.sendAfterTranscription) {
-        if (sessionCallbacksRef.current?.onSendAfterTranscription) sessionCallbacksRef.current.onSendAfterTranscription(text, nextIds, session);
-        else callbacks.onSendAfterTranscription?.(text, nextIds, session);
+      if (draft.sendAfterTranscription && callbacks.onSendRecording && !session.pendingPromptId) {
+        setUploading(true);
+        const sameTarget = transcriptionConversationIdRef.current === session.conversationId && !transcriptionPendingPromptIdRef.current;
+        await callbacks.onSendRecording(draft.blob, draft.fileName, session, sameTarget ? transcriptionIdsRef.current : []);
+        transcriptionIdsRef.current = []; setTranscriptionIds([]);
+      } else {
+        setUploading(true);
+        const result = await api.transcribeAudio(draft.blob, draft.fileName, {
+          conversationId: session.conversationId ?? undefined,
+          draftText: session.draftText,
+          attachmentNames: session.attachmentNames,
+          clientRecordingId: draft.id,
+          onUploadComplete: () => setUploading(false),
+        });
+        const sameTarget = transcriptionConversationIdRef.current === session.conversationId
+          && transcriptionPendingPromptIdRef.current === (session.pendingPromptId ?? null);
+        const nextIds = [...new Set([...(sameTarget ? transcriptionIdsRef.current : []), result.transcriptionId])].slice(-20);
+        transcriptionIdsRef.current = nextIds;
+        setTranscriptionIds(nextIds);
+        transcriptionConversationIdRef.current = session.conversationId;
+        setTranscriptionConversationId(session.conversationId);
+        transcriptionPendingPromptIdRef.current = session.pendingPromptId ?? null;
+        setTranscriptionPendingPromptId(session.pendingPromptId ?? null);
+        const text = appendTranscript(session.draftText, result.text);
+        callbacks.onTranscript?.(result.text, result.transcriptionId, session);
+        if (draft.sendAfterTranscription) {
+          if (sessionCallbacksRef.current?.onSendAfterTranscription) sessionCallbacksRef.current.onSendAfterTranscription(text, nextIds, session);
+          else callbacks.onSendAfterTranscription?.(text, nextIds, session);
+        }
       }
       if (draft.accountId) {
         try { await deleteVoiceDraft(draft.id); } catch (reason) { setDraftStorageError(reason instanceof Error ? reason.message : "语音草稿清理失败。"); }
@@ -233,13 +245,15 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
       setPendingDraft(null);
       setNotice("");
       setError("");
+      setUploading(false);
       changeState("idle");
       setElapsed(0);
       sessionRef.current = null;
       sessionCallbacksRef.current = null;
     } catch (reason) {
+      setUploading(false);
       const message = reason instanceof Error ? reason.message : "语音识别失败，请重试。";
-      const failed = { ...draft, status: "retryable" as const, retryCount: draft.retryCount + 1, lastError: message, updatedAt: new Date().toISOString() };
+      const failed = { ...draft, conversationId: session.conversationId, status: "retryable" as const, retryCount: draft.retryCount + 1, lastError: message, updatedAt: new Date().toISOString() };
       activeDraftRef.current = failed;
       if (current.persistDraft) {
         pendingDraftRef.current = failed;
@@ -358,6 +372,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         attachmentNames: (current.attachmentNames ?? []).slice(0, 12),
       };
       sessionCallbacksRef.current = {
+        onSendRecording: current.onSendRecording,
         onTranscript: current.onTranscript,
         onSendAfterTranscription: current.onSendAfterTranscription,
       };
@@ -432,13 +447,22 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
 
   const finish = useCallback((sendAfterTranscription = false) => {
     if (state !== "recording" || recorderRef.current?.state !== "recording") return;
+    // Freeze text/quote/attachments as they are at Send, not when recording began.
+    const current = optionsRef.current;
+    if (sessionRef.current && sessionRef.current.conversationId === (current.conversationId ?? null)
+      && (sessionRef.current.pendingPromptId ?? null) === (current.pendingPromptId ?? null)) {
+      sessionRef.current = { ...sessionRef.current, draftText: current.draftText, quoteExcerpt: current.quoteExcerpt ?? "", attachmentNames: (current.attachmentNames ?? []).slice(0, 12) };
+      sessionCallbacksRef.current = { onTranscript: current.onTranscript, onSendAfterTranscription: current.onSendAfterTranscription, onSendRecording: current.onSendRecording };
+    }
     sendAfterRef.current = sendAfterTranscription;
+    setUploading(true);
     recorderRef.current.requestData();
     recorderRef.current.stop();
     changeState("transcribing");
   }, [changeState, state]);
 
   const cancel = useCallback(() => {
+    if (acquiringRef.current) { acquisitionRef.current += 1; acquiringRef.current = false; setStarting(false); }
     if (state !== "recording") return;
     discardRef.current = true;
     sendAfterRef.current = false;
@@ -504,6 +528,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
 
   return {
     state,
+    uploading,
     starting,
     elapsed,
     error,

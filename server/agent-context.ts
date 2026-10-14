@@ -71,11 +71,13 @@ export function buildAgentTurnPrompt(options: TurnPromptOptions): string {
     parts.push("处理图片时先形成简短、可复用的文字摘要；后续优先引用摘要与原文件路径，只有细节不足时再调用 `view_image` 重读原图。");
   }
   if (options.runtimeWarning) parts.push(options.runtimeWarning);
+  if (process.env.CODEX_WEB_TOOL_PROFILE === "base") parts.push("当前为基础工具环境：包含 Python 标准库与 uv，不预装 pandas/openpyxl、LibreOffice、Poppler 或 CJK 字体。先检查所需工具；缺少 Python 包时可用 CWW_PYTHON_RUNNER 在本任务临时环境按需安装，离线时说明未执行。系统办公工具需由部署者选择 documents 镜像目标，不能假定已安装。");
   if (options.isolationReason) {
     parts.push(`安全要求：本轮已启用离线隔离（${options.isolationReason}）。只做静态检查，不执行不受信任的附件、宏或脚本；若必须动态执行，请说明尚未执行。`);
   }
   if (options.capabilityRoutingHint) parts.push(options.capabilityRoutingHint);
   if (options.personalContext?.trim()) parts.push(options.personalContext.trim());
+  if (/机会|opportunit/i.test(instruction)) parts.push('机会主题在服务器项目的正常会话中管理：使用 codex_web_opportunities（先 topics / context）。旧会话未发现该工具时，可将同样的 JSON 请求写入过程文件，再运行 node "$CODEX_WEB_OPPORTUNITY_CLI" 请求文件；凭据由运行环境提供，不读取、打印或复制。远程项目不可操作机会主题。');
   parts.push(instruction);
   return parts.join("\n\n");
 }

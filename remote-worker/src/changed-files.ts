@@ -1,4 +1,4 @@
-import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
+import { REMOTE_TRANSFER_MAX_FILES_PER_JOB, REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -16,7 +16,7 @@ export async function collectChangedFiles(
   upload: (absolutePath: string, name: string) => Promise<void>,
   options: Options = {},
 ): Promise<{ uploaded: number; uploadedBytes: number; hasUploadedImage: boolean; omitted: OmittedArtifact[] }> {
-  const maximumFiles = options.maximumFiles ?? 20;
+  const maximumFiles = options.maximumFiles ?? REMOTE_TRANSFER_MAX_FILES_PER_JOB;
   const maximumFileBytes = options.maximumFileBytes ?? REMOTE_TRANSFER_MAX_FILE_BYTES;
   const maximumTotalBytes = options.maximumTotalBytes ?? REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB;
   const maximumManifestItems = options.maximumManifestItems ?? 100;

@@ -2,7 +2,10 @@
 name = "codex-web-runtime"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+documents = [
   "beautifulsoup4>=4.13,<5",
   "lxml>=5.4,<7",
   "matplotlib>=3.10,<4",

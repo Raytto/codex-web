@@ -16,7 +16,7 @@ into an Ubuntu execution checklist.
 
 ## Local Docker deployment
 
-Follow the root README. Docker named volumes persist the SQLite database, tenant workspaces, Codex login/thread state, and the seeded Codex CLI runtime.
+Follow the root README. Bind mounts under `.state/` persist SQLite, tenant workspaces and Codex login/thread state. Use the [isolated build and cleanup workflow](BUILD_AND_STORAGE.md); no host development dependency installation is required.
 
 Compose expects the external `codex-web-egress` network. Create it once before
 the first `up` (and do not remove it during routine updates):
@@ -61,10 +61,11 @@ To verify the offline-retry path, start a recording, interrupt connectivity afte
 
 ```bash
 git pull --ff-only
-docker compose up -d
+./scripts/build-image.sh
+sudo docker compose up -d --no-build
 ```
 
-The container seeds a newer bundled Codex CLI into the persistent runtime volume on startup. Existing login and thread state remain in the tenant volume.
+The default container runs the pinned image-bundled Codex CLI directly, without copying it to the persistent runtime volume. Existing login/thread state and old runtime releases are preserved; see [runtime migration and rollback](BUILD_AND_STORAGE.md#upgrade-and-rollback).
 
 For source-based publishing, use `deploy/codex-web-request-rebuild` and the
 single-consumer `deploy/codex-web-rebuild-coordinator`; the optional

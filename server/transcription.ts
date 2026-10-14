@@ -56,6 +56,8 @@ export class TranscriptionError extends Error {
   constructor(message: string, readonly status = 502) { super(message); }
 }
 
+type VoiceTiming = (stage: string, details?: Record<string, number | string | boolean>) => void;
+
 export class TranscriptionService {
   readonly audioRoot: string;
 
@@ -99,12 +101,25 @@ export class TranscriptionService {
       return;
     }
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    const started = performance.now();
+    res.on("finish", () => console.info("[voice-timing]", JSON.stringify({ at: new Date().toISOString(),
+      audioId: fileName.split(".")[0], stage: "provider_audio_download", elapsedMs: Math.round(performance.now() - started), status: res.statusCode,
+    })));
     res.sendFile(fileName, { root: this.audioRoot });
   }
 
   async transcribe(fileName: string, context: TranscriptionContext = {}): Promise<string> {
     if (!this.config.dashscopeApiKey || !this.config.dashscopeBaseUrl) throw new TranscriptionError("语音识别服务尚未配置完成。", 503);
-    const prepared = await this.prepareAudio(fileName);
+    const started = performance.now();
+    const timing: VoiceTiming = (stage, details = {}) => console.info("[voice-timing]", JSON.stringify({
+      at: new Date().toISOString(), audioId: fileName.split(".")[0], stage,
+      elapsedMs: Math.round(performance.now() - started), ...details,
+    }));
+    timing("prepare_start");
+    let prepared: Awaited<ReturnType<TranscriptionService["prepareAudio"]>>;
+    try { prepared = await this.prepareAudio(fileName); }
+    catch (error) { timing("prepare_failed"); throw error; }
+    timing("prepare_done", { servedAudioId: prepared.fileName.split(".")[0], bytes: fs.statSync(path.join(this.audioRoot, prepared.fileName)).size });
     const enrichedContext: TranscriptionContext = {
       ...context,
       attachmentTexts: context.attachmentTexts ?? readTextAttachmentHeads(context.attachments ?? []),
@@ -115,6 +130,7 @@ export class TranscriptionService {
       maxImageBytes: this.config.transcriptionContextMaxImageBytes,
       temporaryRoot: this.audioRoot,
     }).catch(() => []);
+    timing("context_done", { images: contextImages.length });
     const imageTokens = contextImages.reduce((total, image) => total + image.tokenCost, 0);
     const textContextBudget = Math.max(0, this.config.transcriptionContextTokenBudget - imageTokens);
     try {
@@ -147,10 +163,11 @@ export class TranscriptionService {
           stream: true,
           stream_options: { include_usage: true },
         }),
-      });
+      }, timing);
+      timing("transcription_done");
       if (!transcript) throw new TranscriptionError("没有识别到清晰语音，请靠近麦克风后重试。", 422);
       return transcript;
-    } finally {
+    } catch (error) { timing("transcription_failed", { status: error instanceof TranscriptionError ? error.status : 500 }); throw error; } finally {
       if (prepared.temporary) {
         try { fs.rmSync(path.join(this.audioRoot, prepared.fileName), { force: true }); } catch {}
       }
@@ -199,10 +216,11 @@ export class TranscriptionService {
     };
   }
 
-  private async requestTranscript(url: string, init: RequestInit): Promise<string> {
+  private async requestTranscript(url: string, init: RequestInit, timing: VoiceTiming): Promise<string> {
     const deadline = Date.now() + this.config.transcriptionTimeoutMs;
     for (let attempt = 0; ; attempt += 1) {
       let response: globalThis.Response;
+      timing("upstream_start", { attempt: attempt + 1 });
       try {
         const remainingMs = Math.max(1, deadline - Date.now());
         response = await this.fetchImpl(url, {
@@ -216,6 +234,7 @@ export class TranscriptionService {
         })) continue;
         throw new TranscriptionError("暂时无法连接语音识别服务，请稍后重试。", 503);
       }
+      timing("upstream_headers", { attempt: attempt + 1, status: response.status });
       if (!response.ok) {
         try { await response.body?.cancel(); } catch {}
         if (isRetryableTranscriptionStatus(response.status) && await this.retryTransientFailure(attempt, deadline, {

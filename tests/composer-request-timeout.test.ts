@@ -40,3 +40,28 @@ test("caller cancellation remains cancellation instead of a timeout", async (t) 
   controller.abort();
   await assert.rejects(result, { name: "AbortError" });
 });
+
+test("proofreading upload completion is independent of the transcription response", async (t) => {
+  const { api, setCsrf } = await import("../src/api");
+  let transport: FakeXhr;
+  class FakeXhr {
+    upload: { onload?: () => void } = {};
+    onload?: () => void; onerror?: () => void; ontimeout?: () => void;
+    responseText = ""; status = 0; timeout = 0; withCredentials = false;
+    headers: Record<string, string> = {};
+    open(method: string, url: string) { assert.equal(method, "POST"); assert.ok(url.endsWith("/api/transcriptions")); }
+    setRequestHeader(key: string, value: string) { this.headers[key] = value; }
+    send(body: FormData) { assert.equal(body.get("draftText"), "proofreading text"); transport = this; }
+  }
+  const old = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+  Object.defineProperty(globalThis, "XMLHttpRequest", { configurable: true, value: FakeXhr });
+  t.after(() => { if (old) Object.defineProperty(globalThis, "XMLHttpRequest", old); else Reflect.deleteProperty(globalThis, "XMLHttpRequest"); setCsrf(); });
+  setCsrf("test-csrf");
+  let uploadFinished = false, responseFinished = false;
+  const result = api.transcribeAudio(new Blob(["fixture"]), "test.wav", { draftText: "proofreading text", onUploadComplete: () => { uploadFinished = true; } }).then(value => { responseFinished = true; return value; });
+  assert.equal(transport!.headers["X-CSRF-Token"], "test-csrf");
+  transport!.upload.onload!(); await Promise.resolve();
+  assert.equal(uploadFinished, true); assert.equal(responseFinished, false);
+  transport!.status = 200; transport!.responseText = JSON.stringify({ text: "recognized", transcriptionId: "test-id" }); transport!.onload!();
+  assert.deepEqual(await result, { text: "recognized", transcriptionId: "test-id" });
+});

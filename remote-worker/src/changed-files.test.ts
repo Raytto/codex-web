@@ -58,3 +58,21 @@ test("changed files share a byte budget and leave oversized batches available fo
   assert.deepEqual(result.omitted, [{ path: "b.zip", reason: "total_size_limit" }]);
   assert.equal(fs.readFileSync(path.join(root, "b.zip"), "utf8"), "1234");
 });
+
+
+test("automatic results deliver 256 files and leave overflow intact on the execution computer", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-result-count-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const files = Array.from({ length: 257 }, (_, index) => {
+    const name = `result-${index}.md`;
+    fs.writeFileSync(path.join(root, name), "result");
+    return name;
+  });
+  const uploaded: string[] = [];
+  const result = await collectChangedFiles(root, files, async (_, name) => { uploaded.push(name); });
+  assert.deepEqual(uploaded, files.slice(0, 256));
+  assert.equal(result.uploaded, 256);
+  assert.equal(result.uploadedBytes, 256 * 6);
+  assert.deepEqual(result.omitted, [{ path: files[256], reason: "count_limit" }]);
+  assert.equal(fs.readFileSync(path.join(root, files[256]), "utf8"), "result");
+});

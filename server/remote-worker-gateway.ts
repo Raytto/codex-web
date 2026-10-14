@@ -28,13 +28,12 @@ import {
 import { loadRemoteWorkerReleaseManifest, REMOTE_WORKER_TARGET_REF, REMOTE_WORKER_TARGET_VERSION, type RemoteWorkerReleaseManifest, type RemoteWorkerReleaseArchive } from "./remote-worker-release.js";
 import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
 import { isValidRemoteWorkerCapacity, normalizeRemoteWorkerCapacity, remoteWorkerHasCapacity } from "./remote-worker-capacity.js";
-import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB, REMOTE_TRANSFER_TIMEOUT_MS, RemoteTransferError } from "./remote-transfer.js";
+import { REMOTE_TRANSFER_MAX_FILES_PER_JOB, REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB, REMOTE_TRANSFER_TIMEOUT_MS, RemoteTransferError } from "./remote-transfer.js";
 import { cleanupOwnedStagingDirectory, ownedStagingDirectory, sweepOwnedStagingDirectories } from "./owned-staging.js";
 import { parseRemoteWorkerMessage, REMOTE_WORKER_MAX_MESSAGE_BYTES, REMOTE_WORKER_MAX_PROTOCOL_ERRORS } from "./remote-worker-message.js";
 import { ensureTenantWorkspace, resolveInside } from "./paths.js";
 import type { RemoteWorkerBootstrapPlatform } from "./remote-worker-bootstrap.js";
 
-const REMOTE_TRANSFER_MAX_FILES_PER_JOB = 32;
 const REMOTE_TRANSFER_MAX_ACTIVE_PER_JOB = 4;
 const REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS = 5 * 60_000;
 export const REMOTE_WORKER_UPDATE_TIMEOUT_MS = 15 * 60_000;

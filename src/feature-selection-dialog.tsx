@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
-import { LayoutDashboard, LoaderCircle, SlidersHorizontal, X } from "lucide-react";
+import { LayoutDashboard, Lightbulb, LoaderCircle, SlidersHorizontal, X } from "lucide-react";
 import { useFeatureSelection } from "./feature-selection-context";
 
 export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
-  const { features, saving, error, changeParaBoard } = useFeatureSelection();
+  const { features, saving, error, changeParaBoard, changeOpportunityCards } = useFeatureSelection();
   const closeButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -13,7 +13,7 @@ export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
     return () => { cancelAnimationFrame(frame); document.removeEventListener("keydown", keydown); if (previous?.isConnected) previous.focus({ preventScroll: true }); };
   }, [onClose]);
   return <div className="project-dialog-backdrop display-settings-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
-    <section className="project-dialog display-settings-dialog feature-selection-dialog" role="dialog" aria-modal="true" aria-labelledby="feature-selection-title">
+    <section className="project-dialog display-settings-dialog feature-selection-dialog ui-dialog" role="dialog" aria-modal="true" aria-labelledby="feature-selection-title">
       <header>
         <div><SlidersHorizontal size={19} /><div><h2 id="feature-selection-title">功能选择</h2><p>选择要显示的功能，自动同步到同账号的其他设备。</p></div></div>
         <button ref={closeButton} type="button" onClick={onClose} aria-label="关闭功能选择"><X size={18} /></button>
@@ -23,6 +23,11 @@ export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
           <span className="feature-selection-icon"><LayoutDashboard size={22} /></span>
           <span className="display-settings-card-copy"><strong>项目看板</strong><small id="para-feature-description">从想法、推进到验收，管理项目完整生命周期。隐藏后保留已有内容及会话关联。</small></span>
           <input type="checkbox" aria-label="项目看板" aria-describedby="para-feature-description" checked={features.paraBoard} aria-disabled={saving} aria-busy={saving} onChange={e => { if (!saving) void changeParaBoard(e.target.checked); }} />
+        </label>
+        <label className="feature-selection-option">
+          <span className="feature-selection-icon"><Lightbulb size={22} /></span>
+          <span className="display-settings-card-copy"><strong>机会卡片</strong><small id="opportunity-feature-description">发现、筛选和验证新想法，保留好候选。隐藏入口会保留内容；已启用的周期任务继续运行，可在项目中暂停。</small></span>
+          <input type="checkbox" aria-label="机会卡片" aria-describedby="opportunity-feature-description" checked={features.opportunityCards === true} aria-disabled={saving} aria-busy={saving} onChange={e => { if (!saving) void changeOpportunityCards(e.target.checked); }} />
         </label>
         <p className="feature-selection-status" role="status">{saving ? <><LoaderCircle size={14} className="spin" />正在保存…</> : "勾选后显示，取消勾选后隐藏。"}</p>
         {error && <p className="feature-selection-error" role="alert">{error}</p>}

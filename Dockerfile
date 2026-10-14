@@ -1,8 +1,10 @@
 FROM node:22-bookworm-slim AS source
 
 WORKDIR /app
+ARG NODE_OPTIONS=--max-old-space-size=1536
+ENV NODE_OPTIONS=$NODE_OPTIONS
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci && npm cache clean --force
 COPY index.html tsconfig*.json vite.config.ts ./
 COPY Dockerfile ./Dockerfile
 COPY compose.yaml ./
@@ -14,12 +16,16 @@ COPY deploy ./deploy
 COPY skills ./skills
 COPY account-resources ./account-resources
 COPY remote-worker ./remote-worker
+COPY scripts ./scripts
 
 FROM source AS test
 COPY .github ./.github
 COPY README.md ./README.md
 COPY docs ./docs
-RUN apt-get update \
+RUN mkdir -p /etc/ssl/certs \
+    && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3 \
     && rm -rf /var/lib/apt/lists/* \
     && npm --prefix remote-worker ci \
@@ -29,8 +35,12 @@ FROM source AS build
 RUN npm run build && npm prune --omit=dev
 
 FROM source AS worker-release
-ARG WORKER_RELEASE_COMMIT=0000000000000000000000000000000000000000
-RUN apt-get update \
+ARG WORKER_RELEASE_COMMIT
+RUN test -n "$WORKER_RELEASE_COMMIT" || (echo "Set WORKER_RELEASE_COMMIT to the reviewed source SHA; scripts/build-image.sh supplies it automatically" >&2; exit 2)
+RUN mkdir -p /etc/ssl/certs \
+    && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zip \
     && rm -rf /var/lib/apt/lists/* \
     && npm --prefix remote-worker ci \
@@ -39,17 +49,21 @@ RUN apt-get update \
     && remote-worker/scripts/build-release-package.sh /app/worker-release "$WORKER_RELEASE_COMMIT"
 
 FROM node:22-bookworm-slim AS codex-baked
-ARG CODEX_CLI_VERSION=latest
+ARG CODEX_CLI_VERSION=0.162.1
 RUN npm install --global --prefix /opt/codex-baked "@openai/codex@${CODEX_CLI_VERSION}" \
-    && /opt/codex-baked/bin/codex --version
+    && /opt/codex-baked/bin/codex --version \
+    && npm cache clean --force
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime-base
 
 ARG UV_VERSION=0.11.28
-RUN apt-get update \
+ARG PYTHON_VERSION=3.12.12
+RUN mkdir -p /etc/ssl/certs \
+    && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
+    && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash bubblewrap ca-certificates curl ffmpeg fontconfig fonts-liberation fonts-noto-cjk git \
-      libreoffice-calc libreoffice-impress libreoffice-writer poppler-utils tini \
+      acl bash bubblewrap ca-certificates curl ffmpeg git tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -73,7 +87,7 @@ ENV NODE_ENV=production \
     HOME=/home/cww \
     CODEX_HOME=/home/cww/.codex \
     PYTHON_RUNTIME_ROOT=/opt/cww-python \
-    PYTHON_VERSION=3.12 \
+    PYTHON_VERSION=${PYTHON_VERSION} \
     TZ=Asia/Shanghai
 
 RUN chmod 0755 scripts/*.sh \
@@ -95,3 +109,17 @@ RUN chmod 0755 scripts/*.sh \
 USER 0:0
 EXPOSE 37821
 CMD ["/app/scripts/start-supervisor.sh"]
+
+# Opt in with CODEX_WEB_BUILD_TARGET=documents. The final/default target stays lean.
+FROM runtime-base AS documents
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      fontconfig fonts-liberation fonts-noto-cjk libreoffice-calc libreoffice-impress \
+      libreoffice-writer poppler-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && PYTHON_RUNTIME_PROFILE=documents /app/scripts/setup-python.sh \
+    && rm -rf /opt/cww-python/cache
+ENV CODEX_WEB_TOOL_PROFILE=documents
+
+FROM runtime-base AS runtime
+ENV CODEX_WEB_TOOL_PROFILE=base

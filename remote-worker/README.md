@@ -208,3 +208,6 @@ unchanged and size queries do not change unread flags or sidebar order.
 The optional `nodeTransfer` capability allows authenticated endpoint commands for a single source/target path. Control remains outbound HTTPS/WSS; direct transfers may use short-lived ICE UDP sockets, with encrypted server memory relay as fallback. No general listening file server is exposed. Keep the configured server URL's application path (`/codex-web`); endpoints reject mismatched origins or transfer paths.
 
 Regular attachments, remote downloads and generated files use a 2 GiB per-file limit, 8 GiB aggregate result budget and 30-minute transfer deadline. Existing manifest count limits, quotas and omission reports remain. Transfer temporary objects are excluded from generated/changed-file collection. The coordinator tracks task identity, route, restart/resume, hash checks and cleanup independently of the model turn. A completed target is reported separately from cleanup completion. See [transfer protocol and deployment](../docs/NODE_TRANSFERS.md).
+
+
+Version 1.20.2 allows up to 256 automatically collected result files (including generated images). The 2 GiB single-file, 8 GiB aggregate and 30-minute limits remain unchanged. It does not receive server account login state or server-only opportunity tools.

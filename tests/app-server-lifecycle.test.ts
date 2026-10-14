@@ -20,11 +20,11 @@ const send = m => process.stdout.write(JSON.stringify(m) + '\\n');
 let attempts = 0;
 // Emulate the native writer retaining its lease after turn/completed.
 const keepAlive = setInterval(() => {}, 1000);
-process.on('SIGTERM', () => setTimeout(() => {
+process.on('SIGTERM', () => { if (mode === 'stubborn' || mode === 'stubborn-failed') return; setTimeout(() => {
   fs.rmSync(path.join(root, 'writer'), {force:true});
   fs.writeFileSync(path.join(root, 'exited'), 'yes');
   process.exit(0);
-}, 200));
+}, 200); });
 readline.createInterface({input:process.stdin}).on('line', line => {
   const m = JSON.parse(line);
   log(m.method);
@@ -37,7 +37,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     send({id:m.id,result:{turn:{id:'turn'}}});
     setTimeout(() => {
       send({method:'item/completed',params:{threadId:'root',item:{type:'agentMessage',text:'done'}}});
-      send({method:'turn/completed',params:{threadId:'root',turn:{id:'turn',status:mode === 'turn-failed' ? 'failed' : 'completed',error:{message:'thread root already has an active writer'}}}});
+      send({method:'turn/completed',params:{threadId:'root',turn:{id:'turn',status:mode === 'turn-failed' || mode === 'stubborn-failed' ? 'failed' : 'completed',error:{message:'thread root already has an active writer'}}}});
     }, 10);
   } else if (typeof m.id === 'number') send({id:m.id,result:{}});
 });
@@ -45,7 +45,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const controller = new AbortController();
   const progress: unknown[] = [];
   const run = (threadId: string | null = "root") => startAppServerTurn({
-    executablePath, cwd:root, env:{...process.env, FAKE_MODE:mode}, threadId,
+    executablePath, cwd:root, env:{...process.env, CODEX_HOME:root, FAKE_MODE:mode}, threadId,
     prompt:"perform one action", imagePaths:[], model:"test", reasoningEffort:"low", library:root,
     shellEnvironment:{}, networkAccessEnabled:false, webSearchMode:"cached",
     optionalCapabilities:DEFAULT_OPTIONAL_AGENT_CAPABILITIES, codexEgressKind:"unchanged",
@@ -104,4 +104,17 @@ test("persistent contention has a bounded retry budget and never starts a turn",
   await assert.rejects(f.run().result,/active writer/);
   assert.equal(f.requests().filter(x=>x === "thread/resume").length, 7);
   assert.equal(f.requests().includes("turn/start"), false);
+});
+
+test("completed turn survives shutdown escalation without replaying the action", {timeout:20_000}, async t => {
+  const f = fixture(t, "stubborn");
+  assert.equal(await f.run().result, "done");
+  assert.equal(f.requests().filter(x => x === "turn/start").length, 1);
+  assert.ok(f.progress.some(p => (p as {shutdown?: {phase: string}}).shutdown?.phase === "force_stop"));
+});
+
+test("failed turn keeps its original error after shutdown escalation", {timeout:20_000}, async t => {
+  const f = fixture(t, "stubborn-failed");
+  await assert.rejects(f.run().result, /active writer/);
+  assert.equal(f.requests().filter(x => x === "turn/start").length, 1);
 });

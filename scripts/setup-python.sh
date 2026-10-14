@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python_version="${PYTHON_VERSION:-3.12}"
+python_version="${PYTHON_VERSION:-3.12.12}"
 uv_version="${UV_VERSION:-0.11.28}"
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime_root="${PYTHON_RUNTIME_ROOT:-$project_root/data/python}"
@@ -16,5 +16,15 @@ if [[ ! -x "$runtime_root/bin/uv" ]]; then
 fi
 "$runtime_root/bin/uv" python install "$python_version"
 "$runtime_root/bin/uv" lock --project "$project_root/python-runtime" --check
-"$runtime_root/bin/uv" sync --project "$project_root/python-runtime" --locked --no-dev --managed-python --python "$python_version"
-"$runtime_root/shared/bin/python" -c "import pandas, openpyxl, docx, pptx, pypdf, PIL; print('Python runtime ready')"
+profile="${PYTHON_RUNTIME_PROFILE:-base}"
+extras=()
+case "$profile" in
+  base) ;;
+  documents) extras=(--extra documents) ;;
+  *) echo "Unknown Python runtime profile: $profile" >&2; exit 2 ;;
+esac
+"$runtime_root/bin/uv" sync "${extras[@]}" --project "$project_root/python-runtime" --locked --no-dev --managed-python --python "$python_version"
+"$runtime_root/shared/bin/python" -c "import json, ssl, sqlite3; print('Base Python runtime ready')"
+if [[ "$profile" == documents ]]; then
+  "$runtime_root/shared/bin/python" -c "import pandas, openpyxl, docx, pptx, pypdf, PIL; print('Document tools ready')"
+fi

@@ -170,6 +170,7 @@ export type Message = {
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; attachment_references: string[]; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
+  voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null };
   id: string;
   conversation_id: string;
   content: string;
@@ -459,6 +460,28 @@ type RequestOptions = { allowStatuses?: readonly number[]; timeoutMs?: number };
 const COMPOSER_REQUEST_TIMEOUT_MS = 45_000;
 const COMPOSER_UPLOAD_TIMEOUT_MS = 600_000;
 
+// Upload completion is distinct from cloud recognition for the proofreading route.
+function transcribeWithUploadProgress<T>(path: string, body: FormData, uploaded: () => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE_PATH}/api${path}`);
+    xhr.withCredentials = true;
+    xhr.timeout = COMPOSER_UPLOAD_TIMEOUT_MS;
+    if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+    xhr.upload.onload = uploaded;
+    xhr.onload = () => {
+      let data: { error?: string } = {};
+      try { data = JSON.parse(xhr.responseText); } catch { /* Report the response status below. */ }
+      if (xhr.status < 200 || xhr.status >= 300) reject(new ApiError(data.error || `请求失败 (${xhr.status})`, xhr.status));
+      else resolve(data as T);
+    };
+    xhr.onerror = () => reject(new Error("语音上传连接中断，录音已保留，请重试。"));
+    xhr.ontimeout = () => reject(new Error("语音识别确认超时，录音已保留，请重试。"));
+    xhr.onabort = () => reject(new Error("语音请求已中止，录音已保留。"));
+    xhr.send(body);
+  });
+}
+
 export async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
@@ -699,7 +722,15 @@ export const api = {
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body }, { timeoutMs: files.length ? COMPOSER_UPLOAD_TIMEOUT_MS : COMPOSER_REQUEST_TIMEOUT_MS });
   },
-  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; projectId?: string; draftText?: string; attachmentNames?: string[]; purpose?: "composer" | "search"; clientRecordingId?: string } = {}) => {
+  sendVoiceMessage: (id: string, audio: Blob, fileName: string, clientRecordingId: string, message: string, quoteExcerpt: string, voiceTranscriptionIds: string[]) => {
+    const body = new FormData();
+    body.set("audio", audio, fileName); body.set("clientRecordingId", clientRecordingId);
+    body.set("message", message); body.set("quoteExcerpt", quoteExcerpt);
+    body.set("voiceTranscriptionIds", JSON.stringify(voiceTranscriptionIds));
+    return request<{ accepted: boolean; pendingPrompt: PendingPrompt | null }>(`/conversations/${id}/voice-messages`, { method: "POST", body }, { timeoutMs: COMPOSER_UPLOAD_TIMEOUT_MS });
+  },
+  retryVoiceMessage: (id: string, pendingId: string) => request<{ accepted: boolean }>(`/conversations/${id}/pending-prompts/${pendingId}/retry-voice`, { method: "POST" }),
+  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; projectId?: string; draftText?: string; attachmentNames?: string[]; purpose?: "composer" | "search"; clientRecordingId?: string; onUploadComplete?: () => void } = {}) => {
     const body = new FormData();
     body.set("audio", audio, fileName);
     body.set("conversationId", context.conversationId ?? "");
@@ -708,6 +739,7 @@ export const api = {
     body.set("purpose", context.purpose ?? "composer");
     body.set("attachmentNames", JSON.stringify(context.attachmentNames ?? []));
     body.set("clientRecordingId", context.clientRecordingId ?? "");
+    if (context.onUploadComplete) return transcribeWithUploadProgress<{ text: string; transcriptionId: string }>("/transcriptions", body, context.onUploadComplete);
     return request<{ text: string; transcriptionId: string }>("/transcriptions", { method: "POST", body });
   },
   reorderPendingPrompts: (conversationId: string, ids: string[]) => request<{ pendingPrompts: PendingPrompt[] }>(

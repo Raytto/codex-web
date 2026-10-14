@@ -35,7 +35,7 @@ export function ConversationVoicePanel({ voice, className, panelClassName, contr
         <canvas ref={voice.waveformRef} aria-label="实时音量波形" />
         <time>{formatVoiceDuration(voice.elapsed)}</time>
         <button type="button" className="voice-stop" onClick={() => voice.finish(false)} aria-label="停止录音并识别" title="停止并转成文字"><Square size={12} fill="currentColor" /></button>
-      </> : <><LoaderCircle className="spin" size={17} /><span>正在识别语音…</span></>}
+      </> : <><LoaderCircle className="spin" size={17} /><span>{voice.uploading ? "正在上传语音，请稍候…" : "正在识别语音…"}</span></>}
     </div>}
     <div className={`conversation-voice-wrap ${className ?? ""} ${controlClassName ?? ""}`}>
       {voice.draftRestoring && <span className="voice-draft-restoring" role="status" aria-live="polite"><LoaderCircle className="spin" size={13} />正在恢复未发送语音…</span>}

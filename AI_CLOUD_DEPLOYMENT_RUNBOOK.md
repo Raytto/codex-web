@@ -126,7 +126,7 @@ Codex 授权的撤销与重登必须仍以 UID 11001 和第 8 节相同的 `HOME
 | --- | --- | --- |
 | `SSH_TARGET` | `deploy@example-host` | SSH 用户和地址；不要把真实生产地址写回公开仓库。 |
 | `APP_DIR` | `/opt/codex-web` | 服务器上的安装目录。 |
-| `CODEX_WEB_REF` | 经审阅的标签或提交 | 未指定时可先检出 `master`，但部署报告必须写明最终提交。 |
+| `CODEX_WEB_REF` | 经审阅的标签或提交 | 未指定时可先检出 `main`，但部署报告必须写明最终提交。 |
 | `BASE_PATH` | `/codex-web` | 反向代理和应用必须一致。 |
 | `CODEX_WEB_PORT` | `37821` | 只监听宿主回环地址。 |
 | `DOMAIN` | 可空 | 有域名时启用 Nginx HTTPS 和自动证书。 |
@@ -211,7 +211,7 @@ sudo ufw status verbose
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl dnsutils git gnupg jq nginx openssl snapd ufw
+sudo apt-get install -y ca-certificates curl dnsutils git gnupg jq nginx openssl ufw
 sudo systemctl enable --now nginx
 ```
 
@@ -254,7 +254,7 @@ sudo chown "$(id -un):$(id -gn)" /opt/codex-web
 git clone https://github.com/Raytto/codex-web.git /opt/codex-web
 cd /opt/codex-web
 git fetch --tags --prune
-git switch master
+git switch main
 git pull --ff-only
 git status --short
 git rev-parse HEAD
@@ -262,14 +262,14 @@ git rev-parse HEAD
 
 如果部署私有分叉，优先使用只读 Deploy Key 或受限的机器凭据；私钥只存放在部署用户的 `~/.ssh/`，权限设为 `600`，不要复制到项目目录。
 
-在写入生产配置前运行仓库测试镜像：
+在写入生产配置前构建基础镜像。发布维护者必须通过测试门禁；普通安装无需另装宿主开发依赖。需要在这台服务器重验源码时，给下方命令增加 `CODEX_WEB_VERIFY_BUILD=1`；专用 builder 会先测试再构建，并在退出时删除本次缓存，不留下测试镜像。4 GB 机器需预留构建峰值空间、合理保留 swap，详见[构建与容量](docs/BUILD_AND_STORAGE.md)。
 
 ```bash
 cd /opt/codex-web
-sudo docker build --target test -t codex-web-test:preflight .
+sudo ./scripts/build-image.sh
 ```
 
-测试失败就停止，不得继续部署。
+构建或选择执行的测试失败就停止，不得继续部署。默认镜像不含办公增强包；需要时显式使用 `sudo env CODEX_WEB_BUILD_TARGET=documents ./scripts/build-image.sh`。
 
 ## 7. 创建生产 `.env`
 
@@ -302,8 +302,7 @@ PUBLIC_BASE_URL=<见下文>
 
 - `SESSION_SECRET` 可由人类在可信终端运行 `openssl rand -base64 48` 生成，然后直接粘贴到服务器的安全编辑器。不要让 AI 回显结果。
 - `APP_PASSWORD_HASH` 必须通过仓库的 `npm run hash-password` 或 `scripts/hash-password.mjs` 生成。密码至少 12 个字符。不要把真实密码直接写进可保存的命令、聊天或自动化日志。
-- 最稳妥的方式是在可信工作站安装 Node.js 22，克隆同一提交后运行 `npm ci`，再由人类交互输入密码并只把最终 bcrypt 哈希粘贴进 `.env`。
-- 如果只能在服务器生成，先安装 Node.js 22，或临时进入官方 Node 22 容器；人类必须在交互终端输入且完成后清除变量。不要把示例占位符当成真实密码。
+- 使用[标准输入密码命令](docs/BUILD_AND_STORAGE.md#new-production-installation)，直接从第 6 节已构建镜像生成哈希；无需在宿主安装 Node.js/npm/开发依赖。人类在可信终端静默输入密码，不放进命令参数或 shell 历史。
 
 有域名时：
 
@@ -319,9 +318,11 @@ PUBLIC_BASE_URL=http://localhost:37821/codex-web
 
 保持 `.env.example` 中的上传、存储和租户隔离默认值，除非用户明确要求调整。修改限制时，要同时检查 Nginx 的 `client_max_body_size`。
 
-提交启动前检查，但不要把配置内容输出到日志：
+编辑完成后让容器内 Web UID 10001 独占读取配置；租户 UID 11001 不可读取。后续使用特权编辑器修改此文件。提交启动前检查，但不要把配置内容输出到日志：
 
 ```bash
+sudo chown 10001:10001 .env
+sudo chmod 600 .env
 test "$(stat -c '%a' .env)" = 600
 sudo docker compose config --quiet
 git status --short
@@ -343,8 +344,7 @@ sudo docker network inspect codex-web-egress >/dev/null 2>&1 \
 
 ```bash
 cd /opt/codex-web
-sudo docker compose build --pull
-sudo docker compose up -d
+sudo docker compose up -d --no-build
 sudo docker compose ps
 ```
 
@@ -443,9 +443,10 @@ curl -fsS http://codex.example.com/codex-web/api/health
 
 ### 9.2 申请并验证 HTTPS 证书
 
-默认使用 Certbot 的 Nginx 插件和 Let's Encrypt。HTTP-01 验证要求公网能够访问 TCP 80：
+仅在启用公网 HTTPS 时安装 Certbot/Snap。它们属于可选宿主依赖，Snap 的 core、certbot 镜像及保留修订需单独记入空间账，不包含在基础应用实测中。默认使用 Certbot 的 Nginx 插件和 Let's Encrypt。HTTP-01 验证要求公网能够访问 TCP 80：
 
 ```bash
+sudo apt-get install -y snapd
 sudo snap install core
 sudo snap refresh core
 sudo snap install --classic certbot
@@ -683,23 +684,32 @@ cd /opt/codex-web
 git status --short
 git rev-parse HEAD
 git fetch --tags --prune
-git log --oneline --decorate HEAD..origin/master
+git log --oneline --decorate HEAD..origin/main
 ```
 
 如果有未确认的本地修改就停止。选择目标提交后执行测试、构建和滚动重建：
 
 ```bash
 git switch --detach TARGET_COMMIT
-sudo docker build --target test -t codex-web-test:upgrade .
-sudo docker compose build --pull
-sudo docker compose up -d
+sudo env CODEX_WEB_VERIFY_BUILD=1 ./scripts/build-image.sh
+sudo docker compose up -d --no-build
 sudo docker compose ps
 curl -fsS http://127.0.0.1:37821/codex-web/api/health
 ```
 
 升级后重复第 10 节验收。应用回滚时切回已记录的旧提交并重新构建；数据结构如果发生不可逆迁移，必须使用与旧版本匹配的备份恢复，不能只切 Git。任何时候都不要用 `down -v` 作为“重新安装”。
 
-## 16. 常见故障定位
+## 16. 新部署与升级收尾
+
+按[容量账与安全清理](docs/BUILD_AND_STORAGE.md#new-deployment-closeout)分别记录镜像逻辑大小、去重常驻层、构建峰值/缓存、测试镜像、宿主依赖、持久 runtime、用户卷、备份/恢复临时副本、OS 和 swap。不能把 Docker 的共享镜像层与缓存直接相加。
+
+默认构建脚本已自动删除本次唯一 builder 的缓存；旧指引生成的测试标签，只能在确认归属和无容器引用后按精确标签删除。恢复演练临时目录应有独立名称、状态根和端口，验收后停止专属容器并核对挂载再移除该临时副本；保留真实 `.state/data`、`.state/tenants` 和可恢复备份。禁止跨项目全局 prune、无差别删卷或为达到容量数字盲删 swap。
+
+本轮 Linux amd64 隔离实测：默认镜像约 1.53 GB，构建收尾后的基础应用安装约 1.87 GB（含 BuildKit 镜像、源码和初始化状态）；构建时 Docker 目录观测峰值约 6.01 GB。旧指引同口径约 6.75 GB，包含测试镜像、缓存、宿主 npm 依赖和重复 CLI。完整字节数、采样口径和限制见[实测对比](docs/BUILD_AND_STORAGE.md#measured-clean-install-example-2026-10-14)。
+
+4 GB 物理内存云主机的 swap 属于系统内存策略，不计入基础应用大小；构建可能需要更多空闲盘。基础应用约 2–3 GB 的目标不包含系统、swap、个人文件、模型下载、历史版本和备份，不应承诺整个服务器永远小于 3 GB。
+
+## 17. 常见故障定位
 
 | 现象 | 优先检查 | 不要做 |
 | --- | --- | --- |
@@ -712,7 +722,7 @@ curl -fsS http://127.0.0.1:37821/codex-web/api/health
 | 容器启动后立即退出 | `docker compose ps`、最近 200 行日志、`.env` 必填项 | 不要打印完整 `.env` |
 | Worker 任务无响应 | Supervisor 状态、租户配额、资源限制、Codex 登录 | 不要改成 root 运行 |
 
-## 17. AI 交付报告模板
+## 18. AI 交付报告模板
 
 交付报告应简短、可复核且不含秘密：
 

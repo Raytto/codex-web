@@ -68,3 +68,10 @@ The shared `src/reader/navigation.tsx` handler keeps reader anchors in the curre
 `node_transfers` stores coordinator metadata separately from conversation attachments. Worker 1.20.0 and the optional host bridge execute scoped endpoint commands; the server owns retry, epoch changes, route selection and cleanup state. The data path uses authenticated WebRTC or encrypted WSS memory relay under the configured application base path. Endpoint confirmation, final SHA-256, atomic publication and separate source/target cleanup receipts determine completion. Normal tenants cannot use the host transfer path as an alternative execution boundary.
 
 Composer writes use a 45-second ordinary-write budget and a 10-minute new-file form budget; durable confirmation releases input before background refresh. Remote byte streams use independent 30-minute limits, up to 2 GiB per file and a bounded aggregate result budget.
+
+
+## Base image and October updates
+
+The [build and capacity guide](BUILD_AND_STORAGE.md) defines the base/document profiles, isolated build cleanup, direct bundled Codex runtime and upgrade migration. Default Compose retains read-only application layers, separate web/tenant UIDs, no Docker socket and empty optional host/Worker/model configuration. `documents` only adds office tools; it grants no host capability. Runtime state is created after installation under the configured state root and is excluded from build context.
+
+[Voice submissions](VOICE_SEND.md) add durable accepted/processing/failed states and restart recovery; [opportunity cards](OPPORTUNITY_CARDS.md) start empty and disabled, enforce account/project ownership, CSRF on browser writes and scoped live-Job authorization on automation writes. These changes do not introduce phone/SMS login or production provider defaults. Migrations `2026101401` and `2026101402` require the usual pre-upgrade state backup. Worker 1.20.2 permits 256 automatic results per batch without raising byte/time limits.

@@ -16,7 +16,7 @@ test("production documentation follows managed deployment and current persistenc
   const compose = read("compose.yaml");
 
   for (const document of [readme, deployment]) {
-    assert.doesNotMatch(document, /^\s*(?:sudo\s+)?docker compose[^\n]*(?:\bbuild\b|\bup\b[^\n]*--build)/m);
+    assert.doesNotMatch(document, /^\s*(?:sudo\s+)?docker compose[^\n]*(?:\sbuild(?:\s|$)|\sup\s[^\n]*--build(?:\s|$))/m);
     assert.match(document, /codex-web-self-maintain\.service/);
     assert.match(document, /codex-web-request-rebuild/);
   }

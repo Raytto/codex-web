@@ -48,3 +48,6 @@
 ## 验证
 
 专项测试涵盖日历/时区/DST、同时间重复扫描、独立连接与重开数据库、停止/失败后的下一轮、长期离线占用、停机补一次、事务异常回滚、模型与深度快照、次数与暂停/恢复、陈旧编辑、CSRF、跨账号隔离及归档门禁。正式发布还需完整构建/应用测试、容器门禁及真实登录后的桌面/手机视口验收。每个自托管实例仍须验收自己的部署、时区和执行器配置。
+
+
+The compact editor reuses the conversation model/effort menus. Long intervals display days/hours/minutes; expanded project folders wait for both recurring tasks and the initial conversation page. Failed list loading offers retry. Opportunity discovery may link a native task; a new linked task starts paused, and hiding the optional cards feature does not silently disable an existing schedule.

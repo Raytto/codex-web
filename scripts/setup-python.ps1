@@ -28,5 +28,5 @@ if (-not (Test-Path -LiteralPath $uv)) {
 $pythonProject = Join-Path $projectRoot "python-runtime"
 Invoke-CheckedNative $uv @("python", "install", $PythonVersion)
 Invoke-CheckedNative $uv @("lock", "--project", $pythonProject)
-Invoke-CheckedNative $uv @("sync", "--project", $pythonProject, "--locked", "--no-dev", "--managed-python", "--python", $PythonVersion)
-Invoke-CheckedNative $uv @("run", "--project", $pythonProject, "python", "-c", "import pandas, openpyxl, docx, pptx, pypdf, PIL; print('Python runtime ready')")
+Invoke-CheckedNative $uv @("sync", "--project", $pythonProject, "--locked", "--no-dev", "--extra", "documents", "--managed-python", "--python", $PythonVersion)
+Invoke-CheckedNative $uv @("run", "--no-sync", "--project", $pythonProject, "python", "-c", "import pandas, openpyxl, docx, pptx, pypdf, PIL; print('Python runtime ready')")

@@ -58,3 +58,22 @@ test("generated images respect the remaining result byte budget", async (context
   assert.equal(result.uploaded, 1);
   assert.deepEqual(result.omitted, [{ path: "a.png", reason: "total_size_limit" }]);
 });
+
+
+test("generated images can exceed twenty files and obey the remaining shared count", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-image-count-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const threadId = crypto.randomUUID();
+  const directory = path.join(root, "generated_images", threadId);
+  fs.mkdirSync(directory, { recursive: true });
+  for (let index = 0; index < 257; index += 1) fs.writeFileSync(path.join(directory, `${index}.png`), "image");
+  const full = await collectGeneratedImages(root, threadId, new Map(), async () => {});
+  assert.equal(full.uploaded, 256);
+  assert.equal(full.omitted.length, 1);
+  assert.equal(full.omitted[0].reason, "count_limit");
+  const remaining = await collectGeneratedImages(root, threadId, new Map(), async () => {}, { maximumFiles: 1 });
+  assert.equal(remaining.uploaded, 1);
+  const exhausted = await collectGeneratedImages(root, threadId, new Map(), async () => {}, { maximumFiles: 0 });
+  assert.equal(exhausted.uploaded, 0);
+  assert.equal(fs.readdirSync(directory).length, 257);
+});

@@ -8,6 +8,7 @@ const FeatureSelectionContext = createContext({
   error: "",
   applyFeatures: (_value: FeatureSelection) => {},
   changeParaBoard: async (_enabled: boolean) => {},
+  changeOpportunityCards: async (_enabled: boolean) => {},
 });
 
 async function boundedRequest<T>(run: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal): Promise<T> {
@@ -62,15 +63,17 @@ export function FeatureSelectionProvider({ initial, children }: { initial?: Feat
     };
   }, [refresh]);
 
-  const changeParaBoard = async (paraBoard: boolean) => {
+  const change = async (patch: Partial<FeatureSelection>) => {
     if (savingRef.current) return;
     savingRef.current = true; setSaving(true); setError("");
-    try { const revision = current.current.revision; applyFeatures(await boundedRequest(signal => api.updateFeatureSelection({ paraBoard, revision }, signal))); }
+    try { const revision = current.current.revision; applyFeatures(await boundedRequest(signal => api.updateFeatureSelection({ ...current.current, ...patch, revision }, signal))); }
     catch (e) {
       setError(e instanceof DOMException && e.name === "AbortError" ? "保存超时，请检查网络后重试。" : e instanceof Error ? e.message : "保存失败，请重试。");
       // Also resolves a lost write response and a concurrent device change.
       try { await refresh(); } catch { /* Keep the last confirmed value. */ }
     } finally { savingRef.current = false; setSaving(false); }
   };
-  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changeParaBoard }}>{children}</FeatureSelectionContext.Provider>;
+  const changeParaBoard = (paraBoard: boolean) => change({ paraBoard });
+  const changeOpportunityCards = (opportunityCards: boolean) => change({ opportunityCards });
+  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changeParaBoard, changeOpportunityCards }}>{children}</FeatureSelectionContext.Provider>;
 }

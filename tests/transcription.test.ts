@@ -162,8 +162,9 @@ test("Qwen Omni receives the silence-trimmed WAV and temporary audio is removed"
     fs.writeFileSync(path.join(service.audioRoot, sourceName), Buffer.from("webm-test"));
     assert.equal(await service.transcribe(sourceName), "裁剪成功");
     assert.ok(Math.abs(submittedDurationMs - 2_700) <= 50);
-    assert.equal(logs.mock.callCount(), 1);
-    assert.ok(logs.mock.calls[0].arguments[1].removedDurationMs > 5_200);
+    const trimming = logs.mock.calls.filter((call) => call.arguments[0] === "[voice-transcription] trimmed long silence");
+    assert.equal(trimming.length, 1);
+    assert.ok(trimming[0].arguments[1].removedDurationMs > 5_200);
     assert.deepEqual(fs.readdirSync(service.audioRoot), [sourceName]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -313,4 +314,23 @@ test("personalized lexicon includes only desired canonical terms and no historic
   assert.match(prompt, /只包含希望优先保留的常用标准术语/);
   assert.match(prompt, /会话/);
   assert.doesNotMatch(prompt, /绘画|历史错误样例.*绘画/);
+});
+
+test("voice stage diagnostics distinguish preparation/provider time without transcript or credentials", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-timing-"));
+  const logs = t.mock.method(console, "info", () => undefined);
+  try {
+    const service = new TranscriptionService(testConfig(root), (async () => new Response(
+      'data: {"choices":[{"delta":{"content":"private transcript sentinel"}}]}\n\ndata: [DONE]\n\n',
+    )) as typeof fetch, async (_input, output) => fs.writeFileSync(output, testWavBuffer()), async () => []);
+    const source = `${crypto.randomUUID()}.webm`;
+    fs.writeFileSync(path.join(service.audioRoot, source), "fixture");
+    await service.transcribe(source, { draftText: "private draft sentinel", personalizedTerms: ["private terminology sentinel"] });
+    const marks = logs.mock.calls.filter((call) => call.arguments[0] === "[voice-timing]").map((call) => JSON.parse(String(call.arguments[1])));
+    assert.deepEqual(marks.map((mark) => mark.stage), ["prepare_start", "prepare_done", "context_done", "upstream_start", "upstream_headers", "transcription_done"]);
+    assert.ok(marks.every((mark) => Number.isFinite(mark.elapsedMs) && mark.elapsedMs >= 0));
+    assert.match(marks[1].servedAudioId, /^[a-f0-9-]{36}$/);
+    assert.ok(marks.every((mark) => mark.audioId === source.split(".")[0]));
+    assert.doesNotMatch(JSON.stringify(marks), /sentinel|dashscope-key|signature=|Bearer/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -85,6 +85,7 @@ input.on("line", (line) => {
           CODEX_WEB_AUTOMATION_TOKEN: message.request.automation.token,
           CODEX_WEB_AUTOMATION_JOB_ID: message.request.jobId,
           CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+          CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
         } : {}),
       };
       activeExecution = startAppServerTurn({

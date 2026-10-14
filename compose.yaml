@@ -1,9 +1,30 @@
 services:
+  init-state:
+    image: ${CODEX_WEB_IMAGE:-codex-web:local}
+    entrypoint: ["/app/scripts/migrate-tenant-permissions.sh"]
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/data:/app/data
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/tenants:/app/tenants
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
+      target: ${CODEX_WEB_BUILD_TARGET:-runtime}
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.162.1}
+        WORKER_RELEASE_COMMIT: ${WORKER_RELEASE_COMMIT:-}
     image: ${CODEX_WEB_IMAGE:-codex-web:local}
+    depends_on:
+      init-state:
+        condition: service_completed_successfully
     restart: unless-stopped
     init: true
     environment:
@@ -15,7 +36,7 @@ services:
       TENANT_ROOT: /app/tenants
       PYTHON_RUNTIME_ROOT: /opt/cww-python
       CODEX_HOME: /home/cww/.codex
-      CODEX_RUNTIME_PATH: ${CWW_CODEX_RUNTIME_PATH:-/opt/codex-runtime/current/bin/codex}
+      CODEX_RUNTIME_PATH: ${CWW_CODEX_RUNTIME_PATH:-/opt/codex-baked/bin/codex}
       HOME: /home/cww
       TENANT_WORKER_ISOLATION: "true"
       CWW_SHARED_CODEX_AUTH_FILE: /app/shared-codex-auth/auth.json
@@ -33,10 +54,10 @@ services:
       - ${CODEX_WEB_ENV_FILE:-./.env}:/app/.env:ro
       - ${CODEX_WEB_STATE_ROOT:-./.state}/data:/app/data
       - ${CODEX_WEB_STATE_ROOT:-./.state}/tenants:/app/tenants
-      - ${CODEX_WEB_SHARED_AUTH_ROOT:-./.state/shared-codex-auth}:/app/shared-codex-auth
-      - ${CODEX_WEB_MARKETPLACE_ROOT:-./.state/codex-marketplaces}:/opt/codex-marketplaces:ro
-      - ${CODEX_WEB_RUNTIME_ROOT:-./.state/codex-runtime}:/opt/codex-runtime
-      - ${CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-./.state/deploy-status}:/app/deploy-status:ro
+      - ${CODEX_WEB_SHARED_AUTH_ROOT:-${CODEX_WEB_STATE_ROOT:-./.state}/shared-codex-auth}:/app/shared-codex-auth
+      - ${CODEX_WEB_MARKETPLACE_ROOT:-${CODEX_WEB_STATE_ROOT:-./.state}/codex-marketplaces}:/opt/codex-marketplaces:ro
+      - ${CODEX_WEB_RUNTIME_ROOT:-${CODEX_WEB_STATE_ROOT:-./.state}/codex-runtime}:/opt/codex-runtime
+      - ${CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-${CODEX_WEB_STATE_ROOT:-./.state}/deploy-status}:/app/deploy-status:ro
     networks:
       - egress
     read_only: true

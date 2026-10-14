@@ -398,7 +398,7 @@ test("chat font sizing keeps readable bounds and scales from the default", () =>
 test("each Codex job pins the primary proxy or the backup after one ten-second probe", async () => {
   const controller = new AbortController();
   const primary = "http://127.0.0.1:17890";
-  const backup = "http://127.0.0.1:17891";
+  const backup = "http://127.0.0.1:19092";
   let observedTimeout = 0;
   const selectedPrimary = await selectCodexEgress({
     primaryProxyUrl: primary,
@@ -1936,7 +1936,7 @@ test("configured tenants have distinct Unix identities and workers reject cross-
   assert.match(appServerSource, /show_raw_agent_reasoning: false/);
   assert.match(composeSource, /codex-runtime\}:\/opt\/codex-runtime/);
   assert.match(composeSource, /CODEX_WEB_DEPLOY_STATUS_FILE: \/app\/deploy-status\/status\.json/);
-  assert.match(composeSource, /CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-\.\/\.state\/deploy-status\}:\/app\/deploy-status:ro/);
+  assert.match(composeSource, /CODEX_WEB_DEPLOY_STATUS_HOST_ROOT:-\$\{CODEX_WEB_STATE_ROOT:-\.\/\.state\}\/deploy-status\}:\/app\/deploy-status:ro/);
   assert.match(executionSource, /cwd: request\.projectDirectory/);
   assert.match(executionSource, /CWW_OUTPUTS_DIR: path\.join\(request\.workspace, "outputs"\)/);
   const supervisorSource = fs.readFileSync(path.join(process.cwd(), "server", "supervisor.ts"), "utf8");
@@ -4867,7 +4867,26 @@ test("remote Worker output uploads keep large JSON files on the raw streaming tr
         assert.throws(() => instance.remoteWorkers.beginArtifactUpload(
           message.request!.jobId, message.request!.transferToken, "over-budget.bin", "application/octet-stream", 2 * 1024 * 1024 * 1024,
         ), (error: unknown) => error instanceof Error && "code" in error && error.code === "REMOTE_JOB_BYTES_LIMIT");
-        for (const reservation of reservations) await instance.remoteWorkers.abortUpload(reservation);
+        const fourth = instance.remoteWorkers.beginArtifactUpload(
+          message.request!.jobId, message.request!.transferToken, "fourth.txt", "text/plain", 0,
+        )!;
+        assert.throws(() => instance.remoteWorkers.beginArtifactUpload(
+          message.request!.jobId, message.request!.transferToken, "fifth.txt", "text/plain", 0,
+        ), (error: unknown) => error instanceof Error && "code" in error && error.code === "REMOTE_UPLOAD_CONCURRENCY_LIMIT");
+        for (const reservation of [...reservations, fourth]) await instance.remoteWorkers.abortUpload(reservation);
+        // Cross both former limits (20 Worker / 32 gateway), including the new boundary.
+        for (let index = 1; index < 256; index += 1) {
+          const small = await fetch(`${origin}/api/remote-worker-files/${message.request!.jobId}/output`, {
+            method: "PUT", headers: { authorization: `Bearer ${message.request!.transferToken}`, "content-type": "text/plain", "x-file-name": `result-${index}.txt` }, body: String(index),
+          });
+          assert.equal(small.status, 201, `result ${index + 1} must be accepted`);
+          await small.arrayBuffer();
+        }
+        const overflow = await fetch(`${origin}/api/remote-worker-files/${message.request!.jobId}/output`, {
+          method: "PUT", headers: { authorization: `Bearer ${message.request!.transferToken}`, "content-type": "text/plain", "x-file-name": "overflow.txt" }, body: "",
+        });
+        assert.equal(overflow.status, 429);
+        assert.equal((await overflow.json() as { code: string }).code, "REMOTE_FILE_COUNT_LIMIT");
         socket.send(JSON.stringify({ type: "event", jobId: message.request?.jobId, event: { type: "completed", finalResponse: "done" } }));
       })().catch(reject);
     });
@@ -4897,7 +4916,7 @@ test("remote Worker output uploads keep large JSON files on the raw streaming tr
     selection: { model: "gpt-5", reasoningEffort: "medium" }, optionalCapabilities: DEFAULT_OPTIONAL_AGENT_CAPABILITIES,
   }, [], { onThreadStarted: () => {}, onProgress: () => {}, onContextUsage: () => {}, onQuotaUsage: () => {} });
   assert.equal(result.finalResponse, "done");
-  assert.equal(result.artifacts.length, 1);
+  assert.equal(result.artifacts.length, 256);
   assert.equal(result.artifacts[0]?.name, "analysis.json");
   assert.equal(result.artifacts[0]?.size, 128 * 1024 * 1024 + 11);
   assert.match(result.artifacts[0]!.sha256, /^[0-9a-f]{64}$/);
@@ -4908,6 +4927,7 @@ test("remote Worker output uploads keep large JSON files on the raw streaming tr
     onThreadStarted: () => {}, onProgress: () => {}, onContextUsage: () => {}, onQuotaUsage: () => {},
   });
   assert.equal(resumed.finalResponse, "done");
+  assert.equal(resumed.artifacts.length, 256);
   assert.equal(resumed.artifacts[0]?.sha256, result.artifacts[0]?.sha256);
   instance.remoteWorkers.release(jobId);
   assert.equal(fs.existsSync(recoveryPath), false);
@@ -6517,10 +6537,13 @@ test("maintenance deployment templates queue, verify, and publish a clean commit
   assert.match(coordinator, /STATE_HELPER|state claim|queue paused/);
   assert.match(stateHelper, /deployment_requests|target_sha|phase_history/);
   assert.match(rebuild, /docker compose|CODEX_WEB_EXPECTED_COMMIT|previous-commit/);
-  assert.match(rebuild, /npm run verify/);
+  assert.match(rebuild, /CODEX_WEB_VERIFY_BUILD="\$verify_build"/);
+  assert.match(rebuild, /scripts\/build-image\.sh/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "scripts", "build-image.sh"), "utf8"), /--target test/);
   assert.match(selfMaintain, /ExecStart=.*codex-web-rebuild-coordinator/);
   assert.match(pathUnit, /PathExists=.*pending-commit/);
   const dockerfile = fs.readFileSync(path.join(process.cwd(), "Dockerfile"), "utf8");
+  assert.match(dockerfile, /npm run verify/);
   assert.match(dockerfile, /COPY deploy \.\/deploy/);
   assert.match(dockerfile, /COPY skills \.\/skills/);
   assert.match(dockerfile, /COPY account-resources \.\/account-resources/);

@@ -45,6 +45,7 @@ export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: Exec
     CODEX_WEB_AUTOMATION_TOKEN: request.automation.token,
     CODEX_WEB_AUTOMATION_JOB_ID: request.jobId,
     CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+    CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
   });
   return startAppServerTurn({
     executablePath: process.env.CODEX_RUNTIME_PATH || undefined,

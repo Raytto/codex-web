@@ -1,4 +1,4 @@
-import { REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
+import { REMOTE_TRANSFER_MAX_FILES_PER_JOB, REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -407,7 +407,7 @@ async function startRun(request: RunRequest): Promise<void> {
         generatedImageThreadId,
         generatedImagesBeforeThreadId === generatedImageThreadId ? generatedImagesBefore : new Map(),
         async (realPath, name) => uploadResultFile(run, realPath, name),
-        { maximumFiles: Math.max(0, 20 - changed.uploaded), maximumTotalBytes: Math.max(0, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB - changed.uploadedBytes) },
+        { maximumFiles: Math.max(0, REMOTE_TRANSFER_MAX_FILES_PER_JOB - changed.uploaded), maximumTotalBytes: Math.max(0, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB - changed.uploadedBytes) },
       )
       : { uploaded: 0, omitted: [] };
     const omittedArtifacts = [...changed.omitted, ...generated.omitted].slice(0, 100);

@@ -1,3 +1,4 @@
+import { reserveOpportunityBatch, reconcileOpportunityBatches } from "./opportunity-schema.js";
 import crypto from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppDatabase } from "./db.js";
@@ -30,7 +31,7 @@ export class RecurringConflict extends Error {}
 export class RecurringStore {
   constructor(readonly db: AppDatabase) {}
   private row(user: string, id: string): Row | undefined { return this.db.sqlite.prepare(`SELECT t.* FROM recurring_tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=? AND t.user_id=? AND t.deleted_at IS NULL AND p.archived_at IS NULL`).get(id, user) as Row | undefined; }
-  get(user: string, id: string) { const r = this.row(user, id); return r ? view(r) : undefined; }
+  get(user: string, id: string) { const r = this.row(user, id); return r ? { ...view(r), opportunityTopic: this.db.sqlite.prepare("SELECT id,name FROM opportunity_topics WHERE task_id=? AND user_id=? AND deleted_at IS NULL").get(id,user) as { id: string; name: string } | undefined ?? null } : undefined; }
   list(user: string) { return (this.db.sqlite.prepare(`SELECT t.* FROM recurring_tasks t JOIN projects p ON p.id=t.project_id WHERE t.user_id=? AND t.deleted_at IS NULL AND p.archived_at IS NULL ORDER BY t.created_at,t.id`).all(user) as Row[]).map(view); }
   create(user: string, project: string, input: RecurringInput, now = Date.now()) {
     if (!this.db.getActiveProjectForUser(project, user)) throw new Error("项目不存在。");
@@ -42,6 +43,14 @@ export class RecurringStore {
     const current = this.get(user, id);
     if (!current) return undefined;
     if (current.revision !== revision) throw new RecurringConflict("任务已变化，请重新加载后再修改。");
+    if (state === "active") {
+      const topic = this.db.sqlite.prepare("SELECT archived_at,deleted_at FROM opportunity_topics WHERE task_id=?").get(id) as { archived_at: string | null; deleted_at: string | null } | undefined;
+      if (topic) {
+        const p = this.db.getActiveProjectForUser(current.project_id,user);
+        const expected = user === "00000000-0000-4000-8000-000000000010" ? "local-host" : "tenant-local";
+        if (topic.archived_at || topic.deleted_at || !p || p.executor_id !== expected) throw new RecurringConflict("关联机会主题已归档，或项目不是有效服务器项目。请先恢复主题与项目。");
+      }
+    }
     const exhausted = input.maxRuns !== null && current.runCount >= input.maxRuns;
     const nextState = exhausted ? "completed" : state;
     const scheduleChanged = JSON.stringify(current.schedule) !== JSON.stringify(input.schedule);
@@ -70,9 +79,21 @@ export class RecurringStore {
     try {
       const t = this.get(user, id), time = new Date(now).toISOString();
       if (!t || t.state !== "active" || !t.nextRunAt || t.nextRunAt > time) { sql.exec("COMMIT"); return null; }
+      const opportunity = sql.prepare("SELECT id,archived_at,deleted_at FROM opportunity_topics WHERE task_id=?").get(id) as { id: string; archived_at: string | null; deleted_at: string | null } | undefined;
+      if (opportunity) {
+        const project = this.db.getActiveProjectForUser(t.project_id, user);
+        const expected = user === "00000000-0000-4000-8000-000000000010" ? "local-host" : "tenant-local";
+        if (!project || project.executor_id !== expected || opportunity.archived_at || opportunity.deleted_at) {
+          sql.prepare("UPDATE recurring_tasks SET state='paused',next_run_at=NULL,revision=revision+1 WHERE id=?").run(id);
+          sql.exec("COMMIT"); return null;
+        }
+      }
       // One outstanding run per task, including an offline queued run or a
       // conversation waiting for a one-shot continuation. Other tasks are independent.
-      const busy = sql.prepare(`SELECT 1 FROM recurring_runs r JOIN conversations c ON c.id=r.conversation_id WHERE r.task_id=? AND c.deleted_at IS NULL AND (
+      if (opportunity) reconcileOpportunityBatches(sql,user,opportunity.id);
+      const opportunityDay = opportunity ? new Intl.DateTimeFormat("en-CA", { timeZone: t.schedule.timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(now)) : "";
+      const topicBusy = opportunity && (sql.prepare("SELECT 1 FROM opportunity_batches WHERE topic_id=? AND day=? AND (status<>'failed' OR attempts>=3)").get(opportunity.id,opportunityDay) || sql.prepare("SELECT 1 FROM opportunity_requests r JOIN conversations c ON c.id=json_extract(r.result_json,'$.conversationId') WHERE r.user_id=? AND r.operation=? AND (EXISTS(SELECT 1 FROM pending_prompts p WHERE p.conversation_id=c.id AND p.status='queued') OR EXISTS(SELECT 1 FROM jobs j WHERE j.conversation_id=c.id AND j.status IN ('queued','running')))").get(user,'start:'+opportunity.id+':'));
+      const busy = topicBusy || sql.prepare(`SELECT 1 FROM recurring_runs r JOIN conversations c ON c.id=r.conversation_id WHERE r.task_id=? AND c.deleted_at IS NULL AND (
         EXISTS(SELECT 1 FROM pending_prompts p WHERE p.conversation_id=c.id AND p.status='queued') OR
         EXISTS(SELECT 1 FROM jobs j WHERE j.conversation_id=c.id AND j.status IN ('queued','running')) OR
         EXISTS(SELECT 1 FROM wake_plans w WHERE w.conversation_id=c.id AND w.state='armed')
@@ -84,9 +105,10 @@ export class RecurringStore {
         const stamp = new Intl.DateTimeFormat("zh-CN", { timeZone: t.schedule.timeZone, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(t.nextRunAt));
         this.db.createConversation(conversationId, `${t.name} · ${stamp}`, selection, user, t.project_id);
         sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(conversationId);
-        this.db.createPendingPrompt(pendingId, conversationId, t.prompt, selection);
+        this.db.createPendingPrompt(pendingId, conversationId, t.prompt + (opportunity ? `\n\n关联机会主题：${opportunity.id}。使用 codex_web_opportunities context 读取当前目标与反馈，再按本任务指令执行。保持本项目正常会话链路。` : ""), selection);
+        if (opportunity) reserveOpportunityBatch(sql,opportunity.id,user,conversationId,t.project_id,t.id,opportunityDay,time);
       }
-      sql.prepare(`INSERT INTO recurring_runs(id,task_id,scheduled_at,conversation_id,pending_prompt_id,outcome,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`).run(crypto.randomUUID(), id, t.nextRunAt, conversationId, pendingId, busy ? "skipped" : "created", busy ? "上一轮仍在运行或等待，已跳过本次" : null, time);
+      sql.prepare(`INSERT INTO recurring_runs(id,task_id,scheduled_at,conversation_id,pending_prompt_id,outcome,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`).run(crypto.randomUUID(), id, t.nextRunAt, conversationId, pendingId, busy ? "skipped" : "created", busy ? (topicBusy ? "关联主题今日已处理或仍在运行，已跳过重复执行" : "上一轮仍在运行或等待，已跳过本次") : null, time);
       const count = t.runCount + (busy ? 0 : 1), complete = t.maxRuns !== null && count >= t.maxRuns;
       sql.prepare(`UPDATE recurring_tasks SET run_count=?,state=?,next_run_at=?,revision=revision+1,updated_at=? WHERE id=?`).run(count, complete ? "completed" : "active", complete ? null : nextOccurrence(t.schedule, now, Date.parse(t.nextRunAt)), time, id);
       sql.exec("COMMIT"); return conversationId;

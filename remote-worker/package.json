@@ -1,6 +1,6 @@
 {
   "name": "codex-web-remote-worker",
-  "version": "1.20.0",
+  "version": "1.20.2",
   "private": true,
   "type": "module",
   "engines": {

@@ -8,25 +8,27 @@ Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。�
 
 阅读器支持从当前 Markdown 文档选中文本后直接询问 Reader Agent，引用会以可移除的引用卡片进入同一会话；PDF/EPUB 使用有界分页渲染，选区、高亮和备注会在翻页、文本层重挂载及 Safari/WebKit 兼容路径中通过持久文本锚点恢复；公开版仍只使用账号密码登录，服务端模型与语音能力由部署者自行配置。
 
+默认是基础运行镜像；LibreOffice、字体、Poppler 与 Python 文档库通过 `documents` 构建目标选装。基础镜像保留 FFmpeg 与 Python/uv；任务可按需安装临时 Python 包。构建使用专用 builder 并自动收尾。镜像常驻、构建峰值、缓存、swap 和用户数据须分开计算，详见[构建、容量与安全清理](docs/BUILD_AND_STORAGE.md)。本轮 Linux amd64 干净安装实测：基础镜像约 1.53 GB，收尾后的应用安装约 1.87 GB，构建时 Docker 目录观测峰值约 6.01 GB；不含 OS、Docker 安装、swap、备份和用户数据。
+
 ## 快速开始
 
 面向新云服务器的完整部署、登录、备份、更新与验收步骤，请参阅 [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)。想先按“基础版 → 逐项询问扩展”的方式搭建，请阅读[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。公开版网页登录始终使用 `.env` 中的 `APP_USERNAME` 与 `APP_PASSWORD_HASH`；本仓库不提供手机号或短信登录。
 
-环境要求：Docker Engine、Docker Compose v2，以及可登录 Codex CLI 的账号。
+环境要求：Git、Docker Engine、Docker Compose v2、Buildx，以及可登录 Codex CLI 的账号。
 
 ```bash
+./scripts/build-image.sh
 cp .env.example .env
-npm ci
-npm run hash-password -- '请设置一个至少十二位的独立密码'
+chmod 600 .env
 ```
 
-把生成的哈希填入 `.env` 的 `APP_PASSWORD_HASH`，并设置至少 32 个字符的随机 `SESSION_SECRET`。然后执行：
+按[构建与容量指引](docs/BUILD_AND_STORAGE.md#new-production-installation)从已构建镜像以标准输入生成密码哈希，无需在宿主安装 npm 开发依赖。把生成的哈希填入 `.env` 的 `APP_PASSWORD_HASH`，并设置至少 32 个字符的随机 `SESSION_SECRET`。完成编辑后执行 `sudo chown 10001:10001 .env && sudo chmod 600 .env`，使 Web 进程可读取而租户 Worker 不可读取。然后执行：
 
 ```bash
 docker network inspect codex-web-egress >/dev/null 2>&1 \
   || docker network create codex-web-egress
-docker compose up -d
-docker compose exec --user 11001:11001 \
+sudo docker compose up -d --no-build
+sudo docker compose exec --user 11001:11001 \
   -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
   -e CODEX_HOME=/app/tenants/00000000-0000-4000-8000-000000000001/codex-home \
   app codex login --device-auth
@@ -228,3 +230,12 @@ stateDiagram-v2
 - 输入提交在服务端持久确认后立即解除输入锁，列表后台刷新；超时保留输入，不自动重发。Codex SDK 固定为 0.162.1。
 
 继续保留用户名/密码登录、`/codex-web` 子路径、隔离租户执行器和可选模块空配置。启用扩展前请阅读[部署说明](docs/DEPLOYMENT.md)。
+
+
+## Recent product updates / 近期更新
+
+- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription, survive restart, and use idempotent retries. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
+- [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. No private business topics, credentials or pre-created schedules are shipped.
+- Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
+- [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
+- Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.

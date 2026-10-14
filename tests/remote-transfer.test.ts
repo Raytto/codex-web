@@ -49,6 +49,7 @@ test("remote transfer rejects body length mismatches and removes partial files",
 test("standalone Worker and server use the same transfer contract", async () => {
   const server = await import("../server/remote-transfer.js");
   const worker = await import("../remote-worker/src/transfer-policy.js");
+  assert.equal(server.REMOTE_TRANSFER_MAX_FILES_PER_JOB, worker.REMOTE_TRANSFER_MAX_FILES_PER_JOB);
   assert.equal(server.REMOTE_TRANSFER_MAX_FILE_BYTES, worker.REMOTE_TRANSFER_MAX_FILE_BYTES);
   assert.equal(server.REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB, worker.REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB);
   assert.equal(server.REMOTE_TRANSFER_TIMEOUT_MS, worker.REMOTE_TRANSFER_TIMEOUT_MS);

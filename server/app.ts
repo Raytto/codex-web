@@ -1,3 +1,5 @@
+import { mountOpportunityRoutes, mountOpportunityAutomation } from "./opportunity-routes.js";
+import { VoiceSubmissionService, VoiceSubmissionError } from "./voice-submissions.js";
 import { RecurringStore } from "./recurring-store.js";
 import { mountRecurringRoutes } from "./recurring-routes.js";
 import { isFeatureSelection } from "../src/feature-selection.js";
@@ -290,6 +292,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       .catch(() => undefined);
   }
   const transcription = new TranscriptionService(config);
+  const voiceSubmissions = new VoiceSubmissionService(config, db, transcription, (id) => {
+    const conversation = db.getConversation(id);
+    if (conversation && !conversation.deleted_at) publishConversationChanged(conversation);
+  }, () => { if (config.queueAutoStart) scheduleQueuePump(); });
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs));
   const personalMemory = new PersonalMemoryService(config, db);
@@ -493,6 +499,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   async function waitForBackgroundTasks(): Promise<void> {
     while (backgroundTasks.size > 0) await Promise.allSettled([...backgroundTasks]);
+    await voiceSubmissions.wait();
     await reader.waitForBackgroundTasks();
   }
 
@@ -765,6 +772,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
+    voiceSubmissions.cancel(prompt.id);
     const workspace = ensureTenantWorkspace(config.tenantRoot, userId, prompt.conversation_id);
     for (const file of prompt.files) {
       try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); }
@@ -854,19 +862,24 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return quoteExcerpt ? buildAskAgentDraft(content, quoteExcerpt) : content;
   }
 
-  function scheduleGeneratedConversationTitle(conversationId: string, content: string, jobId?: string, trigger: "first_message" | "remote_import" = "first_message", messageId?: string): void {
+  function scheduleGeneratedConversationTitle(conversationId: string, content: string, jobId?: string, trigger: "first_message" | "remote_import" = "first_message", messageId?: string, triggerMessageId?: string): void {
     if (titleRequests.has(conversationId)) return;
     const conversation = db.getConversation(conversationId);
     if (!conversation || conversation.title_source !== "default") return;
     const project = conversation.project_id ? db.getProject(conversation.project_id) : undefined;
     if (!project) return;
+    // Submission and queue dispatch can both reach this function, including
+    // after a restart. A message gets one attempt; a new message can retry.
+    if (triggerMessageId && db.hasConversationTitleAttemptForMessage(conversationId, triggerMessageId)) return;
     const latestAudit = db.getLatestConversationTitleAudit(conversationId);
-    if (latestAudit?.status === "running" || latestAudit?.status === "succeeded") return;
+    if (latestAudit?.status === "running" || (!triggerMessageId && latestAudit?.status === "succeeded")) return;
     if (latestAudit?.status === "failed") {
       if (latestAudit.error === "worker_upgrade_required" && !remoteWorkers.supportsTitleAgent(project.executor_id)) return;
       const remoteTitleNowAvailable = latestAudit.error === "worker_upgrade_required";
       const completedAt = latestAudit.completed_at ? Date.parse(latestAudit.completed_at) : Date.now();
-      if (!remoteTitleNowAvailable && Date.now() - completedAt < 5 * 60_000) return;
+      // Repeated remote imports keep their cooldown; an explicit new message
+      // should not have to wait five minutes to recover a default title.
+      if (!triggerMessageId && !remoteTitleNowAvailable && Date.now() - completedAt < 5 * 60_000) return;
     }
     const requestText = extractTitleRequestText(content);
     if (!requestText) return;
@@ -889,6 +902,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         projectName: project.name, projectDirectory: directoryName, attachmentNames,
         requestCharacters: Array.from(requestText).length, executorName: executor?.machineName ?? null,
         executorKind: executor?.kind ?? null, codexVersion: executor?.runtime?.installedVersion ?? null,
+        sourceMessageId: messageId ?? null, triggerMessageId: triggerMessageId ?? null,
       }),
       started_at: startedAt,
     });
@@ -909,8 +923,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function scheduleConversationTitle(conversationId: string, messageId: string, content: string, jobId?: string): void {
-    if (!db.isFirstUserMessage(conversationId, messageId)) return;
-    scheduleGeneratedConversationTitle(conversationId, content, jobId, "first_message", messageId);
+    const message = db.getMessage(messageId);
+    if (!message || message.conversation_id !== conversationId || message.role !== "user" || message.is_internal) return;
+    const firstMessage = db.getFirstUserMessage(conversationId);
+    const source = firstMessage && extractTitleRequestText(firstMessage.content) ? firstMessage : { id: messageId, content };
+    scheduleGeneratedConversationTitle(conversationId, source.content, jobId, "first_message", source.id, messageId);
   }
 
   function scheduleImportedConversationTitle(conversationId: string): void {
@@ -1486,6 +1503,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
   }
 
+  mountOpportunityAutomation(api, db, authenticatedAutomationJob);
+
   function wakeDeadline(value: unknown): string | null {
     const seconds = Number(value);
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 365 * 24 * 60 * 60) return null;
@@ -1703,6 +1722,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
     return next();
   });
+
+  mountOpportunityRoutes(api, db, { selection: (user, executor) => userAgentSelection(user, optionsForExecutor(user, executor)), changed: cid => { const c = db.getConversation(cid); if (c) publishConversationChanged(c); if (config.queueAutoStart) scheduleQueuePump(); } });
 
   mountRecurringRoutes(api, db, (user, executor, model, effort) => resolveAgentSelection(optionsForExecutor(user, executor), model, effort));
 
@@ -2585,7 +2606,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.put("/user-settings/features", (req, res) => {
     const session = res.locals.session as SessionRow;
     res.setHeader("Cache-Control", "private, no-store");
-    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "revision"].includes(key))) {
+    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "opportunityCards", "revision"].includes(key))) {
       return res.status(400).json({ error: "功能选择无效，请重新打开设置。" });
     }
     const features = db.setFeatureSelection(session.user_id, req.body);
@@ -3136,6 +3157,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.status(204).end();
   });
 
+  const voiceRequestTiming = (req: Request, res: Response, next: NextFunction) => {
+    const started = performance.now();
+    const forwarded = req.get("X-Request-ID") ?? "";
+    const id = /^[a-f0-9]{32}$/.test(forwarded) ? forwarded : newId();
+    res.locals.voiceTiming = (stage: string) => console.info("[voice-timing]", JSON.stringify({
+      at: new Date().toISOString(), requestId: id, stage, elapsedMs: Math.round(performance.now() - started),
+      audioId: req.file?.filename.split(".")[0], status: res.statusCode,
+    }));
+    res.on("finish", () => res.locals.voiceTiming("request_finished"));
+    next();
+  };
+
   const voiceUpload = multer({
     storage: multer.diskStorage({
       destination(_req, _file, callback) {
@@ -3147,7 +3180,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         callback(null, `${crypto.randomUUID()}${AUDIO_MIME_EXTENSIONS[mime] ?? ""}`);
       },
     }),
-    limits: { files: 1, fileSize: 30 * 1024 * 1024, fields: 6, fieldSize: 10 * 1024 },
+    limits: { files: 1, fileSize: 30 * 1024 * 1024, fields: 6, fieldSize: 400 * 1024 },
     fileFilter(_req, file, callback) {
       const mime = file.mimetype.toLowerCase().split(";", 1)[0];
       callback(null, Boolean(AUDIO_MIME_EXTENSIONS[mime]));
@@ -3163,8 +3196,44 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     message: { error: "语音识别请求过于频繁，请稍后再试。" },
   });
 
-  api.post("/transcriptions", transcriptionLimiter, voiceUpload.single("audio"), async (req, res) => {
+  api.post("/conversations/:id/voice-messages", transcriptionLimiter, voiceRequestTiming, voiceUpload.single("audio"), (req, res) => {
     const file = req.file;
+    res.locals.voiceTiming?.("upload_received");
+    if (!file) return res.status(400).json({ error: "没有收到可识别的录音。" });
+    try {
+      const session = res.locals.session as SessionRow;
+      const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+      if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+      if (conversation.archived_at || conversation.cold_storage_state !== "local" || deletingConversations.has(conversation.id)) return res.status(409).json({ error: "请恢复会话后再发送。" });
+      const recordingId = String(req.body?.clientRecordingId ?? "");
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recordingId)) return res.status(400).json({ error: "录音 ID 无效。" });
+      const pendingPrompt = voiceSubmissions.accept({ conversation, recordingId, filePath: file.path, mimeType: file.mimetype.split(";", 1)[0]!,
+        content: typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "",
+        quote: submittedQuoteExcerpt(req.body?.quoteExcerpt), selection: conversationAgentSelection(conversation),
+        voiceIds: submittedVoiceTranscriptionIds(req.body?.voiceTranscriptionIds), maximumBytes: maximumStoredBytesForUser(session.user_id) });
+      db.touchConversationActivity(conversation.id);
+      res.status(202).json({ accepted: true, pendingPrompt });
+      scheduleBackground("voice_submission", () => voiceSubmissions.pump());
+    } catch (error) {
+      if (error instanceof VoiceSubmissionError) return res.status(error.status).json({ error: error.message });
+      throw error;
+    } finally { fs.rmSync(file.path, { force: true }); }
+  });
+
+  api.post("/conversations/:id/pending-prompts/:promptId/retry-voice", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
+    if (!conversation || !pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "语音消息不存在。" });
+    if (conversation.archived_at || conversation.cold_storage_state !== "local") return res.status(409).json({ error: "请恢复会话后再重试。" });
+    if (!voiceSubmissions.retry(session.user_id, pending.id)) return res.status(409).json({ error: "语音状态已变化，请刷新后重试。" });
+    res.status(202).json({ accepted: true });
+    scheduleBackground("voice_submission_retry", () => voiceSubmissions.pump());
+  });
+
+  api.post("/transcriptions", transcriptionLimiter, voiceRequestTiming, voiceUpload.single("audio"), async (req, res) => {
+    const file = req.file;
+    res.locals.voiceTiming?.("upload_received");
     if (!file) return res.status(400).json({ error: "没有收到可识别的录音，请重新录制。" });
     let persistedAudio: PersistedVoiceRecording | undefined;
     try {
@@ -3534,7 +3603,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再引导任务。" });
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
-    if (!pending || pending.conversation_id !== conversation.id || pending.status !== "queued") return res.status(404).json({ error: "待发送任务不存在。" });
+    if (!pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
+    if (!db.pendingVoiceReady(pending.id)) return res.status(409).json({ error: "请等待语音识别完成。" });
+    if (pending.status !== "queued") return res.status(409).json({ error: "请先完成编辑。" });
     const running = db.listActiveJobsForConversation(conversation.id).find((job) => job.status === "running");
     if (!running) {
       const job = db.materializePendingPrompt(pending.id, newId(), newId());
@@ -3918,19 +3989,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   wakeSchedulerTimer?.unref();
   if (config.queueAutoStart) {
     scheduleBackground("wake_scheduler_startup", processDueWakePlans);
+    scheduleBackground("voice_submission_recovery", () => voiceSubmissions.pump());
     scheduleQueuePump();
     personalMemory.start();
     voiceLexicon.start();
   }
   if (config.queueAutoStart) resumableUploads.start();
   return {
-    app, db, runner, conversationTitles, personalMemory, voiceLexicon, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
+    app, db, runner, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
       nodeTransfers.close();
       reader.stop();
       personalMemory.stop();
       voiceLexicon.stop();
+      voiceSubmissions.stop();
       resumableUploads.stop();
       if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
       wakeSchedulerTimer = undefined;

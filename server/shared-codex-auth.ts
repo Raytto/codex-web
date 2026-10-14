@@ -85,7 +85,12 @@ export async function acquireSharedCodexAuth(options: AcquireOptions): Promise<S
     if (released) return;
     released = true;
     try {
-      if (commit) copyValidatedCodexAuth(targetFile, sourceFile);
+      if (commit) {
+        // The supervisor has SETUID/SETGID but no DAC_OVERRIDE. Read the
+        // tenant-owned 0600 file as its owner, then publish under the same lock.
+        const payload = readCodexAuthAsIdentity(targetFile, options.targetUid, options.targetGid);
+        writeValidatedCodexAuth(payload, sourceFile);
+      }
     } finally {
       await releaseFlock(holder);
     }
@@ -97,7 +102,22 @@ export async function acquireSharedCodexAuth(options: AcquireOptions): Promise<S
 }
 
 export function copyValidatedCodexAuth(sourceFile: string, targetFile: string, uid?: number, gid?: number): void {
-  const payload = fs.readFileSync(sourceFile);
+  writeValidatedCodexAuth(fs.readFileSync(sourceFile), targetFile, uid, gid);
+}
+
+function readCodexAuthAsIdentity(sourceFile: string, uid?: number, gid?: number): Buffer {
+  if (uid === undefined && gid === undefined) return fs.readFileSync(sourceFile);
+  if (uid === undefined || gid === undefined) throw new Error("Target Codex auth identity requires both uid and gid");
+  const result = spawnSync(process.execPath, ["-e",
+    "try{process.stdout.write(require('node:fs').readFileSync(process.argv[1]));}catch{process.exitCode=1;}",
+    sourceFile,
+  ], { uid, gid, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  // Never surface a child error or its output: stdout contains credentials.
+  if (result.status !== 0) throw new Error("Could not read tenant Codex auth as its owner");
+  return result.stdout;
+}
+
+function writeValidatedCodexAuth(payload: Buffer, targetFile: string, uid?: number, gid?: number): void {
   validateCodexAuthPayload(payload);
   const targetDirectory = path.dirname(targetFile);
   if (uid !== undefined || gid !== undefined) {
