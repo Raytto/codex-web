@@ -1,4 +1,5 @@
 import { reserveOpportunityBatch, reconcileOpportunityBatches } from "./opportunity-schema.js";
+import { opportunityLearningPrompt } from './opportunity-learning-prompt.js';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import type { AppDatabase, StoredAgentSelection } from './db.js';
@@ -10,7 +11,9 @@ import { stripPersonalContext } from './personal-context.js';
 import type { OpportunityTopic, OpportunityContent, OpportunityIdea, OpportunityBatch, OpportunityPreference, OpportunityFeedback, OpportunityResearch, OpportunityDetail, OpportunityState } from '../src/opportunity-types.js';
 const id = () => crypto.randomUUID(), stamp = () => new Date().toISOString();
 const text = z.string().trim().max(6000), required = text.min(1), uuid = z.string().uuid();
-export const topicInput = z.object({ name: required.max(120), project_id: uuid, goal: required, questions: text.default(''), constraints: text.default(''), limit_count: z.number().int().min(1).max(10).default(3), exploration: z.number().int().min(0).max(40).default(20), read_recent: z.boolean().default(false) });
+const knowledgePathInput=z.string().trim().max(500).refine(v=>v===''||(!v.startsWith('/')&&!v.includes('\\')&&!/[\x00-\x1f]/.test(v)&&v.split('/').every(part=>part&&part!=='.'&&part!=='..')&&/\.md$/i.test(v)), '知识库入口须为项目内的相对 Markdown 路径');
+const preferenceInput = z.object({id:uuid.optional(),text:required,kind:z.enum(['explicit','inferred']),scope:z.enum(['topic','project','account']).default('topic'),source:required.max(1000),active:z.boolean().default(true)});
+export const topicInput = z.object({ name: required.max(120), project_id: uuid, goal: required, questions: text.default(''), constraints: text.default(''), limit_count: z.number().int().min(1).max(10).default(3), exploration: z.number().int().min(0).max(40).default(20), read_recent: z.boolean().default(false), knowledge_path: knowledgePathInput.optional() });
 export const contentInput = z.object({
   title: required.max(180), summary: required.max(1200), audience: required, problem: required, mechanism: required, value: required,
   fit: required, facts: required, assumptions: required, doubt: required, validation: required, difference: required,
@@ -23,8 +26,10 @@ export class OpportunityError extends Error { constructor(readonly status: numbe
 function fail(message: string, status=400): never { throw new OpportunityError(status,message); }
 type IdeaRow = Omit<OpportunityIdea,'content'> & { content_json: string };
 const ideaView = (r: IdeaRow): OpportunityIdea => { const {content_json,...other}=r; return {...other,content:JSON.parse(content_json)}; };
+const workingIdea = "(i.state IN ('kept','project') OR i.para_project_id IS NOT NULL OR EXISTS(SELECT 1 FROM opportunity_research r WHERE r.idea_id=i.id AND r.user_id=i.user_id))";
+const pendingIdea = `i.state='recommended' AND i.manual_processed=0 AND NOT ${workingIdea}`;
 export function opportunityPrompt(topic: OpportunityTopic) {
-  return `发现主题「${topic.name}」的新机会。主题 ID：${topic.id}。\n使用 codex_web_opportunities 工具读取 context（目标、反馈、备用库、历史及操作说明），按主题约束检索可核对的外部信息。在本项目的正常会话内完成采集、生成、独立评审、语义查重及库存排序。先 begin；所有新候选先 ingest 记录历史，再 review；历史备用与当天通过质量门槛的新候选一起复评，挑选最多 ${topic.limit_count} 条首次推荐并 publish。不得重推已推荐/人工处理项，不为凑数编造来源。不足时写明原因。新证据补到旧卡；其余合格候选保留备用，不当作负面偏好。\n先查历史，比较服务对象、问题、核心交互与价值，改名/同义改写不是新机会。评审须检查来源、相关性、可验证性、投入边界、实质新意及组合多样性；对召回的近似项逐一说明差异或合并。生成与评审分两步操作。失败调用 fail 并说明原因，不将抓取失败当空批次成功。每轮最多 60 个新候选，同日最多 3 次尝试；尽量在 20 分钟内完成，不安排额外续跑或独立周期。模型和日程只在本原生周期任务中管理。\n若主题授权 read_recent，使用 recent 增量读取本账号相关新对话，引用消息编号提炼偏好，区分 explicit 与 inferred；只保存相关偏好，推断默认仅限本主题，不复制无关私人内容。个人记忆以当前会话注入内容为背景，服从当前主题和最新明确反馈。\n结束汇报精选、备用数量和不足/失败原因。不要自动开发、购买、交易、发布或联系第三方。`;
+  return `为「${topic.name}」发现值得尝试的新机会，最多推荐 ${topic.limit_count} 条。`+'\n'+opportunityLearningPrompt(topic.id,topic.knowledge_path);
 }
 export class OpportunityStore {
   constructor(readonly db: AppDatabase) {}
@@ -47,15 +52,39 @@ export class OpportunityStore {
     if(!t)fail('机会主题不存在。',404);
     return {...t,task:t.task_id?new RecurringStore(this.db).get(user,t.task_id)??null:null};
   }
-  topics(user:string){return (this.sql.prepare('SELECT id FROM opportunity_topics WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at,id').all(user) as {id:string}[]).map(r=>this.topic(user,r.id));}
+  topics(user:string){
+    const counts=new Map((this.sql.prepare(`SELECT i.topic_id,COUNT(*) AS n FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id AND t.user_id=i.user_id WHERE i.user_id=? AND t.deleted_at IS NULL AND ${pendingIdea} GROUP BY i.topic_id`).all(user) as {topic_id:string;n:number}[]).map(r=>[r.topic_id,r.n]));
+    return (this.sql.prepare('SELECT id FROM opportunity_topics WHERE user_id=? AND deleted_at IS NULL ORDER BY position,created_at,id').all(user) as {id:string}[]).map(r=>({...this.topic(user,r.id),pending_count:counts.get(r.id)??0}));
+  }
+  reorderTopics(user: string, raw: unknown) {
+    const { sourceId, targetId, placement } = z.object({ sourceId: uuid, targetId: uuid, placement: z.enum(['before', 'after']) }).parse(raw);
+    return this.transaction(() => {
+      const source = this.topic(user, sourceId), target = this.topic(user, targetId);
+      if (source.archived_at || target.archived_at) fail('请先恢复主题再调整顺序。', 409);
+      if (sourceId === targetId) return this.topics(user);
+      const ordered = this.topics(user);
+      const [moved] = ordered.splice(ordered.findIndex(t => t.id === sourceId), 1);
+      ordered.splice(ordered.findIndex(t => t.id === targetId) + (placement === 'after' ? 1 : 0), 0, moved);
+      const update = this.sql.prepare('UPDATE opportunity_topics SET position=? WHERE id=? AND user_id=?');
+      ordered.forEach((t, position) => update.run(position, t.id, user));
+      return this.topics(user);
+    });
+  }
+  renameTopic(user: string, topicId: string, raw: unknown) {
+    const { name, revision } = z.object({ name: required.max(120), revision: z.number().int().positive() }).parse(raw);
+    this.topic(user, topicId);
+    const result = this.sql.prepare('UPDATE opportunity_topics SET name=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=? AND revision=?').run(name, stamp(), topicId, user, revision);
+    if (!result.changes) fail('主题已在其他页面更新，请重新加载。', 409);
+    return this.topic(user, topicId);
+  }
   createTopic(user:string,raw:unknown,key:string) {
     const b=topicInput.parse(raw);this.serverProject(user,b.project_id);
-    return this.receipt(user,key,'create-topic:'+JSON.stringify(b),()=>{const tid=id(),time=stamp();this.sql.prepare('INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,questions,constraints,limit_count,exploration,read_recent,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(tid,user,b.project_id,b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,time,time);return this.topic(user,tid);});
+    return this.receipt(user,key,'create-topic:'+JSON.stringify(b),()=>{const tid=id(),time=stamp();this.sql.prepare('INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,questions,constraints,limit_count,exploration,read_recent,created_at,updated_at,position,knowledge_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(tid,user,b.project_id,b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,time,time,Number((this.sql.prepare("SELECT COALESCE(MAX(position),-1)+1 AS next FROM opportunity_topics WHERE user_id=?").get(user) as {next:number}).next),b.knowledge_path??'');return this.topic(user,tid);});
   }
   updateTopic(user:string,topicId:string,raw:unknown) {
     const b=topicInput.extend({revision:z.number().int().positive()}).parse(raw),old=this.topic(user,topicId);this.serverProject(user,b.project_id);
     if(old.project_id!==b.project_id && (old.task_id || this.sql.prepare('SELECT 1 FROM opportunity_batches WHERE topic_id=? LIMIT 1').get(topicId)))fail('已有计划或执行记录的主题不能更换项目。请新建主题。',409);
-    const r=this.sql.prepare('UPDATE opportunity_topics SET name=?,goal=?,questions=?,constraints=?,limit_count=?,exploration=?,read_recent=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=? AND revision=?').run(b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,b.project_id,stamp(),topicId,user,b.revision);
+    const r=this.sql.prepare('UPDATE opportunity_topics SET name=?,goal=?,questions=?,constraints=?,limit_count=?,exploration=?,read_recent=?,project_id=?,knowledge_path=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=? AND revision=?').run(b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,b.project_id,b.knowledge_path??old.knowledge_path,stamp(),topicId,user,b.revision);
     if(!r.changes)fail('主题已在其他页面更新，请重新加载。',409);return this.topic(user,topicId);
   }
   lifecycle(user:string,topicId:string,revision:number,action:'archive'|'restore'|'delete') {
@@ -95,10 +124,52 @@ export class OpportunityStore {
     return Number.parseInt(digest.slice(0,12),16);
   }
   preferences(user:string,topicId:string,all=false){const t=this.topic(user,topicId);return this.sql.prepare(`SELECT p.* FROM opportunity_preferences p JOIN opportunity_topics t ON t.id=p.topic_id WHERE p.user_id=? AND (p.topic_id=? OR p.scope='account' OR (p.scope='project' AND t.project_id=?)) ${all?'':'AND p.active=1'} ORDER BY p.created_at`).all(user,topicId,t.project_id) as OpportunityPreference[];}
+  feedbackLearning(user:string,topicId:string) {
+    const topic=this.topic(user,topicId);
+    const counts=this.sql.prepare('SELECT COUNT(*) total,COUNT(CASE WHEN f.rowid>? THEN 1 END) pending FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=?').get(topic.feedback_watermark,user,topicId) as {total:number;pending:number};
+    const last=this.sql.prepare('SELECT summary FROM opportunity_feedback_learning WHERE user_id=? AND topic_id=? ORDER BY rowid DESC LIMIT 1').get(user,topicId) as {summary:string}|undefined;
+    return {...counts,learned:counts.total-counts.pending,watermark:topic.feedback_watermark,lastLearnedAt:topic.feedback_learned_at,lastSummary:last?.summary??''};
+  }
+  feedbackInbox(user:string,topicId:string) {
+    const learning=this.feedbackLearning(user,topicId);
+    const rows=this.sql.prepare(`SELECT f.rowid AS cursor,f.id,f.idea_id,f.action,f.reason,f.rating,f.note,f.created_at,
+      i.state AS current_state,i.rating AS current_rating,i.note AS current_note,i.manual_processed,
+      json_extract(i.content_json,'$.title') AS title,json_extract(i.content_json,'$.summary') AS summary,
+      (SELECT MAX(latest.rowid) FROM opportunity_feedback latest WHERE latest.idea_id=i.id AND latest.user_id=f.user_id) AS latest_feedback_cursor
+      FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=? AND f.rowid>? ORDER BY f.rowid LIMIT 30`).all(user,topicId,learning.watermark) as Array<{cursor:number;id:string;idea_id:string}>;
+    return {...learning,items:rows,through:rows.at(-1)?.cursor??learning.watermark,feedbackRevision:this.feedbackRevision(user,topicId),preferences:this.topic(user,topicId).knowledge_path?[]:this.preferences(user,topicId,true),knowledgePath:this.topic(user,topicId).knowledge_path};
+  }
+  learnFeedback(user:string,topicId:string,conversationId:string,raw:unknown) {
+    const v=z.object({requestKey:uuid,after:z.number().int().nonnegative(),through:z.number().int().nonnegative(),feedbackRevision:z.number().int().nonnegative(),summary:required,principles:z.array(preferenceInput).max(40).default([]),knowledgeFiles:z.array(knowledgePathInput.refine(v=>v.length>0)).max(20).default([])}).parse(raw);
+    this.assertJob(user,topicId,conversationId);
+    return this.receipt(user,v.requestKey,'learn-feedback:'+topicId+':'+JSON.stringify(v),()=>{
+      const page=this.feedbackInbox(user,topicId);
+      if(v.after!==page.watermark||v.through!==page.through||!page.items.length)fail('反馈学习进度已变化，请重新读取 feedback_inbox；不能跳过未读反馈。',409);
+      if(v.feedbackRevision!==page.feedbackRevision)fail('反馈或知识库已更新，请重新读取并归纳。',409);
+      const knowledgePath=this.topic(user,topicId).knowledge_path;
+      if(knowledgePath){
+        const directory=knowledgePath.slice(0,knowledgePath.lastIndexOf('/')+1);
+        if(!v.knowledgeFiles.length||v.knowledgeFiles.some(file=>!file.startsWith(directory)))fail('请先把归纳写入本主题项目知识库，再提供 knowledgeFiles 记录已更新的文件。');
+        if(v.principles.length)fail('本主题以项目知识库为准，请将原则写入知识文件，不再维护第二份页面偏好。');
+      }
+      for(const principle of v.principles){
+        const source=this.sql.prepare('SELECT 1 FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.id=? AND f.user_id=? AND i.topic_id=?').get(principle.source,user,topicId);
+        if(!source)fail('反馈学习原则须引用本主题的真实反馈编号。');
+        this.setPreference(user,topicId,principle,true);
+      }
+      const time=stamp();
+      this.sql.prepare('INSERT INTO opportunity_feedback_learning(id,user_id,topic_id,from_watermark,to_watermark,feedback_ids_json,summary,conversation_id,created_at,knowledge_files_json) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id(),user,topicId,v.after,v.through,JSON.stringify(page.items.map(f=>f.id)),v.summary,conversationId,time,JSON.stringify(v.knowledgeFiles));
+      this.sql.prepare('UPDATE opportunity_topics SET feedback_watermark=?,feedback_learned_at=? WHERE id=? AND user_id=?').run(v.through,time,topicId,user);
+      return {learning:this.feedbackLearning(user,topicId),preferences:this.topic(user,topicId).knowledge_path?[]:this.preferences(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId)};
+    });
+  }
+  private assertFeedbackLearned(user:string,topicId:string) {
+    if(this.feedbackLearning(user,topicId).pending)fail('还有未归纳的用户反馈：先用 feedback_inbox / learn_feedback 更新主题知识库，再按最新反馈搜索和复评。',409);
+  }
   context(user:string,topicId:string) {
     const t=this.topic(user,topicId);this.reconcile(user,topicId);
     const reserve=(this.sql.prepare("SELECT * FROM opportunity_ideas WHERE user_id=? AND topic_id=? AND state IN ('reserve','pending') AND first_recommended_at IS NULL AND manual_processed=0 ORDER BY score DESC,first_created_at").all(user,topicId) as IdeaRow[]).map(ideaView);
-    return {topic:t,inventory:reserve,history:this.history(user),feedback:this.sql.prepare('SELECT f.* FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=? ORDER BY f.rowid DESC LIMIT 200').all(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId),preferences:this.preferences(user,topicId),batches:this.batches(user,topicId),instructions:OPPORTUNITY_WORKFLOW};
+    return {topic:t,inventory:reserve,history:this.history(user),feedback:this.sql.prepare('SELECT f.* FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=? ORDER BY f.rowid DESC LIMIT 200').all(user,topicId),feedbackLearning:this.feedbackLearning(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId),preferences:t.knowledge_path?[]:this.preferences(user,topicId),knowledge:{entry:t.knowledge_path,projectId:t.project_id},batches:this.batches(user,topicId),instructions:OPPORTUNITY_WORKFLOW};
   }
   batches(user:string,topicId?:string){return this.sql.prepare(`SELECT * FROM opportunity_batches WHERE user_id=? ${topicId?'AND topic_id=?':''} ORDER BY day DESC,created_at DESC LIMIT 60`).all(...(topicId?[user,topicId]:[user])) as OpportunityBatch[];}
   reconcile(user:string,topicId?:string) { reconcileOpportunityBatches(this.sql,user,topicId); }
@@ -113,17 +184,18 @@ export class OpportunityStore {
     this.assertJob(user,topicId,conversationId,jobId??undefined);this.reconcile(user,topicId);
     return this.transaction(()=>{const t=this.topic(user,topicId),time=new Date(now).toISOString(),day=new Intl.DateTimeFormat('en-CA',{timeZone:t.task?.schedule.timeZone??'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
       const old=this.sql.prepare('SELECT * FROM opportunity_batches WHERE topic_id=? AND day=?').get(topicId,day) as OpportunityBatch|undefined;
-      if(old){if(old.status==='completed')return {...old,alreadyCompleted:true};if(old.conversation_id===conversationId&&old.status!=='failed'){if(!old.job_id&&jobId)this.sql.prepare('UPDATE opportunity_batches SET job_id=?,feedback_snapshot=?,context_watermark=? WHERE id=?').run(jobId,JSON.stringify({preferences:this.preferences(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId)}),t.context_watermark,old.id);return this.batch(user,old.id);}
+      if(old){if(old.status==='completed')return {...old,alreadyCompleted:true};if(old.conversation_id===conversationId&&old.status!=='failed'){if(!old.job_id&&jobId)this.sql.prepare('UPDATE opportunity_batches SET job_id=?,feedback_snapshot=?,context_watermark=? WHERE id=?').run(jobId,JSON.stringify({knowledgePath:t.knowledge_path,preferences:t.knowledge_path?[]:this.preferences(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId)}),t.context_watermark,old.id);return this.batch(user,old.id);}
         if(old.status!=='failed')fail('本主题今日已有执行中的批次，请查看来源会话。',409);
         if(old.attempts>=3)fail('今日已尝试三次，请检查原因后明日继续。',409);
         this.sql.prepare("UPDATE opportunity_batches SET status='generating',conversation_id=?,job_id=?,attempts=attempts+1,error='',completed_at=NULL WHERE id=?").run(conversationId,jobId,old.id);return this.batch(user,old.id);}
-      const bid=id(),snapshot={preferences:this.preferences(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId)};
+      const bid=id(),snapshot={preferences:this.topic(user,topicId).knowledge_path?[]:this.preferences(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId)};
       this.sql.prepare('INSERT INTO opportunity_batches(id,user_id,topic_id,day,status,conversation_id,job_id,project_id,task_id,context_watermark,feedback_snapshot,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(bid,user,topicId,day,'generating',conversationId,jobId,t.project_id,t.task_id,t.context_watermark,JSON.stringify(snapshot),time);return this.batch(user,bid);});
   }
   writableBatch(user:string,batchId:string,conversationId:string){const b=this.batch(user,batchId,conversationId);this.assertJob(user,b.topic_id,conversationId,b.job_id??undefined);if(!['generating','reviewing'].includes(b.status))fail('批次已经结束。',409);return b;}
   ingest(user:string,batchId:string,conversationId:string,raw:unknown) {
     const input=z.array(z.object({key:required.max(120),content:contentInput})).min(1).max(30).parse(raw);
     return this.transaction(()=>{const b=this.writableBatch(user,batchId,conversationId),count=Number((this.sql.prepare('SELECT count(*) n FROM opportunity_candidates WHERE batch_id=?').get(batchId) as {n:number}).n);
+      this.assertFeedbackLearned(user,b.topic_id);
       let added=0;
       return input.map(v=>{const previous=this.sql.prepare('SELECT * FROM opportunity_candidates WHERE batch_id=? AND candidate_key=?').get(batchId,v.key) as {idea_id:string;payload:string;outcome:string}|undefined;
         if(previous){if(previous.payload!==JSON.stringify(v.content))fail('同一候选编号内容不同；更新旧想法应使用 evidence 更正证据。',409);return {idea:this.idea(user,previous.idea_id),outcome:previous.outcome,neighbors:this.neighbors(user,v.content,previous.idea_id)};}
@@ -157,6 +229,7 @@ export class OpportunityStore {
   review(user:string,batchId:string,conversationId:string,raw:unknown) {
     const reviews=z.array(reviewInput).min(1).max(60).parse(raw);
     return this.transaction(()=>{const b=this.writableBatch(user,batchId,conversationId);
+      this.assertFeedbackLearned(user,b.topic_id);
       for(const r of reviews){const idea=this.idea(user,r.idea_id);
         if(idea.topic_id!==b.topic_id||idea.first_recommended_at||idea.manual_processed||!['pending','reserve'].includes(idea.state))fail('只能评审本主题尚未正式推荐、未经人工处理的有效候选。',409);
         for(const c of r.compared)this.idea(user,c.id);
@@ -177,6 +250,7 @@ export class OpportunityStore {
       const b=this.writableBatch(user,batchId,conversationId),topic=this.topic(user,b.topic_id);
       if(new Set(v.ids).size!==v.ids.length||v.ids.length>topic.limit_count)fail('精选数量超出主题上限或包含重复项。');
       if(v.feedbackRevision!==this.feedbackRevision(user,b.topic_id))fail('用户反馈已更新，请重新读取并复评后提交。',409);
+      this.assertFeedbackLearned(user,b.topic_id);
       const pool=(this.sql.prepare("SELECT i.id FROM opportunity_ideas i WHERE i.topic_id=? AND i.state IN ('pending','reserve') AND i.first_recommended_at IS NULL AND i.manual_processed=0 AND NOT EXISTS(SELECT 1 FROM opportunity_reviews r WHERE r.batch_id=? AND r.idea_id=i.id AND r.feedback_revision=?)").all(b.topic_id,batchId,v.feedbackRevision) as {id:string}[]);
       if(pool.length)fail(`还有 ${pool.length} 条历史备用/新候选尚未参与本轮复评，或尚未按最新反馈复评。`,409);
       const time=stamp();
@@ -205,7 +279,7 @@ export class OpportunityStore {
       this.sql.prepare('UPDATE opportunity_ideas SET state=?,rating=?,note=?,manual_processed=?,state_reason=?,revision=revision+1,updated_at=? WHERE id=?').run(next.state,next.rating,next.note,next.manual_processed,next.state_reason,stamp(),ideaId);return this.idea(user,ideaId);});
   }
   setPreference(user:string,topicId:string,raw:unknown,agent=false) {
-    const v=z.object({id:uuid.optional(),text:required,kind:z.enum(['explicit','inferred']),scope:z.enum(['topic','project','account']).default('topic'),source:required.max(1000),active:z.boolean().default(true)}).parse(raw);this.topic(user,topicId);
+    const v=preferenceInput.parse(raw);if(this.topic(user,topicId).knowledge_path)fail('本主题已迁入项目知识库，请在知识库中维护偏好。',409);
     if(agent&&v.scope!=='topic')fail('Agent 提炼偏好只能作用于当前主题；扩大范围需用户在页面确认。',403);
     if(agent&&v.source!=='topic-goal'){
       const valid=this.sql.prepare("SELECT 1 FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id=? AND c.user_id=? AND c.deleted_at IS NULL AND m.role='user' UNION ALL SELECT 1 FROM opportunity_feedback WHERE id=? AND user_id=?").get(v.source,user,v.source,user);if(!valid)fail('偏好须引用本账号的可回查消息或反馈编号。');
@@ -222,18 +296,39 @@ export class OpportunityStore {
     const relevant=rows.filter(r=>r.project_id===t.project_id||words.some(w=>(r.title+' '+r.content).includes(w))||(/游戏|儿童|绘画/.test(t.name+t.goal)&&/游戏|绘画|画鱼|侦探|英语|小朋友|孩子/.test(r.title+r.content)));
     return {items:relevant.map(r=>({...r,content:stripPersonalContext(r.content).slice(0,2400)})),scanned:rows.length,nextWatermark:rows.at(-1)?.cursor??cursor,hasMore:rows.length===120,notice:'只提炼与主题相关偏好；无关私人内容不入卡。最多增量翻页十次，将返回水位在 publish 时保存。'};
   }
-  view(user:string,topicId:string|undefined,tab:string,offset=0) {
+  view(user:string,topicId:string|undefined,tab='screen',offset=0) {
     if(topicId)this.topic(user,topicId);this.reconcile(user,topicId);
-    const todayBatches=this.topics(user).flatMap(t=>{
+    const topics=this.topics(user);
+    const work=workingIdea;
+    const negative="i.state IN ('dismissed','expired','internal_rejected','duplicate')";
+    const collections={
+      screen:pendingIdea,
+      reserve:`i.state='reserve' AND i.first_recommended_at IS NULL AND i.manual_processed=0 AND NOT ${work}`,
+      working:`NOT (${negative}) AND ${work}`,
+      processed:`i.manual_processed=1 AND NOT (${negative}) AND NOT ${work}`,
+      dismissed:"(i.state='dismissed' OR (i.state='expired' AND i.manual_processed=1))",
+      rejected:"(i.state IN ('internal_rejected','duplicate') OR (i.state='expired' AND i.manual_processed=0))",
+    };
+    const scope=`i.user_id=? AND t.deleted_at IS NULL ${topicId?'AND i.topic_id=?':''}`;
+    const ownerParams=topicId?[user,topicId]:[user];
+    const counts=this.sql.prepare(`SELECT ${Object.entries(collections).map(([name,filter])=>`COUNT(CASE WHEN ${filter} THEN 1 END) AS ${name}`).join(',')} FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id WHERE ${scope}`).get(...ownerParams) as Record<keyof typeof collections,number>;
+    const todayBatches=tab==='today'?topics.flatMap(t=>{
       const day=new Intl.DateTimeFormat('en-CA',{timeZone:t.task?.schedule.timeZone??'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
       const b=this.sql.prepare("SELECT id FROM opportunity_batches WHERE topic_id=? AND day=? AND status='completed'").get(t.id,day) as {id:string}|undefined;
       return b?[b.id]:[];
-    });
-    const filters:Record<string,string>={today:`i.recommended_batch_id IN (${todayBatches.map(()=>'?').join(',')||'NULL'})`,reserve:"i.state='reserve' AND i.first_recommended_at IS NULL AND i.manual_processed=0",history:"(i.first_recommended_at IS NOT NULL OR i.manual_processed=1)",screen:"i.state='recommended' AND i.manual_processed=0",rejected:"i.state IN ('internal_rejected','expired','duplicate')"};
-    const clause=`i.user_id=? AND t.deleted_at IS NULL ${topicId?'AND i.topic_id=?':''} AND ${filters[tab]??filters.today}`,params=[...(topicId?[user,topicId]:[user]),...((tab==='today'||!filters[tab])?todayBatches:[])];
+    }):[];
+    const filters:Record<string,string>={...collections,today:`${collections.screen} AND i.recommended_batch_id IN (${todayBatches.map(()=>'?').join(',')||'NULL'})`,history:`(i.first_recommended_at IS NOT NULL OR i.manual_processed=1 OR ${work})`};
+    const clause=`${scope} AND (${filters[tab]??filters.screen})`,params=[...ownerParams,...(tab==='today'?todayBatches:[])];
     const total=Number((this.sql.prepare(`SELECT count(*) n FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id WHERE ${clause}`).get(...params) as {n:number}).n);
-    const rows=this.sql.prepare(`SELECT i.* FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id WHERE ${clause} ORDER BY i.first_recommended_at DESC,i.score DESC,i.first_created_at DESC LIMIT 40 OFFSET ?`).all(...params,Math.max(0,offset)) as IdeaRow[];
-    return {topics:this.topics(user),ideas:rows.map(ideaView),batches:this.batches(user,topicId),preferences:topicId?this.preferences(user,topicId,true):[],total,nextOffset:offset+rows.length<total?offset+rows.length:null};
+    const start=Math.max(0,Math.floor(offset));
+    const rows=this.sql.prepare(`SELECT i.*,t.name AS topic_name FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id WHERE ${clause} ORDER BY i.first_recommended_at DESC,i.score DESC,i.first_created_at DESC,i.id LIMIT 40 OFFSET ?`).all(...params,start) as (IdeaRow & {topic_name:string})[];
+    const ideas=rows.map(row=>({...ideaView(row),topic_name:row.topic_name,...(tab==='working'?{work:this.workSummary(user,row)}:{})}));
+    return {topics,ideas,counts,batches:this.batches(user,topicId),preferences:topicId&&!this.topic(user,topicId).knowledge_path?this.preferences(user,topicId,true):[],learning:topicId?this.feedbackLearning(user,topicId):null,total,nextOffset:start+rows.length<total?start+rows.length:null};
+  }
+  private workSummary(user:string,idea:OpportunityIdea|IdeaRow) {
+    const research=this.sql.prepare('SELECT * FROM opportunity_research WHERE user_id=? AND idea_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(user,idea.id) as OpportunityResearch|undefined;
+    const project=idea.para_project_id?this.sql.prepare('SELECT id,board_id,title,stage,archived_at FROM para_projects WHERE id=? AND user_id=?').get(idea.para_project_id,user) as {id:string;board_id:string;title:string;stage:string;archived_at:string|null}|undefined:undefined;
+    return {research:research?{status:research.status,result:research.result,conversation_id:research.conversation_id,project_id:idea.project_id,available:!!this.db.getConversationForUser(research.conversation_id,user)}:null,project:project??null};
   }
   start(user:string,topicId:string,selection:StoredAgentSelection,key:string,researchIdeaId?:string) {
     const t=this.topic(user,topicId);this.serverProject(user,t.project_id);if(t.archived_at)fail('请先恢复主题。',409);
@@ -243,10 +338,13 @@ export class OpportunityStore {
       const idea=researchIdeaId?this.idea(user,researchIdeaId):null;if(idea&&idea.topic_id!==topicId)fail('卡片不属于当前主题。');
       const cid=id(),selected=t.task?{model:t.task.model,reasoningEffort:t.task.reasoningEffort}:selection;
       this.db.createConversation(cid,idea?'深入研究 · '+idea.content.title:t.name+' · 发现机会',selected,user,t.project_id);this.sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(cid);
-      const prompt=idea?`深入研究机会卡片 ${idea.id}，主题 ${topicId}。先用 codex_web_opportunities context/detail 读取目标、证据、疑点和反馈，检索权威资料，执行不涉及购买/交易/发布的最小可行验证。区分已验证、被证伪及待验证；完成后 research_result 写回本卡，result 提供证据和结论。不自动宣称项目完成。\n${JSON.stringify(idea.content)}`:(t.task?.prompt??opportunityPrompt(t))+`\n关联机会主题：${topicId}。先用 codex_web_opportunities context 读取当前目标、反馈与库存。`;
+      const prompt=idea?`深入研究机会卡片 ${idea.id}，主题 ${topicId}。${t.knowledge_path?`先读取本项目知识库 ${t.knowledge_path}。`:''}先用 codex_web_opportunities context/detail 读取目标、证据、疑点和反馈，检索权威资料，执行不涉及购买/交易/发布的最小可行验证。区分已验证、被证伪及待验证；完成后 research_result 写回本卡，result 提供证据和结论。不自动宣称项目完成。\n${JSON.stringify(idea.content)}`:(t.task?.prompt??opportunityPrompt(t))+'\n\n'+opportunityLearningPrompt(topicId,t.knowledge_path);
       this.db.createPendingPrompt(id(),cid,prompt,selected);
       if(!idea){const day=new Intl.DateTimeFormat('en-CA',{timeZone:t.task?.schedule.timeZone??'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());reserveOpportunityBatch(this.sql,t.id,user,cid,t.project_id,t.task_id,day,stamp());}
-      if(idea)this.sql.prepare('INSERT INTO opportunity_research VALUES(?,?,?,?,?,?,?,?,?)').run(id(),user,idea.id,cid,key,'interested','',stamp(),stamp());
+      if(idea){
+        this.sql.prepare('INSERT INTO opportunity_research VALUES(?,?,?,?,?,?,?,?,?)').run(id(),user,idea.id,cid,key,'interested','',stamp(),stamp());
+        this.sql.prepare('UPDATE opportunity_ideas SET manual_processed=1,revision=revision+1,updated_at=? WHERE id=? AND user_id=?').run(stamp(),idea.id,user);
+      }
       return {conversationId:cid,projectId:t.project_id};});
   }
   researchResult(user:string,ideaId:string,conversationId:string,raw:unknown){const v=z.object({status:z.enum(['validated','invalidated','inconclusive']),result:required}).parse(raw),idea=this.idea(user,ideaId);this.assertJob(user,idea.topic_id,conversationId);const r=this.sql.prepare('UPDATE opportunity_research SET status=?,result=?,updated_at=? WHERE user_id=? AND idea_id=? AND conversation_id=?').run(v.status,v.result,stamp(),user,ideaId,conversationId);if(!r.changes)fail('当前会话未关联这张卡片的研究。',403);return this.detail(user,ideaId);}
@@ -260,7 +358,7 @@ export class OpportunityStore {
   }
 }
 export const OPPORTUNITY_WORKFLOW = `工具 action 与 data：
-context: 读取目标/偏好/反馈/库存摘要；inventory: {offset,limit} 分页读取所有待评审与备用候选详情（context 只显示前25条摘要，须按 nextInventoryOffset 继续）；history: {offset,limit} 分页读取本账号全历史（含淘汰），先查再生成；detail: {ideaId}。
+context: 读取目标/知识库入口/反馈学习进度/库存摘要。topic.knowledge_path 非空时，项目内该 Markdown 入口及其索引是详细要求和原则的唯一权威；先读取，按需检索知识库链接的项目资料、当前变化和信息源。页面目标/边界只是简短摘要，旧页面偏好不再注入。每轮搜索前先学习全部未归纳反馈，直到 pending=0，重新读取 context 后以有效原则指导搜索、生成和评审。feedback_inbox: {} 返回最早未归纳的30条反馈、当前卡片状态、已有含停用原则、watermark/through/feedbackRevision；逐页处理，不限昨天，不能只看 context 最近30条。learn_feedback: {requestKey:UUID,after:本页watermark,through:本页through,feedbackRevision:本页值,summary:本页归纳及取舍说明,knowledgeFiles?:已更新的项目相对Markdown路径数组,principles?:[{id?:更新旧原则ID,text,kind:explicit|inferred,scope:topic,source:本主题反馈ID,active?:false可停用}]}。关联项目知识库时，先用本项目正常文件工具把原则/修正及反馈ID写入知识库，成功后携带 knowledgeFiles 确认进度，不再传 principles；写失败不得确认。文件已写但确认失败时按反馈ID核对，不重复应用。同页原始反馈ID保存在学习记录；原始卡片留在业务库，知识库只保存凝练原则和引用。未关联知识库的主题由 principles 原子保存原则、来源和进度；失败不推进、同key重试不重复写。未读反馈存在时 ingest/review/publish 拒绝。原则优先整合已有项；按当前状态纠正被撤销的旧证据，不复活用户已停用的原则；弱信号/无可推广结论允许 principles:[] 但须说明原因。此学习独立于 read_recent。inventory: {offset,limit} 分页读取所有待评审与备用候选详情（context 只显示前25条摘要，须按 nextInventoryOffset 继续）；history: {offset,limit} 分页读取本账号全历史（含淘汰），先查再生成；detail: {ideaId}。
 begin: 建立/恢复今日批次。返回 alreadyCompleted=true 则立即停止，不能重复推荐。保留 batch.id 后续使用。
 recent: {after?} 仅授权主题可用，增量返回当前账号相关用户消息及水位；最多翻页十次。
 preferences: {text,kind:explicit|inferred,scope:topic,source:消息或反馈ID|topic-goal,id?,active?}。明确评价才 explicit；无备注淘汰/未读是弱信号，AI 淘汰不算用户负面偏好。按最新状态和时间处理撤销，已撤销的反馈不能继续作为有效负面证据。先查已有偏好，相同来源更新旧项。用户可修正/撤销。

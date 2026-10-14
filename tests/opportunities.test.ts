@@ -17,6 +17,7 @@ const id=()=>crypto.randomUUID(),u=LEGACY_USER_ID,selection={model:'gpt-6-sol',r
 const content=(n:number)=>contentInput.parse({title:'候选 '+n,summary:'第 '+n+' 种独立实验',audience:'儿童',problem:'探索问题 '+n,mechanism:'具体互动机制 '+n,value:'独立学习价值 '+n,fit:'在主题投入限制内',facts:'来源说明',assumptions:'乐趣待孩子验证',doubt:'首次互动是否足够清晰',validation:'完成纸面和浏览器两分钟试验',difference:'问题与核心机制独立编号 '+n,category:'实验 '+n,keywords:['探索','实验'+n],sources:[{title:'Canvas API',url:'https://developer.mozilla.org/en-US/docs/Web/API/Canvas_API',date:'2026-10-14',finding:'浏览器可以绘制交互图形'}]});
 function fixture(t:test.TestContext){const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-')),db=new AppDatabase(root),s=new OpportunityStore(db),p=db.createProject(id(),u,'Server',root,'tenant-local'),c=db.createConversation(id(),'Discovery',selection,u,p.id),topic=s.createTopic(u,{name:'验收主题',project_id:p.id,goal:'探索不同创作游戏'},id());t.after(()=>{db.close();fs.rmSync(root,{recursive:true,force:true});});return {root,db,s,p,c,topic};}
 function reviewAll(s:OpportunityStore,topicId:string,bid:string,cid:string){const pool=s.context(u,topicId).inventory;return s.review(u,bid,cid,pool.map((v,i)=>({idea_id:v.id,verdict:'approve',score:90-i/100,quality:85,rationale:'证据、投入和独立可验证性通过；根据当前偏好重排',compared:s.neighbors(u,v.content,v.id).map(n=>({id:n.id,difference:'编号代表具体不同的试验问题与核心机制，仅共享受众'}))})));}
+function learn(s:OpportunityStore,tid:string,cid:string){let page=s.feedbackInbox(u,tid);while(page.pending){s.learnFeedback(u,tid,cid,{requestKey:id(),after:page.watermark,through:page.through,feedbackRevision:page.feedbackRevision,summary:'测试逐页归纳：保留原始反馈，暂未推断通用偏好',principles:[]});page=s.feedbackInbox(u,tid);}}
 function publish(s:OpportunityStore,tid:string,bid:string,cid:string,ids:string[]){return s.publish(u,bid,cid,{ids,summary:'以适配与玩法组合多样性选取，其余合格项继续保留',feedbackRevision:s.feedbackRevision(u,tid)});}
 test('multi-day inventory: 10 -> 3+7; new 10 -> 17 -> 3+14; zero new still selects stable old identities',t=>{const {s,c,topic}=fixture(t);const b1=s.begin(u,topic.id,c.id,null,day);const first=s.ingest(u,b1.id,c.id,Array.from({length:10},(_,i)=>({key:'d1-'+i,content:content(i)})));reviewAll(s,topic.id,b1.id,c.id);publish(s,topic.id,b1.id,c.id,first.slice(0,3).map(v=>v.idea.id));assert.equal(s.context(u,topic.id).inventory.length,7);assert.equal(s.history(u).total,10);
  const c2=s.db.createConversation(id(),'Next day',selection,u,c.project_id!),b2=s.begin(u,topic.id,c2.id,null,day+86400000);s.ingest(u,b2.id,c2.id,Array.from({length:10},(_,i)=>({key:'d2-'+i,content:content(i+10)})));assert.equal(s.context(u,topic.id).inventory.length,17);assert.throws(()=>publish(s,topic.id,b2.id,c2.id,[first[3].idea.id]),/尚未参与/);reviewAll(s,topic.id,b2.id,c2.id);publish(s,topic.id,b2.id,c2.id,first.slice(3,6).map(v=>v.idea.id));assert.equal(s.context(u,topic.id).inventory.length,14);assert.ok(s.idea(u,first[3].idea.id).first_recommended_at);assert.equal(s.idea(u,first[3].idea.id).source_batch_id,b1.id);assert.equal(s.idea(u,first[3].idea.id).recommended_batch_id,b2.id);
@@ -34,11 +35,11 @@ test('semantic recall catches Chinese paraphrases, requires material judgment an
  s.review(u,b.id,c.id,[{idea_id:second.idea.id,verdict:'duplicate',duplicate_of:first.idea.id,score:80,quality:80,rationale:'同样以足迹推理人物，未增加核心互动',compared:[{id:first.idea.id,difference:'没有实质差异'}]}]);assert.equal(s.idea(u,second.idea.id).duplicate_of,first.idea.id);
  const different={...a,title:'绘画节奏花园',problem:'探索音乐节拍',mechanism:'儿童绘画花朵，通过拖动改变节奏，按声音排列循环',summary:'画出的花朵产生乐声',keywords:['声音','节奏','绘画']};assert.ok(opportunitySimilarity(a,different)<.65);s.ingest(u,b.id,c.id,[{key:'different',content:different}]);reviewAll(s,topic.id,b.id,c.id);assert.equal(s.context(u,topic.id).inventory.length,2);
 });
-test('feedback is durable, distinguishes reasons, stale ranking cannot publish; manual handling excludes reserve and undo restores',t=>{const {s,c,topic}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),ideas=s.ingest(u,b.id,c.id,[{key:'one',content:content(1)},{key:'two',content:content(2)}]);reviewAll(s,topic.id,b.id,c.id);const before=s.feedbackRevision(u,topic.id),i=s.idea(u,ideas[0].idea.id),f=s.feedback(u,i.id,{requestKey:id(),revision:i.revision,action:'later',reason:'no_time',rating:5,note:'暑假再做'});assert.equal(f.state,'later');assert.equal(s.context(u,topic.id).inventory.length,1);assert.throws(()=>s.publish(u,b.id,c.id,{ids:[],summary:'不足',feedbackRevision:before}),/反馈已更新/);assert.equal(s.context(u,topic.id).feedback[0].reason,'no_time');assert.throws(()=>publish(s,topic.id,b.id,c.id,[]),/最新反馈/);reviewAll(s,topic.id,b.id,c.id);assert.throws(()=>publish(s,topic.id,b.id,c.id,[i.id]),/未经人工|从未正式/);
+test('feedback is durable, distinguishes reasons, stale ranking cannot publish; manual handling excludes reserve and undo restores',t=>{const {s,c,topic}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),ideas=s.ingest(u,b.id,c.id,[{key:'one',content:content(1)},{key:'two',content:content(2)}]);reviewAll(s,topic.id,b.id,c.id);const before=s.feedbackRevision(u,topic.id),i=s.idea(u,ideas[0].idea.id),f=s.feedback(u,i.id,{requestKey:id(),revision:i.revision,action:'later',reason:'no_time',rating:5,note:'暑假再做'});assert.equal(f.state,'later');assert.equal(s.context(u,topic.id).inventory.length,1);assert.throws(()=>s.publish(u,b.id,c.id,{ids:[],summary:'不足',feedbackRevision:before}),/反馈已更新/);assert.equal(s.context(u,topic.id).feedback[0].reason,'no_time');assert.throws(()=>publish(s,topic.id,b.id,c.id,[]),/未归纳/);learn(s,topic.id,c.id);reviewAll(s,topic.id,b.id,c.id);assert.throws(()=>publish(s,topic.id,b.id,c.id,[i.id]),/未经人工|从未正式/);
  const undone=s.feedback(u,i.id,{requestKey:id(),revision:f.revision,action:'undo'});assert.equal(undone.state,'reserve');assert.equal(undone.manual_processed,0);assert.equal(s.context(u,topic.id).inventory.length,2);
- s.review(u,b.id,c.id,[{idea_id:i.id,verdict:'expired',score:0,quality:0,rationale:'依赖服务关闭，已有来源不再适用',compared:[]}]);assert.equal(s.idea(u,i.id).state,'expired');assert.ok(s.idea(u,i.id).state_reason.includes('服务关闭'));assert.equal(s.history(u).total,2);
+ learn(s,topic.id,c.id);s.review(u,b.id,c.id,[{idea_id:i.id,verdict:'expired',score:0,quality:0,rationale:'依赖服务关闭，已有来源不再适用',compared:[]}]);assert.equal(s.idea(u,i.id).state,'expired');assert.ok(s.idea(u,i.id).state_reason.includes('服务关闭'));assert.equal(s.history(u).total,2);
 });
-test('native task is sole execution authority: paused creation, edited prompt/model, correct project, archive/delete and remote guard',t=>{const {s,c,topic,p,db}=fixture(t);assert.equal(new RecurringStore(db).list(u).length,0);const task=s.configureTask(u,topic.id,selection);assert.equal(task.state,'paused');assert.equal(s.configureTask(u,topic.id,selection).id,task.id);assert.equal(new RecurringStore(db).list(u).length,1);const r=new RecurringStore(db),changed=r.update(u,task.id,task.revision,{...task,prompt:'CHANGED_NATIVE_PROMPT',model:'gpt-6-astra',reasoningEffort:'max',schedule:{...task.schedule,kind:'interval',intervalMinutes:1}},'active',day)!;const cid=r.fire(u,task.id,Date.parse(changed.nextRunAt!))!;assert.equal(db.getConversation(cid)?.project_id,p.id);assert.ok(db.listPendingPrompts(cid)[0].content.includes('CHANGED_NATIVE_PROMPT'));assert.ok(db.listPendingPrompts(cid)[0].content.includes(topic.id));assert.equal(db.getConversation(cid)?.agent_model,'gpt-6-astra');
+test('native task is sole execution authority: paused creation, edited prompt/model, correct project, archive/delete and remote guard',t=>{const {s,c,topic,p,db}=fixture(t);assert.equal(new RecurringStore(db).list(u).length,0);const task=s.configureTask(u,topic.id,selection);assert.equal(task.state,'paused');assert.equal(s.configureTask(u,topic.id,selection).id,task.id);assert.equal(new RecurringStore(db).list(u).length,1);const r=new RecurringStore(db),changed=r.update(u,task.id,task.revision,{...task,prompt:'CHANGED_NATIVE_PROMPT',model:'gpt-6-astra',reasoningEffort:'max',schedule:{...task.schedule,kind:'interval',intervalMinutes:1}},'active',day)!;const cid=r.fire(u,task.id,Date.parse(changed.nextRunAt!))!;assert.equal(db.getConversation(cid)?.project_id,p.id);assert.ok(db.listPendingPrompts(cid)[0].content.includes('CHANGED_NATIVE_PROMPT'));assert.ok(db.listPendingPrompts(cid)[0].content.includes(topic.id));assert.match(db.listPendingPrompts(cid)[0].content,/feedback_inbox/);assert.match(db.listPendingPrompts(cid)[0].content,/learn_feedback/);assert.equal(r.get(u,task.id)?.prompt,'CHANGED_NATIVE_PROMPT');assert.equal(db.getConversation(cid)?.agent_model,'gpt-6-astra');
  assert.equal(r.fire(u,task.id,Date.parse(changed.nextRunAt!)+60000),null);db.deletePendingPromptsForConversation(cid);
  s.lifecycle(u,topic.id,s.topic(u,topic.id).revision,'archive');assert.equal(r.get(u,task.id)?.state,'paused');s.lifecycle(u,topic.id,s.topic(u,topic.id).revision,'restore');assert.equal(r.get(u,task.id)?.state,'paused');
  const active=r.update(u,task.id,r.get(u,task.id)!.revision,task,'active',day)!;db.sqlite.prepare('UPDATE projects SET executor_id=? WHERE id=?').run('remote:bad',p.id);assert.equal(r.fire(u,task.id,Date.parse(active.nextRunAt!)),null);assert.equal(r.get(u,task.id)?.state,'paused');assert.throws(()=>s.begin(u,topic.id,c.id,null),/服务器项目/);db.sqlite.prepare("UPDATE projects SET executor_id='tenant-local' WHERE id=?").run(p.id);s.lifecycle(u,topic.id,s.topic(u,topic.id).revision,'delete');assert.equal(r.list(u).length,0);assert.ok(db.getConversation(cid));
@@ -51,9 +52,26 @@ test('research and project promotion use normal conversations and stable links w
 test('real routes enforce CSRF, ownership, server executor, live job credential and no feature-driven background creation',async t=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-api-')),password='fixture-password',secret='opportunity-test-secret-at-least-32-characters';const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'owner',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,minimumFreeDiskBytes:0});t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});const a=request.agent(app.app),login=await a.post('/api/auth/login').send({username:'owner',password}).expect(200),csrf=login.body.csrfToken,p=app.db.createProject(id(),u,'API Server',root,'tenant-local');const body={requestKey:id(),name:'API topic',project_id:p.id,goal:'探索'};await a.post('/api/opportunities/topics').send(body).expect(403);const created=await a.post('/api/opportunities/topics').set('X-CSRF-Token',csrf).send(body).expect(201);const tid=created.body.topic.id;
  assert.equal(new RecurringStore(app.db).list(u).length,0);await a.put('/api/user-settings/features').set('X-CSRF-Token',csrf).send({paraBoard:false,opportunityCards:true,revision:0}).expect(200);assert.equal(new RecurringStore(app.db).list(u).length,0);
  const other=id(),now=new Date().toISOString();app.db.createUser({id:other,username:'other',display_name:'Other',password_hash:bcrypt.hashSync(password,4),role:'member',status:'active',created_at:now,updated_at:now});const friend=request.agent(app.app),fl=await friend.post('/api/auth/login').send({username:'other',password}).expect(200);await friend.get('/api/opportunities/topics/'+tid).expect(404);await friend.patch('/api/opportunities/topics/'+tid).set('X-CSRF-Token',fl.body.csrfToken).send({...body,revision:1}).expect(404);assert.equal((await friend.get('/api/opportunities')).body.topics.length,0);
+ await request(app.app).get('/api/opportunities/topics').expect(401);
+ const listing=await a.get('/api/opportunities/topics').expect(200);assert.deepEqual(listing.body.topics.map((v:{id:string})=>v.id),[tid]);assert.equal(listing.body.ideas,undefined);assert.match(listing.headers['cache-control'],/no-store/);
+ assert.deepEqual((await friend.get('/api/opportunities/topics').expect(200)).body.topics,[]);
+ const second=await a.post('/api/opportunities/topics').set('X-CSRF-Token',csrf).send({...body,name:'Second',requestKey:id()}).expect(201);
+ const movement={sourceId:second.body.topic.id,targetId:tid,placement:'before'};
+ await a.post('/api/opportunities/topics/reorder').send(movement).expect(403);
+ await friend.post('/api/opportunities/topics/reorder').set('X-CSRF-Token',fl.body.csrfToken).send(movement).expect(404);
+ await a.post('/api/opportunities/topics/reorder').set('X-CSRF-Token',csrf).send({...movement,placement:'invalid'}).expect(400);
+ const reordered=await a.post('/api/opportunities/topics/reorder').set('X-CSRF-Token',csrf).send(movement).expect(200);
+ assert.deepEqual(reordered.body.topics.map((v:{id:string})=>v.id),[second.body.topic.id,tid]);
+ await a.patch('/api/opportunities/topics/'+tid+'/name').send({name:'New',revision:1}).expect(403);
+ await friend.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',fl.body.csrfToken).send({name:'New',revision:1}).expect(404);
+ await a.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',csrf).send({name:'New',revision:1}).expect(200);
+ await a.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',csrf).send({name:'Stale',revision:1}).expect(409);
  const c=app.db.createConversation(id(),'Agent',selection,u,p.id),j=app.db.createJob(id(),c.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(j.id);const token=createJobAutomationToken(secret,j.id,c.id);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(200);
  const store=new OpportunityStore(app.db),batch=store.begin(u,tid,c.id,j.id),idea=store.ingest(u,batch.id,c.id,[{key:'route',content:content(9)}])[0].idea;
  const corrected=await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'evidence',topicId:tid,data:{ideaId:idea.id,requestKey:id(),revision:idea.revision,reason:'实际受控接口更正',patch:{facts:'有来源支持的更正事实'}}}).expect(200);assert.equal(corrected.body.idea.content.facts,'有来源支持的更正事实');
+ const rated=store.idea(u,idea.id);store.feedback(u,idea.id,{requestKey:id(),revision:rated.revision,action:'rate',rating:5,note:'优先容易验证的方案'});
+ const inbox=await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'feedback_inbox',topicId:tid}).expect(200);assert.equal(inbox.body.pending,1);
+ await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'learn_feedback',topicId:tid,data:{requestKey:id(),after:inbox.body.watermark,through:inbox.body.through,feedbackRevision:inbox.body.feedbackRevision,summary:'明确反馈凝练验证原则',principles:[{text:'优先容易验证的方案',kind:'explicit',source:inbox.body.items[0].id}]}}).expect(200);assert.equal(store.feedbackLearning(u,tid).pending,0);assert.equal(store.preferences(u,tid)[0].text,'优先容易验证的方案');
  const otherTopic=store.createTopic(u,{name:'Other topic',project_id:p.id,goal:'different scope'},id());await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'evidence',topicId:otherTopic.id,data:{ideaId:idea.id}}).expect(403);
  app.db.sqlite.prepare("UPDATE projects SET executor_id='remote:fixture' WHERE id=?").run(p.id);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(403);app.db.sqlite.prepare("UPDATE jobs SET status='completed' WHERE id=?").run(j.id);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'topics'}).expect(401);
 });
@@ -101,4 +119,119 @@ test('corrected reserve evidence invalidates prior ranking without deleting revi
  s.correctEvidence(u,i.id,c.id,j.id,{requestKey:id(),revision:s.idea(u,i.id).revision,reason:'资料给出的条件有限，需重审',patch:{assumptions:'仅说明技术可行，目标用户是否理解尚待验证'}});
  assert.notEqual(s.feedbackRevision(u,topic.id),oldRevision);assert.equal(s.sql.prepare('SELECT count(*) n FROM opportunity_reviews').get()?.n,1);assert.equal(s.detail(u,i.id).feedback.length,0);
  assert.throws(()=>publish(s,topic.id,b.id,c.id,[i.id]),/最新反馈/);reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,[i.id]);assert.equal(s.idea(u,i.id).state,'recommended');
+});
+
+test('topic relative ordering persists, appends new topics and isolates owners and archived entries', t => {
+ const {s,db,p,topic}=fixture(t);
+ const b=s.createTopic(u,{name:'B',project_id:p.id,goal:'B'},id()),c=s.createTopic(u,{name:'C',project_id:p.id,goal:'C'},id());
+ const order=()=>s.topics(u).map(v=>v.id);
+ assert.deepEqual(s.reorderTopics(u,{sourceId:c.id,targetId:topic.id,placement:'before'}).map(v=>v.id),[c.id,topic.id,b.id]);
+ s.reorderTopics(u,{sourceId:c.id,targetId:b.id,placement:'after'});
+ assert.deepEqual(order(),[topic.id,b.id,c.id]);
+ assert.deepEqual(new OpportunityStore(db).topics(u).map(v=>v.id),order());
+ const d=s.createTopic(u,{name:'D',project_id:p.id,goal:'D'},id());assert.equal(order().at(-1),d.id);
+ s.lifecycle(u,b.id,b.revision,'archive');
+ assert.throws(()=>s.reorderTopics(u,{sourceId:b.id,targetId:c.id,placement:'before'}),/恢复主题/);
+ assert.throws(()=>s.reorderTopics(id(),{sourceId:c.id,targetId:topic.id,placement:'before'}),/不存在/);
+ assert.throws(()=>s.reorderTopics(u,{sourceId:c.id,targetId:id(),placement:'before'}),/不存在/);
+ assert.throws(()=>s.reorderTopics(u,{sourceId:c.id,targetId:topic.id,placement:'invalid'}));
+ assert.deepEqual(order(),[topic.id,b.id,c.id,d.id]);
+ const renamed=s.renameTopic(u,topic.id,{name:' New name ',revision:topic.revision});
+ assert.equal(renamed.name,'New name');assert.equal(renamed.goal,topic.goal);assert.equal(renamed.revision,topic.revision+1);
+ assert.throws(()=>s.renameTopic(u,topic.id,{name:'stale',revision:topic.revision}),/其他页面更新/);
+ assert.throws(()=>s.renameTopic(id(),topic.id,{name:'foreign',revision:renamed.revision}),/不存在/);
+ assert.throws(()=>s.renameTopic(u,topic.id,{name:' ',revision:renamed.revision}));
+ assert.equal(s.topic(u,topic.id).name,'New name');
+});
+
+test('inbox, working, processed and dismissed views separate feedback and keep research links', t => {
+ const {s,db,c,topic,p}=fixture(t);
+ s.updateTopic(u,topic.id,{...topic,read_recent:false,limit_count:10,revision:topic.revision});
+ const b=s.begin(u,topic.id,c.id,null),created=s.ingest(u,b.id,c.id,Array.from({length:10},(_,n)=>({key:'flow-'+n,content:content(200+n)}))).map(v=>v.idea);
+ reviewAll(s,topic.id,b.id,c.id);
+ s.review(u,b.id,c.id,[{idea_id:created[9].id,verdict:'reject',score:10,quality:10,rationale:'未达到质量门槛',compared:s.neighbors(u,created[9].content,created[9].id).map(n=>({id:n.id,difference:'不同的验证问题'}))}]);
+ publish(s,topic.id,b.id,c.id,created.slice(0,8).map(v=>v.id));
+ const feedback=(n:number,action:string)=>{const idea=s.idea(u,created[n].id);return s.feedback(u,idea.id,{requestKey:id(),revision:idea.revision,action,rating:3,note:'test feedback'});};
+ feedback(1,'dismissed');feedback(2,'kept');feedback(3,'later');feedback(4,'rate');feedback(8,'expired');
+ const requestKey=id(),beforeResearch=s.idea(u,created[5].id),research=s.start(u,topic.id,selection,requestKey,created[5].id);
+ const afterResearch=s.idea(u,created[5].id);assert.equal(afterResearch.manual_processed,1);assert.equal(afterResearch.revision,beforeResearch.revision+1);
+ assert.equal(s.start(u,topic.id,selection,requestKey,created[5].id).conversationId,research.conversationId);assert.equal(s.idea(u,created[5].id).revision,afterResearch.revision);
+ const board=new ParaStore(db).createBoard(u,'工作总览测试',null),project=s.toProject(u,created[6].id,board.id,id());
+ const inbox=s.view(u,topic.id);assert.deepEqual(new Set(inbox.ideas.map(i=>i.id)),new Set([created[0].id,created[7].id]));
+ assert.deepEqual({...inbox.counts},{screen:2,reserve:0,working:3,processed:2,dismissed:2,rejected:1});
+ s.sql.prepare('UPDATE opportunity_ideas SET manual_processed=0 WHERE id=?').run(created[5].id); // Existing research predates the new handling marker.
+ assert.equal(s.view(u,topic.id,'today').total,2);assert.equal(s.view(u,topic.id,'unknown').total,2);
+ assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,2); // Also excludes legacy research without manual_processed.
+ assert.deepEqual(new Set(s.view(u,topic.id,'processed').ideas.map(i=>i.id)),new Set([created[3].id,created[4].id]));
+ assert.deepEqual(new Set(s.view(u,topic.id,'dismissed').ideas.map(i=>i.id)),new Set([created[1].id,created[8].id]));
+ const work=s.view(u,undefined,'working');assert.equal(work.total,3);
+ assert.equal(work.ideas.find(i=>i.id===created[5].id)?.work?.research?.conversation_id,research.conversationId);
+ assert.equal(work.ideas.find(i=>i.id===created[6].id)?.work?.project?.id,project.id);
+ assert.equal(work.ideas.find(i=>i.id===created[6].id)?.topic_name,topic.name);
+ db.sqlite.prepare('DELETE FROM conversations WHERE id=?').run(research.conversationId);
+ assert.equal(s.view(u,topic.id,'working').ideas.find(i=>i.id===created[5].id)?.work?.research?.available,false);
+ feedback(1,'undo');assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,3);assert.equal(s.view(u,topic.id).total,3);assert.equal(s.view(u,topic.id,'dismissed').total,1);
+ feedback(2,'dismissed');assert.equal(s.view(u,topic.id,'working').total,2);assert.equal(s.view(u,topic.id,'dismissed').total,2);
+ const outsider=id();assert.deepEqual(s.topics(outsider),[]);assert.equal(s.view(outsider,undefined).total,0);assert.equal(Object.values(s.view(outsider,undefined).counts).reduce((a,b)=>a+b,0),0);assert.throws(()=>s.view(outsider,topic.id),/不存在/);
+ const second=s.createTopic(u,{name:'another',project_id:p.id,goal:'other'},id());assert.equal(s.view(u,second.id,'working').total,0);assert.equal(s.topics(u).find(t=>t.id===second.id)?.pending_count,0);assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,3);
+ assert.deepEqual(db.sqlite.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
+test('candidate pagination includes older unanswered cards and totals match filtering', t => {
+ const {s,c,topic}=fixture(t),b=s.begin(u,topic.id,c.id,null);
+ const inputs=Array.from({length:43},(_,n)=>({key:'page-'+n,content:content(300+n)}));
+ const ideas=[...s.ingest(u,b.id,c.id,inputs.slice(0,30)),...s.ingest(u,b.id,c.id,inputs.slice(30))].map(v=>v.idea);
+ const mark=s.sql.prepare("UPDATE opportunity_ideas SET state='recommended',first_recommended_at='2026-10-01T00:00:00.000Z' WHERE id=?");ideas.forEach(i=>mark.run(i.id));
+ const first=s.view(u,topic.id),second=s.view(u,topic.id,'screen',first.nextOffset!);
+ assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,43);assert.equal(first.total,43);assert.equal(first.counts.screen,43);assert.equal(first.ideas.length,40);assert.equal(second.ideas.length,3);assert.equal(second.nextOffset,null);assert.equal(new Set([...first.ideas,...second.ideas].map(i=>i.id)).size,43);
+ const i=first.ideas[0];s.feedback(u,i.id,{requestKey:id(),revision:i.revision,action:'rate',rating:4});
+ assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,42);assert.equal(s.view(u,topic.id).total,42);assert.equal(s.view(u,topic.id,'processed').total,1);
+});
+
+test('feedback learning drains all old feedback in order, persists principles atomically and gates discovery', t => {
+ const {s,c,topic,root}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),ideas=s.ingest(u,b.id,c.id,[{key:'learning',content:content(800)},{key:'reserve',content:content(801)}]);
+ const iid=ideas[0].idea.id;
+ for(let n=0;n<35;n++)s.feedback(u,iid,{requestKey:id(),revision:s.idea(u,iid).revision,action:'rate',rating:4,note:'优先两分钟可以验证的交互 '+n});
+ s.sql.prepare("UPDATE opportunity_feedback SET created_at='2026-09-01T00:00:00Z' WHERE idea_id=?").run(iid);
+ const page=s.feedbackInbox(u,topic.id);assert.equal(page.pending,35);assert.equal(page.items.length,30);assert.equal(topic.read_recent,0);
+ assert.throws(()=>s.ingest(u,b.id,c.id,[{key:'blocked',content:content(802)}]),/未归纳/);
+ assert.throws(()=>reviewAll(s,topic.id,b.id,c.id),/未归纳/);assert.throws(()=>publish(s,topic.id,b.id,c.id,[]),/未归纳/);
+ const input={requestKey:id(),after:page.watermark,through:page.through,feedbackRevision:page.feedbackRevision,summary:'明确要求低成本验证，形成可复用原则。',principles:[{text:'优先两分钟可验证的交互',kind:'explicit',source:page.items[0].id}]};
+ assert.throws(()=>s.learnFeedback(u,topic.id,c.id,{...input,through:page.through+1}),/不能跳过/);
+ assert.throws(()=>s.learnFeedback(u,topic.id,c.id,{...input,principles:[...input.principles,{text:'无来源',kind:'inferred',source:id()}]}),/真实反馈/);
+ assert.equal(s.preferences(u,topic.id).length,0);assert.equal(s.feedbackLearning(u,topic.id).watermark,0);
+ const learned=s.learnFeedback(u,topic.id,c.id,input);assert.equal(learned.learning.pending,5);assert.equal(learned.learning.learned,30);
+ assert.deepEqual(s.learnFeedback(u,topic.id,c.id,input),JSON.parse(JSON.stringify(learned)));assert.equal(s.preferences(u,topic.id).length,1);
+ const reopened=new AppDatabase(root,undefined,false);try{const persisted=new OpportunityStore(reopened);assert.equal(persisted.feedbackInbox(u,topic.id).pending,5);assert.equal(persisted.preferences(u,topic.id)[0].text,input.principles[0].text);}finally{reopened.close();}
+ const stale=s.feedbackInbox(u,topic.id);s.feedback(u,iid,{requestKey:id(),revision:s.idea(u,iid).revision,action:'undo'});
+ assert.throws(()=>s.learnFeedback(u,topic.id,c.id,{...input,requestKey:id(),after:stale.watermark,through:stale.through,feedbackRevision:stale.feedbackRevision}),/进度已变化|知识库已更新/);
+ const remaining=s.feedbackInbox(u,topic.id);assert.equal(remaining.pending,6);assert.equal(remaining.items.length,6);
+ const pref=s.preferences(u,topic.id)[0];s.learnFeedback(u,topic.id,c.id,{requestKey:id(),after:remaining.watermark,through:remaining.through,feedbackRevision:remaining.feedbackRevision,summary:'撤销后重新检查证据，停用原原则待确认。',principles:[{...pref,source:remaining.items.at(-1)!.id,active:false}]});
+ assert.equal(s.preferences(u,topic.id).length,0);assert.equal(s.feedbackLearning(u,topic.id).pending,0);assert.equal(s.feedbackLearning(u,topic.id).learned,36);
+ reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,[ideas[1].idea.id]);
+ assert.equal(s.sql.prepare('SELECT count(*) n FROM opportunity_feedback_learning').get()?.n,2);
+ assert.throws(()=>s.feedbackInbox(id(),topic.id),/不存在/);assert.deepEqual(s.sql.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
+test('project knowledge is the single principle source and learning records written files without duplicating page preferences', t => {
+ const {s,c,topic,root}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),idea=s.ingest(u,b.id,c.id,[{key:'knowledge',content:content(900)}])[0].idea;
+ s.setPreference(u,topic.id,{text:'迁移前偏好',kind:'explicit',source:'用户设置'});
+ assert.throws(()=>s.updateTopic(u,topic.id,{...topic,read_recent:false,knowledge_path:'../another/README.md'}),/相对/);
+ const entry='knowledge/opportunities/topic/README.md',linked=s.updateTopic(u,topic.id,{...topic,read_recent:false,knowledge_path:entry});
+ const withoutPath={...linked,read_recent:false};delete (withoutPath as Partial<typeof linked>).knowledge_path;
+ assert.equal(s.updateTopic(u,topic.id,withoutPath).knowledge_path,entry);
+ assert.deepEqual(s.context(u,topic.id).preferences,[]);assert.equal(s.context(u,topic.id).knowledge.entry,entry);
+ assert.equal(s.preferences(u,topic.id,true).length,1); // Keep legacy provenance, never inject it as current rules.
+ assert.throws(()=>s.setPreference(u,topic.id,{text:'另一份偏好',kind:'explicit',source:'用户设置'}),/项目知识库/);
+ const task=s.configureTask(u,topic.id,selection);assert.match(task.prompt,/knowledge\/opportunities\/topic\/README.md/);assert.ok(task.prompt.length<500);
+ s.feedback(u,idea.id,{requestKey:id(),revision:idea.revision,action:'rate',rating:5,note:'优先可以观察验证的原型'});
+ const page=s.feedbackInbox(u,topic.id),input={requestKey:id(),after:page.watermark,through:page.through,feedbackRevision:page.feedbackRevision,summary:'凝练验证原则并保存知识文件'};
+ assert.equal(page.knowledgePath,entry);assert.deepEqual(page.preferences,[]);
+ assert.throws(()=>s.learnFeedback(u,topic.id,c.id,input),/knowledgeFiles/);
+ assert.throws(()=>s.learnFeedback(u,topic.id,c.id,{...input,knowledgeFiles:['another/README.md']}),/knowledgeFiles/);
+ assert.equal(s.feedbackLearning(u,topic.id).pending,1);
+ const file='knowledge/opportunities/topic/principles.md';fs.mkdirSync(path.dirname(path.join(root,file)),{recursive:true});fs.writeFileSync(path.join(root,file),'优先可以观察验证的原型\n来源反馈：'+page.items[0].id);
+ const result=s.learnFeedback(u,topic.id,c.id,{...input,knowledgeFiles:[file]});assert.equal(result.learning.pending,0);assert.deepEqual(result.preferences,[]);
+ assert.deepEqual(JSON.parse(String(s.sql.prepare('SELECT knowledge_files_json FROM opportunity_feedback_learning').get()?.knowledge_files_json)),[file]);
+ assert.equal(s.preferences(u,topic.id,true).length,1);assert.match(fs.readFileSync(path.join(root,file),'utf8'),/可观察|观察验证/);
 });

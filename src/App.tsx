@@ -1,4 +1,5 @@
-import { OpportunitySidebar, OpportunityWorkspace } from "./opportunities";
+import { OpportunityWorkspace } from "./opportunities";
+import { OpportunitySidebar } from "./opportunity-sidebar";
 import { RecurringSidebar, RecurringWorkspace } from "./recurring-tasks";
 import type { RecurringTask } from "./recurring-types";
 import { NodeTransfersDialog } from "./node-transfers-dialog";
@@ -1082,13 +1083,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [createTypeOpen, setCreateTypeOpen] = useState(false);
   const [opportunityVisible, setOpportunityVisible] = useState(false);
-  const [opportunityTopic, setOpportunityTopic] = useState<string | null>(null);
+  const opportunityLocationKey = `codex-web:${session.accountId}:opportunity-topic`;
+  const [opportunityTopic, setOpportunityTopic] = useState(() => { try { return localStorage.getItem(opportunityLocationKey) || ""; } catch { return ""; } });
+  const [opportunityCreate, setOpportunityCreate] = useState(false);
+  useEffect(() => { try { localStorage.setItem(opportunityLocationKey, opportunityTopic); } catch { /* Private mode */ } }, [opportunityLocationKey, opportunityTopic]);
   const [opportunityNavigation, setOpportunityNavigation] = useState(0);
   const [opportunityReturn, setOpportunityReturn] = useState(false);
-  function openOpportunities(topicId?: string) {
+  function openOpportunities(topicId?: string, create = false) {
     if (!leaveRecurring() || !features.opportunityCards) return;
     setParaVisible(false); setOpportunityVisible(true); setSidebarOpen(false);
-    if (topicId) setOpportunityTopic(topicId);
+    if (topicId !== undefined) setOpportunityTopic(topicId);
+    setOpportunityCreate(create);
     setOpportunityNavigation(n => n + 1);
   }
   useEffect(() => { if (!features.opportunityCards) { setOpportunityVisible(false); setOpportunityReturn(false); } }, [features.opportunityCards]);
@@ -3851,7 +3856,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
-      {features.opportunityCards && <OpportunitySidebar selected={opportunityVisible} onOpen={() => openOpportunities()} />}
+      {features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />}
       {features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />}
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
@@ -4055,7 +4060,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {nodeTransfersOpen && createPortal(<NodeTransfersDialog onClose={() => setNodeTransfersOpen(false)} />, document.body)}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
-    {features.opportunityCards && <OpportunityWorkspace accountId={session.accountId!} projects={projects} visible={opportunityVisible} openTopicId={opportunityTopic} navigation={opportunityNavigation} onMenu={() => setSidebarOpen(true)} onCreateProject={() => setProjectDialogOpen(true)}
+    {features.opportunityCards && <OpportunityWorkspace key={session.accountId} accountId={session.accountId!} projects={projects} visible={opportunityVisible} topicId={opportunityTopic} onTopicChange={setOpportunityTopic} createTopic={opportunityCreate} navigation={opportunityNavigation} onMenu={() => setSidebarOpen(true)} onCreateProject={() => setProjectDialogOpen(true)}
       onConversation={(pid, cid) => { setOpportunityReturn(true); selectProjectConversation(pid, cid); void refreshList(false, pid); }}
       onRecurring={(pid, tid) => { setOpportunityReturn(true); openRecurring(pid, tid); }} onProject={(bid, pid) => openPara(bid, pid)} />}
     {features.paraBoard && paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}

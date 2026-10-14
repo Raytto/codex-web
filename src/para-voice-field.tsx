@@ -34,7 +34,7 @@ export function paraVoiceBusy(voice: VoiceInputController) {
   return voice.starting || voice.state !== "idle" || voice.draftRestoring || Boolean(voice.pendingDraft);
 }
 
-export function ParaVoiceField({ label, value, onChange, voice, disabled, placeholder, maxLength, rows = 2, required = false }: {
+export function ParaVoiceField({ label, value, onChange, voice, disabled, placeholder, maxLength, rows = 2, required = false, autoFocus = true }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
@@ -44,6 +44,7 @@ export function ParaVoiceField({ label, value, onChange, voice, disabled, placeh
   maxLength: number;
   rows?: number;
   required?: boolean;
+  autoFocus?: boolean;
 }) {
   const id = useId();
   const tooLong = value.length > maxLength;
@@ -53,7 +54,7 @@ export function ParaVoiceField({ label, value, onChange, voice, disabled, placeh
       {maxLength <= 180 && <span className={tooLong ? "para-voice-limit" : undefined}>{value.length} / {maxLength}</span>}
     </div>
     <div className={`para-voice-composer ${voice.state}`}>
-      <textarea id={id} autoFocus rows={rows} required={required} maxLength={maxLength}
+      <textarea id={id} autoFocus={autoFocus} rows={rows} required={required} maxLength={maxLength}
         value={value} onChange={(event) => onChange(event.target.value)}
         placeholder={voice.state === "recording" ? "正在录音，也可以继续输入文字…" : placeholder}
         disabled={disabled || voice.state === "transcribing"} aria-invalid={tooLong}

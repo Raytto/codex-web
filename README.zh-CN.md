@@ -237,7 +237,7 @@ stateDiagram-v2
 ## Recent product updates / 近期更新
 
 - [语音先发送](docs/VOICE_SEND.md)：录音先持久接收，再云端识别；识别进度、结果和失败重试只显示在同一条待发送任务中，刷新后保留，派发执行后只生成一条聊天消息。重试保持幂等，各会话保留独立录音与上传状态。服务商密钥和 HTTPS 端点仍为可选项，默认留空。
-- [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. No private business topics, credentials or pre-created schedules are shipped.
+- [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. Topic navigation/order/actions, pending counts, separate candidate/work/history collections and incremental feedback learning use the same normal project workflow; an optional relative Markdown knowledge entry keeps project requirements authoritative. No private business topics, credentials or pre-created schedules are shipped.
 - Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
 - [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
 - Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.

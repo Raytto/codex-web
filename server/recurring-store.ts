@@ -1,4 +1,5 @@
 import { reserveOpportunityBatch, reconcileOpportunityBatches } from "./opportunity-schema.js";
+import { opportunityLearningPrompt } from './opportunity-learning-prompt.js';
 import crypto from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppDatabase } from "./db.js";
@@ -79,7 +80,7 @@ export class RecurringStore {
     try {
       const t = this.get(user, id), time = new Date(now).toISOString();
       if (!t || t.state !== "active" || !t.nextRunAt || t.nextRunAt > time) { sql.exec("COMMIT"); return null; }
-      const opportunity = sql.prepare("SELECT id,archived_at,deleted_at FROM opportunity_topics WHERE task_id=?").get(id) as { id: string; archived_at: string | null; deleted_at: string | null } | undefined;
+      const opportunity = sql.prepare("SELECT id,knowledge_path,archived_at,deleted_at FROM opportunity_topics WHERE task_id=?").get(id) as { id: string; knowledge_path: string; archived_at: string | null; deleted_at: string | null } | undefined;
       if (opportunity) {
         const project = this.db.getActiveProjectForUser(t.project_id, user);
         const expected = user === "00000000-0000-4000-8000-000000000010" ? "local-host" : "tenant-local";
@@ -105,7 +106,7 @@ export class RecurringStore {
         const stamp = new Intl.DateTimeFormat("zh-CN", { timeZone: t.schedule.timeZone, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(t.nextRunAt));
         this.db.createConversation(conversationId, `${t.name} · ${stamp}`, selection, user, t.project_id);
         sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(conversationId);
-        this.db.createPendingPrompt(pendingId, conversationId, t.prompt + (opportunity ? `\n\n关联机会主题：${opportunity.id}。使用 codex_web_opportunities context 读取当前目标与反馈，再按本任务指令执行。保持本项目正常会话链路。` : ""), selection);
+        this.db.createPendingPrompt(pendingId, conversationId, t.prompt + (opportunity ? '\n\n' + opportunityLearningPrompt(opportunity.id, opportunity.knowledge_path) : ""), selection);
         if (opportunity) reserveOpportunityBatch(sql,opportunity.id,user,conversationId,t.project_id,t.id,opportunityDay,time);
       }
       sql.prepare(`INSERT INTO recurring_runs(id,task_id,scheduled_at,conversation_id,pending_prompt_id,outcome,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`).run(crypto.randomUUID(), id, t.nextRunAt, conversationId, pendingId, busy ? "skipped" : "created", busy ? (topicBusy ? "关联主题今日已处理或仍在运行，已跳过重复执行" : "上一轮仍在运行或等待，已跳过本次") : null, time);

@@ -763,3 +763,7 @@ Codex Web 部署结果
 - GitHub Deploy Key：https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys
 
 执行时应以仓库当前提交及上述官方文档为准。若两者与本文冲突，AI 必须暂停、说明差异并让用户确认更新方案，而不是静默套用旧命令。
+
+## Opportunity cards increment
+
+Use the normal build and upgrade path; back up the deployment's own state first. No extra environment settings, cloud credentials or services are required for navigation, counts and feedback-learning bookkeeping. Optional voice needs the operator's own provider configuration. Topic knowledge is an optional project-relative Markdown entry. Review [migration details](docs/OPPORTUNITY_CARDS.md#upgrade-and-migration), then verify login, ownership and SQLite integrity. No topics or schedules are enabled automatically.

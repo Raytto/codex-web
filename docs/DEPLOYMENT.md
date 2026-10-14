@@ -182,3 +182,7 @@ The regression uses synthetic audio/transcription and a controlled model runner
 with actual scheduler/database transitions; real provider/model and microphone checks
 remain separate operator acceptance. An installation with voice disabled does
 not need provider credentials merely to upgrade.
+
+### Opportunity navigation and learning upgrade
+
+The optional opportunity-card increment requires no new environment variables or services. Back up your own database/state, then follow the existing immutable build/deploy commands. Startup migrations add topic ordering, learning cursors/history and project-relative knowledge entries without importing topics or schedules. See [opportunity upgrade and migration](OPPORTUNITY_CARDS.md#upgrade-and-migration) for verification and rollback boundaries. Configure your own Markdown knowledge entry and provider only if needed; keep empty/fail-closed defaults otherwise.

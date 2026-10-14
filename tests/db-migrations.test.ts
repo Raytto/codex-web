@@ -79,6 +79,9 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026101001, name: "project-recurring-tasks" },
     { version: 2026101401, name: "durable-voice-submissions" },
     { version: 2026101402, name: "opportunity-cards" },
+    { version: 2026101403, name: "opportunity-topic-order" },
+    { version: 2026101404, name: "opportunity-feedback-learning" },
+    { version: 2026101405, name: "opportunity-project-knowledge" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
@@ -256,4 +259,39 @@ test("PARA sidebar migration starts from activity and preserves card order, data
   const reopened = new AppDatabase(root, undefined, false);
   assert.deepEqual(new ParaStore(reopened).sidebarProjects(LEGACY_USER_ID, board.id, "", false, 5, 0).projects.map((p) => p.id), [b.id, a.id]);
   assert.deepEqual(reopened.sqlite.prepare("PRAGMA foreign_key_check").all(), []); reopened.close();
+});
+
+
+test("opportunity order migration preserves old identities and order across reopen", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "opportunity-order-migration-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const first = new AppDatabase(root);
+  const project = first.createProject(crypto.randomUUID(), LEGACY_USER_ID, "Server", root, "tenant-local");
+  const insert = first.sqlite.prepare("INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,created_at,updated_at) VALUES(?,?,?,?,?,?,?)");
+  for (const [id, time] of [["b", "2026-10-14T00:00:00Z"], ["a", "2026-10-14T00:00:00Z"], ["c", "2026-10-15T00:00:00Z"]]) insert.run(id, LEGACY_USER_ID, project.id, id, "goal", time, time);
+  first.sqlite.exec("DROP INDEX opportunity_topics_order; ALTER TABLE opportunity_topics DROP COLUMN position; DELETE FROM schema_migrations WHERE version=2026101403");
+  first.close();
+  const migrated = new AppDatabase(root);
+  assert.deepEqual(migrated.sqlite.prepare("SELECT id,position FROM opportunity_topics ORDER BY position").all().map(row=>({...row})), [{id:"a",position:0},{id:"b",position:1},{id:"c",position:2}]);
+  migrated.sqlite.exec("UPDATE opportunity_topics SET position=5 WHERE id='a'");
+  migrated.close();
+  const reopened = new AppDatabase(root);
+  assert.equal(reopened.sqlite.prepare("SELECT position FROM opportunity_topics WHERE id='a'").get()?.position,5);
+  assert.deepEqual(reopened.sqlite.prepare("PRAGMA foreign_key_check").all(),[]);
+  reopened.close();
+});
+
+test("feedback learning upgrade retains old topics and starts with all feedback unread", context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "opportunity-learning-migration-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const first = new AppDatabase(root, undefined, false);
+  const project = first.createProject(crypto.randomUUID(), LEGACY_USER_ID, "Server", root, "tenant-local");
+  first.sqlite.prepare("INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").run("existing", LEGACY_USER_ID, project.id, "Existing", "goal", "now", "now");
+  first.sqlite.exec("DROP TABLE opportunity_feedback_learning; ALTER TABLE opportunity_topics DROP COLUMN feedback_watermark; ALTER TABLE opportunity_topics DROP COLUMN feedback_learned_at; ALTER TABLE opportunity_topics DROP COLUMN knowledge_path; DELETE FROM schema_migrations WHERE version IN (2026101404,2026101405)");first.close();
+  const upgraded = new AppDatabase(root, undefined, false);
+  assert.equal(upgraded.sqlite.prepare("SELECT feedback_watermark FROM opportunity_topics WHERE id='existing'").get()?.feedback_watermark, 0);
+  upgraded.sqlite.exec("UPDATE opportunity_topics SET feedback_watermark=17,feedback_learned_at='learned' WHERE id='existing'");upgraded.close();
+  const reopened = new AppDatabase(root, undefined, false);
+  assert.equal(reopened.sqlite.prepare("SELECT feedback_watermark FROM opportunity_topics WHERE id='existing'").get()?.feedback_watermark, 17);
+  assert.deepEqual(reopened.sqlite.prepare("PRAGMA foreign_key_check").all(), []);reopened.close();
 });

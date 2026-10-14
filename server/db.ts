@@ -790,6 +790,26 @@ export class AppDatabase {
     });
     this.applyMigration(2026101001, "project-recurring-tasks", () => migrateRecurring(this.sqlite));
     this.applyMigration(2026101402, "opportunity-cards", () => migrateOpportunities(this.sqlite));
+    this.applyMigration(2026101403, "opportunity-topic-order", () => {
+      this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+        WITH ordered AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at,id) - 1 AS position FROM opportunity_topics)
+        UPDATE opportunity_topics SET position = (SELECT position FROM ordered WHERE ordered.id=opportunity_topics.id);
+        CREATE INDEX opportunity_topics_order ON opportunity_topics(user_id,deleted_at,position);`);
+    });
+    this.applyMigration(2026101404, "opportunity-feedback-learning", () => {
+      this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN feedback_watermark INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE opportunity_topics ADD COLUMN feedback_learned_at TEXT;
+        CREATE TABLE opportunity_feedback_learning (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), topic_id TEXT NOT NULL REFERENCES opportunity_topics(id),
+          from_watermark INTEGER NOT NULL, to_watermark INTEGER NOT NULL, feedback_ids_json TEXT NOT NULL,
+          summary TEXT NOT NULL, conversation_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX opportunity_feedback_learning_topic ON opportunity_feedback_learning(user_id,topic_id,created_at);`);
+    });
+    this.applyMigration(2026101405, "opportunity-project-knowledge", () => {
+      this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN knowledge_path TEXT NOT NULL DEFAULT '';
+        ALTER TABLE opportunity_feedback_learning ADD COLUMN knowledge_files_json TEXT NOT NULL DEFAULT '[]';`);
+    });
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain

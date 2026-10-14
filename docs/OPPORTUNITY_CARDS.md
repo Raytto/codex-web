@@ -4,7 +4,7 @@
 
 ## Execution and ownership
 
-唯一执行链为服务器 `projects` → `recurring_tasks` → 普通 `conversations` / `jobs` → `codex_web_opportunities` → 主题批次与卡片。没有独立模型执行器、周期表或 Agent 循环。原生周期任务保存 prompt、模型、深度、日程和启停；主题只保存业务目标、约束、推荐上限、探索比例及绑定 ID。配置自动发现先创建暂停的原生计划，用户在原编辑页启用；也可关联同一服务器项目已有计划。
+唯一执行链为服务器 `projects` → `recurring_tasks` → 普通 `conversations` / `jobs` → `codex_web_opportunities` → 主题批次与卡片。没有独立模型执行器、周期表或 Agent 循环。原生周期任务保存 prompt、模型、深度、日程和启停；主题保存目标摘要、约束、推荐上限、探索比例、项目内知识库相对入口及绑定 ID。配置自动发现先创建暂停的原生计划，用户在原编辑页启用；也可关联同一服务器项目已有计划。
 
 可选宿主桥账号只接受自身 `local-host` 项目；普通账号只接受自身 `tenant-local` 项目。入口选择远程工程不改变主题路由。自动化 API 复用在运行 Job 的短期签名凭据，并核对真实会话账号、项目及执行器，不接受调用者指定的 user ID。既有网页 API 继续使用登录、CSRF 与同源校验。
 
@@ -36,8 +36,20 @@
 
 ## UI and validation
 
-页面复用现有 CSS token、紧凑周期页、侧栏功能区和 `ui-dialog`。每日精选、备用、统一待筛选、历史/已处理四个主视图；初筛/失效在历史范围内。完整依据、事实/假设、最强疑点、最小验证及来源在卡片详情。移动端折叠目标，保留明显的计划编辑、来源及返回路径。
+页面复用现有 CSS token、紧凑周期页、侧栏功能区和 `ui-dialog`。默认展示全部未反馈候选，备用单列；工作总览、暂放/已反馈、已淘汰及初筛记录分别展示，不把已研究或转项目的卡片混入待反馈列表。完整依据、事实/假设、最强疑点、最小验证及来源在卡片详情。移动端折叠目标，保留明显的计划编辑、来源及返回路径。
 
 自动化涵盖迁移、旧设置保留、真实认证路由/CSRF、跨账号与远程执行拒绝、10→3+7/17→3+14 库存结转、稳定身份、重试、中文改写/跨主题/新证据、反馈撤销/复评/过时、原生调度归属与 prompt、来源 GC、研究/看板关联。运行 `npm test` 和 Docker test stage。
 
 上线还必须完成真实短期登录、正式浏览器及正常 Agent/原生调度验收，不能以此文档或合成内容代表模型采集通过。部署者应记录自己的验收版本、测试范围及设备限制；默认没有主题、卡片、自动计划或业务记录。
+
+## Topic navigation and feedback learning
+
+The sidebar lists each topic, supports search, drag ordering and rename/archive/restore actions, and keeps the pending count visible beside long names. Counts cover all unprocessed recommended cards, including older days and later pages; reserve, feedback and work items do not count. A stale topic response cannot replace the current selection. Feedback can be recorded by typing or optional voice input; recording and retry state stay with the feedback field. Voice remains unavailable without the operator's own provider configuration.
+
+Each normal discovery run drains `feedback_inbox` in pages of 30 and confirms `learn_feedback` before ingest, review or publish. The service checks cursor, feedback revision, ownership and idempotency. Revoked/updated feedback must be interpreted using the current card state. With no knowledge entry, reusable principles are saved transactionally in the topic database. With a project-relative Markdown entry such as `knowledge/README.md`, that knowledge tree is authoritative: the normal project agent writes condensed principles and feedback references, then acknowledges the affected Markdown paths. No second page-level principles copy is injected. File writing and the database acknowledgment are separate operations; after acknowledgment failure the agent must check references before retrying. Paths are validated syntactically; the acknowledgment does not independently prove file contents or quality.
+
+No new provider, environment variable or background model runner is introduced. The feature is off by default; no real topics, knowledge files, learned principles or schedules are bundled. Operators create their own project knowledge and explicitly enable schedules.
+
+## Upgrade and migration
+
+Back up the operator's own database and state before upgrading. Startup migrations `2026101403`, `2026101404` and `2026101405` add per-user topic order, feedback-learning progress/history and optional project-knowledge paths; existing topics and feedback remain, and old feedback initially awaits learning. Run the existing build/deploy workflow and verify SQLite integrity plus owner isolation after upgrade. Do not overwrite state with source or sample data. The environment template and Compose defaults need no new keys for this increment. A rollback of code does not restore the database; retain the pre-upgrade backup for an intentional data restore.

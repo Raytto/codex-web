@@ -1,10 +1,11 @@
 import type { RecurringTask } from './recurring-types.js';
 export type OpportunityTopic = {
   id: string; user_id: string; project_id: string; task_id: string | null; name: string; goal: string;
-  questions: string; constraints: string; limit_count: number; exploration: number; read_recent: number;
-  context_watermark: number; revision: number; archived_at: string | null; deleted_at: string | null;
+  questions: string; constraints: string; knowledge_path: string; limit_count: number; exploration: number; read_recent: number;
+  context_watermark: number; feedback_watermark: number; feedback_learned_at: string | null; revision: number; archived_at: string | null; deleted_at: string | null;
   created_at: string; updated_at: string; task?: RecurringTask | null;
 };
+export type OpportunityTopicSummary = OpportunityTopic & { pending_count: number };
 export type OpportunityEvidence = { title: string; url: string; date: string; finding: string };
 export type OpportunityContent = {
   title: string; summary: string; audience: string; problem: string; mechanism: string; value: string;
@@ -31,4 +32,11 @@ export type OpportunityFeedback = { id: string; idea_id: string; action: string;
 export type OpportunityPreference = { id: string; topic_id: string; text: string; kind: 'explicit' | 'inferred'; scope: 'topic' | 'project' | 'account'; source: string; active: number; created_at: string; updated_at: string };
 export type OpportunityResearch = { id: string; idea_id: string; conversation_id: string; status: string; result: string; created_at: string; updated_at: string };
 export type OpportunityDetail = { sourceBatch: OpportunityBatch; recommendedBatch: OpportunityBatch | null; availableConversations: string[]; idea: OpportunityIdea; feedback: OpportunityFeedback[]; versions: Array<{ id: string; reason: string; created_at: string; conversation_id: string; project_id?: string | null; content_json: string }>; research: OpportunityResearch[] };
-export type OpportunityView = { topics: OpportunityTopic[]; ideas: OpportunityIdea[]; batches: OpportunityBatch[]; preferences: OpportunityPreference[]; total: number; nextOffset: number | null };
+export type OpportunityCollection = 'screen' | 'reserve' | 'working' | 'processed' | 'dismissed' | 'rejected';
+export type OpportunityWork = {
+  research: { status: string; result: string; conversation_id: string; project_id: string; available: boolean } | null;
+  project: { id: string; board_id: string; title: string; stage: string; archived_at: string | null } | null;
+};
+export type OpportunityViewIdea = OpportunityIdea & { topic_name: string; work?: OpportunityWork };
+export type OpportunityLearning = { total: number; pending: number; learned: number; watermark: number; lastLearnedAt: string | null; lastSummary: string };
+export type OpportunityView = { learning: OpportunityLearning | null; counts: Record<OpportunityCollection, number>; topics: OpportunityTopicSummary[]; ideas: OpportunityViewIdea[]; batches: OpportunityBatch[]; preferences: OpportunityPreference[]; total: number; nextOffset: number | null };
