@@ -39,3 +39,18 @@
 **/*.log
 **/__pycache__
 **/.venv
+# Local backups, restore drills and editor copies are never build inputs.
+**/backups
+**/backup
+**/restore-drill
+**/.cache
+**/*.bak
+**/*.backup
+**/*.orig
+**/*.rej
+**/*~
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.zip
+**/*.7z

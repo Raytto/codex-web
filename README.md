@@ -8,6 +8,8 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 
 [中文说明](README.zh-CN.md)
 
+The default build prioritizes a small, usable installation: one Codex CLI and one base Python runtime, with office tools available through the optional `documents` profile. Runtime images exclude browser acceptance scripts, backup copies and retired duplicate tool trees. See [building and storage](docs/BUILD_AND_STORAGE.md) for setup and dated capacity measurements.
+
 ## What it includes
 
 - A responsive React chat interface for Codex CLI

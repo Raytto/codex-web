@@ -8,7 +8,7 @@ Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。�
 
 阅读器支持从当前 Markdown 文档选中文本后直接询问 Reader Agent，引用会以可移除的引用卡片进入同一会话；PDF/EPUB 使用有界分页渲染，选区、高亮和备注会在翻页、文本层重挂载及 Safari/WebKit 兼容路径中通过持久文本锚点恢复；公开版仍只使用账号密码登录，服务端模型与语音能力由部署者自行配置。
 
-默认是基础运行镜像；LibreOffice、字体、Poppler 与 Python 文档库通过 `documents` 构建目标选装。基础镜像保留 FFmpeg 与 Python/uv；任务可按需安装临时 Python 包。构建使用专用 builder 并自动收尾。镜像常驻、构建峰值、缓存、swap 和用户数据须分开计算，详见[构建、容量与安全清理](docs/BUILD_AND_STORAGE.md)。本轮 Linux amd64 干净安装实测：基础镜像约 1.53 GB，收尾后的应用安装约 1.87 GB，构建时 Docker 目录观测峰值约 6.01 GB；不含 OS、Docker 安装、swap、备份和用户数据。
+默认是基础运行镜像；LibreOffice、字体、Poppler 与 Python 文档库通过 `documents` 构建目标选装。基础镜像保留 FFmpeg 与 Python/uv；任务可按需安装临时 Python 包。构建使用专用 builder 并自动收尾，运行镜像只带必需的启动和工具脚本，不携带浏览器验收脚本、备份副本或旧版重复运行环境。镜像常驻、构建峰值、缓存、swap 和用户数据须分开计算，详见[构建、容量与安全清理](docs/BUILD_AND_STORAGE.md)。2026-10-14 的 Linux amd64 干净安装实测：基础镜像约 1.53 GB，收尾后的应用安装约 1.87 GB，构建时 Docker 目录观测峰值约 6.01 GB；不含 OS、Docker 安装、swap、备份和用户数据。
 
 ## 快速开始
 

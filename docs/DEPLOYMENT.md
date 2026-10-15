@@ -73,7 +73,7 @@ single-consumer `deploy/codex-web-rebuild-coordinator`; the optional
 queue. Configure paths through `CODEX_WEB_*` variables and keep queue, status,
 logs, backups, and credentials outside Git.
 
-Managed skills are copied from the repository's `skills/` directory when a tenant is initialized. The default set includes `local-spreadsheets` and `html-report`; the latter also installs its relative `references/`, `assets/`, and `scripts/` files, so a newly created user can follow and validate the report workflow without any extra volume or environment setting. Do not manually place these managed skills under `.system/`.
+The platform spreadsheet skill is copied from `skills/local-spreadsheets/` when a tenant is initialized. The HTML report skill is seeded from `account-resources/common/skills/html-report/` into the account library and synchronized as an enabled account skill. Its relative `references/`, `assets/`, and `scripts/` files are included, so a newly created user can follow and validate the report workflow without any extra volume or environment setting. Do not manually place these managed skills under `.system/`.
 
 After upgrading, verify that archived conversations remain listed under personal settings and that any job interrupted by an ungraceful previous stop has a visible interruption message instead of being retried.
 

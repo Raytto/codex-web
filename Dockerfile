@@ -75,7 +75,10 @@ COPY --from=codex-baked /opt/codex-baked /opt/codex-baked
 COPY package.json ./
 COPY --from=build /app/remote-worker/package.json ./remote-worker/package.json
 COPY python-runtime ./python-runtime
-COPY scripts ./scripts
+# Ship only Linux runtime/setup entrypoints; browser checks stay in source/test.
+COPY scripts/codex-runtime.sh scripts/hash-password.mjs \
+     scripts/migrate-tenant-permissions.sh scripts/run-python-task.sh \
+     scripts/setup-python.sh scripts/start-supervisor.sh ./scripts/
 COPY skills ./skills
 COPY account-resources ./account-resources
 

@@ -16,6 +16,16 @@ assert.match(execFileSync('/opt/codex-baked/bin/codex', ['--version'], { encodin
 assert.ok(fs.existsSync('/app/dist/index.html'));
 assert.equal(fs.existsSync('/app/.git'), false);
 assert.equal(fs.existsSync('/app/.env'), false);
+for (const name of ['codex-runtime.sh', 'hash-password.mjs', 'migrate-tenant-permissions.sh', 'run-python-task.sh', 'setup-python.sh', 'start-supervisor.sh']) {
+  assert.ok(fs.statSync('/app/scripts/' + name).isFile(), `runtime entrypoint ${name}`);
+}
+for (const name of ['check-composer-race.mjs', 'composer-race-scenario.mjs', 'build-image.sh', 'run-local.ps1']) {
+  assert.equal(fs.existsSync('/app/scripts/' + name), false, `development-only script ${name}`);
+}
+assert.equal(fs.existsSync('/app/skills/html-report'), false);
+assert.equal(fs.existsSync('/app/spreadsheet-runtime'), false);
+assert.ok(fs.existsSync('/app/account-resources/common/skills/html-report/assets/report-template.html'));
+
 assert.equal(fs.existsSync('/opt/codex-runtime/current/bin/codex'), false);
 for (const dir of ['/app/data', '/app/tenants']) assert.deepEqual(fs.readdirSync(dir), []);
 execFileSync('ffmpeg', ['-version']);
