@@ -41,4 +41,4 @@ jobs:
         shell: pwsh
         run: .\scripts\test-update-hardening.ps1 -WorkerRoot .
       - name: Run Remote Worker tests
-        run: node --test dist/src/*.test.js
+        run: node scripts/test-ci.mjs
