@@ -3,7 +3,9 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { GeminiAccountManager, geminiProfileEnvironment, googleAuthorizationUrl, type GeminiRuntime } from "./gemini-accounts.js";
 import { isPersistableWorkerMessage, parseServerMessage } from "./protocol-validation.js";
 import type { AgentOptions } from "./protocol.js";
@@ -11,12 +13,27 @@ import { assertGeminiAccountChangeAllowed } from "./gemini-account-guard.js";
 const catalog: AgentOptions = { models: [{ id: "antigravity:gemini", label: "Gemini", description: "", reasoningEfforts: ["high"] }], reasoningEfforts: [{ id: "high", label: "High" }], defaults: { model: "antigravity:gemini", reasoningEffort: "high" } };
 const authUrl = "https://accounts.google.com/o/oauth2/auth?client_id=example&state=some-state&code_challenge=pkce&response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback";
 const tick = () => new Promise(resolve => setTimeout(resolve, 30));
+// Account-state tests inject a terminal; real CLI pipes are exercised by client tests.
+// A dummy OS child can be killed before Windows flushes its input, causing EPIPE.
+function loginTerminalFixture(): ChildProcess {
+  const child = new EventEmitter() as ChildProcess;
+  const stdin = new PassThrough(); stdin.resume();
+  Object.assign(child, { stdin, stdout: new PassThrough(), stderr: new PassThrough(),
+    pid: undefined, exitCode: null, signalCode: null, killed: false,
+    kill(signal: NodeJS.Signals = "SIGTERM") {
+      Object.assign(child, { killed: true, signalCode: signal });
+      queueMicrotask(() => child.emit("close", null, signal));
+      return true;
+    } });
+  return child;
+}
+
 function fixture(t: test.TestContext, options: { readModels?: (runtime: GeminiRuntime) => Promise<AgentOptions | null>; assertSwitchAllowed?: () => void; now?: () => Date; executable?: () => string | null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pp-gemini-accounts-"));
   const children: ChildProcess[] = [];
   const manager = new GeminiAccountManager({ root, platform: "linux", executable: () => process.execPath, assertSwitchAllowed: () => {}, readModels: async () => null,
     installRuntime: async () => { throw new Error("fixture refuses installation"); },
-    launchLogin: () => { const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: ["pipe", "pipe", "pipe"] }); children.push(child); return child; }, ...options });
+    launchLogin: () => { const child = loginTerminalFixture(); children.push(child); return child; }, ...options });
   t.after(async () => { manager.close(); for (const child of children) child.kill("SIGKILL"); await tick(); fs.rmSync(root, { recursive: true, force: true }); });
   return { root, manager, children };
 }
@@ -98,7 +115,7 @@ test("an account activation rechecks Gemini execution after awaiting credential 
 test("profiles scrub inherited auth and force an isolated Linux credential fallback", () => {
   const base = { HOME: "/unrelated", CODEX_HOME: "/codex", CWW_SHARED_CODEX_AUTH_FILE: "/sensitive", GEMINI_API_KEY: "secret", GOOGLE_APPLICATION_CREDENTIALS: "/cloud", ANTIGRAVITY_GEMINI_DIR: "/shared", AGY_ADC_AUTH: "true", AGY_LLM_GATEWAY_URL: "https://other.invalid", AGY_ACCOUNT: "other", PATH: "/bin", CWW_JOB_ID: "job" };
   const env = geminiProfileEnvironment("/profile", base);
-  assert.equal(env.HOME, "/profile"); assert.equal(env.DBUS_SESSION_BUS_ADDRESS, "unix:path=/profile/.dbus-unavailable"); assert.equal(env.XDG_CONFIG_HOME, "/profile/.config");
+  assert.equal(env.HOME, "/profile"); assert.equal(env.DBUS_SESSION_BUS_ADDRESS, `unix:path=${path.join("/profile", ".dbus-unavailable")}`); assert.equal(env.XDG_CONFIG_HOME, path.join("/profile", ".config"));
   for (const name of ["CODEX_HOME", "CWW_SHARED_CODEX_AUTH_FILE", "GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "ANTIGRAVITY_GEMINI_DIR", "AGY_ADC_AUTH", "AGY_LLM_GATEWAY_URL", "AGY_ACCOUNT"]) assert.equal(env[name], undefined);
   assert.equal(env.CWW_JOB_ID, "job"); assert.equal(base.HOME, "/unrelated");
 });
@@ -134,7 +151,7 @@ test("parallel account, catalog and run checks share a full-budget CLI probe wit
       else process.stdout.write(JSON.stringify({ models: ['gemini-fixture-high'] }));
     }, state.delayMs);
   `);
-  const manager = new GeminiAccountManager({ root, platform: "linux", executable: () => executable, assertSwitchAllowed: () => {} });
+  const manager = new GeminiAccountManager({ root, platform: "linux", executable: () => executable, assertSwitchAllowed: () => {}, launchLogin: () => { throw new Error("Probe-only fixture must not open a terminal"); } });
   t.after(() => { manager.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const id = "76ec966c-d7ce-4082-8278-130b5b8e9ec9";
   fs.mkdirSync(path.join(root, "profiles", id));
@@ -168,7 +185,7 @@ test("a failed native version probe is shared but later account refresh can veri
     fs.appendFileSync(capture, 'models\\n');
     process.stdout.write(JSON.stringify({ models: ['gemini-fixture-high'] }));
   `);
-  const manager = new GeminiAccountManager({ root, platform: "linux", executable: () => executable, assertSwitchAllowed: () => {} });
+  const manager = new GeminiAccountManager({ root, platform: "linux", executable: () => executable, assertSwitchAllowed: () => {}, launchLogin: () => { throw new Error("Probe-only fixture must not open a terminal"); } });
   t.after(() => { manager.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const id = "68a27f57-d7ce-4082-8278-130b5b8e9ec9";
   fs.mkdirSync(path.join(root, "profiles", id));
@@ -262,8 +279,12 @@ test("Google login success requires authenticated catalog, and credentials stay 
   const completed = manager.loginStatus(login.id); assert.equal(completed.status, "completed");
   const state = await manager.listAccounts(); assert.equal(state.accounts.length, 1); assert.equal(state.accounts[0]!.authenticated, true); assert.equal(state.activeAccountId, completed.accountId);
   const runtime = await manager.getActiveRuntime(); assert.equal(runtime?.accountId, completed.accountId);
-  assert.equal(fs.statSync(path.join(root, "index.json")).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(runtime!.home).mode & 0o777, 0o700);
+  assert.ok(fs.lstatSync(path.join(root, "index.json")).isFile());
+  assert.equal(fs.lstatSync(runtime!.home).isSymbolicLink(), false);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(path.join(root, "index.json")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(runtime!.home).mode & 0o777, 0o700);
+  }
   assert.ok(!JSON.stringify(state).includes("one-time-code")); assert.ok(!JSON.stringify(state).includes(root));
   authenticated = false;
   assert.equal((await manager.listAccounts()).accounts[0]!.authenticated, false);
