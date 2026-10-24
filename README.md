@@ -349,3 +349,7 @@ Username/password login, `/codex-web`, isolated tenant workers and empty optiona
 ## Recent capabilities
 
 Managed interactive HTML attachments run in an isolated sandbox, with explicit user export and versioned, private-by-default sharing. Optional [judgment books](docs/JUDGMENT_BOOK.md) preserve your probabilities, evidence and confirmations. Project schedules support daily time windows and one-time checks; new conversations may use a saved per-account model choice. Opportunity voice feedback continues and saves after upload. Project menus can acknowledge current unread results. [Transient routing recovery](docs/UPSTREAM_RETRY.md) and SQLite-safe finalization preserve committed work. See [upgrade notes](docs/UPGRADE_20261020.md).
+
+## Recent capabilities
+
+Stable conversation links support browser history. Opportunity cards have kept/completed collections and bounded previews. Managed remote HTML declarations and explicit presentation conversion preserve reader/web intent. Optional [Gemini / Antigravity](docs/MULTI_ENGINE.md) execution shares project context while keeping credentials and native sessions on the selected node; its extra CLI is installed only on explicit account addition. [Usage metrics](docs/ANTIGRAVITY_QUOTA.md), temporary notices and durable expiring Codex-credit logs are included. See [upgrade notes](docs/UPGRADE_20261025.md).

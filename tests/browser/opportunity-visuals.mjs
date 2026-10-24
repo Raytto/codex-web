@@ -36,13 +36,13 @@ try {
   const topic2 = store.createTopic(user, { name: '另一个主题', project_id: project.id, goal: '验收排序' }, crypto.randomUUID());
   const source = (await api('POST', '/conversations', { projectId: project.id, reuseEmpty: false })).conversation;
   const batch = store.begin(user, topic.id, source.id, null);
-  const content = contentInput.parse({ title: '示意图：从问题到最小验证', summary: '配图之后再阅读正文', audience: '验收', problem: '需要看懂概念', mechanism: '流程可视化', value: '快速理解', fit: '可验证', facts: '测试数据', assumptions: '测试', doubt: '测试', validation: '检查标题、配图、正文的顺序', difference: '测试样本', category: '验收', keywords: ['图解'], sources: [{title: '测试来源', url: 'https://example.org/visuals', date: '2026-10-17', finding: '合成数据'}] });
+  const content = contentInput.parse({ title: '示意图：从问题到最小验证', summary: '配图之后再阅读正文，长摘要应保持卡片尺寸并在详情中完整查看。'.repeat(15), audience: '验收', problem: '需要看懂概念', mechanism: '流程可视化', value: '快速理解', fit: '可验证', facts: '测试数据', assumptions: '测试', doubt: '测试', validation: '检查标题、配图、正文的顺序', difference: '测试样本', category: '验收', keywords: ['图解'], sources: [{title: '测试来源', url: 'https://example.org/visuals', date: '2026-10-17', finding: '合成数据'}] });
   const idea = store.ingest(user, batch.id, source.id, [{key: 'visual', content}])[0].idea;
   store.review(user, batch.id, source.id, [{idea_id: idea.id, verdict: 'approve', score: 90, quality: 90, rationale: '测试符合', compared: []}]);
   const { OpportunityImages } = await import(repo + '/dist-server/server/opportunity-images.js');
   const dir = root + '/tenants/' + user + '/conversations/' + source.id + '/outputs'; fs.mkdirSync(dir, {recursive: true});
   // Synthetic bitmaps test rendering only; they are not published user content.
-  await require('sharp')({create: {width: 640, height: 400, channels: 3, background: '#ffe3b0'}}).png().toFile(dir + '/concept.png');
+  await require('sharp')({create: {width: 1200, height: 2400, channels: 3, background: '#ffe3b0'}}).png().toFile(dir + '/concept.png');
   await require('sharp')({create: {width: 400, height: 600, channels: 3, background: '#ccdfff'}}).webp().toFile(dir + '/example.webp');
   await new OpportunityImages(instance.db, root + '/tenants').attach(user, source.id, undefined, {ideaId: idea.id, requestKey: crypto.randomUUID(), revision: store.idea(user, idea.id).revision, images: [{path:'outputs/concept.png', alt:'核心流程说明',caption:'概念图'}, {path:'outputs/example.webp',alt:'交互示例',caption:'示例'}]});
   store.publish(user,batch.id,source.id,{ids:[idea.id],summary:'可视化验收',feedbackRevision:store.feedbackRevision(user,topic.id)});
@@ -70,12 +70,27 @@ try {
   await page.locator('[data-opportunity-topic="'+topic.id+'"] .project-select').click();
   const card = page.locator('[data-opportunity-idea="'+idea.id+'"]');
   await card.locator('img').first().waitFor(); await page.waitForFunction(()=>Array.from(document.querySelectorAll('.opportunity-card img')).every(i=>i.complete && i.naturalWidth>0));
-  assert.equal(await card.locator('img').count(),2);
+  assert.equal(await card.locator('img').count(),1);
+  await card.getByText('共 2 张图，详情中查看全部',{exact:true}).waitFor();
   const title = await card.locator('h3').boundingBox(), image = await card.locator('img').first().boundingBox(), summary = await card.locator('.opportunity-card-summary').boundingBox();
   assert.ok(title.y + title.height <= image.y && image.y < summary.y);
+  for(const width of [320,390,768,1440,1920,3440])for(const theme of ['light','dark']){
+    await page.setViewportSize({width,height:1000});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+    await card.scrollIntoViewIfNeeded();const box=await card.boundingBox(),img=await card.locator('img').boundingBox(),button=await card.getByRole('button',{name:'查看与反馈',exact:true}).boundingBox();
+    assert.ok(box.width<=440.5&&box.height<=680.5,'card bounds '+width);assert.ok(img.height<=220.5,'image bounds '+width);
+    assert.ok(button.y>=box.y&&button.y+button.height<=box.y+box.height,'footer remains in card '+width);
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'page overflow '+width);
+    if(width===390||width===3440)await card.screenshot({path:output+'/bounded-card-'+width+'-'+theme+'.png'});
+  }
+  await page.setViewportSize({width:320,height:1000});await page.evaluate(()=>document.documentElement.style.fontSize='200%');
+  const large=await card.boundingBox(),footer=await card.getByRole('button',{name:'查看与反馈',exact:true}).boundingBox();assert.ok(large.height<=680.5&&footer.y+footer.height<=large.y+large.height);
+  await page.evaluate(()=>document.documentElement.style.fontSize='');await page.setViewportSize({width:1440,height:1000});
+  report.checks.push('single_card_portrait_multi_image_320_to_3440_bounds_actions_and_large_type');
   await card.getByRole('button',{name:'查看与反馈',exact:true}).click();
   const dialog = page.getByRole('dialog'); await dialog.locator('img').first().waitFor();
   assert.equal(await dialog.locator('img').count(),2);
+  for(const img of await dialog.locator('img').all())assert.ok((await img.boundingBox()).height<=480.5);
+  assert.equal(await dialog.locator('.opportunity-lead').innerText(),content.summary);
   assert.equal(await dialog.locator('.opportunity-dialog-body > *').first().getAttribute('aria-label'),'思路图解');
   await page.screenshot({path:output+'/desktop.png'});
   report.checks.push('real_images_multi_image_title_then_images_then_body_list_and_detail');
@@ -90,6 +105,13 @@ try {
   await card.getByRole('button',{name:'查看配图',exact:true}).first().click();
   await card.locator('img').first().waitFor();await page.waitForFunction(()=>document.querySelector('.opportunity-card img')?.naturalWidth>0);
   assert.equal(restoreRequests,1);report.checks.push('cold_image_placeholder_explicit_activation_restored_bytes');
+  await card.getByRole('button',{name:'查看与反馈',exact:true}).click();await dialog.getByRole('button',{name:'保留',exact:true}).click();await dialog.waitFor({state:'hidden'});
+  await page.getByRole('navigation',{name:'已处理卡片总览'}).getByRole('button',{name:/工作总览/}).click();
+  const workCard=page.locator('.opportunity-work-item[data-opportunity-idea="'+idea.id+'"]');await workCard.waitFor();
+  await page.setViewportSize({width:3440,height:1000});const workBox=await workCard.boundingBox();assert.ok(workBox.width<=440.5&&workBox.height<=680.5);
+  assert.equal(await workCard.locator('img').count(),1);await workCard.getByRole('button',{name:'查看详情',exact:true}).click();await dialog.locator('img').first().waitFor();assert.equal(await dialog.locator('img').count(),2);await dialog.getByRole('button',{name:'关闭弹窗',exact:true}).click();
+  report.checks.push('work_overview_uses_same_card_bounds_and_full_detail');
+
   await page.setViewportSize({width:390,height:844});
   await page.getByRole('button',{name:'打开侧栏',exact:true}).click();
   await group('opportunities').locator('.extension-toggle').click();

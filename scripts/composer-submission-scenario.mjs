@@ -91,6 +91,7 @@ export async function run({ context, origin, assert, expectBug = false }) {
         status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Injected delayed draft failure' }),
       });
       await page.getByRole('button', { name: '发送', exact: true }).click(); await draft.ready;
+      await page.waitForFunction(() => !document.querySelector('.toast')?.textContent.includes('Injected steering rejection'));
       await page.getByText(/请求确认超时/).waitFor();
       await idle('typed during steering');
       draft.release(); await page.unrouteAll({ behavior: 'wait' });
@@ -101,7 +102,7 @@ export async function run({ context, origin, assert, expectBug = false }) {
       assert.equal(detail.activeJob, null);
       results.push({ viewport, refreshDoesNotLock: true, queueActionAvailable: true,
         nextDraftPreserved: true, steeringKeepsInputEditable: true, steeringFailureRecovers: true,
-        stalledDraftTimesOut: true, retryExactlyOnce: true, modelJobsStarted: 0 });
+        priorSteerErrorDoesNotMaskSubmissionFailure: true, stalledDraftTimesOut: true, retryExactlyOnce: true, modelJobsStarted: 0 });
     } finally {
       for (const release of releases) release();
       await page.unrouteAll({ behavior: 'wait' });

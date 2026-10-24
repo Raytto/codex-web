@@ -31,8 +31,9 @@ export function isPersistableWorkerMessage(value: unknown): value is WorkerMessa
     case "request_failed": return optionalUuid(value.requestId) && shortString(value.message, 2_000, 1);
     case "event": return uuid(value.jobId) && workerEvent(value.event);
     case "thread_rollout_size_result": return uuid(value.requestId) && (value.bytes === null || integer(value.bytes, 0, Number.MAX_SAFE_INTEGER));
-    case "thread_rename_result":
-    case "file_fetch_result": return uuid(value.requestId) && typeof value.ok === "boolean" && optionalString(value.message, 2_000, 1);
+    case "thread_rename_result": return uuid(value.requestId) && typeof value.ok === "boolean" && optionalString(value.message, 2_000, 1);
+    case "file_fetch_result": return uuid(value.requestId) && typeof value.ok === "boolean" && optionalString(value.message, 2_000, 1)
+      && (value.errorCode === undefined || (!value.ok && value.errorCode === "NOT_FOUND"));
     case "title_agent_result": return uuid(value.requestId) && typeof value.ok === "boolean"
       && optionalString(value.output, 1_000, 1) && optionalString(value.message, 2_000, 1);
     case "runtime_status": return optionalUuid(value.requestId) && runtimeStatus(value);
@@ -44,6 +45,11 @@ export function isPersistableWorkerMessage(value: unknown): value is WorkerMessa
       && nullableString(value.installedRef, 160) && nullableString(value.installedCommit, 64) && optionalString(value.message, 2_000, 1);
     case "worker_config_result": return uuid(value.requestId) && typeof value.ok === "boolean"
       && (value.capacity === undefined || integer(value.capacity, 0, 8)) && optionalString(value.message, 2_000, 1);
+    case "gemini_accounts_result": return uuid(value.requestId) && typeof value.ok === "boolean" && optionalString(value.message, 2_000, 1)
+      && (value.usage === undefined || antigravityUsage(value.usage))
+      && (value.state === undefined || geminiAccountsState(value.state))
+      && (value.login === undefined || geminiAccountLogin(value.login))
+      && (value.catalog === undefined || runtimeStatus({ installedVersion: "agy", latestVersion: null, versionCheckedAt: null, catalogUpdatedAt: null, agentOptions: value.catalog }));
     case "codex_accounts_result": return uuid(value.requestId) && typeof value.ok === "boolean"
       && (value.resetResult === undefined || resetConsumption(value.resetResult))
       && (value.state === undefined || codexAccountsState(value.state))
@@ -93,9 +99,21 @@ function isServerMessage(value: unknown): value is ServerMessage {
     case "worker_update": return uuid(value.requestId) && shortString(value.targetVersion, 80, 1) && shortString(value.targetRef, 160, 1);
     case "worker_update_result_ack": return uuid(value.requestId);
     case "worker_config": return uuid(value.requestId) && integer(value.capacity, 0, 8);
+    case "gemini_accounts": {
+      if (!uuid(value.requestId) || !["list", "catalog", "usage", "login_start", "login_status", "login_cancel", "login_code", "activate", "delete"].includes(String(value.action))) return false;
+      if (value.action === "usage") return optionalUuid(value.accountId) && (value.refresh === undefined || typeof value.refresh === "boolean") && value.label === undefined && value.loginId === undefined && value.code === undefined;
+      if (value.refresh !== undefined) return false;
+      if (value.action === "list" || value.action === "catalog") return value.label === undefined && value.loginId === undefined && value.accountId === undefined && value.code === undefined;
+      if (value.action === "login_start") return optionalString(value.label, 60) && value.loginId === undefined && value.accountId === undefined && value.code === undefined;
+      if (value.action === "login_code") return uuid(value.loginId) && shortString(value.code, 4_096, 1) && !/[\r\n\0]/.test(String(value.code)) && value.label === undefined && value.accountId === undefined;
+      if (value.action === "login_status" || value.action === "login_cancel") return uuid(value.loginId) && value.label === undefined && value.accountId === undefined && value.code === undefined;
+      return uuid(value.accountId) && value.label === undefined && value.loginId === undefined && value.code === undefined;
+    }
     case "codex_accounts": {
       if (!uuid(value.requestId) || !["list", "login_start", "login_status", "login_cancel", "activate", "delete", "reset_credit"].includes(String(value.action))) return false;
       if (value.action === "reset_credit" ? !uuid(value.attemptId) : value.attemptId !== undefined) return false;
+      if (value.autoExpiresAt !== undefined && (value.action !== "reset_credit" || typeof value.autoExpiresAt !== "string"
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.autoExpiresAt) || !Number.isFinite(Date.parse(value.autoExpiresAt)))) return false;
       if (value.refreshUsage !== undefined && (value.action !== "list" || typeof value.refreshUsage !== "boolean")) return false;
       if (value.threadIds !== undefined && (value.action !== "list" || !Array.isArray(value.threadIds) || value.threadIds.length > 200 || !value.threadIds.every(threadUuid))) return false;
       if (value.action === "list") return value.label === undefined && value.loginId === undefined && value.accountId === undefined;
@@ -109,9 +127,11 @@ function isServerMessage(value: unknown): value is ServerMessage {
 }
 
 function runRequest(value: unknown): value is RunRequest {
-  if (!record(value) || !exactKeys(value, ["jobId", "conversationId", "projectRoot", "codexThreadId", "prompt", "attachments", "transferToken", "selection", "optionalCapabilities", "accountSkills", "automation", "turnContext"])
+  if (!record(value) || !exactKeys(value, ["jobId", "conversationId", "projectRoot", "codexThreadId", "agentSessionId", "agentAccountId", "prompt", "attachments", "transferToken", "selection", "optionalCapabilities", "accountSkills", "automation", "turnContext"])
     || !uuid(value.jobId) || !uuid(value.conversationId) || !shortString(value.projectRoot, 4_096, 1)
     || !(value.codexThreadId === null || shortString(value.codexThreadId, 200, 1)) || !shortString(value.prompt, 100_000, 1)
+    || !(value.agentSessionId === undefined || value.agentSessionId === null || shortString(value.agentSessionId, 200, 1))
+    || !optionalString(value.agentAccountId, 200)
     || !secret(value.transferToken) || !record(value.selection) || !exactKeys(value.selection, ["model", "reasoningEffort"]) || !shortString(value.selection.model, 100, 1)
     || !shortString(value.selection.reasoningEffort, 32, 1) || !booleanRecord(value.optionalCapabilities, 32)
     || (value.accountSkills !== undefined && !isAccountSkillBundle(value.accountSkills))) return false;
@@ -157,6 +177,19 @@ function thread(value: unknown): value is ThreadSnapshot {
       && (item.files === undefined || stringArray(item.files, 200, 2_000)) && shortString(item.createdAt, 80, 1));
 }
 
+function antigravityUsage(value: unknown): boolean {
+  const numberOrNull = (n: unknown, max = Number.MAX_SAFE_INTEGER) => n === null || (typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= max);
+  const date = (v: unknown) => typeof v === "string" && v.length <= 80 && /^\d{4}-\d{2}-\d{2}T/.test(v) && Number.isFinite(Date.parse(v));
+  return record(value) && exactKeys(value, ["accountId", "state", "checkedAt", "quotaUpdatedAt", "creditsUpdatedAt", "groups", "remainingCredits", "error"])
+    && (value.accountId === null || uuid(value.accountId)) && ["ok", "partial", "error", "unavailable"].includes(String(value.state))
+    && date(value.checkedAt) && (value.quotaUpdatedAt === null || date(value.quotaUpdatedAt)) && (value.creditsUpdatedAt === null || date(value.creditsUpdatedAt))
+    && numberOrNull(value.remainingCredits) && nullableString(value.error, 2_000)
+    && recordArray(value.groups, 30, group => exactKeys(group, ["label", "buckets"]) && shortString(group.label, 200, 1)
+      && recordArray(group.buckets, 30, bucket => exactKeys(bucket, ["id", "label", "window", "remainingPercent", "remainingAmount", "resetAt", "disabled"])
+        && shortString(bucket.id, 200, 1) && shortString(bucket.label, 200, 1) && nullableString(bucket.window, 80)
+        && numberOrNull(bucket.remainingPercent, 100) && numberOrNull(bucket.remainingAmount) && (bucket.resetAt === null || date(bucket.resetAt)) && typeof bucket.disabled === "boolean"));
+}
+
 function runtimeStatus(value: unknown): boolean {
   if (!record(value) || !shortString(value.installedVersion, 80, 1) || !nullableString(value.latestVersion, 80)
     || !nullableString(value.versionCheckedAt, 80) || !nullableString(value.catalogUpdatedAt, 80)) return false;
@@ -170,7 +203,7 @@ function runtimeStatus(value: unknown): boolean {
 
 function resetConsumption(value: unknown): boolean {
   return record(value) && exactKeys(value, ["attemptId", "outcome", "resetCredits", "quota", "refreshed"])
-    && uuid(value.attemptId) && ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"].includes(String(value.outcome))
+    && uuid(value.attemptId) && ["reset", "alreadyRedeemed", "nothingToReset", "noCredit", "notDue"].includes(String(value.outcome))
     && resetCredits(value.resetCredits) && typeof value.refreshed === "boolean"
     && (value.quota === null || (record(value.quota) && exactKeys(value.quota, ["remainingPercent", "resetAt"])
       && typeof value.quota.remainingPercent === "number" && Number.isFinite(value.quota.remainingPercent)
@@ -183,6 +216,17 @@ function codexAccount(value: unknown): boolean {
     && typeof value.active === "boolean" && shortString(value.createdAt, 80, 1)
     && (value.lastUsedAt === null || shortString(value.lastUsedAt, 80, 1))
     && (value.resetCredits === undefined || value.resetCredits === null || resetCredits(value.resetCredits));
+}
+function geminiAccountsState(value: unknown): boolean {
+  return record(value) && (value.activeAccountId === null || uuid(value.activeAccountId)) && typeof value.runtimeAvailable === "boolean" && (value.loginAvailable === undefined || typeof value.loginAvailable === "boolean") && optionalString(value.error, 2_000, 1)
+    && recordArray(value.accounts, 20, entry => uuid(entry.id) && shortString(entry.label, 60, 1) && nullableString(entry.email, 254)
+      && shortString(entry.createdAt, 80, 1) && nullableString(entry.lastUsedAt, 80) && typeof entry.active === "boolean" && typeof entry.authenticated === "boolean");
+}
+function geminiAccountLogin(value: unknown): boolean {
+  return record(value) && uuid(value.id) && shortString(value.label, 60, 1)
+    && ["starting", "waiting", "completed", "failed", "cancelled"].includes(String(value.status)) && nullableString(value.verificationUrl, 8_000)
+    && typeof value.requiresCode === "boolean" && nullableString(value.message, 2_000) && (value.accountId === null || uuid(value.accountId))
+    && shortString(value.createdAt, 80, 1) && shortString(value.expiresAt, 80, 1);
 }
 function codexAccountsState(value: unknown): boolean {
   return record(value) && uuid(value.activeAccountId) && recordArray(value.accounts, 20, codexAccount);
@@ -258,6 +302,7 @@ const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
   worker_update: ["type", "requestId", "targetVersion", "targetRef"],
   worker_update_result_ack: ["type", "requestId"],
   worker_config: ["type", "requestId", "capacity"],
-  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds", "refreshUsage", "attemptId"],
+  gemini_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "code", "refresh"],
+  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds", "refreshUsage", "attemptId", "autoExpiresAt"],
   heartbeat_ack: ["type", "at"],
 };

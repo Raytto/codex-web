@@ -1,4 +1,6 @@
+import { CodexAutoResetHistory } from "./codex-auto-reset-history";
 import { CodexResetCreditDetails } from "./codex-reset-credits";
+import { GeminiAccountList, GeminiLoginFlow, useGeminiAccounts } from "./gemini-account-panel";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy, ExternalLink, LoaderCircle, Monitor, Plus, RefreshCw, Server, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
 import { api, type CodexAccount, type CodexAccountLogin, type CodexAccountsState, type Executor } from "./api";
@@ -12,6 +14,10 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
   const [login, setLogin] = useState<CodexAccountLogin | null>(null);
   const [label, setLabel] = useState("");
   const [adding, setAdding] = useState(false);
+  const [accountType, setAccountType] = useState<"codex" | "gemini">("codex");
+  const accountTypeSelect = useRef<HTMLSelectElement>(null);
+  const gemini = useGeminiAccounts(executorId, () => setAdding(false));
+  useEffect(() => { if (adding) accountTypeSelect.current?.focus(); }, [adding]);
   const [busyId, setBusyId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -70,7 +76,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
       void api.codexAccountLoginStatus(executorId, login.id).then(({ login: current }) => {
         setLogin(current);
         if (current.status === "succeeded") {
-          setNotice(`${current.account?.label ?? "Codex 账号"} 已添加，可随时切换为全局账号。`);
+          setNotice(`${current.account?.label ?? "Codex 账号"} 已添加，可在当前机器切换使用。`);
           setAdding(false);
           void load(executorId);
         }
@@ -107,6 +113,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     if (login && ["starting", "waiting_for_user"].includes(login.status)) {
       try { await api.cancelCodexAccountLogin(executorId, login.id); } catch { /* Server expiry also cleans the isolated login home. */ }
     }
+    await gemini.cancel();
     onClose();
   }
 
@@ -145,7 +152,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     setNotice("");
     try {
       setState(await api.activateCodexAccount(executorId, account.id));
-      setNotice(`已切换到 ${account.label}，之后由当前机器启动的任务将使用此账号。`);
+      setNotice(`已切换到 ${account.label}，之后由当前机器启动的 Codex 任务将使用此账号。`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "账号切换失败");
     } finally {
@@ -170,7 +177,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
       resetAttempts.current.delete(storageKey);
       try { localStorage.removeItem(storageKey); } catch {}
       if (mounted.current) {
-        const messages = { reset: "已使用 1 张最早到期的重置卡。", alreadyRedeemed: "已确认这次重置成功，没有重复使用重置卡。", nothingToReset: "当前没有可重置的额度窗口。", noCredit: "当前没有可用的重置卡。" };
+        const messages = { reset: "已使用 1 张最早到期的重置卡。", alreadyRedeemed: "已确认这次重置成功，没有重复使用重置卡。", nothingToReset: "当前没有可重置的额度窗口。", noCredit: "当前没有可用的重置卡。", notDue: "到期卡已变化或过期，未自动使用重置卡。" };
         setNotice(messages[result.outcome] + (result.refreshed ? "额度和重置卡信息已更新。" : "最新额度暂未取得，请稍后刷新。"));
       }
     } catch (reason) {
@@ -216,7 +223,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     }
   }
 
-  const loginActive = Boolean(login && ["starting", "waiting_for_user"].includes(login.status));
+  const loginActive = Boolean(login && ["starting", "waiting_for_user"].includes(login.status)) || gemini.active;
   const selectedExecutor = executors.find((executor) => executor.id === executorId) ?? null;
   const remote = selectedExecutor?.kind === "remote_worker";
   const workerVersion = selectedExecutor?.worker?.installedVersion?.split(".").map(Number) ?? [];
@@ -228,20 +235,20 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
       try { await api.cancelCodexAccountLogin(executorId, login.id); } catch {}
     }
     selectedMachine.current = nextId;
-    setExecutorId(nextId); setState(null); setLogin(null); setAdding(false); setLabel(""); setError(""); setNotice("");
+    setExecutorId(nextId); setState(null); setLogin(null); setAdding(false); setAccountType("codex"); setLabel(""); setError(""); setNotice("");
     void load(nextId).then((loaded) => { if (loaded) void refreshUsage(nextId); });
   }
 
   return <div className="codex-account-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) void close(); }}>
     <section className="codex-account-dialog ui-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-account-title">
       <header>
-        <div><ShieldCheck size={20} /><div><h2 id="codex-account-title" className="dialog-title">Codex 账号管理</h2><p className="dialog-description">选择机器，管理在这台机器上使用的账号</p></div></div>
-        <button ref={closeButton} type="button" aria-label="关闭 Codex 账号管理" onClick={() => void close()}><X size={20} /></button>
+        <div><ShieldCheck size={20} /><div><h2 id="codex-account-title" className="dialog-title">账号管理</h2><p className="dialog-description">选择机器，管理 Codex 和 Gemini 账号</p></div></div>
+        <button ref={closeButton} type="button" aria-label="关闭账号管理" onClick={() => void close()}><X size={20} /></button>
       </header>
 
       <div className="codex-account-body">
         <label className="codex-account-executor">目标机器
-          <select value={executorId} disabled={loginActive || Boolean(busyId)} onChange={(event) => void chooseExecutor(event.target.value)}>
+          <select aria-label="目标机器" value={executorId} disabled={loginActive || Boolean(busyId) || Boolean(gemini.busy)} onChange={(event) => void chooseExecutor(event.target.value)}>
             {executors.map((executor) => <option key={executor.id} value={executor.id} disabled={executor.status !== "online" || !executor.codexAccountManagementCapable}>
               {executor.machineName} · {executor.status === "online" ? executor.codexAccountManagementCapable ? "可管理" : "需升级 Worker" : "离线"}
             </option>)}
@@ -255,17 +262,19 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
         <div className="codex-account-summary">
           <ShieldCheck size={16} /><p>登录凭据仅保存在所选机器，不会返回浏览器或传到其他机器。</p>
         </div>
+        <div className="codex-account-toolbar account-add-toolbar">
+          <button type="button" className="codex-account-add" onClick={() => { setAdding(true); setLogin(null); gemini.resetLogin(); setError(""); setNotice(""); }} disabled={loginActive || Boolean(busyId) || Boolean(gemini.busy) || !selectedExecutor?.codexAccountManagementCapable}><Plus size={16} />新增账号</button>
+        </div>
 
         {error && <div className="codex-account-alert error" role="alert">{error}</div>}
         {notice && <div className="codex-account-alert success" role="status"><Check size={15} />{notice}</div>}
 
         <div className="codex-account-section-title">
-          <div><h3 className="dialog-section-heading">账号列表 <span className="codex-account-count" aria-label={`已保存 ${state?.accounts.length ?? "—"} 个账号`}>{state?.accounts.length ?? "—"}</span></h3><p className="dialog-description">当前账号用于这台机器之后启动的新任务</p></div>
+          <div><h3 className="dialog-section-heading">Codex <span className="codex-account-count" aria-label={`已保存 ${state?.accounts.length ?? "—"} 个账号`}>{state?.accounts.length ?? "—"}</span></h3><p className="dialog-description">当前账号用于这台机器之后启动的 Codex 任务</p></div>
           <div className="codex-account-toolbar">
             <button type="button" className="codex-account-refresh" disabled={refreshingUsage || Boolean(busyId) || !selectedExecutor?.codexAccountManagementCapable} onClick={() => void refreshUsage(executorId)}>
               {refreshingUsage ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshingUsage ? "正在刷新…" : "刷新重置卡"}
             </button>
-            <button type="button" className="codex-account-add" onClick={() => { setAdding(true); setLogin(null); setError(""); setNotice(""); }} disabled={loginActive || !selectedExecutor?.codexAccountManagementCapable}><Plus size={16} />新增账号</button>
           </div>
         </div>
         {!state && !error && <div className="codex-account-loading"><LoaderCircle className="spin" size={18} />正在读取账号…</div>}
@@ -295,20 +304,27 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
             </div>
             <div className="codex-account-actions">
               {account.active
-                ? <span className="codex-account-current">新任务使用此账号</span>
+                ? <span className="codex-account-current">新的 Codex 任务使用此账号</span>
                 : <button type="button" className="primary" disabled={Boolean(busyId)} onClick={() => void activate(account)}>{busyId === account.id ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}切换</button>}
               <button type="button" className="danger" aria-label={`删除 ${account.label}`} title={account.active ? "请先切换到其他账号" : "删除账号"} disabled={account.active || Boolean(busyId)} onClick={() => void remove(account)}><Trash2 size={16} /></button>
             </div>
           </article>)}
         </div>
 
-        {adding && <section className="codex-login-panel" aria-label="新增 Codex 账号">
-          <div className="codex-login-heading"><div><h3 className="dialog-section-heading">新增 Codex 账号</h3><p className="dialog-description">使用设备码在你自己的浏览器中完成登录</p></div>{!loginActive && <button type="button" aria-label="收起新增账号" onClick={() => setAdding(false)}><X size={18} /></button>}</div>
-          {!login && <>
+        <CodexAutoResetHistory key={executorId} executorId={executorId} />
+
+        <GeminiAccountList management={gemini} disabled={Boolean(busyId) || Boolean(login && ["starting", "waiting_for_user"].includes(login.status))} />
+
+        {adding && <section className="codex-login-panel" aria-label="新增账号">
+          <div className="codex-login-heading"><div><h3 className="dialog-section-heading">新增账号</h3><p className="dialog-description">{accountType === "codex" ? "使用设备码在你自己的浏览器中完成 ChatGPT 登录" : "在 Google 官方页面登录用于 Gemini 的账号"}</p></div>{!loginActive && <button type="button" aria-label="收起新增账号" disabled={Boolean(busyId) || Boolean(gemini.busy)} onClick={() => setAdding(false)}><X size={18} /></button>}</div>
+          <label>账号类型<select ref={accountTypeSelect} aria-label="账号类型" value={accountType} disabled={loginActive || Boolean(busyId) || Boolean(gemini.busy)} onChange={(event) => { setAccountType(event.target.value as "codex" | "gemini"); setLogin(null); gemini.resetLogin(); }}><option value="codex">Codex · ChatGPT 账号</option><option value="gemini">Gemini · Google 账号</option></select></label>
+          {!login && !gemini.login && <>
             <label>账号备注（可选）<input value={label} maxLength={60} placeholder="例如：个人 Plus、公司账号" onChange={(event) => setLabel(event.target.value)} /></label>
-            <button type="button" className="codex-login-start" disabled={busyId === "login"} onClick={() => void beginLogin()}>{busyId === "login" ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}生成登录验证链接</button>
+            {accountType === "gemini" && gemini.state && !gemini.state.runtimeAvailable && <p className="dialog-description">{gemini.state.loginAvailable ? "首次登录会在当前机器自动准备 Gemini 服务，可能需要稍等片刻。" : gemini.state.error || "这台机器暂未准备好 Gemini 登录服务。"}</p>}
+            <button type="button" className="codex-login-start" disabled={Boolean(busyId) || Boolean(gemini.busy) || (accountType === "gemini" && !gemini.state?.runtimeAvailable && !gemini.state?.loginAvailable)} onClick={() => accountType === "codex" ? void beginLogin() : void gemini.begin(label)}>{busyId === "login" || gemini.busy === "login" ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}{accountType === "codex" ? "生成登录验证链接" : gemini.busy === "login" ? "正在准备 Google 登录…" : "生成 Google 登录链接"}</button>
           </>}
-          {login && <div className="codex-login-flow">
+          {accountType === "gemini" && <GeminiLoginFlow management={gemini} />}
+          {accountType === "codex" && login && <div className="codex-login-flow">
             <ol>
               <li className={login.verificationUrl ? "done" : "current"}><span>1</span><div><strong>生成验证信息</strong><small>{login.verificationUrl ? "已准备" : "正在连接登录服务…"}</small></div></li>
               <li className={login.status === "succeeded" ? "done" : login.verificationUrl ? "current" : ""}><span>2</span><div><strong>在浏览器完成验证</strong><small>打开链接，登录目标 ChatGPT 账号并输入一次性代码</small></div></li>

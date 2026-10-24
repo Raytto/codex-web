@@ -53,6 +53,28 @@ export type CodexAccountLogin = {
   expiresAt: string;
 };
 export type CodexAccountsState = { accounts: CodexAccount[]; activeAccountId: string };
+export type GeminiAccount = {
+  id: string;
+  label: string;
+  email: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+  active: boolean;
+  authenticated: boolean;
+};
+export type GeminiAccountsState = { accounts: GeminiAccount[]; activeAccountId: string | null; runtimeAvailable: boolean; loginAvailable?: boolean; error?: string };
+export type { AntigravityUsage } from "../remote-worker/src/antigravity-usage-types.js";
+export type GeminiAccountLogin = {
+  id: string;
+  label: string;
+  status: "starting" | "waiting" | "completed" | "failed" | "cancelled";
+  verificationUrl: string | null;
+  requiresCode: boolean;
+  message: string | null;
+  accountId: string | null;
+  createdAt: string;
+  expiresAt: string;
+};
 export type Conversation = {
   id: string; project_id: string | null; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; external_status: "idle" | "running"; sync_origin: "codex_web" | "codex_app"; remote_updated_at: number; pinned_at: string | null; sidebar_order: number; has_unread_result: number; unread_anchor_message_id: string | null; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; project_move_blocked: number; rollout_bytes: number | null; last_active_at: string; cold_storage_state: "local" | "uploading" | "remote_verified" | "evicting" | "cold" | "restoring" | "error"; cold_storage_generation: number; cold_storage_revision: number; cold_storage_manifest_sha256: string | null; cold_storage_archive_sha256: string | null; cold_storage_archive_bytes: number | null; cold_storage_remote_path: string | null; cold_storage_error: string | null; archived_at: string | null; created_at: string; updated_at: string;
 };
@@ -195,7 +217,7 @@ export type ComposerDraft = {
   created_at: string;
   updated_at: string;
 };
-export type Job = { id: string; status: string; conversation_id: string; error?: string | null; updated_at?: string; queuePosition?: number };
+export type Job = { id: string; status: string; conversation_id: string; agent_model?: string; error?: string | null; updated_at?: string; queuePosition?: number };
 export type WakePlan = {
   id: string;
   conversation_id: string;
@@ -226,10 +248,19 @@ export type WakePlan = {
   updated_at: string;
 };
 export type WakeEvent = { wake_plan_id: string; event_id: string; kind: string; summary: string | null; accepted: number; created_at: string };
-// The online Codex catalog is authoritative. Keep this open so a newer CLI can
+// Each engine's online catalog is authoritative. Keep this open so a newer CLI can
 // expose a new reasoning level without requiring a front-end release first.
 export type ReasoningEffort = string;
-export type AgentModelOption = { id: string; label: string; description: string; reasoningEfforts: ReasoningEffort[] };
+export type AgentModelOption = {
+  id: string;
+  label: string;
+  description: string;
+  engineId?: "codex" | "antigravity";
+  providerLabel?: string;
+  reasoningEfforts: ReasoningEffort[];
+  reasoningEffortOptions?: Array<{ id: ReasoningEffort; label: string }>;
+  defaultReasoningEffort?: ReasoningEffort;
+};
 export type AgentOptions = {
   models: AgentModelOption[];
   reasoningEfforts: Array<{ id: ReasoningEffort; label: string }>;
@@ -360,6 +391,7 @@ export type JobEvent = {
   status?: string;
   queuePosition?: number;
   jobsAhead?: number;
+  starting?: boolean;
   message?: string;
   agents?: SubagentEventState[];
 };
@@ -370,7 +402,7 @@ export type ConversationDetail = {
   hasUnreadResult: boolean;
   hasPendingWork: boolean;
   rolloutBytes: number | null;
-  contextUsage: { inputTokens: number; modelContextWindow: number | null; updatedAt: string | null } | null;
+  contextUsage: { inputTokens: number; modelContextWindow: number | null; updatedAt: string | null; engineId?: "codex" | "antigravity" } | null;
   packageQuota: { remainingPercent: number; updatedAt: string } | null;
   agentSelection: AgentSelection;
   messages: Message[];
@@ -539,6 +571,7 @@ export const api = {
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   systemStatus: () => request<SystemStatus>("/system/status"),
+  codexResetHistory: (executorId: string) => request<{ records: import("../server/codex-reset-auto-use.js").AutoResetRecord[]; enabled: boolean; supported: boolean }>(`/codex-accounts/reset-history?executorId=${encodeURIComponent(executorId)}`),
   consumeCodexResetCredit: (executorId: string, accountId: string, attemptId: string) => request<import("../remote-worker/src/codex-reset-consumer.js").ResetConsumption>(`/codex-accounts/${encodeURIComponent(accountId)}/reset-credit`, { method: "POST", body: JSON.stringify({ executorId, attemptId }) }),
   refreshCodexAccountUsage: (executorId: string) => request<CodexAccountsState>("/codex-accounts/refresh-usage", { method: "POST", body: JSON.stringify({ executorId }) }),
   codexAccounts: (executorId: string) => request<CodexAccountsState>(`/codex-accounts?executorId=${encodeURIComponent(executorId)}`),
@@ -547,6 +580,14 @@ export const api = {
   cancelCodexAccountLogin: (executorId: string, loginId: string) => request<{ login: CodexAccountLogin }>(`/codex-accounts/logins/${encodeURIComponent(loginId)}?executorId=${encodeURIComponent(executorId)}`, { method: "DELETE" }),
   activateCodexAccount: (executorId: string, accountId: string) => request<CodexAccountsState>(`/codex-accounts/${encodeURIComponent(accountId)}/activate`, { method: "POST", body: JSON.stringify({ executorId }) }),
   deleteCodexAccount: (executorId: string, accountId: string) => request<CodexAccountsState>(`/codex-accounts/${encodeURIComponent(accountId)}?executorId=${encodeURIComponent(executorId)}`, { method: "DELETE" }),
+  geminiAccounts: (executorId: string) => request<GeminiAccountsState>(`/gemini-accounts?executorId=${encodeURIComponent(executorId)}`),
+  geminiUsage: (executorId: string, accountId?: string, refresh = false) => request<import("../remote-worker/src/antigravity-usage-types.js").AntigravityUsage>(`/gemini-accounts/usage?${new URLSearchParams({ executorId, ...(accountId ? { accountId } : {}), ...(refresh ? { refresh: "1" } : {}) })}`),
+  beginGeminiAccountLogin: (executorId: string, label: string) => request<{ login: GeminiAccountLogin }>("/gemini-accounts/logins", { method: "POST", body: JSON.stringify({ executorId, label }) }),
+  geminiAccountLoginStatus: (executorId: string, loginId: string) => request<{ login: GeminiAccountLogin }>(`/gemini-accounts/logins/${encodeURIComponent(loginId)}?executorId=${encodeURIComponent(executorId)}`),
+  submitGeminiAccountLoginCode: (executorId: string, loginId: string, code: string) => request<{ login: GeminiAccountLogin }>(`/gemini-accounts/logins/${encodeURIComponent(loginId)}/code`, { method: "POST", body: JSON.stringify({ executorId, code }) }),
+  cancelGeminiAccountLogin: (executorId: string, loginId: string) => request<{ login: GeminiAccountLogin }>(`/gemini-accounts/logins/${encodeURIComponent(loginId)}?executorId=${encodeURIComponent(executorId)}`, { method: "DELETE" }),
+  activateGeminiAccount: (executorId: string, accountId: string) => request<GeminiAccountsState>(`/gemini-accounts/${encodeURIComponent(accountId)}/activate`, { method: "POST", body: JSON.stringify({ executorId }) }),
+  deleteGeminiAccount: (executorId: string, accountId: string) => request<GeminiAccountsState>(`/gemini-accounts/${encodeURIComponent(accountId)}?executorId=${encodeURIComponent(executorId)}`, { method: "DELETE" }),
   personalMemory: () => request<PersonalMemoryManagement>("/personal-memory"),
   voiceLexicon: () => request<VoiceLexiconManagement>("/voice-lexicon"),
   setVoiceKeywordDisabled: (termId: string, disabled: boolean) => request<VoiceLexiconManagement>(
@@ -603,6 +644,7 @@ export const api = {
     return request<ConversationPage>(`/conversations/search-body?${params}`);
   },
   activateConversation: (id: string) => request<ConversationActivation>(`/conversations/${encodeURIComponent(id)}/activate`, { method: "POST" }),
+  conversationNavigation: (id: string) => request<{ conversation: Conversation }>(`/conversations/${encodeURIComponent(id)}/navigation`),
   validateConversationSelection: (conversationId: string, projectId: string) => {
     const params = new URLSearchParams({ conversationId, projectId });
     return request<{ valid: boolean; conversationId: string | null; projectId: string | null }>(`/conversation-selection?${params}`);
@@ -650,7 +692,7 @@ export const api = {
   conversationMessages: (id: string, before: string, limit?: number) => request<ConversationMessagesPage>(
     `/conversations/${id}/messages?before=${encodeURIComponent(before)}${limit ? `&limit=${encodeURIComponent(String(limit))}` : ""}`,
   ),
-  fetchRemoteFile: (conversationId: string, messageId: string, path: string) => request<{ file: WorkFile; alreadyFetched: boolean }>(
+  fetchRemoteFile: (conversationId: string, messageId: string, path: string) => request<{ file: WorkFile; alreadyFetched: boolean; warnings?: Array<{ fileName: string; reason: string }> }>(
     `/conversations/${conversationId}/messages/${messageId}/remote-file`,
     { method: "POST", body: JSON.stringify({ path }) },
   ),

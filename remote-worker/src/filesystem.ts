@@ -41,7 +41,7 @@ export function resolveReadableFile(projectRoot: string, requestedPath: string):
   const candidate = path.isAbsolute(raw) ? raw : path.resolve(resolveDirectory(projectRoot), raw);
   let canonical: string;
   try { canonical = fs.realpathSync.native(candidate); }
-  catch { throw new Error("文件不存在或无法访问"); }
+  catch (cause) { throw Object.assign(new Error("文件不存在或无法访问", { cause }), { code: (cause as NodeJS.ErrnoException).code }); }
   const stat = fs.statSync(canonical);
   if (!stat.isFile()) throw new Error("所选路径不是普通文件");
   if (stat.size > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("文件超过 2 GiB，暂不支持下载");

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { consumeAccountResetCredit, earliestResetCredit, redeemEarliestReset } from "./codex-reset-consumer.js";
+import { autoResetAttemptId, consumeAccountResetCredit, earliestResetCredit, redeemEarliestReset } from "./codex-reset-consumer.js";
 import { isPersistableWorkerMessage, parseServerMessage } from "./protocol-validation.js";
 
 const future = () => Math.floor(Date.now() / 1000) + 86400;
@@ -109,4 +109,82 @@ test("Worker strict protocol accepts reset operations and rejects missing keys a
   for (const value of [{ ...base, attemptId: undefined }, { ...base, refreshUsage: true }, { ...base, action: "delete" }, { ...base, creditId: "client-choice" }]) {
     assert.equal(parseServerMessage(JSON.stringify(value)).ok, false);
   }
+});
+
+test("automatic use rechecks the exact expiration window, never falls through to a changed/unknown/non-expiring card", async t => {
+  const root = temporary(t), due = Math.floor(Date.now() / 1000) + 1800, expiry = new Date(due * 1000).toISOString();
+  for (const [response, expected] of [
+    [limits([credit('too-early', due + 7200)]), new Date((due + 7200) * 1000).toISOString()],
+    [limits([credit('changed', due + 60)]), expiry], [limits([credit('forever', null)]), expiry],
+    [limits([]), expiry], [limits([credit('expired', 1)]), new Date(1000).toISOString()],
+    [{ ...limits(), rateLimitResetCredits: { availableCount: 2, credits: [credit('partial', due)] } }, expiry],
+  ] as const) {
+    const operation = redeemEarliestReset(async method => { assert.equal(method, 'account/rateLimits/read'); return response; }, root, 'fixture-account', crypto.randomUUID(), expected);
+    if (response.rateLimitResetCredits.credits?.[0]?.id === 'too-early' || response.rateLimitResetCredits.credits?.[0]?.id === 'partial') await assert.rejects(operation);
+    else {
+      const result = await operation; assert.equal(result.outcome, 'notDue');
+      assert.equal(isPersistableWorkerMessage({ type: 'codex_accounts_result', requestId: crypto.randomUUID(), ok: true, resetResult: result }), true);
+    }
+    assert.equal(fs.existsSync(path.join(root, 'pending.json')), false);
+  }
+  const id = autoResetAttemptId('fixture-account', expiry); let consumed = 0;
+  const rpc = async (method: string) => { if (method === 'account/rateLimits/read') return limits([credit('due', due)]); consumed++; return { outcome: 'reset' }; };
+  await redeemEarliestReset(rpc, root, 'fixture-account', id, expiry);
+  await redeemEarliestReset(rpc, root, 'fixture-account', id, expiry);
+  assert.equal(consumed, 1);
+  const receipt = JSON.parse(fs.readFileSync(path.join(root, `${id}.json`), 'utf8'));
+  assert.equal(receipt.source, 'auto_expiry'); assert.equal(receipt.autoExpiresAt, expiry); assert.ok(receipt.createdAt && receipt.completedAt);
+  assert.notEqual(id, autoResetAttemptId('another-account', expiry));
+  assert.notEqual(id, autoResetAttemptId('fixture-account', new Date((due + 60) * 1000).toISOString()));
+});
+
+test("automatic retries recover only their pinned card and cannot take over an unresolved manual operation", async t => {
+  const root = temporary(t), due = Math.floor(Date.now() / 1000) + 100, expiry = new Date(due * 1000).toISOString();
+  const id = autoResetAttemptId('fixture-account', expiry); let calls = 0;
+  const rpc = async (method: string, params: unknown) => {
+    if (method === 'account/rateLimits/read') return calls ? limits([credit('next', future())]) : limits([credit('due', due)]);
+    assert.deepEqual(params, { creditId: 'due', idempotencyKey: id }); calls++;
+    if (calls === 1) throw Error('lost response'); return { outcome: 'alreadyRedeemed' };
+  };
+  await assert.rejects(redeemEarliestReset(rpc, root, 'fixture-account', id, expiry), /lost response/);
+  assert.equal((await redeemEarliestReset(rpc, root, 'fixture-account', id, expiry)).outcome, 'alreadyRedeemed');
+  assert.equal(calls, 2);
+  const manualRoot = path.join(root, 'manual');
+  await assert.rejects(redeemEarliestReset(async method => { if (method === 'account/rateLimits/read') return limits([credit('due', due)]); throw Error('uncertain'); }, manualRoot, 'fixture-account', crypto.randomUUID()));
+  await assert.rejects(redeemEarliestReset(async () => { throw Error('must not send'); }, manualRoot, 'fixture-account', id, expiry), /另一笔/);
+});
+
+test("automatic reset guard passes actual Worker parsing only for reset_credit with a valid ISO timestamp", () => {
+  const payload = { type: 'codex_accounts', requestId: crypto.randomUUID(), action: 'reset_credit', accountId: crypto.randomUUID(), attemptId: crypto.randomUUID(), autoExpiresAt: new Date().toISOString() };
+  assert.equal(parseServerMessage(JSON.stringify(payload)).ok, true);
+  for (const changed of [{ autoExpiresAt: true }, { autoExpiresAt: 'invalid' }, { action: 'list' }, { action: 'activate' }]) {
+    assert.equal(parseServerMessage(JSON.stringify({ ...payload, ...changed })).ok, false);
+  }
+});
+
+test("automatic isolated CLI sessions share a per-account expiry key across machine journals without exposing credentials", async t => {
+  const root = temporary(t), authFile = path.join(root, 'auth.json'), executable = path.join(root, 'fake.js');
+  const log = path.join(root, 'requests'), consumed = path.join(root, 'upstream-receipt');
+  const due = Math.floor(Date.now() / 1000) + 1800, expiry = new Date(due * 1000).toISOString();
+  fs.writeFileSync(authFile, JSON.stringify({ tokens: { account_id: 'fixture-account', refresh_token: 'private-fixture', access_token: 'fixture' } }));
+  const before = fs.readFileSync(authFile, 'utf8');
+  fs.writeFileSync(executable, `const fs=require('fs'),readline=require('readline'),path=require('path');
+    if(JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME,'auth.json'))).tokens.refresh_token)throw Error('refresh not stripped');
+    readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(!m.id)return;let result={};
+      if(m.method==='account/rateLimits/read')result=${JSON.stringify(limits([credit('due', due)]))};
+      if(m.method==='account/rateLimitResetCredit/consume'){
+        fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(m.params)+'\\n');
+        if(fs.existsSync(${JSON.stringify(consumed)})){if(fs.readFileSync(${JSON.stringify(consumed)},'utf8')!==m.params.idempotencyKey)throw Error('duplicate physical spend');result={outcome:'alreadyRedeemed'};}
+        else{fs.writeFileSync(${JSON.stringify(consumed)},m.params.idempotencyKey);result={outcome:'reset'};}
+      } console.log(JSON.stringify({id:m.id,result}));});`);
+  const options = { executable, authFile, expectedAccountId: 'fixture-account', temporaryRoot: path.join(root, 'temp'), autoExpiresAt: expiry };
+  const first = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'server'), attemptId: crypto.randomUUID() });
+  const second = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'worker'), attemptId: crypto.randomUUID() });
+  const replay = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'server'), attemptId: crypto.randomUUID() });
+  assert.equal(first.outcome, 'reset'); assert.equal(second.outcome, 'alreadyRedeemed'); assert.equal(replay.outcome, 'reset');
+  assert.equal(first.attemptId, second.attemptId); assert.equal(first.attemptId, autoResetAttemptId('fixture-account', expiry));
+  const requests = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(requests.length, 2); assert.deepEqual(requests[0], requests[1]);
+  assert.equal(fs.readFileSync(authFile, 'utf8'), before); assert.deepEqual(fs.readdirSync(options.temporaryRoot), []);
+  assert.doesNotMatch(JSON.stringify([first, second]), /private-fixture|creditId|fixture-account/);
 });

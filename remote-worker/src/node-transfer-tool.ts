@@ -1,4 +1,4 @@
-export const NODE_TRANSFER_TOOL_NAME = "pp_agent_transfer";
+export const NODE_TRANSFER_TOOL_NAME = "codex_web_transfer";
 export const NODE_TRANSFER_TOOL_SPEC = {
   type: "function" as const,
   name: NODE_TRANSFER_TOOL_NAME,

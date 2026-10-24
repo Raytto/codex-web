@@ -14,7 +14,7 @@ export type OpportunityContent = {
   interaction: string; loop: string; english: string; expansion: string; maturity: string;
   category: string; keywords: string[]; sources: OpportunityEvidence[];
 };
-export type OpportunityState = 'pending' | 'reserve' | 'recommended' | 'kept' | 'later' | 'dismissed' | 'internal_rejected' | 'expired' | 'project' | 'duplicate';
+export type OpportunityState = 'pending' | 'reserve' | 'recommended' | 'kept' | 'completed' | 'later' | 'dismissed' | 'internal_rejected' | 'expired' | 'project' | 'duplicate';
 export type OpportunityIdea = {
   images?: OpportunityImage[];
   id: string; user_id: string; topic_id: string; content: OpportunityContent; state: OpportunityState;
@@ -35,7 +35,7 @@ export type OpportunityPreference = { id: string; topic_id: string; text: string
 export type OpportunityResearch = { id: string; idea_id: string; conversation_id: string; status: string; result: string; created_at: string; updated_at: string };
 export type OpportunityVoiceFeedback = { id: string; state: "queued" | "processing" | "failed" | "completed"; transcript: string; applied_revision: number | null; error: string | null; created_at: string };
 export type OpportunityDetail = { voiceFeedback: OpportunityVoiceFeedback[]; sourceBatch: OpportunityBatch; recommendedBatch: OpportunityBatch | null; availableConversations: string[]; idea: OpportunityIdea; feedback: OpportunityFeedback[]; versions: Array<{ id: string; reason: string; created_at: string; conversation_id: string; project_id?: string | null; content_json: string }>; research: OpportunityResearch[] };
-export type OpportunityCollection = 'screen' | 'reserve' | 'working' | 'processed' | 'dismissed' | 'rejected';
+export type OpportunityCollection = 'screen' | 'reserve' | 'kept' | 'completed' | 'working' | 'processed' | 'dismissed' | 'rejected';
 export type OpportunityWork = {
   research: { status: string; result: string; conversation_id: string; project_id: string; available: boolean } | null;
   project: { id: string; board_id: string; title: string; stage: string; archived_at: string | null } | null;

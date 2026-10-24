@@ -18,6 +18,12 @@ Codex Web administrators can instead use the Codex Web project dialog's **＋新
 
 ## Update and diagnostics
 
+Worker 1.21.4 adds read-only Antigravity quota and AI credit queries through the
+node's existing Google profiles. It advertises `geminiUsage` separately, so older
+Workers can keep their account/model functions while declining the new query.
+No account switch, login, model turn, or credit purchase is performed. See
+`docs/ANTIGRAVITY_QUOTA.md` at the repository root.
+
 The initial installation may use a sparse Git checkout containing only this directory. For an existing checkout, install the package updater once with:
 
 ```powershell
@@ -106,6 +112,24 @@ rotation saves a replacement before retiring the old hash. The server-wide
 enrollment setting is no longer a normal connection credential. Existing
 shared-token installations require the explicit, expiring migration in
 [the upgrade guide](../docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md).
+
+Worker 1.20.3 supplies `CWW_UPLOADS_DIR`, `CWW_OUTPUTS_DIR`, and
+`CWW_JOB_RUNTIME` to every managed Codex turn, including resumed threads. Only
+that Job's `stateRoot/outputs/<job UUID>` is scanned for generated deliverables;
+shell-created files no longer depend on `fileChange` events. Uploads and runtime
+files remain under the transient run directory. Output files survive run cleanup
+for later retrieval, including results omitted by the transfer budget. Existing
+project change collection keeps its realpath boundary, and managed output
+symlinks cannot escape the explicit collection roots.
+
+Interactive HTML must include its adjacent `.html.pp-agent.json` declaration
+with `presentation_mode: "web"` and the final HTML SHA-256. The Worker transfers
+the pair together within the shared 256-member / 8 GiB budget; the server hides
+the declaration, validates the complete bytes, and registers a private web
+presentation. Missing declarations remain reader. Both new and resumed threads
+receive the same self-contained HTML rules as server execution. Manual file
+retrieval reports a typed `NOT_FOUND` only for absent files; permission and
+transport failures remain distinguishable.
 
 Worker 1.13.1 advertises optional persistent-wait automation. For each Codex Web-controlled turn, the server may supply a job-scoped token and the Worker injects the bundled `wait-cli.js` path into that turn's tool-shell environment. Codex can register a one-shot time wait or an event/deadline wait; an external supervisor reports through a single-plan HTTPS receipt. No inbound Worker port is added, and a wake always re-enters the server's normal conversation queue. See `docs/WAKE_AUTOMATION.md` in the repository root.
 
@@ -211,3 +235,9 @@ Regular attachments, remote downloads and generated files use a 2 GiB per-file l
 
 
 Version 1.20.2 allows up to 256 automatically collected result files (including generated images). The 2 GiB single-file, 8 GiB aggregate and 30-minute limits remain unchanged. It does not receive server account login state or server-only opportunity tools.
+
+### Gemini / Antigravity（1.21.0）
+
+账号管理可在当前节点添加 Gemini 账号。首次登录安装并校验受管 Antigravity CLI 1.4.6；Windows 包含 ConPTY 登录组件。Google 登录、账号配置与原生会话保留在本节点，模型和思考深度从活动账号的真实目录读取。没有有效账号时不提供 Gemini 模型。
+
+每次请求只运行所选模型的引擎。项目 AGENTS.md 与知识文件共用；Gemini 原生会话与 Codex 原生会话分别保存。Gemini 补充消息排队到下一轮，图片提供文件路径。完整机制与验收边界见 [多引擎说明](../docs/MULTI_ENGINE.md)。

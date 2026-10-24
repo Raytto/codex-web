@@ -4,7 +4,27 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { cleanupCurrentRunDirectory, sweepRunDirectories } from "./run-directories.js";
+import { cleanupCurrentRunDirectory, createRunDirectories, runDirectoryEnvironment, sweepRunDirectories } from "./run-directories.js";
+
+test("managed output directories are job-scoped and survive transient run cleanup", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-worker-delivery-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const jobId = crypto.randomUUID();
+  const directories = createRunDirectories(root, jobId);
+  assert.deepEqual(runDirectoryEnvironment(directories), {
+    CWW_UPLOADS_DIR: directories.uploads, CWW_OUTPUTS_DIR: directories.outputs, CWW_JOB_RUNTIME: directories.runtime,
+  });
+  assert.deepEqual(runDirectoryEnvironment(), {});
+  assert.notEqual(createRunDirectories(root, crypto.randomUUID()).outputs, directories.outputs);
+  for (const directory of Object.values(directories)) assert.equal(fs.statSync(directory).isDirectory(), true);
+  fs.writeFileSync(path.join(directories.outputs, "result.html"), "deliverable");
+  fs.writeFileSync(path.join(directories.runtime, "log.txt"), "temporary");
+  await cleanupCurrentRunDirectory(root, jobId);
+  assert.equal(fs.existsSync(directories.runtime), false);
+  assert.equal(fs.existsSync(directories.uploads), false);
+  assert.equal(fs.readFileSync(path.join(directories.outputs, "result.html"), "utf8"), "deliverable");
+  assert.throws(() => createRunDirectories(root, "../outside"), /non-UUID/);
+});
 
 test("run cleanup only removes the validated current UUID directory", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-worker-run-cleanup-"));

@@ -40,3 +40,7 @@ HTTP 运行响应由独立的 `/api/web-runtime/:ticket` 路由提供，执行�
 - `scripts/web-presentation-scenario.mjs`：生产维护登录包装器复用，只写新建专属验收会话，并清理测试文件/分享记录。没有模拟业务 API 或运行模型任务。
 
 生产发布编号、真实阿里云盘往返和 iOS 真机边界记录在知识库交互网页专题。手机视口不等于 iOS Safari 真机。
+
+## Managed remote delivery and explicit conversion
+
+Worker output collection scans the current job's `CWW_OUTPUTS_DIR`; it transfers HTML and its adjacent `.html.pp-agent.json` declaration together. The declaration supplies the final SHA-256 and `presentation_mode: "web"`. Full bytes are verified before registration; missing declarations retain reader behavior. Declaration files are hidden from ordinary attachments. Shared limits count both members. Reader settings can explicitly convert an existing HTML presentation after validation; ordinary MIME labels cannot bypass active-content checks. Source links resolve the newest registered presentation version under `/codex-web`.

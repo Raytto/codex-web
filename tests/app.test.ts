@@ -251,11 +251,11 @@ test("Codex account manager migrates the live login, completes device login, swi
   assert.equal(fs.existsSync(path.join(sharedRoot, "accounts", second.id)), false);
 });
 
-test("Codex account UI is restricted to CODEX_WEB, selects a machine, and explains the complete device-code flow", () => {
+test("account UI is restricted to CODEX_WEB, selects a machine, and preserves the complete Codex device-code flow", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const dialogSource = fs.readFileSync(path.join(process.cwd(), "src", "codex-account-dialog.tsx"), "utf8");
   const serverSource = fs.readFileSync(path.join(process.cwd(), "server", "app.ts"), "utf8");
-  assert.match(appSource, /session\.accountId === HOST_ROOT_ACCOUNT_ID[\s\S]{0,260}Codex 账号管理/);
+  assert.match(appSource, /session\.accountId === HOST_ROOT_ACCOUNT_ID[\s\S]{0,260}账号管理/);
   assert.match(dialogSource, /目标机器[\s\S]*codexAccountManagementCapable[\s\S]*生成验证信息[\s\S]*在浏览器完成验证[\s\S]*目标机器自动确认并保存/);
   assert.match(dialogSource, /不会返回浏览器/);
   assert.match(dialogSource, /服务器、COM、home 各自保管自己的登录/);
@@ -471,7 +471,8 @@ test("remote Worker capacity zero means unlimited and is displayed explicitly", 
 test("mobile wake plan cards give copy and actions their own responsive rows", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /pendingActionMode=\{job\?\.status === "running" \? "steer" : "insert"\}/);
+  assert.match(appSource, /pendingActionMode=\{pendingPromptActionMode\(job, selectedModel\)\}/);
+  assert.match(appSource, /canRunPendingPromptImmediately\(actionMode, prompt\.agent_model, runningModel\) && <button[^\n]+className="steer-action"/);
   assert.match(appSource, /const actionLabel = actionMode === "steer" \? "引导" : "插入"/);
   assert.match(appSource, /会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。/);
   assert.match(appSource, /WakePlanCard[\s\S]*onEditWake/);
@@ -763,7 +764,9 @@ test("conversation menu separates actions from read-only capacity and quota info
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /conversation-menu-actions[\s\S]*conversation-menu-separator[\s\S]*conversation-menu-info/);
   assert.match(appSource, /Rollout 文件[\s\S]*Codex 上下文[\s\S]*套餐额度/);
-  assert.match(appSource, /formatContextUsage\(currentDetail\.contextUsage\.inputTokens, currentDetail\.contextUsage\.modelContextWindow\)/);
+  assert.match(appSource, /formatContextUsage\(displayedContextUsage\.inputTokens, displayedContextUsage\.modelContextWindow\)/);
+  assert.match(appSource, /showingGeminiMetrics === \(currentDetail\?\.contextUsage\?\.engineId === "antigravity"\)/);
+  assert.match(appSource, /!showingGeminiMetrics && <div className="conversation-menu-info-row" title="当前 Codex 套餐周期的剩余额度"/);
   assert.match(appSource, /Math\.round\(currentDetail\.packageQuota\.remainingPercent\).*%/);
   assert.match(appSource, /executor_quota[\s\S]*codex-web-executor-quota-changed/);
   assert.match(appSource, /codex-web-executor-quota-changed[\s\S]*refreshDetail\(selected\)/);
@@ -1121,10 +1124,10 @@ test("switching conversations hides stale detail until the selected task loads",
   assert.match(appSource, /currentDetail = detail\?\.conversation\.id === selectedId \? detail : null/);
   assert.match(appSource, /restoringConversationSelection = !conversationSelectionReady/);
   assert.match(appSource, /loadingConversation = restoringConversationSelection \|\| Boolean\(selectedId && !currentDetail\)/);
-  assert.match(appSource, /loadingConversation \? <ConversationLoading restoring=\{restoringConversationSelection\} \/>/);
-  assert.match(appSource, /conversationSelectionReady && \(!selectedId \|\| !selectedConversation\?\.archived_at\) && <Composer/);
+  assert.match(appSource, /loadingConversation \? <ConversationLoading restoring=\{restoringConversationSelection\} state=/);
+  assert.match(appSource, /conversationSelectionReady && !conversationLinkError && \(!selectedId \|\| !selectedConversation\?\.archived_at\) && <Composer/);
   assert.match(appSource, /restoring \? "正在恢复上次任务…" : "正在加载任务…"/);
-  assert.match(appSource, /role="status" aria-live="polite"/);
+  assert.match(appSource, /role=\{failed \? "alert" : "status"\} aria-live="polite"/);
   assert.match(styles, /\.conversation-loading \{[^}]*place-content: center;/);
 });
 
@@ -1812,7 +1815,7 @@ test("transient upstream failures stay bounded while model capacity retries unti
   assert.deepEqual(retryPrompts, ["原始用户指令", MODEL_CAPACITY_CONTINUATION_PROMPT]);
 
   const runnerSource = fs.readFileSync(path.join(process.cwd(), "server", "codex-runner.ts"), "utf8");
-  assert.match(runnerSource, /canRetry: \(error\) => !isModelCapacityError\(error\) && !executionObserved/);
+  assert.match(runnerSource, /canRetry: \(error\) => engine === "codex" && !isModelCapacityError\(error\) && !executionObserved/);
   assert.match(runnerSource, /deferJobForCapacity/);
 
   let permanentCalls = 0;
@@ -4189,7 +4192,7 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.match(shareDialogSource, /return createPortal\(<div className="file-share-backdrop"/);
   assert.match(shareDialogSource, /role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title"/);
   assert.match(shareDialogSource, /event\.target === event\.currentTarget && !busy/);
-  assert.match(shareDialogSource, /aria-label="关闭分享设置" disabled=\{busy\} onClick=\{onClose\}/);
+  assert.match(shareDialogSource, /aria-label=\{openingWeb \? "关闭展示设置" : "关闭分享设置"\} disabled=\{busy\} onClick=\{onClose\}/);
   assert.doesNotMatch(appSource, /访问记录/);
   assert.doesNotMatch(readerAskSource, /nativeSelection\.removeAllRanges|nativeSelection\.addRange/);
   assert.match(readerAskSource, /window\.addEventListener\("pointerup", handleSelectionEnd, \{ passive: true \}\)/);
@@ -4437,6 +4440,7 @@ test("conversation archive API keeps history readable, blocks new turns, and res
   assert.equal(detail.body.conversation.id, conversationId);
   assert.equal(detail.body.rolloutBytes, 7);
   assert.deepEqual(detail.body.contextUsage, {
+    engineId: "codex",
     inputTokens: 202_345,
     modelContextWindow: 258_400,
     updatedAt: detail.body.contextUsage.updatedAt,
@@ -4759,6 +4763,10 @@ test("owner can fetch any readable remote file into the normal deliverable downl
       if (message.type === "file_fetch" && message.requestId && message.transferToken) {
         fetchRequests += 1;
         fetchPaths.push({ projectRoot: message.projectRoot ?? "", path: message.path ?? "" });
+        if (message.path?.endsWith(".pp-agent.json")) {
+          socket.send(JSON.stringify({ type: "file_fetch_result", requestId: message.requestId, ok: false, message: "文件不存在或无法访问" }));
+          return;
+        }
         void fetch(`${origin}/api/remote-worker-files/fetch/${message.requestId}`, {
           method: "PUT", headers: { authorization: `Bearer ${message.transferToken}`, "content-type": "text/html", "x-file-name": encodeURIComponent("index.html") }, body: "remote-file-body",
         }).then((response) => {
@@ -4803,8 +4811,8 @@ test("owner can fetch any readable remote file into the normal deliverable downl
   assert.equal(first.body.file.original_name, "index.html");
   assert.equal(first.body.file.source_path, "E:/dobe/shared/index.html");
   assert.match(first.body.file.relative_path, /^deliverables\//);
-  assert.equal(fetchRequests, 1);
-  assert.deepEqual(fetchPaths, [{ projectRoot: "C:\\workspace\\work", path: "E:/dobe/shared/index.html" }]);
+  assert.equal(fetchRequests, 2);
+  assert.deepEqual(fetchPaths, [{ projectRoot: "C:\\workspace\\work", path: "E:/dobe/shared/index.html" }, { projectRoot: "C:\\workspace\\work", path: "E:/dobe/shared/index.html.pp-agent.json" }]);
   const downloaded = await agent.get(`/api/files/${first.body.file.id}?download=1`).expect(200);
   assert.equal(downloaded.text, "remote-file-body");
 
@@ -4812,7 +4820,7 @@ test("owner can fetch any readable remote file into the normal deliverable downl
     .set("X-CSRF-Token", login.body.csrfToken).send({ path: "E:/dobe/shared/index.html" }).expect(200);
   assert.equal(second.body.alreadyFetched, true);
   assert.equal(second.body.file.id, first.body.file.id);
-  assert.equal(fetchRequests, 1);
+  assert.equal(fetchRequests, 3);
 });
 
 test("remote Worker output uploads keep large JSON files on the raw streaming transfer path", async (context) => {
@@ -5857,6 +5865,14 @@ test("web users have isolated conversations, files, jobs, settings, and tenant d
   assert.ok(fs.existsSync(path.join(friendTenant.library, "default", "projects")));
   const ownerConversation = await owner.post("/api/conversations").set("X-CSRF-Token", ownerLogin.body.csrfToken).expect(201);
   const friendConversation = await friend.post("/api/conversations").set("X-CSRF-Token", friendLogin.body.csrfToken).expect(201);
+
+  const navigation = await owner.get(`/api/conversations/${ownerConversation.body.conversation.id}/navigation`).expect(200);
+  assert.equal(navigation.body.conversation.project_id, ownerConversation.body.conversation.project_id);
+  assert.equal(navigation.body.conversation.id, ownerConversation.body.conversation.id);
+  assert.equal(navigation.body.messages, undefined);
+  await friend.get(`/api/conversations/${ownerConversation.body.conversation.id}/navigation`).expect(404);
+  await owner.get(`/api/conversations/${crypto.randomUUID()}/navigation`).expect(404);
+  await request(instance.app).get(`/api/conversations/${ownerConversation.body.conversation.id}/navigation`).expect(401);
 
   assert.deepEqual((await owner.get("/api/conversation-selection").query({
     conversationId: ownerConversation.body.conversation.id,

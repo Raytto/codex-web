@@ -36,7 +36,7 @@ export async function run({page,context,origin,work,assert,fixtures}) {
       if(await collect.count()) {assert.equal(await collect.evaluate(e=>e.getBoundingClientRect().height>=44&&e.getBoundingClientRect().width>=44),true);await collect.click();await page.locator('dialog.para-dialog').getByRole('heading',{name:'加入项目',exact:true}).waitFor();await page.keyboard.press('Escape');}
       assert.equal(await page.locator('html').getAttribute('data-theme'),width<=390?'dark':'light');
 
-      checks.push(`${width}px: three card types, private panel, no activity or popup, 44px controls, focus and width`);
+      checks.push(`${width}px: web/report/Markdown cards, private panel, no activity or popup, 44px controls, focus and width`);
     }
     stage='private runtime';
     const popup=page.waitForEvent('popup');await page.locator('.file-card').filter({hasText:web.original_name}).getByRole('link',{name:'打开 '+web.original_name,exact:true}).click();
@@ -69,7 +69,52 @@ export async function run({page,context,origin,work,assert,fixtures}) {
       await page.screenshot({path:path.join(work,`reader-${file.id}.png`)});
     }
     checks.push('reports/Markdown: existing header, body, settings and outline retained; sharing removed from reader');
-    stage='manager';await page.goto(origin);if(await page.getByRole('button',{name:'打开侧栏',exact:true}).isVisible())await page.getByRole('button',{name:'打开侧栏',exact:true}).click();await page.locator('.account-profile').click();await page.getByRole('button',{name:'公开分享管理',exact:true}).click();
+    stage='reader explicit web';
+    const undeclared=files.find(file=>file.original_name==='未声明交互网页验收.html');
+    assert.equal(undeclared.presentation_mode,'reader');
+    await api(`/files/${undeclared.id}/share`,'POST');
+    const originalShare=(await api(`/files/${undeclared.id}/share`)).share;
+    await publicPage.goto(originalShare.publicUrl);await publicPage.locator('.file-preview-header').waitFor();
+    await publicPage.locator('.file-reader-settings-button').click();assert.equal(await publicPage.getByRole('menuitem',{name:'以交互网页打开',exact:true}).count(),0);
+    for(const width of [1440,768,390,320]){
+      await page.setViewportSize({width,height:900});await page.emulateMedia({colorScheme:width<=390?'dark':'light'});
+      await page.goto(origin+`/files/${undeclared.id}/preview`);await page.locator('.reader-text-container').waitFor();
+      assert.equal(await page.locator('.web-presentation iframe').count(),0);assert.equal(await page.evaluate(()=>window.fixtureReady),undefined);
+      await page.locator('.file-reader-settings-button').click();
+      const openWeb=page.getByRole('menuitem',{name:'以交互网页打开',exact:true});assert.equal(await openWeb.evaluate(e=>e.getBoundingClientRect().height>=44),true);await openWeb.click();
+      const conversion=page.getByRole('dialog',{name:'以交互网页打开',exact:true});await conversion.getByRole('button',{name:'校验并打开交互网页',exact:true}).waitFor();
+      assert.equal(await conversion.getByText(/新的私有版本/).count(),1);assert.equal(await conversion.getByRole('button',{name:/分享/}).count(),0);
+      assert.equal(await conversion.evaluate(e=>e.scrollWidth<=e.clientWidth),true);
+      await conversion.screenshot({path:path.join(work,`presentation-${width}.png`)});
+      if(width===320){await page.evaluate(()=>document.documentElement.style.fontSize='200%');assert.equal(await conversion.evaluate(e=>e.scrollWidth<=e.clientWidth),true);await page.evaluate(()=>document.documentElement.style.fontSize='');}
+      await page.keyboard.press('Escape');
+      assert.equal(await page.locator('.file-reader-settings-button').evaluate(e=>e===document.activeElement),true);
+    }
+    await page.locator('.file-reader-settings-button').click();await page.getByRole('menuitem',{name:'以交互网页打开',exact:true}).click();
+    const convertedResponse=page.waitForResponse(r=>r.url()===origin+`/api/files/${undeclared.id}/presentation-version`&&r.request().method()==='POST');
+    await page.getByRole('dialog',{name:'以交互网页打开',exact:true}).getByRole('button',{name:'校验并打开交互网页',exact:true}).click();
+    assert.equal((await convertedResponse).status(),201);await page.waitForURL(url=>url.pathname!==`/files/${undeclared.id}/preview`&&/^\/files\/[^/]+\/preview$/.test(url.pathname));
+    const converted=await api(`/files/${page.url().match(/\/files\/([^/]+)\/preview$/)[1]}/share`);fixtures.trackVersion(converted.file.id,undeclared.id);
+    assert.equal(converted.file.presentation_mode,'web');assert.equal(converted.file.mime_type,'text/html');assert.equal(converted.share.enabled,false);
+    await page.waitForURL(origin+`/files/${converted.file.id}/preview`);await exercise(page);
+    assert.deepEqual((await api(`/files/${undeclared.id}/share`)).share,originalShare);assert.equal((await api(`/files/${undeclared.id}/share`)).file.presentation_mode,'reader');
+    assert.equal((await guest.request.get(origin+`/api/files/${converted.file.id}/preview`)).status(),401);
+    checks.push('reader explicit conversion: four widths, dark/light, 200% text, meta does not execute; new private file ID opens runtime, old reader and public sharing unchanged; guests cannot convert or read private version');
+    stage='invalid web conversion';
+    const invalid=files.find(file=>file.original_name==='外部资源拒绝验收.html');
+    await page.goto(origin+`/files/${invalid.id}/preview`);await page.locator('.file-reader-settings-button').click();await page.getByRole('menuitem',{name:'以交互网页打开',exact:true}).click();
+    const invalidPanel=page.getByRole('dialog',{name:'以交互网页打开',exact:true});await invalidPanel.getByRole('button',{name:'校验并打开交互网页',exact:true}).click();
+    await invalidPanel.getByRole('alert').waitFor();assert.match(await invalidPanel.getByRole('alert').innerText(),/script|脚本|外部|内嵌/);assert.equal(page.url(),origin+`/files/${invalid.id}/preview`);assert.equal((await api(`/files/${invalid.id}/share`)).file.presentation_mode,'reader');
+    await page.keyboard.press('Escape');
+    stage='share visible web action';await page.goto(origin);
+    const report=files.find(file=>file.original_name==='报告阅读验收.html');await page.getByRole('button',{name:'分享 '+report.original_name,exact:true}).click();
+    const fromShareResponse=page.waitForResponse(r=>r.url()===origin+`/api/files/${report.id}/presentation-version`&&r.request().method()==='POST');
+    await page.getByRole('dialog',{name:'公开分享',exact:true}).getByRole('button',{name:'以交互网页打开',exact:true}).click();
+    assert.equal((await fromShareResponse).status(),201);await page.waitForURL(url=>url.pathname!==`/files/${report.id}/preview`&&/^\/files\/[^/]+\/preview$/.test(url.pathname));
+    const fromShare=await api(`/files/${page.url().match(/\/files\/([^/]+)\/preview$/)[1]}/share`);fixtures.trackVersion(fromShare.file.id,report.id);assert.equal(fromShare.share.enabled,false);
+    await page.waitForURL(origin+`/files/${fromShare.file.id}/preview`);await page.frameLocator('.web-presentation iframe').getByRole('heading',{name:'报告标题',exact:true}).waitFor();
+    checks.push('conversion errors: unsupported external scripts shown in dialog without navigation; share panel has visible conversion action and opens the new private file ID');
+    stage='manager';await page.goto(origin);await page.locator('.file-card').filter({hasText:web.original_name}).waitFor();if(await page.getByRole('button',{name:'打开侧栏',exact:true}).isVisible())await page.getByRole('button',{name:'打开侧栏',exact:true}).click();await page.locator('.account-profile').click();await page.getByRole('button',{name:'公开分享管理',exact:true}).click();
     const row=page.locator('.public-share-row').filter({hasText:web.original_name});await row.getByRole('button',{name:'管理分享'}).click();await panel.getByRole('button',{name:'关闭分享',exact:true}).click();await panel.getByText('已关闭',{exact:true}).waitFor();await page.keyboard.press('Escape');await row.getByText('已关闭',{exact:true}).waitFor();
     checks.push('manager: same panel, close without opening document, closed item retained');
     await row.getByRole('button',{name:'管理分享'}).click();await panel.locator('summary').click();

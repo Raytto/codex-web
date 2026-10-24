@@ -190,3 +190,7 @@ The optional opportunity-card increment requires no new environment variables or
 ## Upgrading current features
 
 Follow [the upgrade checklist](UPGRADE_20261020.md) for the additive presentation, judgment and background-feedback migrations. The default Docker runtime/documents split, build helper, dependency locks, login method and environment settings are unchanged. New capabilities use existing data/tenant storage and queues; do not introduce extra services or mount a host filesystem for the base installation.
+
+## Optional execution engine and this upgrade
+
+Keep the standard base installation and username/password login. Gemini account support is optional, node-local and unavailable until its own OAuth login succeeds; no extra CLI is downloaded during ordinary setup or status polling. Gemini title generation also requires explicit empty-by-default model/effort settings. See [engine configuration](MULTI_ENGINE.md) and [upgrade/migration notes](UPGRADE_20261025.md).

@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import { withAccountSession, type AccountSessionOptions, type AccountRpc } from "./codex-account-session.js";
 import { normalizeResetCredits, unavailableResetCredits, type CodexResetCredits } from "./codex-reset-credits.js";
 
-export type ResetOutcome = "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit";
+export type ResetOutcome = "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit" | "notDue";
 export type ResetConsumption = {
   attemptId: string; outcome: ResetOutcome; resetCredits: CodexResetCredits;
   quota: { remainingPercent: number; resetAt: string | null } | null;
@@ -12,7 +12,15 @@ export type ResetConsumption = {
 };
 const outcomes = ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"];
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-type Receipt = { attemptId: string; accountId: string; creditId: string | null; outcome?: ResetOutcome };
+type Receipt = { attemptId: string; accountId: string; creditId: string | null; outcome?: ResetOutcome;
+  source?: "manual" | "auto_expiry"; createdAt?: string; completedAt?: string; autoExpiresAt?: string };
+
+export function autoResetAttemptId(accountId: string, expiresAt: string): string {
+  // The upstream account and expiration, not a machine-local UUID: duplicate saved
+  // accounts on different machines share one operation for this expiration.
+  const hex = crypto.createHash("sha256").update(JSON.stringify(["pp-agent-auto-reset-v1", accountId, expiresAt])).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 const inFlight = new Map<string, { attemptId: string; promise: Promise<ResetConsumption> }>();
 
 /** Require all available rows: an omitted credit could expire before every known row. */
@@ -34,19 +42,23 @@ function writeReceipt(file: string, value: Receipt) {
   fs.renameSync(temporary, file);
 }
 
-export function consumeAccountResetCredit(options: AccountSessionOptions & { journalRoot: string; attemptId: string }): Promise<ResetConsumption> {
+export function consumeAccountResetCredit(options: AccountSessionOptions & { journalRoot: string; attemptId: string; autoExpiresAt?: string }): Promise<ResetConsumption> {
   if (!uuid.test(options.attemptId)) return Promise.reject(new Error("重置请求标识无效。"));
+  if (options.autoExpiresAt !== undefined) {
+    if (!Number.isFinite(Date.parse(options.autoExpiresAt)) || new Date(options.autoExpiresAt).toISOString() !== options.autoExpiresAt) return Promise.reject(new Error("自动重置到期时间无效。"));
+    options = { ...options, attemptId: autoResetAttemptId(options.expectedAccountId, options.autoExpiresAt) };
+  }
   const key = path.resolve(options.journalRoot);
   const pending = inFlight.get(key);
   if (pending) return pending.attemptId === options.attemptId ? pending.promise : Promise.reject(new Error("此账号正在使用重置卡，请等待当前操作完成。"));
-  const promise = withAccountSession(options, (rpc) => redeemEarliestReset(rpc, options.journalRoot, options.expectedAccountId, options.attemptId))
+  const promise = withAccountSession(options, (rpc) => redeemEarliestReset(rpc, options.journalRoot, options.expectedAccountId, options.attemptId, options.autoExpiresAt))
     .finally(() => inFlight.delete(key));
   inFlight.set(key, { attemptId: options.attemptId, promise });
   return promise;
 }
 
 /** Durable pinning means a lost response never causes a retry to select a second card. */
-export async function redeemEarliestReset(rpc: AccountRpc, root: string, accountId: string, attemptId: string): Promise<ResetConsumption> {
+export async function redeemEarliestReset(rpc: AccountRpc, root: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
   if (!uuid.test(attemptId)) throw new Error("重置请求标识无效。");
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const activeFile = path.join(root, "pending.json");
@@ -57,12 +69,37 @@ export async function redeemEarliestReset(rpc: AccountRpc, root: string, account
   if (!receipt) receipt = read(activeFile);
   if (receipt && uuid.test(receipt.attemptId)) receipt = read(receiptFile(receipt.attemptId)) ?? receipt;
   if (receipt && (receipt.accountId !== accountId || !uuid.test(receipt.attemptId))) throw new Error("重置操作身份不匹配，请核对账号。");
+  if (autoExpiresAt !== undefined && receipt?.outcome && receipt.attemptId !== attemptId) {
+    // A crash after saving a result can leave the pending pointer behind.
+    if (read(activeFile)?.attemptId === receipt.attemptId) fs.rmSync(activeFile, { force: true });
+    receipt = null;
+  }
+  if (autoExpiresAt !== undefined && receipt && (receipt.source !== "auto_expiry" || receipt.autoExpiresAt !== autoExpiresAt)) {
+    throw new Error("此账号有另一笔未确认的重置操作，自动使用已暂停。");
+  }
   if (receipt && receipt.attemptId !== attemptId) writeReceipt(receiptFile(attemptId), receipt);
   const limits = await rpc("account/rateLimits/read", {});
   if (limits.accountId !== accountId) throw new Error("未能核实账号身份，未使用新的重置卡。");
   if (!receipt) {
+    if (autoExpiresAt !== undefined) {
+      const summary = normalizeResetCredits(limits);
+      if (Date.parse(autoExpiresAt) <= Date.now() || (summary.state === "ok" && summary.expiryStatus === "complete" && summary.earliestExpiresAt !== autoExpiresAt)) {
+        // Another machine/manual action may already have used it. No uncertain
+        // local receipt exists, so there is nothing to retry for this expiry.
+        return { attemptId, outcome: "notDue", resetCredits: summary, quota: null, refreshed: false };
+      }
+    }
     const creditId = earliestResetCredit(limits);
-    receipt = { accountId, attemptId, creditId, ...(creditId ? {} : { outcome: "noCredit" as const }) };
+    if (autoExpiresAt !== undefined) {
+      const summary = normalizeResetCredits(limits);
+      const remaining = Date.parse(autoExpiresAt) - Date.now();
+      if (!creditId || summary.earliestExpiresAt !== autoExpiresAt || remaining <= 0 || remaining > 3_600_000) {
+        throw new Error("最早到期卡尚未进入最后一小时或已变化，未自动使用。");
+      }
+    }
+    receipt = { accountId, attemptId, creditId, source: autoExpiresAt ? "auto_expiry" : "manual",
+      createdAt: new Date().toISOString(), ...(autoExpiresAt ? { autoExpiresAt } : {}),
+      ...(creditId ? {} : { outcome: "noCredit" as const, completedAt: new Date().toISOString() }) };
     // Save the pending pointer first: any crash before sending still pins the same credit/key.
     writeReceipt(activeFile, receipt);
     writeReceipt(receiptFile(receipt.attemptId), receipt);
@@ -72,6 +109,7 @@ export async function redeemEarliestReset(rpc: AccountRpc, root: string, account
     const response = await rpc("account/rateLimitResetCredit/consume", { idempotencyKey: receipt.attemptId, creditId: receipt.creditId });
     if (!outcomes.includes(String(response.outcome))) throw new Error("重置结果未知，请重试以核对同一次操作。");
     receipt.outcome = response.outcome as ResetOutcome;
+    receipt.completedAt = new Date().toISOString();
     writeReceipt(receiptFile(receipt.attemptId), receipt);
   }
   if (read(activeFile)?.attemptId === receipt.attemptId) fs.rmSync(activeFile, { force: true });

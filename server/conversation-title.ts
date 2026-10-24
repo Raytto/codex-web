@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { applyCodexProxyEnvironment, selectCodexEgress } from "./codex-egress.js";
 
+import type { AgentEngineId } from "../remote-worker/src/agent-engine.js";
+export { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "../remote-worker/src/antigravity-title.js";
+
 export const CONVERSATION_TITLE_CODEX_MODEL = "gpt-5.6-luna";
 export const CONVERSATION_TITLE_REASONING_EFFORT = "low";
 export const CONVERSATION_TITLE_PROMPT_VERSION = "codex-title-v1";
@@ -13,6 +16,7 @@ const REQUEST_LIMIT = 12_000;
 
 export type ConversationTitleAgentRequest = {
   userId: string;
+  engineId?: AgentEngineId;
   prompt: string;
   timeoutMs: number;
 };
@@ -25,15 +29,15 @@ export type ConversationTitleContext = {
   trigger: "first_message" | "remote_import";
 };
 
-export type ConversationTitleGenerationInput = ConversationTitleContext & { userId: string; executorId: string };
+export type ConversationTitleGenerationInput = ConversationTitleContext & { userId: string; executorId: string; engineId?: AgentEngineId };
 
 export class ConversationTitleService {
-  constructor(private readonly execute: (userId: string, executorId: string, prompt: string, timeoutMs: number) => Promise<string>) {}
+  constructor(private readonly execute: (userId: string, executorId: string, prompt: string, timeoutMs: number, engineId?: AgentEngineId) => Promise<string>) {}
 
   async generate(input: ConversationTitleGenerationInput): Promise<string | null> {
     const prompt = buildConversationTitlePrompt(input);
     if (!prompt) return null;
-    const output = await this.execute(input.userId, input.executorId, prompt, CONVERSATION_TITLE_TIMEOUT_MS);
+    const output = await this.execute(input.userId, input.executorId, prompt, CONVERSATION_TITLE_TIMEOUT_MS, input.engineId);
     return parseConversationTitleOutput(output);
   }
 }
@@ -98,6 +102,7 @@ export function codexConversationTitleArguments(schemaPath: string, outputPath: 
 }
 
 export function validateConversationTitleRequest(request: ConversationTitleAgentRequest, expectedUserId?: string): void {
+  if (request?.engineId !== undefined && request.engineId !== "codex" && request.engineId !== "antigravity") throw new Error("Invalid title engine");
   if (!request || typeof request !== "object") throw new Error("Invalid Codex title request");
   if (!/^[0-9a-f-]{36}$/i.test(request.userId) || (expectedUserId && request.userId !== expectedUserId)) throw new Error("Codex title user mismatch");
   if (typeof request.prompt !== "string" || request.prompt.length < 1 || Buffer.byteLength(request.prompt, "utf8") > 100_000) throw new Error("Codex title prompt is invalid");

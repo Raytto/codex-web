@@ -27,6 +27,22 @@ mkdir -p "$package_root/scripts" "$output_root"
 cp -a "$worker_root/dist" "$package_root/dist"
 cp -a "$worker_root/node_modules" "$package_root/node_modules"
 cp -a "$worker_root/package.json" "$worker_root/package-lock.json" "$package_root/"
+
+# Linux may omit node-pty after an optional native build failure. The npm package
+# also carries the official Windows ConPTY prebuilds; retain those without
+# executing Linux install scripts, using the same integrity-locked dependencies.
+if [[ ! -f "$package_root/node_modules/node-pty/prebuilds/win32-x64/conpty.node" ]]; then
+  pty_staging="$staging_root/pty-dependencies"
+  mkdir -p "$pty_staging"
+  cp -a "$worker_root/package.json" "$worker_root/package-lock.json" "$pty_staging/"
+  npm ci --prefix "$pty_staging" --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null
+  rm -rf -- "$package_root/node_modules/node-pty"
+  cp -a "$pty_staging/node_modules/node-pty" "$package_root/node_modules/"
+  if [[ ! -d "$package_root/node_modules/node-addon-api" ]]; then
+    cp -a "$pty_staging/node_modules/node-addon-api" "$package_root/node_modules/"
+  fi
+fi
+node "$worker_root/scripts/verify-login-terminal-package.mjs" "$package_root/node_modules/node-pty"
 cp -a \
   "$worker_root/scripts/start-worker.ps1" \
   "$worker_root/scripts/install-package.ps1" \

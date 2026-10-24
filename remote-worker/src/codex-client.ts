@@ -9,6 +9,7 @@ import { WORKER_VERSION } from "./version.js";
 import { rolloutLifecycle } from "./rollout-lifecycle.js";
 import { buildRemoteOptionalCapabilityConfig, remoteThreadInstructions } from "./agent-context.js";
 import { callWaitDynamicTool, WAIT_DYNAMIC_TOOL_NAME, WAIT_DYNAMIC_TOOL_SPEC, type WaitToolConfig } from "./wait-dynamic-tool.js";
+import { runDirectoryEnvironment, type RunDirectories } from "./run-directories.js";
 
 type JsonObject = Record<string, unknown>;
 type Pending = { resolve(value: unknown): void; reject(error: Error): void };
@@ -58,7 +59,7 @@ export class CodexExecution {
   private rejectCompletion!: (error: Error) => void;
   readonly result: Promise<string>;
 
-  constructor(private readonly options: { cwd: string; threadId: string | null; prompt: string; imagePaths: string[]; model: string; reasoningEffort: string; optionalCapabilities: Record<string, boolean>; automation?: { baseUrl: string; token: string; jobId: string; receiptDirectory: string; dynamicTool: boolean } }, private readonly callbacks: Callbacks) {
+  constructor(private readonly options: { cwd: string; threadId: string | null; prompt: string; imagePaths: string[]; model: string; reasoningEffort: string; optionalCapabilities: Record<string, boolean>; directories?: RunDirectories; automation?: { baseUrl: string; token: string; jobId: string; receiptDirectory: string; dynamicTool: boolean } }, private readonly callbacks: Callbacks) {
     this.result = new Promise<string>((resolve, reject) => { this.resolveCompletion = resolve; this.rejectCompletion = reject; }).finally(() => this.dispose());
     const launch = codexLaunch(["app-server", "--listen", "stdio://"]);
     this.child = spawn(launch.command, launch.args, { cwd: options.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -110,12 +111,13 @@ export class CodexExecution {
       if (this.terminal || this.cancellationRequested) return;
       this.notify("initialized");
       void this.refreshQuotaUsage();
-      const automationEnvironment = waitAutomationEnvironment(this.options.automation);
+      const shellEnvironment = { ...waitAutomationEnvironment(this.options.automation), ...runDirectoryEnvironment(this.options.directories) };
       const common = {
         model: this.options.model,
         cwd: this.options.cwd,
         approvalPolicy: "never",
         sandbox: "danger-full-access",
+        developerInstructions: remoteThreadInstructions(),
         config: {
           model_reasoning_summary: "auto",
           hide_agent_reasoning: false,
@@ -123,7 +125,7 @@ export class CodexExecution {
           web_search: "live",
           tool_output_token_limit: 8_000,
           tools: { view_image: true },
-          shell_environment_policy: { inherit: "core", set: automationEnvironment },
+          shell_environment_policy: { inherit: "core", set: shellEnvironment },
           ...buildRemoteOptionalCapabilityConfig(this.options.optionalCapabilities, this.options.prompt),
         },
       };
@@ -131,7 +133,6 @@ export class CodexExecution {
         ? await this.startupRequest("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true }, "正在恢复远端会话")
         : await this.startupRequest("thread/start", {
             ...common,
-            developerInstructions: remoteThreadInstructions(),
             ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC, NODE_TRANSFER_TOOL_SPEC] } : {}),
           }, "正在创建远端会话");
       if (this.terminal || this.cancellationRequested) return;

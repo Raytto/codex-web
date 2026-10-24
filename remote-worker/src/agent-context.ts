@@ -84,10 +84,16 @@ export function buildRemoteSteerPrompt(
   return { prompt: parts.join("\n\n"), imagePaths: imageInput === "preload" ? attachments.filter(isImage).map((item) => item.path) : [] };
 }
 
+// Kept in sync with server/agent-context.ts; the Worker also builds from a sparse checkout.
+const WEB_DELIVERY_RULES = "HTML 交付展示类型：报告保持 reader；需要运行脚本的交互/演示网页必须是 5 MiB 以内的自包含 HTML，所有脚本、CSS、图片、字体与数据内嵌。将最终 HTML 及同名追加 .pp-agent.json 的声明文件一同写入 CWW_OUTPUTS_DIR（如 demo.html.pp-agent.json），JSON 为 {\"presentation_mode\":\"web\",\"sha256\":\"最终 HTML 的完整 SHA-256\"}。报告可同样声明 reader。HTML 中 pp-agent-view meta 仅为提示，不能代替声明；旧文件/仅标记文件仍按阅读器处理。平台完整回传校验后才登记，默认私有。音视频也必须以内嵌 data URL 提供；a/area 的 href 仅允许 #页内锚点，资料来源的外链放在最终聊天回复中，不放入交互 HTML。MP3 等独立成品直接作为附件交付，不在网页内做下载链接。首版无后端、登录、外部 API、外部资源、实时协作或 localStorage；状态仅在本次页面中。需要导出时，仅在用户点击中调用 window.ppAgent.exportFile(\"结果.json\", JSON.stringify(data))，支持 json/csv/txt、UTF-8 文本 1 MiB 以内，平台确认下载；不支持静默存储。用真实按钮验证交互后交付，不把限制内不可用的功能声称成功。声明文件是协议材料，不作为用户附件链接。";
+
 export function remoteThreadInstructions(): string {
   return [
-    "Use pp_agent_transfer for node-to-node and node-to-server files; Codex Web owns coordination and durable task state. Do not relay through attachments, temporary ZIP files or a self-hosted file server.",
+    "产品术语：本工作站的标准名称是 Codex Web。理解和表述本产品时统一使用 Codex Web；历史简称或语音误识别仅用于理解，不沿用为标准名称。引用原文、代码标识符、文件名及其他领域的缩写保留原样。",
+    "Use codex_web_transfer for node-to-node and node-to-server files; Codex Web owns coordination and durable task state. Do not relay through attachments, temporary ZIP files or a self-hosted file server.",
     "This thread is controlled by its owner through Codex Web. Treat the working directory as the project root.",
+    "附件从 CWW_UPLOADS_DIR 读取；最终交付写入 CWW_OUTPUTS_DIR；过程文件、大日志和中间结果写入 CWW_JOB_RUNTIME。仅本轮 CWW_OUTPUTS_DIR 的普通文件会自动收集，包括通过 shell 创建而没有 fileChange 事件的文件；成品保留在执行电脑供后续取回。用 Markdown 文件链接指向最终文件，声明文件不要作为附件链接。",
+    WEB_DELIVERY_RULES,
     "Keep user-visible replies concise and mention changed or generated files.",
     "Write large logs, tables, and machine-readable tool results to a runtime/artifact file; return only a summary, key lines, and its path to the model context.",
   ].join("\n");

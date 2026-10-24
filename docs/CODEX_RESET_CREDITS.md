@@ -32,3 +32,7 @@ Each logical operation has a UUID idempotency key. The owning machine persists t
 Validation covers selection ordering, incomplete details, wrong identity, zero balance, lost responses, cross-browser recovery, durable receipt replay, concurrent requests, post-redemption refresh failure, real isolated CLI transport with synthetic credentials, host credential rotation, and authenticated HTTP → gateway → actual Worker validator → sanitized reply → database persistence. Tests never spend a real reset credit. True account redemption and iOS visual interaction remain user-triggered acceptance boundaries.
 
 Official consume contract: https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt
+
+## Durable automatic use near expiry
+
+Supported online authenticated nodes may consume a reset credit near its verified expiry. Missing expiry, offline nodes and unsupported Workers are skipped. Durable attempt IDs and history prevent uncontrolled repeats, and node guards reject stale account or expiry state. Logs distinguish attempted, successful and skipped outcomes. This automation is specific to Codex; Gemini usage is separate.

@@ -34,7 +34,7 @@ export function paraVoiceBusy(voice: VoiceInputController) {
   return voice.starting || voice.state !== "idle" || voice.draftRestoring || Boolean(voice.pendingDraft);
 }
 
-export function ParaVoiceField({ label, value, onChange, voice, disabled, placeholder, maxLength, rows = 2, required = false, autoFocus = true }: {
+export function ParaVoiceField({ label, value, onChange, voice, disabled, placeholder, maxLength, rows = 2, required = false, autoFocus = true, backgroundStatus }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
@@ -45,6 +45,7 @@ export function ParaVoiceField({ label, value, onChange, voice, disabled, placeh
   rows?: number;
   required?: boolean;
   autoFocus?: boolean;
+  backgroundStatus?: string;
 }) {
   const id = useId();
   const tooLong = value.length > maxLength;
@@ -64,6 +65,9 @@ export function ParaVoiceField({ label, value, onChange, voice, disabled, placeh
         aria-label={voice.starting ? "正在开启麦克风" : "语音输入"} title="语音输入">
         {voice.starting ? <LoaderCircle size={19} className="spin" /> : <Mic size={20} />}
       </button>}
+      {backgroundStatus && voice.state === "idle" && <div className="voice-panel transcribing" role="status" aria-live="polite">
+        <LoaderCircle className="spin" size={17} /><span>{backgroundStatus}</span>
+      </div>}
       <ConversationVoicePanel voice={voice} />
     </div>
     {tooLong && <p className="para-voice-limit" id={`${id}-limit`} role="alert">文字已保留，请精简到 {maxLength} 字以内再保存。</p>}

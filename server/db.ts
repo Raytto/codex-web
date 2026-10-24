@@ -1,3 +1,4 @@
+import { migrateAutoReset } from "./codex-reset-auto-use.js";
 import { migrateJudgments } from "./judgment-schema.js";
 import { migrateOpportunities } from "./opportunity-schema.js";
 import { migrateRecurring } from "./recurring-store.js";
@@ -845,6 +846,20 @@ export class AppDatabase {
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(user_id,client_recording_id));
         CREATE INDEX opportunity_voice_queue ON opportunity_voice_feedback(state,created_at);
         CREATE INDEX opportunity_voice_idea ON opportunity_voice_feedback(user_id,idea_id,applied_revision);`);
+    });
+    this.applyMigration(2026102302, "codex-auto-reset-uses", () => migrateAutoReset(this.sqlite));
+    this.applyMigration(2026102301, "agent-engine-sessions", () => {
+      // Existing projects may reference the same Codex thread. Preserve those
+      // references while keeping each visible conversation's segments distinct.
+      this.sqlite.exec(`CREATE TABLE agent_engine_sessions (
+        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        engine_id TEXT NOT NULL CHECK(engine_id IN ('codex','antigravity')), executor_id TEXT NOT NULL,
+        account_id TEXT NOT NULL, native_id TEXT, created_at TEXT NOT NULL);
+        CREATE INDEX agent_engine_sessions_conversation ON agent_engine_sessions(conversation_id,created_at);
+        CREATE UNIQUE INDEX agent_engine_native ON agent_engine_sessions(conversation_id,engine_id,executor_id,account_id,native_id) WHERE native_id IS NOT NULL;
+        CREATE TABLE agent_job_sessions (
+          job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL REFERENCES agent_engine_sessions(id) ON DELETE CASCADE);`);
     });
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
@@ -2968,8 +2983,9 @@ export class AppDatabase {
   }
 
   getConversationByCodexThread(projectId: string, threadId: string): ConversationRow | undefined {
-    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE project_id=? AND codex_thread_id=? AND deleted_at IS NULL LIMIT 1`)
-      .get(projectId, threadId) as ConversationRow | undefined;
+    return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE project_id=? AND (codex_thread_id=? OR EXISTS (
+        SELECT 1 FROM agent_engine_sessions s WHERE s.conversation_id=conversations.id AND s.engine_id='codex' AND s.native_id=?)) AND deleted_at IS NULL LIMIT 1`)
+      .get(projectId, threadId, threadId) as ConversationRow | undefined;
   }
 
   claimCodexThreadForConversation(id: string, threadId: string): { conversation: ConversationRow; mergedConversationIds: string[] } | undefined {
@@ -3040,6 +3056,10 @@ export class AppDatabase {
     const remoteUpdatedAt = thread.updatedAt > 0 ? new Date(thread.updatedAt * 1000).toISOString() : remoteCreatedAt;
     const title = thread.name.trim().slice(0, 200) || "本机任务";
     let conversation = this.getConversationByCodexThread(projectId, thread.id);
+    // Retired native segments belong to the same visible conversation, but an
+    // observer replay must not overwrite its current title/status/transcript.
+    const lastEngine = conversation ? this.sqlite.prepare("SELECT engine_id,native_id FROM agent_engine_sessions WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1").get(conversation.id) as { engine_id: string; native_id: string | null } | undefined : undefined;
+    if (conversation && lastEngine && (lastEngine.engine_id !== "codex" || lastEngine.native_id !== thread.id)) return { conversation, created: false, changed: false, importedMessages: 0, importedActivities: 0 };
     const created = !conversation;
     const previousRemoteUpdatedAt = conversation?.remote_updated_at ?? 0;
     const previousTitle = conversation?.title;
@@ -3385,7 +3405,9 @@ export class AppDatabase {
     if (!usage.threadId || inputTokens === null) return false;
     const result = this.sqlite.prepare(`
       UPDATE conversations SET context_input_tokens=?,context_window_tokens=?,context_usage_updated_at=?
-      WHERE id=? AND codex_thread_id=? AND deleted_at IS NULL
+      WHERE id=? AND (CASE WHEN EXISTS (SELECT 1 FROM agent_engine_sessions WHERE conversation_id=conversations.id)
+        THEN (SELECT native_id FROM agent_engine_sessions WHERE conversation_id=conversations.id ORDER BY rowid DESC LIMIT 1)
+        ELSE codex_thread_id END)=? AND deleted_at IS NULL
     `).run(inputTokens, modelContextWindow, new Date().toISOString(), id, usage.threadId);
     return result.changes > 0;
   }
@@ -3744,7 +3766,7 @@ export class AppDatabase {
   }
 
   isCodexThreadUsedByAnotherActiveConversation(threadId: string, conversationId: string): boolean {
-    const row = this.sqlite.prepare("SELECT 1 AS found FROM conversations WHERE codex_thread_id=? AND id<>? AND deleted_at IS NULL LIMIT 1").get(threadId, conversationId) as { found: number } | undefined;
+    const row = this.sqlite.prepare("SELECT 1 AS found FROM conversations c JOIN projects p ON p.id=c.project_id WHERE (c.codex_thread_id=? OR EXISTS (SELECT 1 FROM agent_engine_sessions s WHERE s.conversation_id=c.id AND s.engine_id='codex' AND s.executor_id=p.executor_id AND s.native_id=?)) AND c.id<>? AND c.deleted_at IS NULL AND (c.user_id,p.executor_id) IN (SELECT own.user_id,project.executor_id FROM conversations own JOIN projects project ON project.id=own.project_id WHERE own.id=?)").get(threadId, threadId, conversationId, conversationId) as { found: number } | undefined;
     return Boolean(row);
   }
 

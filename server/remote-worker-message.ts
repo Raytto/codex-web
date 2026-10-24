@@ -10,6 +10,16 @@ const id = text(200, 1);
 const uuid = z.string().uuid();
 const iso = text(80, 1);
 const finite = z.number().finite();
+const usageDate = text(80, 1).refine(value => /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value)));
+const usageAmount = finite.min(0).max(Number.MAX_SAFE_INTEGER).nullable();
+const antigravityUsage = z.object({
+  accountId: uuid.nullable(), state: z.enum(["ok", "partial", "error", "unavailable"]), checkedAt: usageDate,
+  quotaUpdatedAt: usageDate.nullable(), creditsUpdatedAt: usageDate.nullable(), remainingCredits: usageAmount, error: text(2_000).nullable(),
+  groups: z.array(z.object({ label: text(200, 1), buckets: z.array(z.object({
+    id: text(200, 1), label: text(200, 1), window: text(80).nullable(), remainingPercent: finite.min(0).max(100).nullable(),
+    remainingAmount: usageAmount, resetAt: usageDate.nullable(), disabled: z.boolean(),
+  }).strict()).max(30) }).strict()).max(30),
+}).strict();
 
 const transcriptItem = z.object({
   turnId: id,
@@ -61,6 +71,9 @@ const runtimeStatus = {
       label: text(200, 1),
       description: text(2_000),
       reasoningEfforts: z.array(text(32, 1)).max(20),
+      engineId: z.enum(["codex", "antigravity"]).optional(), providerLabel: text(100, 1).optional(),
+      reasoningEffortOptions: z.array(z.object({ id: text(32, 1), label: text(100, 1) }).strict()).max(20).optional(),
+      defaultReasoningEffort: text(32, 1).optional(), rawModelByEffort: z.record(text(32, 1), text(200, 1)).optional(),
     }).strict()).max(100),
     reasoningEfforts: z.array(z.object({ id: text(32, 1), label: text(100, 1) }).strict()).max(20),
     defaults: z.object({ model: text(100, 1), reasoningEffort: text(32, 1) }).strict(),
@@ -103,6 +116,11 @@ const artifact = z.object({
 }).strict();
 
 const remoteWorkerMessage = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("gemini_accounts_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional(), catalog: runtimeStatus.agentOptions.optional(),
+    usage: antigravityUsage.optional(),
+    state: z.object({ accounts: z.array(z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), createdAt: iso, lastUsedAt: iso.nullable(), active: z.boolean(), authenticated: z.boolean() }).strict()).max(20), activeAccountId: uuid.nullable(), runtimeAvailable: z.boolean(), loginAvailable: z.boolean().optional(), error: text(2_000, 1).optional() }).strict().optional(),
+    login: z.object({ id: uuid, label: text(60, 1), status: z.enum(["starting", "waiting", "completed", "failed", "cancelled"]), verificationUrl: text(8_000, 8).nullable(), requiresCode: z.boolean(), message: text(2_000, 1).nullable(), accountId: uuid.nullable(), createdAt: iso, expiresAt: iso }).strict().optional(),
+  }).strict(),
   z.object({ type: z.literal("credential_saved"), credentialId: uuid }).strict(),
   z.object({
     type: z.literal("hello"),
@@ -124,7 +142,10 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
       agentTurnContext: z.boolean().optional(),
       accountSkills: z.boolean().optional(),
       titleAgent: z.boolean().optional(),
+      geminiTitleAgent: z.boolean().optional(),
       codexAccounts: z.boolean().optional(),
+      geminiAccounts: z.boolean().optional(),
+      geminiUsage: z.boolean().optional(),
       threadRolloutSize: z.boolean().optional(),
       threadLifecycle: z.boolean().optional(),
     }).strict().optional(),
@@ -148,7 +169,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("artifact_uploaded"), jobId: uuid, artifact }).strict(),
   z.object({ type: z.literal("thread_rollout_size_result"), requestId: uuid, bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable() }).strict(),
   z.object({ type: z.literal("thread_rename_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional() }).strict(),
-  z.object({ type: z.literal("file_fetch_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional() }).strict(),
+  z.object({ type: z.literal("file_fetch_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional(), errorCode: z.literal("NOT_FOUND").optional() }).strict(),
   z.object({ type: z.literal("title_agent_result"), requestId: uuid, ok: z.boolean(), output: text(1_000, 1).optional(), message: text(2_000, 1).optional() }).strict(),
   z.object({ type: z.literal("runtime_status"), requestId: uuid.optional(), ...runtimeStatus }).strict(),
   z.object({ type: z.literal("codex_upgrade_result"), requestId: uuid, ok: z.boolean(), message: text(2_000, 1).optional(), runtime: z.object(runtimeStatus).strict().optional() }).strict(),

@@ -1,10 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown } from "lucide-react";
 
-export type SettingMenuOption = { id: string; label: string; description?: string; indicator?: ReactNode };
+export type SettingMenuOption = { id: string; label: string; description?: string; group?: string; indicator?: ReactNode };
 
-export function SettingMenu({ menuId: menuIdProp, className, panelClassName = "", label, ariaLabel, floating = false, value, options, placeholder, title, disabled, open, onOpenIntent, onOpenIntentCancel, onOpenChange, onChange }: {
+export function SettingMenu({ menuId: menuIdProp, className, panelClassName = "", label, ariaLabel, floating = false, value, options, placeholder, unavailableValueLabel, title, disabled, open, onOpenIntent, onOpenIntentCancel, onOpenChange, onChange }: {
   menuId?: string;
   className: string;
   panelClassName?: string;
@@ -14,6 +14,7 @@ export function SettingMenu({ menuId: menuIdProp, className, panelClassName = ""
   value: string;
   options: SettingMenuOption[];
   placeholder: string;
+  unavailableValueLabel?: string;
   title: string;
   disabled: boolean;
   open: boolean;
@@ -108,13 +109,15 @@ export function SettingMenu({ menuId: menuIdProp, className, panelClassName = ""
 
   const panel = open && <div ref={panelRef} id={menuId} className={`setting-menu-panel${floating ? " floating-setting-menu" : ""} ${panelClassName}`} role="listbox" aria-label={ariaLabel ?? label}
     style={floating ? position : undefined} onKeyDown={keyDown}>
-    {options.map((option, index) => <button key={option.id} type="button" role="option" aria-selected={option.id === value} className={`${option.id === value ? "selected" : ""} ${index === activeIndex ? "active" : ""}`} onMouseEnter={() => setActiveIndex(index)} onClick={() => choose(option)}>
+    {options.map((option, index) => <Fragment key={option.id}>
+      {option.group && option.group !== options[index - 1]?.group && <div className="setting-menu-group" role="presentation">{option.group}</div>}
+      <button type="button" role="option" aria-selected={option.id === value} className={`${option.id === value ? "selected" : ""} ${index === activeIndex ? "active" : ""}`} onMouseEnter={() => setActiveIndex(index)} onClick={() => choose(option)}>
       <span><strong className={option.indicator ? "setting-option-marked" : undefined}>{option.indicator}{option.label}</strong>{option.description && <small>{option.description}</small>}</span>{option.id === value && <Check size={14} />}
-    </button>)}
+    </button></Fragment>)}
   </div>;
   return <div ref={rootRef} className={`setting-menu ${className}`}>
     <button ref={triggerRef} type="button" className="setting-select" aria-label={ariaLabel ?? label} aria-haspopup="listbox" aria-expanded={open} aria-controls={menuId} disabled={disabled} title={title} onPointerDown={onOpenIntent} onPointerCancel={onOpenIntentCancel} onClick={() => { onOpenIntentCancel(); onOpenChange(!open); }} onKeyDown={keyDown}>
-      {label && <span>{label}</span>}<strong className="setting-value">{selected?.indicator}{(selected?.label ?? value) || placeholder}</strong><ChevronDown size={13} />
+      {label && <span>{label}</span>}<strong className="setting-value">{selected?.indicator}{(selected?.label ?? (value ? unavailableValueLabel ?? value : "")) || placeholder}</strong><ChevronDown size={13} />
     </button>
     {floating ? createPortal(panel, document.body) : panel}
   </div>;

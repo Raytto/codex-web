@@ -1,3 +1,4 @@
+import type { GeminiAccountRequest, GeminiAccountResult } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import type { AgentSelection, ExecutorRuntimeStatus } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
@@ -14,6 +15,8 @@ export type HostRootRunRequest = {
   conversationId: string;
   projectRoot: string;
   codexThreadId: string | null;
+  agentSessionId?: string | null;
+  agentAccountId?: string;
   effectivePrompt: string;
   imageRelativePaths: string[];
   outputSchema?: Record<string, unknown>;
@@ -38,6 +41,7 @@ export type HostProjectFsResult = {
 };
 
 export type HostRootClientMessage =
+  | ({ type: "gemini_accounts"; requestId: string; userId: string } & GeminiAccountRequest)
   | { type: "project_skills"; requestId: string; userId: string; projectId: string; action: import("./project-skills.js").ProjectSkillAction; name?: string; content?: string; enabled?: boolean }
   | { type: "node_transfer"; requestId: string; userId: string; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
   | { type: "run"; request: HostRootRunRequest }
@@ -52,7 +56,7 @@ export type HostRootClientMessage =
   | { type: "voice_review"; requestId: string; request: CodexVoiceReviewRequest }
   | { type: "title_agent"; requestId: string; request: ConversationTitleAgentRequest }
   | { type: "codex_upgrade"; requestId: string; userId: string; version: string }
-  | { type: "codex_account_reset"; requestId: string; userId: string; accountId: string; attemptId: string }
+  | { type: "codex_account_reset"; requestId: string; userId: string; accountId: string; attemptId: string; autoExpiresAt?: string }
   | { type: "codex_accounts_list"; requestId: string; userId: string; refreshUsage?: boolean }
   | { type: "codex_account_login_start"; requestId: string; userId: string; label: string }
   | { type: "codex_account_login_status"; requestId: string; userId: string; loginId: string }
@@ -61,6 +65,7 @@ export type HostRootClientMessage =
   | { type: "codex_account_delete"; requestId: string; userId: string; accountId: string };
 
 export type HostRootServerMessage =
+  | ({ type: "gemini_accounts_result"; requestId: string } & GeminiAccountResult)
   | { type: "project_skills_result"; requestId: string; result: import("./project-skills.js").ProjectSkillResult }
   | { type: "node_transfer_started"; requestId: string }
   | { type: "event"; jobId: string; event: TenantWorkerEvent }
@@ -84,6 +89,7 @@ export type HostRootExecutionRequest = HostRootRunRequest & {
   knowledgeRoot: string;
   codexHome: string;
   threadInstructions: string;
+  antigravityRuntime?: import("../remote-worker/src/gemini-accounts.js").GeminiRuntime;
   imagePaths: string[];
 };
 

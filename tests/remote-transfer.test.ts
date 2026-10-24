@@ -56,7 +56,7 @@ test("standalone Worker and server use the same transfer contract", async () => 
 });
 
 test("remote transfer streams a file beyond the former 100 MiB cap with an exact hash", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-remote-large-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-remote-large-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const chunk = Buffer.alloc(1024 * 1024, 0x61);
   const expected = crypto.createHash("sha256");

@@ -1,12 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ModelReasoningEffort } from "@openai/codex-sdk";
+import { engineForModel } from "../remote-worker/src/agent-engine.js";
+export type ModelReasoningEffort = string;
 import type { AppConfig } from "./config.js";
 
 export type AgentModelOption = {
   id: string;
   label: string;
   description: string;
+  engineId?: "codex" | "antigravity";
+  providerLabel?: string;
+  reasoningEffortOptions?: Array<{ id: string; label: string }>;
+  defaultReasoningEffort?: string;
+  rawModelByEffort?: Record<string, string>;
   reasoningEfforts: ModelReasoningEffort[];
 };
 
@@ -219,7 +225,7 @@ export function resolveAgentSelection(options: AgentOptions, rawModel: unknown, 
   if (!model) throw new Error("所选模型当前不可用，请刷新页面后重试。");
 
   const requestedEffort = typeof rawEffort === "string" ? rawEffort.trim() : "";
-  const effort = (requestedEffort || options.defaults.reasoningEffort) as ModelReasoningEffort;
+  const effort = (requestedEffort || model.defaultReasoningEffort || options.defaults.reasoningEffort) as ModelReasoningEffort;
   if (!model.reasoningEfforts.includes(effort)) {
     throw new Error("所选思考深度不受该模型支持，请重新选择。");
   }
@@ -229,12 +235,45 @@ export function resolveAgentSelection(options: AgentOptions, rawModel: unknown, 
 export function repairAgentSelection(options: AgentOptions, rawModel: unknown, rawEffort: unknown): AgentSelection {
   const modelId = typeof rawModel === "string" ? rawModel.trim() : "";
   const model = options.models.find((candidate) => candidate.id === modelId);
+  // Never silently route a saved Gemini request to Codex after logout/offline.
+  if (!model && engineForModel(modelId) === "antigravity") {
+    return { model: modelId, reasoningEffort: typeof rawEffort === "string" ? rawEffort : "" };
+  }
   if (!model) return { ...options.defaults };
   const effort = typeof rawEffort === "string" ? rawEffort.trim() as ModelReasoningEffort : undefined;
+  if (engineForModel(model.id) === "antigravity" && effort) return { model: model.id, reasoningEffort: effort };
   return {
     model: model.id,
     reasoningEffort: effort && model.reasoningEfforts.includes(effort)
       ? effort
-      : model.reasoningEfforts.at(-1)!,
+      : model.defaultReasoningEffort && model.reasoningEfforts.includes(model.defaultReasoningEffort)
+        ? model.defaultReasoningEffort : model.reasoningEfforts.at(-1)!,
   };
+}
+
+/** Resolve a preference for a new request on this node, without changing the saved preference. */
+export function availableAgentSelection(options: AgentOptions, rawModel: unknown, rawEffort: unknown): AgentSelection {
+  const modelId = typeof rawModel === "string" ? rawModel.trim() : "";
+  const model = options.models.find((candidate) => candidate.id === modelId);
+  if (!model) return { ...options.defaults };
+  const effort = typeof rawEffort === "string" ? rawEffort.trim() : "";
+  return {
+    model: model.id,
+    reasoningEffort: model.reasoningEfforts.includes(effort)
+      ? effort
+      : model.defaultReasoningEffort && model.reasoningEfforts.includes(model.defaultReasoningEffort)
+        ? model.defaultReasoningEffort : model.reasoningEfforts.at(-1)!,
+  };
+}
+
+/** Gemini is supplied only by an authenticated execution node, never fallback data. */
+export function mergeEngineOptions(codex: AgentOptions, gemini: AgentOptions | null | undefined): AgentOptions {
+  const codexModels = codex.models.filter(model => engineForModel(model.id) === "codex");
+  const extra = (gemini?.models ?? []).filter(model => engineForModel(model.id) === "antigravity" && model.reasoningEfforts.length > 0);
+  const models = [...codexModels, ...extra];
+  const ids = new Set<string>();
+  const reasoning = [...codex.reasoningEfforts, ...(gemini?.reasoningEfforts ?? [])].filter(option => {
+    if (ids.has(option.id)) return false; ids.add(option.id); return true;
+  });
+  return { models, reasoningEfforts: reasoning, defaults: codex.defaults };
 }

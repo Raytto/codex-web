@@ -1,3 +1,4 @@
+import { modelMenuOptions, modelReasoningOptions } from "../agent-model-options";
 import { useRef, useState } from "react";
 import { ArrowUp, CornerUpLeft, File as FileIcon, FileText, LoaderCircle, Paperclip, Square, X } from "lucide-react";
 import type { AgentOptions, ReasoningEffort } from "../api";
@@ -81,7 +82,7 @@ export function ConversationComposer({ conversationId, value, quote, reference, 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [openMenu, setOpenMenu] = useState<"model" | "effort" | null>(null);
   const selectedModel = agentOptions?.models.find((candidate) => candidate.id === model);
-  const effortOptions = agentOptions?.reasoningEfforts.filter((effort) => selectedModel?.reasoningEfforts.includes(effort.id)) ?? [];
+  const effortOptions = modelReasoningOptions(agentOptions, model);
   const addFiles = (newFiles: File[]) => onFilesChange([...files, ...newFiles].slice(-maxFiles));
   const composerReference = reference ?? (quote?.trim() ? { excerpt: quote } : undefined);
   return <div className={`conversation-composer composer ${collapsed ? "compact" : "expanded"} ${className ?? ""}`}>
@@ -92,7 +93,7 @@ export function ConversationComposer({ conversationId, value, quote, reference, 
       <div className={`composer-primary-actions ${controlsClassName?.includes("reader-ask") ? "reader-ask-controls" : ""}`}>
         <button type="button" className={`attach-button ${attachmentClassName ?? ""}`} onClick={() => fileInputRef.current?.click()} disabled={disabled || submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button>
         <input ref={fileInputRef} type="file" multiple hidden onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.currentTarget.value = ""; }} />
-        <SettingMenu className="model" label="模型" value={model} options={agentOptions?.models.map((option) => ({ id: option.id, label: option.label, description: option.description })) ?? []} placeholder="加载中" title={selectedModel?.description || "选择任务使用的模型"} disabled={Boolean(!agentOptions || disabled || submitting)} open={openMenu === "model"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenMenu(open ? "model" : openMenu === "model" ? null : openMenu)} onChange={onModelChange} />
+        <SettingMenu className="model" label="模型" value={model} options={modelMenuOptions(agentOptions)} placeholder="加载中" unavailableValueLabel={agentOptions ? `${model}（当前不可用）` : undefined} title={selectedModel?.description || "选择任务使用的模型"} disabled={Boolean(!agentOptions || disabled || submitting)} open={openMenu === "model"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenMenu(open ? "model" : openMenu === "model" ? null : openMenu)} onChange={onModelChange} />
         <SettingMenu className="effort" label="思考" value={reasoningEffort} options={effortOptions} placeholder="加载中" title="选择模型的思考深度" disabled={Boolean(!selectedModel || disabled || submitting)} open={openMenu === "effort"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenMenu(open ? "effort" : openMenu === "effort" ? null : openMenu)} onChange={onReasoningChange} />
       </div>
       <ConversationVoiceInput conversationId={conversationId} draftText={value} attachmentNames={attachmentNames ?? files.map((file) => file.name)} disabled={disabled || submitting} className={voiceClassName} panelClassName={voicePanelClassName} controlClassName={voiceControlClassName} micClassName={voiceMicClassName} onStateChange={onVoiceStateChange} onTranscript={onTranscript} onSendAfterTranscription={onSendAfterTranscription} />

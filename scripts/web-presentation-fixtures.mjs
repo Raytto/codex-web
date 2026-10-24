@@ -21,6 +21,8 @@ export function webFixtures(dataRoot, work) {
         [name + '.pp-agent.json', 'application/json', JSON.stringify({presentation_mode:'web',sha256:crypto.createHash('sha256').update(WEB_FIXTURE).digest('hex')})],
         ['报告阅读验收.html', 'text/html', '<!doctype html><meta charset="utf-8"><h1>报告标题</h1><h2>第一节</h2><p>报告正文仍然可选区与标注。</p><script type="application/json">{"safe":true}</script><details><summary>展开报告</summary>原生交互</details>'],
         ['Markdown阅读验收.md','text/markdown','\uFEFF# Markdown 标题\n\n## 第一节\n\n正文可读。'],
+        ['未声明交互网页验收.html', 'application/octet-stream', WEB_FIXTURE],
+        ['外部资源拒绝验收.html', 'text/html', '<!doctype html><meta charset="utf-8"><h1>需要外部资源</h1><script src="https://example.invalid/demo.js"></script>'],
       ];
       const sources = documents.map(([name,mime,body])=>{
         const id=crypto.randomUUID(), source=path.join(work,id);fs.writeFileSync(source,body);

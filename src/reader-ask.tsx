@@ -1,3 +1,4 @@
+import { reasoningForModel } from "./agent-model-options";
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft, Bot, Clock, Highlighter, LoaderCircle, Minus, StickyNote, X, Zap } from "lucide-react";
@@ -845,7 +846,7 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
       onChange={(value) => { setComposerCollapsed(false); setInput(value); }}
       onQuoteRemove={() => setQuote("")}
       onFilesChange={setFiles}
-      onModelChange={(model) => { const nextModel = agentOptions?.models.find((candidate) => candidate.id === model); if (nextModel) setSelection({ model: nextModel.id, reasoningEffort: nextModel.reasoningEfforts[0] ?? "low" }); }}
+      onModelChange={(model) => { if (agentOptions) setSelection({ model, reasoningEffort: reasoningForModel(agentOptions, model, selection?.model ?? "", selection?.reasoningEffort ?? "") }); }}
       onReasoningChange={(effort) => setSelection((current) => current ? { ...current, reasoningEffort: effort } : current)}
       onSend={() => void send()}
       onStop={() => void stop()}

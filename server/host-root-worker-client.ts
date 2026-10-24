@@ -1,3 +1,4 @@
+import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
 import net, { type Socket } from "node:net";
@@ -162,10 +163,10 @@ export class HostRootWorkerClient {
     );
   }
 
-  generateConversationTitle(userId: string, prompt: string, timeoutMs: number): Promise<string> {
+  generateConversationTitle(userId: string, prompt: string, timeoutMs: number, engineId: import("../remote-worker/src/agent-engine.js").AgentEngineId = "codex"): Promise<string> {
     const requestId = crypto.randomUUID();
     return this.singleRequest<string>(
-      { type: "title_agent", requestId, request: { userId, prompt, timeoutMs } },
+      { type: "title_agent", requestId, request: { userId, prompt, timeoutMs, engineId } },
       (message) => message.type === "title_agent_result" && message.requestId === requestId ? message.output : undefined,
       undefined,
       timeoutMs + 15_000,
@@ -201,11 +202,18 @@ export class HostRootWorkerClient {
     );
   }
 
-  consumeResetCredit(userId: string, accountId: string, attemptId: string): Promise<ResetConsumption> {
+  consumeResetCredit(userId: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
     const requestId = crypto.randomUUID();
-    return this.singleRequest({ type: "codex_account_reset", requestId, userId, accountId, attemptId },
+    return this.singleRequest({ type: "codex_account_reset", requestId, userId, accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}) },
       (message) => message.type === "codex_account_reset_result" && message.requestId === requestId ? message.result : undefined,
       undefined, 90_000);
+  }
+
+  geminiAccounts(userId: string, request: GeminiAccountRequest): Promise<GeminiAccountResult> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({ type: "gemini_accounts", requestId, userId, ...request },
+      (message) => message.type === "gemini_accounts_result" && message.requestId === requestId
+        ? { state: message.state, login: message.login, catalog: message.catalog, usage: message.usage } : undefined, undefined, 30_000);
   }
 
   listCodexAccounts(userId: string, refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {

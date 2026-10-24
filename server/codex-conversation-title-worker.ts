@@ -1,3 +1,4 @@
+import { runAntigravityConversationTitle, type AntigravityTitleRuntime } from "../remote-worker/src/antigravity-title.js";
 import readline from "node:readline";
 import { runCodexConversationTitle, validateConversationTitleRequest, type ConversationTitleAgentRequest, type ConversationTitleWorkerEvent } from "./conversation-title.js";
 
@@ -10,12 +11,15 @@ input.on("line", (line) => {
   started = true;
   void (async () => {
     try {
-      const request = JSON.parse(line) as ConversationTitleAgentRequest;
+      const request = JSON.parse(line) as ConversationTitleAgentRequest & { antigravity?: AntigravityTitleRuntime };
       validateConversationTitleRequest(request, process.env.CWW_TENANT_USER_ID || undefined);
       const expectedUid = Number(process.env.CWW_TENANT_UID ?? "NaN");
       const expectedGid = Number(process.env.CWW_TENANT_GID ?? "NaN");
       if (process.platform !== "win32" && (process.getuid?.() !== expectedUid || process.getgid?.() !== expectedGid)) throw new Error("Codex title worker Unix identity mismatch");
-      send({ type: "completed", output: await runCodexConversationTitle(request, { signal: controller.signal, onAuthReady: () => send({ type: "auth_ready" }) }) });
+      const output = request.engineId === "antigravity"
+        ? await runAntigravityConversationTitle(request.prompt, request.timeoutMs, request.antigravity!, controller.signal)
+        : await runCodexConversationTitle(request, { signal: controller.signal, onAuthReady: () => send({ type: "auth_ready" }) });
+      send({ type: "completed", output });
     } catch (error) {
       send({ type: "failed", message: error instanceof Error ? error.message : "Codex title request failed" });
       process.exitCode = 1;

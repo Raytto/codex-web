@@ -1,0 +1,74 @@
+// Actual App UI against an isolated API; synthetic catalogs/usage and no model jobs.
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createServer } from 'vite';
+import react from '@vitejs/plugin-react';
+import bcrypt from 'bcryptjs';
+import { createApp } from '../../dist-server/server/app.js';
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const output = process.env.CWW_BROWSER_TEST_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), 'multi-engine-metrics-'));
+fs.mkdirSync(output, { recursive: true, mode: 0o700 });
+const fixture = fs.mkdtempSync(path.join(output, 'api-'));
+const shortTemp = '/tmp/gemini-metrics-' + crypto.randomUUID(); fs.symlinkSync(fixture, shortTemp, 'dir');
+const cache = process.env.PLAYWRIGHT_BROWSERS_PATH || '/root/.cache/ms-playwright'; process.env.PLAYWRIGHT_BROWSERS_PATH = cache;
+const playwrightRoot = process.env.PLAYWRIGHT_MODULE_PATH || fs.readdirSync(cache + '/.links').map(name => fs.readFileSync(cache + '/.links/' + name, 'utf8').trim()).find(root => fs.existsSync(root + '/index.mjs'));
+const { chromium } = await import(playwrightRoot + '/index.mjs');
+const password = crypto.randomUUID();
+const instance = createApp({ projectRoot: repo, dataRoot: path.join(fixture, 'data'), tenantRoot: path.join(fixture, 'tenants'), codexHome: path.join(fixture, 'codex'), hostRootCodexHome: path.join(fixture, 'host-codex'), hostRootSocketPath: path.join(fixture, 'no-host.sock'), username: 'pp', passwordHash: bcrypt.hashSync(password, 4), sessionSecret: crypto.randomBytes(32).toString('hex'), phoneLoginRequired: false, queueAutoStart: false });
+const server = instance.app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+const vite = await createServer({ root: repo, configFile: false, plugins: [react()], server: { host: '127.0.0.1', port: 0, proxy: { '/api': { target: 'http://127.0.0.1:' + server.address().port, changeOrigin: false, configure(proxy) { proxy.on('proxyReq', (outgoing, incoming) => outgoing.setHeader('x-forwarded-host', incoming.headers.host)); } } } } }); await vite.listen();
+const origin = 'http://127.0.0.1:' + vite.httpServer.address().port;
+let browser, page; const report = { checks: [], errors: [] };
+try {
+  browser = await chromium.launch({ headless: true, ignoreDefaultArgs: ['--disable-dev-shm-usage'], args: ['--disable-gpu'], env: { ...process.env, TMPDIR: shortTemp } });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 960 } });
+  const authenticated = await context.request.post(origin + '/api/auth/login', { data: { username: 'pp', password } }); assert.equal(authenticated.status(), 200); const session = await authenticated.json();
+  const api = async (endpoint, method = 'GET', data) => { const response = await context.request.fetch(origin + '/api' + endpoint, { method, headers: { 'X-CSRF-Token': session.csrfToken }, data }); assert.ok(response.ok(), endpoint + ':' + response.status()); return response.json(); };
+  const project = (await api('/projects')).projects[0];
+  const created = await api('/conversations', 'POST', { projectId: project.id, reuseEmpty: false }); const id = created.conversation.id;
+  const baseline = await api('/agent-options'); let selection = created.agentSelection;
+  const geminiModel = { id: 'antigravity:gemini-metrics-fixture', label: 'Gemini Metrics Fixture', engineId: 'antigravity', description: '合成数据', reasoningEfforts: ['default'], reasoningEffortOptions: [{ id: 'default', label: '模型默认' }] };
+  let usage = { inputTokens: 16000, modelContextWindow: 100000, updatedAt: new Date().toISOString(), engineId: 'codex' };
+  page = await context.newPage(); page.setDefaultTimeout(15000); page.on('pageerror', error => report.errors.push(String(error)));
+  let catalogModels = [...baseline.models, geminiModel], holdNextCatalog = false, releaseHeldCatalog, notifyHeldCatalog;
+  const heldCatalogStarted = new Promise(resolve => { notifyHeldCatalog = resolve; });
+  let catalogRevision = 0;
+  await page.route('**/api/agent-options**', async route => {
+    const models = catalogModels, revision = ++catalogRevision;
+    if (holdNextCatalog) { holdNextCatalog = false; await new Promise(resolve => { releaseHeldCatalog = resolve; notifyHeldCatalog(); }); }
+    await route.fulfill({ headers: { 'X-Fixture-Catalog-Revision': String(revision) }, json: { ...baseline, models, selection } });
+  });
+  await page.route('**/api/conversations/' + id + '/agent-selection', async route => { selection = route.request().postDataJSON(); await route.fulfill({ json: { selection } }); });
+  await page.route(url => url.pathname === '/api/conversations/' + id, async route => { if (route.request().method() !== 'GET') return route.continue(); const response = await route.fetch(); const data = await response.json(); await route.fulfill({ response, json: { ...data, agentSelection: selection, contextUsage: usage, packageQuota: { remainingPercent: 83, updatedAt: usage.updatedAt }, rolloutBytes: 2048 } }); });
+  await page.addInitScript(({ accountId, projectId, id }) => { const prefix = 'cww:account:' + encodeURIComponent(accountId) + ':'; localStorage.setItem(prefix + 'selected-project', projectId); localStorage.setItem(prefix + 'selected-conversation', id); }, { accountId: session.accountId, projectId: project.id, id });
+  await page.goto(origin); await page.locator('.composer textarea').waitFor();
+  const menu = page.locator('.conversation-menu-panel');
+  const open = async () => { if (!(await menu.isVisible())) await page.getByLabel('会话操作', { exact: true }).click(); };
+  const close = async () => { if (await menu.isVisible()) await page.getByLabel('会话操作', { exact: true }).click(); };
+  await open(); await menu.getByText('Codex 上下文', { exact: true }).waitFor(); await menu.getByText('83%', { exact: true }).waitFor(); assert.equal(await menu.getByText('Rollout 文件', { exact: true }).count(), 1); report.checks.push('codex_context_quota_rollout_preserved');
+  await close(); await page.locator('.composer textarea').focus(); await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); await page.getByRole('option', { name: /Gemini Metrics Fixture/ }).click(); await open(); await menu.getByText('Antigravity 上下文', { exact: true }).waitFor();
+  assert.equal(await menu.getByText('套餐额度', { exact: true }).count(), 0); assert.equal(await menu.getByText('Rollout 文件', { exact: true }).count(), 0); await menu.getByTitle('最近一次请求使用的输入上下文 / 当前模型上下文窗口', { exact: true }).getByText('暂无数据', { exact: true }).waitFor(); report.checks.push('gemini_selection_hides_codex_quota_rollout_and_stale_codex_usage');
+  usage = { ...usage, inputTokens: 42000, engineId: 'antigravity' }; await page.evaluate(() => window.dispatchEvent(new Event('pp-agent-executor-quota-changed'))); await page.waitForFunction(() => document.querySelector('.conversation-menu-info')?.textContent.includes('42K / 100K')); report.checks.push('gemini_usage_requires_explicit_engine_provenance');
+  await close(); await page.locator('.composer textarea').focus(); await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); await page.getByRole('option', { name: new RegExp(baseline.models.find(model => model.id === baseline.selection.model).label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).click(); await open(); await menu.getByText('Codex 上下文', { exact: true }).waitFor(); await menu.getByText('83%', { exact: true }).waitFor(); await menu.getByTitle('最近一次请求使用的输入上下文 / 当前模型上下文窗口', { exact: true }).getByText('暂无数据', { exact: true }).waitFor(); report.checks.push('return_to_codex_restores_quota_without_relabeling_gemini_usage');
+  await close(); holdNextCatalog = true; await page.evaluate(() => window.dispatchEvent(new Event('codex-web-models-changed'))); await heldCatalogStarted;
+  const heldRevision = catalogRevision; catalogModels = baseline.models;
+  const freshResponse = page.waitForResponse(response => response.headers()['x-fixture-catalog-revision'] === String(heldRevision + 1));
+  await page.evaluate(() => window.dispatchEvent(new Event('codex-web-models-changed'))); await freshResponse;
+  await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); assert.equal(await page.getByRole('option', { name: /Gemini Metrics Fixture/ }).count(), 0); await page.keyboard.press('Escape');
+  const oldResponse = page.waitForResponse(response => response.headers()['x-fixture-catalog-revision'] === String(heldRevision)); releaseHeldCatalog(); await oldResponse;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); assert.equal(await page.getByRole('option', { name: /Gemini Metrics Fixture/ }).count(), 0); await page.keyboard.press('Escape'); report.checks.push('late_catalog_response_cannot_restore_an_old_node_or_account_model_list');
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.clock.install(); await page.clock.pauseAt(new Date());
+  const copy = async () => { await open(); await menu.getByRole('menuitem', { name: '复制会话链接', exact: true }).click(); await page.locator('.toast.info').waitFor(); };
+  await copy(); await page.clock.runFor(7000); await copy(); await page.clock.runFor(9999); assert.equal(await page.locator('.toast.info').count(), 1);
+  await page.clock.runFor(1); assert.equal(await page.locator('.toast.info').count(), 0);
+  await copy(); await page.getByRole('button', { name: '关闭提示', exact: true }).click(); assert.equal(await page.locator('.toast.info').count(), 0);
+  report.checks.push('actual_app_copy_link_repeated_toast_ten_seconds_and_manual_dismiss');
+  assert.deepEqual(report.errors, []); report.ok = true; await page.screenshot({ path: output + '/provider-metrics.png' });
+} catch (error) { report.error = String(error.stack); process.exitCode = 1; await page?.screenshot({ path: output + '/metrics-failure.png' }).catch(() => {}); }
+finally { await browser?.close(); await vite.close(); instance.beginShutdown(); await instance.waitForBackgroundTasks(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); instance.db.close(); fs.unlinkSync(shortTemp); fs.rmSync(fixture, { recursive: true, force: true }); fs.writeFileSync(output + '/metrics-result.json', JSON.stringify(report, null, 2)); console.log(JSON.stringify(report)); }

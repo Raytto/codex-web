@@ -1,3 +1,4 @@
+import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ThreadEvent } from "@openai/codex-sdk";
@@ -24,6 +25,7 @@ export async function executeTenantTurn(request: TenantWorkerRunRequest, callbac
 }
 
 export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: ExecutionCallbacks): AppServerTurnExecution {
+  if (engineForModel(request.selection.model) !== "codex") throw new Error("此租户尚未配置 Gemini 执行账号。");
   const pythonRuntime = resolvePythonRuntime({
     projectRoot: request.projectRoot,
     pythonRuntimeRoot: request.pythonRuntimeRoot,

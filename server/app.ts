@@ -1,6 +1,11 @@
+import { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "./conversation-title.js";
+import { engineForModel } from "../remote-worker/src/agent-engine.js";
+import { AUTO_RESET_INTERVAL_MS, CodexResetAutoUse } from "./codex-reset-auto-use.js";
 import { OpportunityVoiceService } from './opportunity-voice.js';
+import { createColdRestoreScheduler } from "./cold-restore-scheduler.js";
+import { isTransientRestoreBlock } from "../src/conversation-restore-state.js";
 import { OpportunityError } from './opportunity-store.js';
-import { WEB_RUNTIME_CSP, validateWebDocument, verifiedWebBody } from "./web-presentation.js";
+import { PRESENTATION_SUFFIX, WEB_RUNTIME_CSP, validateWebDocument, verifiedWebBody } from "./web-presentation.js";
 import { WebRuntimeTickets, webRuntimeDocument } from "./web-runtime.js";
 import { mountJudgmentRoutes, mountJudgmentAutomation } from "./judgment-routes.js";
 import { mountOpportunityRoutes, mountOpportunityAutomation } from "./opportunity-routes.js";
@@ -27,7 +32,7 @@ import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-
 import { parseCodexFileMentionRequest } from "../src/codex-file-mentions.js";
 import { AppDatabase, PublicShareStorageBusyError, StorageQuotaExceededError, type ComposerDraftWithFiles, type ConversationRow, type FileRow, type JobRow, type MessageRow, type PendingPromptWithFiles, type PersonalMemoryReviewAction, type ProjectRow, type SessionRow, type UserRow, type WakeEventKind, type WakePlanMode, type WakePlanRow } from "./db.js";
 import { isPublicShareActive } from "../src/public-share.js";
-import { loadAgentOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
+import { availableAgentSelection, loadAgentOptions, mergeEngineOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
 import { AUDIO_MIME_EXTENSIONS, TRANSCRIPTION_PROMPT_VERSION, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_PROMPT_VERSION, CONVERSATION_TITLE_REASONING_EFFORT, ConversationTitleService, extractTitleRequestText } from "./conversation-title.js";
@@ -35,10 +40,10 @@ import { HOST_ROOT_USER_ID, isHostRootUser } from "./host-root-user.js";
 import { DEFAULT_PROJECT_AGENTS_TEMPLATE, PROJECT_AGENTS_TEMPLATE_SETTING } from "./project-instructions.js";
 import { buildUserCancellationSummary } from "./cancellation-summary.js";
 import { RemoteWorkerGateway, type ExecutorView } from "./remote-worker-gateway.js";
+import { RemoteFileDelivery } from "./remote-file-delivery.js";
 import { HOST_EXECUTOR_ID, workerIdFromExecutor } from "./remote-worker-protocol.js";
 import { hashWakeEventToken, readBearerToken, verifyJobAutomationToken } from "./wake-automation.js";
 import { parseRemoteContentLength, RemoteTransferError, streamRemoteUpload } from "./remote-transfer.js";
-import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
 import { sweepUploadOrphans, uploadOwnershipKey } from "./upload-orphans.js";
 import { NodeTransferCoordinator } from "./node-transfer-coordinator.js";
 import { HostRootWorkerClient } from "./host-root-worker-client.js";
@@ -104,6 +109,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: "Codex" });
   db.recoverVoiceTranscriptionReceipts();
   const remoteWorkers = new RemoteWorkerGateway(config, db);
+  const remoteFileDelivery = new RemoteFileDelivery(db, config.dataRoot, remoteWorkers);
   const transferHost = new HostRootWorkerClient(config.hostRootSocketPath);
   const nodeTransfers = new NodeTransferCoordinator(db.sqlite,
     async (executor, spec) => {
@@ -171,9 +177,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return loadAgentOptions(config, ensureTenant(config.tenantRoot, userId).codexHome);
   }
 
+  const geminiCatalogs = new Map<string, AgentOptions | null>();
   function optionsForExecutor(userId: string, executorId?: string | null): AgentOptions {
     if (!isHostRootUser(userId) || !executorId) return optionsForUser(userId);
-    return withPreferredAgentDefaults(db.getExecutorRuntime(executorId)?.agentOptions ?? optionsForUser(userId));
+    return mergeEngineOptions(withPreferredAgentDefaults(db.getExecutorRuntime(executorId)?.agentOptions ?? optionsForUser(userId)), geminiCatalogs.get(executorId));
   }
 
   function optionsForConversation(conversation: ConversationRow): AgentOptions {
@@ -183,10 +190,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function userAgentSelection(userId: string, options: AgentOptions = optionsForUser(userId)): AgentSelection {
     const stored = db.getAgentSelectionPreference(userId);
-    const selection = repairAgentSelection(options, stored?.model, stored?.reasoningEffort);
-    if (!stored || stored.model !== selection.model || stored.reasoningEffort !== selection.reasoningEffort) {
-      db.setAgentSelectionPreference(selection, userId);
-    }
+    const selection = availableAgentSelection(options, stored?.model, stored?.reasoningEffort);
+    // A node without this account may need a local fallback. Visiting it must
+    // not erase the user's choice for another node where the model is available.
+    if (!stored) db.setAgentSelectionPreference(selection, userId);
     return selection;
   }
 
@@ -204,7 +211,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function newConversationAgentSelection(userId: string, options: AgentOptions): AgentSelection {
     const baseline = db.getNewConversationAgentSelection(userId);
     // A temporary executor catalog fallback must not rewrite the saved baseline.
-    return baseline ? repairAgentSelection(options, baseline.model, baseline.reasoningEffort) : userAgentSelection(userId, options);
+    return baseline ? availableAgentSelection(options, baseline.model, baseline.reasoningEffort) : userAgentSelection(userId, options);
   }
 
   function safeConversationMessages(conversation: ConversationRow, messages: Array<MessageRow & { files: FileRow[] }>) {
@@ -257,19 +264,29 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   const runner = new CodexRunner(config, db, publish, remoteWorkers);
-  const restoringConversations = new Map<string, Promise<void>>();
-  function scheduleColdRestore(conversationId: string, userId: string): void {
-    if (restoringConversations.has(conversationId)) return;
-    const task = runner.restoreColdConversation(userId, conversationId).catch((error) => {
+  const autoResetEnabled = config.containerized && config.queueAutoStart;
+  const autoReset = new CodexResetAutoUse(db.sqlite, {
+    executors: () => remoteWorkers.listExecutors().filter(item => item.codexAccountManagementCapable).map(item => ({
+      id: item.id, machineName: item.machineName, online: item.status === "online", supported: remoteWorkers.supportsAutoResetCredit(item.id),
+    })),
+    accounts: executorId => runner.listCodexAccounts(HOST_ROOT_USER_ID, executorId, true),
+    consume: (executorId, accountId, attemptId, expiresAt) => runner.consumeResetCredit(HOST_ROOT_USER_ID, accountId, attemptId, executorId, expiresAt),
+  });
+  let autoResetTimer: ReturnType<typeof setInterval> | undefined;
+  const coldRestoreScheduler = createColdRestoreScheduler({
+    restore: (id, userId) => runner.restoreColdConversation(userId, id),
+    needsRetry: id => db.getConversationStorage(id)?.state === "restoring",
+    failed: (conversationId, error) => {
+      if (error instanceof Error && isTransientRestoreBlock(error.message)) return;
       console.error(JSON.stringify({ event: "conversation_cold_restore_failed", conversationId, message: error instanceof Error ? error.message : String(error) }));
-    }).finally(() => {
-      restoringConversations.delete(conversationId);
+    },
+    settled: conversationId => {
       const refreshed = db.getConversation(conversationId);
       if (refreshed) publishConversationChanged(refreshed);
       publishQueuePositions();
-    });
-    restoringConversations.set(conversationId, task);
-  }
+    },
+  });
+  const scheduleColdRestore = coldRestoreScheduler.schedule;
   function activateConversation(conversation: ConversationRow): { conversation: ConversationRow; state: "local" | "restoring" | "error" } {
     const storage = db.getConversationStorage(conversation.id);
     if (!storage || storage.state === "local") {
@@ -309,7 +326,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }, () => { if (config.queueAutoStart) scheduleQueuePump(); });
   const opportunityVoice = new OpportunityVoiceService(config, db, transcription);
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
-  const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs));
+  const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs, engineId) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs, engineId));
   const personalMemory = new PersonalMemoryService(config, db);
   const personalMemoryManagementPayload = (userId: string) => {
     const tenant = ensureTenant(config.tenantRoot, userId);
@@ -881,6 +898,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (titleRequests.has(conversationId)) return;
     const conversation = db.getConversation(conversationId);
     if (!conversation || conversation.title_source !== "default") return;
+    const engineId = engineForModel((jobId ? db.getJob(jobId)?.agent_model : null) ?? conversation.agent_model);
+    if (engineId === "antigravity" && (!ANTIGRAVITY_TITLE_MODEL || !ANTIGRAVITY_TITLE_EFFORT)) return;
     const project = conversation.project_id ? db.getProject(conversation.project_id) : undefined;
     if (!project) return;
     // Submission and queue dispatch can both reach this function, including
@@ -889,7 +908,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const latestAudit = db.getLatestConversationTitleAudit(conversationId);
     if (latestAudit?.status === "running" || (!triggerMessageId && latestAudit?.status === "succeeded")) return;
     if (latestAudit?.status === "failed") {
-      if (latestAudit.error === "worker_upgrade_required" && !remoteWorkers.supportsTitleAgent(project.executor_id)) return;
+      if (latestAudit.error === "worker_upgrade_required" && !remoteWorkers.supportsTitleAgent(project.executor_id, engineId)) return;
       const remoteTitleNowAvailable = latestAudit.error === "worker_upgrade_required";
       const completedAt = latestAudit.completed_at ? Date.parse(latestAudit.completed_at) : Date.now();
       // Repeated remote imports keep their cooldown; an explicit new message
@@ -903,21 +922,21 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const executor = project.executor_id === TENANT_LOCAL_EXECUTOR_ID ? tenantExecutorView() : remoteWorkers.executor(project.executor_id);
     const context = {
       requestText, projectName: project.name, projectDirectory: directoryName, attachmentNames, trigger,
-      userId: conversation.user_id, executorId: project.executor_id,
+      userId: conversation.user_id, executorId: project.executor_id, engineId,
     } as const;
     const auditId = newId();
     const startedAt = new Date().toISOString();
     const startedMs = Date.now();
     db.createConversationTitleAudit({
       id: auditId, conversation_id: conversation.id, user_id: conversation.user_id, project_id: project.id,
-      executor_id: project.executor_id, trigger, model: CONVERSATION_TITLE_CODEX_MODEL,
-      reasoning_effort: CONVERSATION_TITLE_REASONING_EFFORT, prompt_version: CONVERSATION_TITLE_PROMPT_VERSION,
+      executor_id: project.executor_id, trigger, model: engineId === "antigravity" ? ANTIGRAVITY_TITLE_MODEL : CONVERSATION_TITLE_CODEX_MODEL,
+      reasoning_effort: engineId === "antigravity" ? ANTIGRAVITY_TITLE_EFFORT : CONVERSATION_TITLE_REASONING_EFFORT, prompt_version: engineId === "antigravity" ? "antigravity-title-v1" : CONVERSATION_TITLE_PROMPT_VERSION,
       request_excerpt: conversationTitleAuditExcerpt(requestText), request_sha256: crypto.createHash("sha256").update(requestText, "utf8").digest("hex"),
       context_json: JSON.stringify({
         projectName: project.name, projectDirectory: directoryName, attachmentNames,
         requestCharacters: Array.from(requestText).length, executorName: executor?.machineName ?? null,
         executorKind: executor?.kind ?? null, codexVersion: executor?.runtime?.installedVersion ?? null,
-        sourceMessageId: messageId ?? null, triggerMessageId: triggerMessageId ?? null,
+        sourceMessageId: messageId ?? null, triggerMessageId: triggerMessageId ?? null, engineId,
       }),
       started_at: startedAt,
     });
@@ -929,7 +948,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         if (jobId) publish(jobId, "conversation_title", { title });
         const updated = db.getConversation(conversationId);
         if (updated) publishConversationChanged(updated);
-        void runner.renameRemoteThread(conversationId, title).catch(() => undefined);
+        if (engineId === "codex") void runner.renameRemoteThread(conversationId, title).catch(() => undefined);
       }
     }).catch((error) => {
       try { db.finishConversationTitleAudit(auditId, { status: "failed", error: conversationTitleAuditError(error), completedAt: new Date().toISOString(), durationMs: Date.now() - startedMs }); } catch { /* App shutdown can close SQLite before a detached naming request returns. */ }
@@ -1064,10 +1083,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const waitingForRemote = Boolean(project && workerIdFromExecutor(project.executor_id) && executor?.status !== "online");
       const blocked = dispatchBlock(queued.conversation_id);
       const retry = db.getJobAttemptState(queued.id);
+      const retryWaiting = Boolean(retry?.nextAttemptAt && retry.nextAttemptAt > new Date().toISOString());
       publish(queued.id, "status", {
         status: "queued",
         queuePosition,
         jobsAhead,
+        // Durable admission is not necessarily a resource wait. Distinguish
+        // an immediately dispatchable task from work that cannot start yet.
+        starting: config.queueAutoStart && maintenancePhase === "idle" && !retryWaiting
+          && !waitingForRemote && !blocked && jobsAhead === 0,
         label: maintenancePhase !== "idle"
           ? maintenanceQueueGuidance[maintenancePhase]
           : retry?.nextAttemptAt && retry.nextAttemptAt > new Date().toISOString() ? `模型容量等待中，将于 ${new Date(retry.nextAttemptAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）自动继续`
@@ -1157,6 +1181,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         db.updateConversation(job.conversation_id, { status: "running" });
         const startedConversation = db.getConversation(job.conversation_id);
         if (startedConversation) publishConversationChanged(startedConversation);
+        // Account validation and context preparation can take seconds. Publish
+        // the reserved state before that work so SSE/replay does not retain queued.
+        publish(job.id, "status", { status: "running", starting: true, label: "正在准备执行" });
         trackBackground("queued_job", runQueuedJob(job));
       }
     } finally {
@@ -2141,6 +2168,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "Codex 账号读取失败。" }); }
   });
 
+  api.get("/codex-accounts/reset-history", (req, res) => {
+    if (!codexAccountAdminSession(res)) return;
+    const executorId = typeof req.query.executorId === "string" ? req.query.executorId : HOST_EXECUTOR_ID;
+    if (!remoteWorkers.executor(executorId)) return res.status(404).json({ error: "执行机器不存在。" });
+    return res.json({ records: autoReset.history(executorId), enabled: autoResetEnabled, supported: remoteWorkers.supportsAutoResetCredit(executorId) });
+  });
+
   api.post("/codex-accounts/refresh-usage", async (req, res) => {
     const session = codexAccountAdminSession(res);
     if (!session) return;
@@ -2198,6 +2232,68 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const executorId = codexAccountExecutor(req, res); if (!executorId) return;
     try { return res.json(await runner.deleteCodexAccount(session.user_id, String(req.params.accountId), executorId)); }
     catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "Codex 账号删除失败。" }); }
+  });
+
+  const geminiAccountLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 6,
+    standardHeaders: "draft-8", legacyHeaders: false, message: { error: "Gemini 账号登录发起过于频繁，请稍后再试。" } });
+  function geminiAccountContext(req: Request, res: Response): { userId: string; executorId: string } | null {
+    const session = res.locals.session as SessionRow;
+    if (!isHostRootUser(session.user_id)) { res.status(403).json({ error: "当前账号不能管理 Gemini 账号。" }); return null; }
+    res.setHeader("Cache-Control", "private, no-store, no-cache, must-revalidate");
+    const executorId = typeof req.body?.executorId === "string" ? req.body.executorId : typeof req.query.executorId === "string" ? req.query.executorId : HOST_EXECUTOR_ID;
+    const executor = remoteWorkers.executor(executorId);
+    if (!executor) { res.status(404).json({ error: "执行机器不存在。" }); return null; }
+    if (executor.status !== "online") { res.status(409).json({ error: `${executor.machineName} 当前离线。` }); return null; }
+    if (req.method !== "GET") geminiCatalogs.delete(executorId);
+    return { userId: session.user_id, executorId };
+  }
+  api.get("/gemini-accounts", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { const result = await runner.geminiAccounts(context.userId, { action: "list" }, context.executorId); return res.json(result.state); }
+    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "Gemini 账号读取失败。" }); }
+  });
+  api.get("/gemini-accounts/usage", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    const accountId = req.query.accountId, refresh = req.query.refresh;
+    if ((accountId !== undefined && (typeof accountId !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(accountId)))
+      || (refresh !== undefined && refresh !== "1")) return res.status(400).json({ error: "Antigravity 用量查询参数无效。" });
+    try {
+      const result = await runner.geminiAccounts(context.userId, { action: "usage", ...(accountId ? { accountId: accountId as string } : {}), ...(refresh === "1" ? { refresh: true } : {}) }, context.executorId);
+      if (!result.usage) return res.status(503).json({ error: "当前节点尚未提供 Antigravity 用量，请稍后刷新。" });
+      return res.json(result.usage);
+    } catch { return res.status(503).json({ error: "Antigravity 用量暂不可用，请确认节点在线并已更新，然后重试。" }); }
+  });
+  api.post("/gemini-accounts/logins", geminiAccountLoginLimiter, async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { return res.status(201).json(await runner.geminiAccounts(context.userId, { action: "login_start", label: typeof req.body?.label === "string" ? req.body.label : "" }, context.executorId)); }
+    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "Gemini 账号登录无法发起。" }); }
+  });
+  api.get("/gemini-accounts/logins/:loginId", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { return res.json(await runner.geminiAccounts(context.userId, { action: "login_status", loginId: String(req.params.loginId) }, context.executorId)); }
+    catch (error) { return res.status(404).json({ error: error instanceof Error ? error.message : "登录验证不存在。" }); }
+  });
+  api.delete("/gemini-accounts/logins/:loginId", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { return res.json(await runner.geminiAccounts(context.userId, { action: "login_cancel", loginId: String(req.params.loginId) }, context.executorId)); }
+    catch (error) { return res.status(404).json({ error: error instanceof Error ? error.message : "登录验证不存在。" }); }
+  });
+  api.post("/gemini-accounts/logins/:loginId/code", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    const code = req.body?.code;
+    if (typeof code !== "string" || !code.trim() || code.length > 4_096 || /[\r\n\0]/.test(code)) return res.status(400).json({ error: "请粘贴有效的 Google 授权码。" });
+    try { return res.json(await runner.geminiAccounts(context.userId, { action: "login_code", loginId: String(req.params.loginId), code }, context.executorId)); }
+    catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "Google 授权码提交失败。" }); }
+  });
+  api.post("/gemini-accounts/:accountId/activate", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { const result = await runner.geminiAccounts(context.userId, { action: "activate", accountId: String(req.params.accountId) }, context.executorId); return res.json(result.state); }
+    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "Gemini 账号切换失败。" }); }
+  });
+  api.delete("/gemini-accounts/:accountId", async (req, res) => {
+    const context = geminiAccountContext(req, res); if (!context) return;
+    try { const result = await runner.geminiAccounts(context.userId, { action: "delete", accountId: String(req.params.accountId) }, context.executorId); return res.json(result.state); }
+    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "Gemini 账号删除失败。" }); }
   });
 
   api.get("/personal-memory/status", (_req, res) => {
@@ -2662,7 +2758,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }));
   });
 
-  api.get("/agent-options", (req, res) => {
+  api.get("/agent-options", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const requestedConversationId = typeof req.query.conversationId === "string" ? req.query.conversationId : "";
     const requestedConversation = requestedConversationId ? db.getConversationForUser(requestedConversationId, session.user_id) : undefined;
@@ -2676,6 +2772,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const requestedExecutor = isHostRootUser(session.user_id) && typeof req.query.executorId === "string"
       ? req.query.executorId
       : requestedProject?.executor_id ?? conversationProject?.executor_id;
+    if (isHostRootUser(session.user_id) && requestedExecutor) {
+      try { const result = await runner.geminiAccounts(session.user_id, { action: "catalog" }, requestedExecutor); geminiCatalogs.set(requestedExecutor, result.catalog ?? null); }
+      catch { geminiCatalogs.delete(requestedExecutor); }
+    }
     const options = optionsForExecutor(session.user_id, requestedExecutor);
     return res.json({
       ...options,
@@ -2815,6 +2915,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return restored ? res.json({ conversation: restored }) : res.status(409).json({ error: "会话归档状态已经变化。" });
   });
 
+  // Resolve a stable link without scanning sidebar pages, reading transcripts,
+  // contacting a remote executor, or activating cold storage.
+  api.get("/conversations/:id/navigation", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
+    if (!conversation) return res.status(404).json({ error: "会话不存在或当前账号无权访问。" });
+    return res.json({ conversation });
+  });
+
   api.post("/conversations/:id/activate", (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -2868,6 +2977,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       contextUsage: conversation.context_input_tokens === null
         ? null
         : {
+          engineId: (db.sqlite.prepare("SELECT engine_id FROM agent_engine_sessions WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1").get(conversation.id) as { engine_id: "codex" | "antigravity" } | undefined)?.engine_id ?? "codex",
           inputTokens: conversation.context_input_tokens,
           modelContextWindow: conversation.context_window_tokens,
           updatedAt: conversation.context_usage_updated_at,
@@ -3137,9 +3247,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     db.deletePendingPromptsForConversation(conversation.id);
     for (const file of db.listFiles(conversation.id)) removePersistedDeliverable(config.dataRoot, file.relative_path);
     const tenant = ensureTenant(config.tenantRoot, conversation.user_id);
-    if (conversation.codex_thread_id && !db.isCodexThreadUsedByAnotherActiveConversation(conversation.codex_thread_id, conversation.id)) {
-      const hostRemoved = await runner.deleteCodexThread(conversation.user_id, conversation.id, conversation.codex_thread_id);
-      if (hostRemoved === null) removeCodexThreadFiles(tenant.codexHome, conversation.codex_thread_id);
+    const project = conversation.project_id ? db.getProject(conversation.project_id) : undefined;
+    const segments = project ? db.sqlite.prepare("SELECT native_id FROM agent_engine_sessions WHERE conversation_id=? AND engine_id='codex' AND executor_id=? AND native_id IS NOT NULL").all(conversation.id, project.executor_id) as Array<{ native_id: string }> : [];
+    const nativeIds = new Set([...(conversation.codex_thread_id ? [conversation.codex_thread_id] : []), ...segments.map(segment => segment.native_id)]);
+    for (const nativeId of nativeIds) {
+      if (db.isCodexThreadUsedByAnotherActiveConversation(nativeId, conversation.id)) continue;
+      const hostRemoved = await runner.deleteCodexThread(conversation.user_id, conversation.id, nativeId);
+      if (hostRemoved === null) removeCodexThreadFiles(tenant.codexHome, nativeId);
     }
     await reader.removeConversationResources(conversation.id, conversation.user_id);
     removeWorkspace(tenant.conversations, conversation.id);
@@ -3765,6 +3879,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (config.queueAutoStart) await pumpQueue();
       return res.json({ ok: true, mode: "insert", job: db.getJob(job.id) ?? job });
     }
+    if (running.agent_model && pending.agent_model !== running.agent_model) return res.status(409).json({ error: "这条待发送请求使用的模型与当前任务不同，将保留在队列中按所选模型执行。" });
     try {
       const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
       const message = db.materializeSteeredPrompt(pending.id, newId());
@@ -3861,38 +3976,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!project || !workerIdFromExecutor(project.executor_id)) return res.status(400).json({ error: "该任务不属于远程机器项目。" });
     const sourcePath = normalizeRemoteSourcePath(req.body?.path);
     if (!sourcePath) return res.status(400).json({ error: "远程文件路径无效。" });
-    const existing = db.getFileForMessageSource(message.id, sourcePath);
-    if (existing) return res.json({ file: existing, alreadyFetched: true });
-
-    let stagingOwnerId: string | undefined;
+    if (sourcePath.endsWith(PRESENTATION_SUFFIX)) return res.status(400).json({ error: "展示声明是协议文件，请获取对应 HTML 成品。" });
     try {
-      const artifact = await remoteWorkers.fetchFile(project.executor_id, project.root_path, sourcePath);
-      stagingOwnerId = path.basename(path.dirname(artifact.tempPath));
-      const fetchedAfterWait = db.getFileForMessageSource(message.id, sourcePath);
-      if (fetchedAfterWait) return res.json({ file: fetchedAfterWait, alreadyFetched: true });
-      const fileId = newId();
-      const storedPath = path.posix.join("deliverables", fileId, artifact.name);
-      const destination = resolveInside(config.dataRoot, storedPath);
-      await fs.promises.mkdir(path.dirname(destination), { recursive: true });
-      await fs.promises.copyFile(artifact.tempPath, destination);
-      const file: FileRow = {
-        id: fileId, conversation_id: conversation.id, message_id: message.id,
-        original_name: artifact.name, relative_path: storedPath, source_path: sourcePath,
-        mime_type: artifact.mimeType, size: artifact.size, kind: "output", created_at: new Date().toISOString(),
-      };
-      try { db.addFile(file); }
-      catch (error) {
-        fs.rmSync(path.dirname(destination), { recursive: true, force: true });
-        throw error;
-      }
-      return res.status(201).json({ file, alreadyFetched: false });
+      const result = await remoteFileDelivery.fetch({ conversationId: conversation.id, messageId: message.id,
+        userId: session.user_id, sourcePath, executorId: project.executor_id, projectRoot: project.root_path,
+        maximumStoredBytes: maximumStoredBytesForUser(session.user_id) });
+      return res.status(result.alreadyFetched ? 200 : 201).json(result);
     } catch (error) {
       return res.status(409).json({ error: error instanceof Error ? error.message : "远程文件获取失败。" });
-    } finally {
-      if (stagingOwnerId) {
-        try { cleanupOwnedStagingDirectory(config.dataRoot, "remote-worker-fetch-staging", stagingOwnerId); }
-        catch { /* Staging cleanup must not hide a successful fetch. */ }
-      }
     }
   });
 
@@ -3947,7 +4038,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const manifest = mode === "web" ? JSON.stringify(validateWebDocument(body, original.original_name, false)) : null;
       const id = newId();
       const file: FileRow = { ...original, id, kind: "output", relative_path: path.posix.join("deliverables", id, original.original_name),
-        pending_prompt_id: null, composer_draft_id: null, presentation_mode: mode, presentation_manifest: manifest, previous_file_id: original.id,
+        pending_prompt_id: null, composer_draft_id: null, mime_type: mode === "web" ? "text/html" : original.mime_type,
+        presentation_mode: mode, presentation_manifest: manifest, previous_file_id: original.id,
         size: body.length, sha256: crypto.createHash("sha256").update(body).digest("hex"), created_at: new Date().toISOString() };
       destination = resolveFilePath(file, session.user_id);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
@@ -4205,6 +4297,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       }));
   });
 
+  if (autoResetEnabled) {
+    autoResetTimer = setInterval(() => scheduleBackground("codex_auto_reset", () => autoReset.tick()), AUTO_RESET_INTERVAL_MS);
+    autoResetTimer.unref();
+    scheduleBackground("codex_auto_reset_startup", () => autoReset.tick());
+  }
   wakeSchedulerTimer = config.queueAutoStart ? setInterval(() => void processDueWakePlans(), 1_000) : undefined;
   wakeSchedulerTimer?.unref();
   if (config.queueAutoStart) {
@@ -4220,6 +4317,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     app, db, runner, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, opportunityVoice, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
+      autoReset.stop();
+      if (autoResetTimer) clearInterval(autoResetTimer);
+      coldRestoreScheduler.stop();
       nodeTransfers.close();
       reader.stop();
       personalMemory.stop();

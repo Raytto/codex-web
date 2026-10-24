@@ -771,3 +771,7 @@ Use the normal build and upgrade path; back up the deployment's own state first.
 ## Feature upgrades
 
 Apply the [upgrade checklist](docs/UPGRADE_20261020.md) after saving an operator-controlled backup. Interactive artifacts, optional judgments and background voice feedback use the existing database and persistent volumes; no additional host npm installation, dependency set or default service is required. Keep optional providers empty until explicitly configured.
+
+## Optional engine after basic installation
+
+First bring up the default `runtime` image and verify password login, persistence and isolation. Then optionally connect Gemini on the selected node following [MULTI_ENGINE](docs/MULTI_ENGINE.md). Keep its credentials local and configure naming only when desired. Apply [current migrations](docs/UPGRADE_20261025.md) on your own state; do not import another instance's data.

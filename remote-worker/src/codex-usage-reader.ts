@@ -73,7 +73,7 @@ export async function readAccountResetCredits(options: {
           finish();
         }
       });
-      send(1, "initialize", { clientInfo: { name: "pp_agent_account_usage", version: "1.0" } });
+      send(1, "initialize", { clientInfo: { name: "codex_web_account_usage", version: "1.0" } });
     });
     output.close();
     // Even a failed usage read can have refreshed auth; commit only after the writer exits.

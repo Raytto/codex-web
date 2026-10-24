@@ -96,3 +96,23 @@ test("artifact metadata uses the 2 GiB transfer boundary and accepts total-budge
   assert.equal(parseRemoteWorkerMessage(JSON.stringify({ type: "event", jobId, event: { type: "completed", finalResponse: "done",
     omittedArtifacts: [{ path: "archive.zip", reason: "total_size_limit" }] } })).ok, true);
 });
+
+test("Gemini title capability is optional for old workers and retained for upgraded workers", () => {
+  for (const capabilities of [{ titleAgent: true }, { titleAgent: true, geminiTitleAgent: true }]) {
+    const parsed = parseRemoteWorkerMessage(JSON.stringify(hello({ capabilities })));
+    assert.equal(parsed.ok, true);
+    if (parsed.ok && parsed.message.type === 'hello') assert.deepEqual(parsed.message.capabilities, capabilities);
+  }
+});
+
+test("Gemini usage capability and sanitized snapshots cross the server schema without accepting credentials", () => {
+  const parsed = parseRemoteWorkerMessage(JSON.stringify(hello({ capabilities: { geminiAccounts: true, geminiUsage: true } })));
+  assert.equal(parsed.ok, true);
+  const checkedAt = new Date().toISOString();
+  const message = { type: "gemini_accounts_result", requestId: crypto.randomUUID(), ok: true, usage: {
+    accountId: crypto.randomUUID(), state: "ok", checkedAt, quotaUpdatedAt: checkedAt, creditsUpdatedAt: checkedAt,
+    groups: [{ label: "Gemini", buckets: [{ id: "weekly", label: "Weekly", window: "weekly", remainingPercent: 0, remainingAmount: null, resetAt: checkedAt, disabled: false }] }], remainingCredits: 0, error: null,
+  } };
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok, true);
+  for (const extra of [{ access_token: "must-not-cross" }, { remainingCredits: -1 }, { quotaUpdatedAt: "invalid" }]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ ...message, usage: { ...message.usage, ...extra } })).ok, false);
+});

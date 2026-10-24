@@ -109,11 +109,13 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
     source: normalizePath(file.source_path ?? "")?.toLocaleLowerCase() ?? "",
     name: normalizePath(file.original_name)?.toLocaleLowerCase() ?? "",
   }));
-  const exact = candidates.find((candidate) => (candidate.source && folded === candidate.source)
-    || (candidate.relative && (folded === candidate.relative || folded.endsWith(`/${candidate.relative}`))));
+  // Persisted paths identify an immutable version. Source paths are aliases:
+  // message files arrive oldest first, with newly delivered versions appended.
+  const immutable = candidates.find((candidate) => candidate.relative && (folded === candidate.relative || folded.endsWith(`/${candidate.relative}`)));
+  const source = candidates.slice().reverse().find((candidate) => candidate.source && folded === candidate.source);
   const basename = folded.split("/").pop() ?? "";
   const named = candidates.find((candidate) => candidate.name && basename === candidate.name);
-  const matched = exact ?? named;
+  const matched = immutable ?? source ?? named;
   if (matched) {
     const readerKind = fileReaderKind(matched.file);
     if (readerKind === "html" || readerKind === "pdf" || readerKind === "epub") return { kind: "preview", href: filePreviewUrl(matched.file), ...(matched.file.presentation_mode === "web" ? { web: true } : {}) };

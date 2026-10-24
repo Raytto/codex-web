@@ -58,7 +58,7 @@ export async function withAccountSession<T>(options: AccountSessionOptions, run:
       } catch {}
     };
     try {
-      await rpc("initialize", { clientInfo: { name: "pp_agent_reset_credit", version: "1.0" } });
+      await rpc("initialize", { clientInfo: { name: "codex_web_reset_credit", version: "1.0" } });
       child.stdin.write(JSON.stringify({ method: "initialized" }) + "\n", () => {});
       return await run(rpc);
     } finally {

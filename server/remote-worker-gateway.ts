@@ -1,9 +1,12 @@
+import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { assertGeminiAccountChangeAllowed } from "../remote-worker/src/gemini-account-guard.js";
+import { countRunningGeminiJobsForExecutor } from "./executor-job-status.js";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import type { AppConfig } from "./config.js";
 import { AppDatabase, type FileRow, type RemoteWorkerRow } from "./db.js";
@@ -44,7 +47,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; codexAccounts: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; geminiTitleAgent: boolean; codexAccounts: boolean; geminiAccounts: boolean; geminiUsage: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -64,6 +67,10 @@ type PendingFileFetch = {
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
 };
+export class RemoteFileFetchError extends Error {
+  constructor(message: string, readonly errorCode?: "NOT_FOUND") { super(message); }
+}
+
 export type StoredArtifact = RemoteArtifact & { tempPath: string; sha256: string };
 export type StoredFetchedArtifact = RemoteFetchedArtifact & { tempPath: string; sha256: string };
 export type RemoteUploadReservation = {
@@ -125,6 +132,7 @@ export type ExecutorView = {
     idempotencyReceipts: false;
   };
   codexAccountManagementCapable: boolean;
+  geminiAccountManagementCapable?: boolean;
   worker: {
     installedVersion: string;
     installedRef: string | null;
@@ -158,6 +166,7 @@ export class RemoteWorkerGateway extends EventEmitter {
   private readonly pendingUpgrades = new Map<string, PendingUpgrade>();
   private readonly pendingWorkerConfigs = new Map<string, PendingWorkerConfig>();
   private readonly pendingTitleAgents = new Map<string, PendingTitleAgent>();
+  private readonly pendingGeminiAccounts = new Map<string, { workerId: string; resolve(value: GeminiAccountResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private readonly pendingCodexAccounts = new Map<string, PendingCodexAccounts>();
   private readonly pendingFileFetches = new Map<string, PendingFileFetch>();
   private readonly pendingSteers = new Map<string, { jobId: string; workerId: string; resolve(turnId: string): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
@@ -217,6 +226,9 @@ export class RemoteWorkerGateway extends EventEmitter {
     }
     for (const [requestId, pending] of this.pendingTitleAgents) {
       clearTimeout(pending.timer); this.pendingTitleAgents.delete(requestId); pending.reject(new Error("服务正在停止"));
+    }
+    for (const [requestId, pending] of this.pendingGeminiAccounts) {
+      clearTimeout(pending.timer); this.pendingGeminiAccounts.delete(requestId); pending.reject(new Error("服务正在停止"));
     }
     for (const [requestId, pending] of this.pendingCodexAccounts) {
       clearTimeout(pending.timer); this.pendingCodexAccounts.delete(requestId); pending.reject(new Error("服务正在停止"));
@@ -303,6 +315,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       },
       retryCapability: { transparentBeforeStart: true, replayAfterStart: false, idempotencyReceipts: false },
       codexAccountManagementCapable: true,
+      geminiAccountManagementCapable: true,
       worker: null,
     }, ...remote];
   }
@@ -343,11 +356,11 @@ export class RemoteWorkerGateway extends EventEmitter {
     return Boolean(connection?.waitAutomation && connection.socket.readyState === WebSocket.OPEN);
   }
 
-  supportsTitleAgent(executorId: string): boolean {
+  supportsTitleAgent(executorId: string, engineId: "codex" | "antigravity" = "codex"): boolean {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return true;
     const connection = this.connections.get(workerId);
-    return Boolean(connection?.titleAgent && connection.socket.readyState === WebSocket.OPEN);
+    return Boolean(connection?.titleAgent && (engineId !== "antigravity" || connection.geminiTitleAgent) && connection.socket.readyState === WebSocket.OPEN);
   }
 
   supportsDynamicWaitTool(executorId: string): boolean {
@@ -378,13 +391,20 @@ export class RemoteWorkerGateway extends EventEmitter {
     return Boolean(connection?.codexAccounts && connection.socket.readyState === WebSocket.OPEN);
   }
 
-  consumeResetCredit(executorId: string, accountId: string, attemptId: string): Promise<ResetConsumption> {
+  supportsAutoResetCredit(executorId: string): boolean {
+    if (executorId === HOST_EXECUTOR_ID) return true;
+    const [major, minor, patch] = (this.executor(executorId)?.worker?.installedVersion ?? "").split(".").map(Number);
+    return major > 1 || (major === 1 && (minor > 21 || (minor === 21 && patch >= 5)));
+  }
+
+  consumeResetCredit(executorId: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
     const version = this.executor(executorId)?.worker?.installedVersion ?? "";
     const parts = version.split(".").map(Number);
     if (!(parts[0] > 1 || (parts[0] === 1 && (parts[1] > 19 || (parts[1] === 19 && parts[2] >= 6))))) {
       return Promise.reject(new Error("请先升级此机器的 Worker，才能使用重置卡。"));
     }
-    return this.codexAccountsRequest(executorId, "reset_credit", { accountId, attemptId }).then((result) => {
+    if (autoExpiresAt && !this.supportsAutoResetCredit(executorId)) return Promise.reject(new Error("请先升级此机器的 Worker，才能自动使用重置卡。"));
+    return this.codexAccountsRequest(executorId, "reset_credit", { accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}) }).then((result) => {
       if (!result.resetResult) throw new Error("远程 Worker 未返回重置结果，请重试核对同一次操作。");
       return result.resetResult;
     });
@@ -454,7 +474,32 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string }): Promise<{ resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
+  geminiAccounts(executorId: string, request: GeminiAccountRequest): Promise<GeminiAccountResult> {
+    const workerId = workerIdFromExecutor(executorId);
+    if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
+    const connection = this.connection(workerId);
+    if (request.action === "usage" && !connection.geminiUsage) return Promise.reject(new Error("该节点需要升级 Worker 后才能查询 Antigravity 用量。"));
+    if (!connection.geminiAccounts) {
+      if (request.action === "catalog") return Promise.resolve({ catalog: null });
+      if (request.action === "list") return Promise.resolve({ state: { accounts: [], activeAccountId: null, runtimeAvailable: false, error: "该节点需要先升级 Worker，才能管理 Gemini 账号。" } });
+      return Promise.reject(new Error("该节点需要先升级 Worker，才能管理 Gemini 账号。"));
+    }
+    if (["activate", "delete"].includes(request.action)) {
+      try {
+        const update = this.db.getRemoteWorkerUpdate(workerId);
+        assertGeminiAccountChangeAllowed({ maintenance: this.closing || Boolean(update && ["queued", "dispatching", "updating"].includes(update.state)),
+          runningGeminiJobs: countRunningGeminiJobsForExecutor(this.db.sqlite, executorId) });
+      } catch (error) { return Promise.reject(error); }
+    }
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pendingGeminiAccounts.delete(requestId); reject(new Error("远程 Gemini 账号请求超时")); }, 30_000);
+      this.pendingGeminiAccounts.set(requestId, { workerId, resolve, reject, timer });
+      this.send(connection.socket, { type: "gemini_accounts", requestId, ...request });
+    });
+  }
+
+  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string }): Promise<{ resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
     const connection = this.connection(workerId);
@@ -558,16 +603,16 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  generateConversationTitle(executorId: string, prompt: string, timeoutMs: number): Promise<string> {
+  generateConversationTitle(executorId: string, prompt: string, timeoutMs: number, engineId: import("../remote-worker/src/agent-engine.js").AgentEngineId = "codex"): Promise<string> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行器无效"));
     const connection = this.connection(workerId);
-    if (!connection.titleAgent) return Promise.reject(new Error("远程 Worker 尚未支持 Codex 命名器，请先升级 Worker"));
+    if (!connection.titleAgent || (engineId === "antigravity" && !connection.geminiTitleAgent)) return Promise.reject(new Error("远程 Worker 尚未支持所选引擎命名器，请先升级 Worker"));
     const requestId = crypto.randomUUID();
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => { this.pendingTitleAgents.delete(requestId); reject(new Error("远程 Codex 命名请求超时")); }, timeoutMs + 15_000);
       this.pendingTitleAgents.set(requestId, { workerId, resolve, reject, timer });
-      this.send(connection.socket, { type: "title_agent", requestId, prompt, timeoutMs });
+      this.send(connection.socket, { type: "title_agent", requestId, prompt, timeoutMs, engineId });
     });
   }
 
@@ -942,6 +987,10 @@ export class RemoteWorkerGateway extends EventEmitter {
         if (pending.workerId !== authenticatedWorkerId) continue;
         clearTimeout(pending.timer); this.pendingTitleAgents.delete(requestId); pending.reject(new Error("远程电脑在命名过程中离线"));
       }
+      for (const [requestId, pending] of this.pendingGeminiAccounts) {
+        if (pending.workerId !== authenticatedWorkerId) continue;
+        clearTimeout(pending.timer); this.pendingGeminiAccounts.delete(requestId); pending.reject(new Error("远程电脑在 Gemini 账号操作期间离线"));
+      }
       for (const [requestId, pending] of this.pendingCodexAccounts) {
         if (pending.workerId !== authenticatedWorkerId) continue;
         clearTimeout(pending.timer); this.pendingCodexAccounts.delete(requestId); pending.reject(new Error("远程电脑在 Codex 账号操作期间离线"));
@@ -1018,7 +1067,10 @@ export class RemoteWorkerGateway extends EventEmitter {
       agentTurnContext: Boolean(hello.capabilities?.agentTurnContext),
       accountSkills: Boolean(hello.capabilities?.accountSkills),
       titleAgent: Boolean(hello.capabilities?.titleAgent),
+      geminiTitleAgent: Boolean(hello.capabilities?.geminiTitleAgent),
       codexAccounts: Boolean(hello.capabilities?.codexAccounts),
+      geminiAccounts: Boolean(hello.capabilities?.geminiAccounts),
+      geminiUsage: Boolean(hello.capabilities?.geminiUsage),
       threadRolloutSize: Boolean(hello.capabilities?.threadRolloutSize),
       threadLifecycle: Boolean(hello.capabilities?.threadLifecycle),
       accountSwitching: false,
@@ -1151,6 +1203,14 @@ export class RemoteWorkerGateway extends EventEmitter {
       pending.resolve(this.workerView(worker));
       return;
     }
+    if (message.type === "gemini_accounts_result") {
+      const pending = this.pendingGeminiAccounts.get(message.requestId);
+      if (!pending || pending.workerId !== workerId) return;
+      clearTimeout(pending.timer); this.pendingGeminiAccounts.delete(message.requestId);
+      if (!message.ok) pending.reject(new Error(message.message || "远程 Gemini 账号操作失败"));
+      else pending.resolve({ state: message.state, login: message.login, catalog: message.catalog, usage: message.usage });
+      return;
+    }
     if (message.type === "codex_accounts_result") {
       const pending = this.pendingCodexAccounts.get(message.requestId);
       if (!pending || pending.workerId !== workerId) return;
@@ -1257,7 +1317,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       if (message.ok && pending.artifact) pending.resolve(pending.artifact);
       else {
         if (pending.artifact) this.removeStagedArtifact(pending.artifact);
-        pending.reject(new Error(message.message || "远程文件未能成功获取"));
+        pending.reject(new RemoteFileFetchError(message.message || "远程文件未能成功获取", message.errorCode));
       }
       return;
     }
@@ -1441,6 +1501,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       },
       retryCapability: { transparentBeforeStart: true, replayAfterStart: false, idempotencyReceipts: false },
       codexAccountManagementCapable: Boolean(connection?.codexAccounts),
+      geminiAccountManagementCapable: Boolean(connection?.geminiAccounts),
       worker: {
         credentialState: this.db.pendingRemoteWorkerCredential(worker.id) ? "pending"
           : credentials.some((item) => item.state === "active" && (!item.expires_at || item.expires_at > new Date().toISOString())) ? "active"

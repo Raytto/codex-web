@@ -143,7 +143,7 @@ export class CodexAccountManager {
 
   private readonly resetOperations = new Map<string, { attemptId: string; promise: Promise<ResetConsumption> }>();
 
-  consumeResetCredit(accountId: string, attemptId: string): Promise<ResetConsumption> {
+  consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
     if (!ENTRY_ID.test(accountId)) return Promise.reject(new Error("账号标识无效。"));
     const pending = this.resetOperations.get(accountId);
     if (pending) return pending.attemptId === attemptId ? pending.promise : Promise.reject(new Error("此账号正在使用重置卡，请等待当前操作完成。"));
@@ -155,7 +155,7 @@ export class CodexAccountManager {
       const egress = await selectCodexEgress({ signal: AbortSignal.timeout(5_000) });
       return consumeAccountResetCredit({ executable: this.codexExecutable, authFile: source,
         expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.root, "account-usage"),
-        journalRoot: path.join(this.root, "reset-receipts", accountId), attemptId,
+        journalRoot: path.join(this.root, "reset-receipts", accountId), attemptId, autoExpiresAt,
         env: applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl),
         commitAuth: (file) => this.copyAuth(file, source, account.codexAccountId),
       });

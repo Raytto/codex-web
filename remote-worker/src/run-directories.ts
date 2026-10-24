@@ -7,6 +7,29 @@ export function isRunDirectoryId(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+export type RunDirectories = { uploads: string; outputs: string; runtime: string };
+
+export function createRunDirectories(stateRoot: string, jobId: string): RunDirectories {
+  const runRoot = resolveRunDirectory(stateRoot, jobId);
+  const directories = {
+    uploads: path.join(runRoot, "uploads"),
+    // Deliverables remain readable after transient run cleanup, including files
+    // omitted by the transfer budget and paths linked in the final response.
+    outputs: path.resolve(stateRoot, "outputs", jobId),
+    runtime: path.join(runRoot, "runtime"),
+  };
+  for (const directory of Object.values(directories)) fs.mkdirSync(directory, { recursive: true });
+  return directories;
+}
+
+export function runDirectoryEnvironment(directories?: RunDirectories): Record<string, string> {
+  return directories ? {
+    CWW_UPLOADS_DIR: directories.uploads,
+    CWW_OUTPUTS_DIR: directories.outputs,
+    CWW_JOB_RUNTIME: directories.runtime,
+  } : {};
+}
+
 export async function cleanupCurrentRunDirectory(stateRoot: string, jobId: string): Promise<void> {
   const target = resolveRunDirectory(stateRoot, jobId);
   await fs.promises.rm(target, { recursive: true, force: true });

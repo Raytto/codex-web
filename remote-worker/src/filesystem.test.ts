@@ -63,3 +63,12 @@ test("remote downloads allow the full 2 GiB boundary and reject larger files", (
   stat.size += 1;
   assert.throws(() => resolveReadableFile(root, large), /2 GiB/);
 });
+
+test("remote file lookup preserves missing versus inaccessible error codes", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-fetch-error-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const absent = path.join(root, "missing.html.pp-agent.json");
+  assert.throws(() => resolveReadableFile(root, absent), { code: "ENOENT", message: "文件不存在或无法访问" });
+  context.mock.method(fs.realpathSync, "native", () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); });
+  assert.throws(() => resolveReadableFile(root, absent), { code: "EACCES", message: "文件不存在或无法访问" });
+});

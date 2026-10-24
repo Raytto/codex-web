@@ -1,3 +1,6 @@
+import { engineForModel } from "../remote-worker/src/agent-engine.js";
+import { bindEngineSession, recordEngineNativeId, engineHandoffContext } from "./agent-engine-sessions.js";
+import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import { paraJobPrompt } from "./para-schema.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -115,13 +118,14 @@ export class CodexRunner {
     return this.workerClient.reviewVoiceLexicon(userId, prompt, timeoutMs);
   }
 
-  generateConversationTitle(userId: string, executorId: string, prompt: string, timeoutMs: number): Promise<string> {
+  generateConversationTitle(userId: string, executorId: string, prompt: string, timeoutMs: number, engineId: import("../remote-worker/src/agent-engine.js").AgentEngineId = "codex"): Promise<string> {
     const remoteWorkerId = workerIdFromExecutor(executorId);
-    if (remoteWorkerId) return this.remoteWorkers.generateConversationTitle(executorId, prompt, timeoutMs);
+    if (remoteWorkerId) return this.remoteWorkers.generateConversationTitle(executorId, prompt, timeoutMs, engineId);
     if (executorId === HOST_EXECUTOR_ID) {
       if (!isHostRootUser(userId)) return Promise.reject(new Error("Host title executor is not available to this account"));
-      return this.hostWorkerClient.generateConversationTitle(userId, prompt, timeoutMs);
+      return this.hostWorkerClient.generateConversationTitle(userId, prompt, timeoutMs, engineId);
     }
+    if (engineId === "antigravity") return Promise.reject(new Error("当前租户执行器未配置 Gemini 账号"));
     if (!this.workerClient) return Promise.reject(new Error("Tenant worker isolation is required for Codex title generation"));
     if (executorId !== TENANT_LOCAL_EXECUTOR_ID) return Promise.reject(new Error("Conversation title executor is invalid"));
     return this.workerClient.generateConversationTitle(userId, prompt, timeoutMs);
@@ -254,21 +258,25 @@ export class CodexRunner {
   }
 
   async deleteCodexThread(userId: string, conversationId: string, threadId: string): Promise<number | null> {
-    if (!isHostRootUser(userId)) return null;
     const conversation = this.db.getConversation(conversationId);
     if (!conversation || conversation.user_id !== userId) return null;
     const project = conversation?.project_id ? this.db.getProjectForUser(conversation.project_id, userId) : undefined;
     const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
     if (remoteWorkerId) {
-      try { await this.remoteWorkers.archiveThread(remoteWorkerId, threadId); }
-      catch (error) {
-        // Deletion is an idempotent saga step. A previous canonical
-        // conversation may already have archived this same Remote thread.
-        if (!isAlreadyAbsentRemoteThread(error, threadId)) throw error;
-        return 0;
+      const segments = this.db.sqlite.prepare("SELECT native_id FROM agent_engine_sessions WHERE conversation_id=? AND engine_id='codex' AND executor_id=? AND native_id IS NOT NULL").all(conversationId, project!.executor_id) as Array<{ native_id: string }>;
+      const threads = new Set([threadId, ...segments.map(segment => segment.native_id)]);
+      let removed = 0;
+      for (const nativeId of threads) {
+        if (this.db.isCodexThreadUsedByAnotherActiveConversation(nativeId, conversationId)) continue;
+        try { await this.remoteWorkers.archiveThread(remoteWorkerId, nativeId); removed += 1; }
+        catch (error) {
+          // Every segment is an idempotent saga step; already archived is success.
+          if (!isAlreadyAbsentRemoteThread(error, nativeId)) throw error;
+        }
       }
-      return 1;
+      return removed;
     }
+    if (!isHostRootUser(userId)) return null;
     return this.hostWorkerClient.deleteThread(userId, threadId);
   }
 
@@ -349,6 +357,13 @@ export class CodexRunner {
     return this.remoteWorkers.upgradeCodex(executorId, version);
   }
 
+  geminiAccounts(userId: string, request: GeminiAccountRequest, executorId = HOST_EXECUTOR_ID): Promise<GeminiAccountResult> {
+    if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Gemini 账号"));
+    return executorId === HOST_EXECUTOR_ID
+      ? this.hostWorkerClient.geminiAccounts(userId, request)
+      : this.remoteWorkers.geminiAccounts(executorId, request);
+  }
+
   async listCodexAccounts(userId: string, executorId = HOST_EXECUTOR_ID, refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
     if (!isHostRootUser(userId)) return Promise.reject(new Error("当前账号不能管理 Codex 账号"));
     const previousAccountId = this.db.getExecutorActiveCodexAccount(executorId);
@@ -360,12 +375,13 @@ export class CodexRunner {
     return this.withAccountQuotas(executorId, state);
   }
 
-  async consumeResetCredit(userId: string, accountId: string, attemptId: string, executorId = HOST_EXECUTOR_ID) {
+  async consumeResetCredit(userId: string, accountId: string, attemptId: string, executorId = HOST_EXECUTOR_ID, autoExpiresAt?: string) {
     if (!isHostRootUser(userId)) throw new Error("当前账号不能管理 Codex 账号");
     const result = executorId === HOST_EXECUTOR_ID
-      ? await this.hostWorkerClient.consumeResetCredit(userId, accountId, attemptId)
-      : await this.remoteWorkers.consumeResetCredit(executorId, accountId, attemptId);
-    this.db.setAccountCodexQuota(executorId, accountId, { remainingPercent: result.quota?.remainingPercent ?? null,
+      ? await this.hostWorkerClient.consumeResetCredit(userId, accountId, attemptId, autoExpiresAt)
+      : await this.remoteWorkers.consumeResetCredit(executorId, accountId, attemptId, autoExpiresAt);
+    if (result.outcome === "notDue") this.db.setAccountResetCredits(executorId, accountId, result.resetCredits);
+    else this.db.setAccountCodexQuota(executorId, accountId, { remainingPercent: result.quota?.remainingPercent ?? null,
       resetAt: result.quota?.resetAt ?? null, resetCredits: result.resetCredits });
     this.remoteWorkers.emit("quota_usage", { executorId });
     return result;
@@ -449,6 +465,7 @@ export class CodexRunner {
   async steer(jobId: string, prompt: string, uploads: FileRow[]): Promise<string> {
     const job = this.db.getJob(jobId);
     if (!job || job.status !== "running") throw new Error("当前任务已经结束，无法引导");
+    if (engineForModel(job.agent_model) === "antigravity") throw new Error("Gemini 当前不支持运行中引导，请将补充消息加入下一轮队列。");
     const conversation = this.db.getConversation(job.conversation_id);
     if (!conversation) throw new Error("会话不存在");
     const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversation.id);
@@ -486,6 +503,7 @@ export class CodexRunner {
   }
 
   async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection, options: { resumeRemote?: boolean } = {}): Promise<void> {
+    const engine = engineForModel(selection.model);
     const controller = new AbortController();
     const eventQueue = new SqliteJobEventQueue(this.db.sqlite, { onFailure: (error) => {
       const cause = error.cause as { code?: unknown; errcode?: unknown } | undefined;
@@ -516,17 +534,33 @@ export class CodexRunner {
       if (!conversation) throw new Error("会话不存在");
       const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
       const accountSkills = loadAccountSkillBundle(tenant.library);
-      const personalContextSnapshot = attemptState?.contextRevision !== null && attemptState?.contextRevision !== undefined ? null : loadPersonalContextForTurn(
-        tenant.library, conversation.codex_thread_id, conversation.personal_context_revision,
-        this.db.getPersonalMemoryState(conversation.user_id).revision, prompt,
-      );
-      const personalContext = personalContextSnapshot?.content;
       const workspace = ensureTenantWorkspace(this.config.tenantRoot, conversation.user_id, conversationId);
       const hostRoot = isHostRootUser(conversation.user_id);
       const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
       const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
+      if (engine === "antigravity" && !hostRoot) throw new Error("当前账号尚未配置 Gemini 执行权限。");
+      const executorId = project?.executor_id ?? (hostRoot ? HOST_EXECUTOR_ID : TENANT_LOCAL_EXECUTOR_ID);
+      // Keep Codex's existing account-switch/resume behavior; Gemini profiles are separately bound.
+      let engineAccountId = "codex-default";
+      const recoveringSession = options.resumeRemote ? this.db.sqlite.prepare("SELECT s.account_id FROM agent_job_sessions j JOIN agent_engine_sessions s ON s.id=j.session_id WHERE j.job_id=? AND s.engine_id='antigravity'").get(jobId) as { account_id: string } | undefined : undefined;
+      if (recoveringSession) engineAccountId = recoveringSession.account_id;
+      if (engine === "antigravity" && !recoveringSession) {
+        const result = await this.geminiAccounts(conversation.user_id, { action: "list" }, executorId);
+        const state = result.state;
+        if (!state?.activeAccountId || !state.accounts.some((account) => account.id === state.activeAccountId && account.authenticated)) throw new Error("当前节点没有已登录的 Gemini 账号，请在账号管理中登录后重试。");
+        engineAccountId = state.activeAccountId;
+      }
+      const binding = bindEngineSession(this.db.sqlite, { conversationId, jobId, engine, executorId, accountId: engineAccountId, legacyCodexThreadId: conversation.codex_thread_id });
+      const nativeThreadId = binding.session.native_id;
+      if (binding.handoff && !nativeThreadId) this.db.sqlite.prepare("UPDATE conversations SET context_input_tokens=NULL,context_window_tokens=NULL,context_usage_updated_at=NULL WHERE id=?").run(conversationId);
+      const handoff = binding.handoff ? engineHandoffContext(this.db.sqlite, conversationId, jobId) : "";
+      const personalContextSnapshot = attemptState?.contextRevision !== null && attemptState?.contextRevision !== undefined ? null : loadPersonalContextForTurn(
+        tenant.library, nativeThreadId, binding.handoff ? undefined : conversation.personal_context_revision,
+        this.db.getPersonalMemoryState(conversation.user_id).revision, prompt,
+      );
+      const personalContext = personalContextSnapshot?.content;
       const localCodexHome = hostRoot ? this.config.hostRootCodexHome : tenant.codexHome;
-      const generatedImagesBeforeThreadId = attemptState ? attemptState.imageThreadId : conversation.codex_thread_id;
+      const generatedImagesBeforeThreadId = engine === "codex" ? (attemptState ? attemptState.imageThreadId : nativeThreadId) : null;
       const generatedImagesBefore = attemptState ? new Map(attemptState.images) : !remoteWorkerId && generatedImagesBeforeThreadId
         ? await snapshotGeneratedImages(localCodexHome, generatedImagesBeforeThreadId)
         : new Map<string, string>();
@@ -546,7 +580,7 @@ export class CodexRunner {
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
       const recoveryCheckpoint = this.db.getTaskRecoveryForTurn(conversationId, jobId);
-      const recoveredPrompt = withTaskRecoveryPrompt(prompt, recoveryCheckpoint);
+      const recoveredPrompt = handoff + withTaskRecoveryPrompt(prompt, recoveryCheckpoint);
       const storedCapabilities = this.db.getConversationOptionalCapabilities(conversationId);
       const optionalCapabilities = storedCapabilities
         ? updateOptionalAgentCapabilities(storedCapabilities, [prompt])
@@ -564,7 +598,7 @@ export class CodexRunner {
       this.publish(jobId, "status", { status: "running", label: executionBoundaryLabel });
 
       const attachments = this.attachmentContext(uploads, workspace, agentWorkspace, hostRoot);
-      const imageInputDecision = decideImageInput(attachments);
+      const imageInputDecision = engine === "antigravity" ? { ...decideImageInput(attachments), preload: false } : decideImageInput(attachments);
       const baseEffectivePrompt = buildAgentTurnPrompt({
         managedWebDelivery: Boolean(remoteWorkerId),
         userPrompt: recoveredPrompt + paraJobPrompt(this.db.sqlite, jobId),
@@ -608,7 +642,7 @@ export class CodexRunner {
         workspace,
         runtimeRoot,
         codexHome: tenant.codexHome,
-        codexThreadId: conversation.codex_thread_id,
+        codexThreadId: engine === "codex" ? nativeThreadId : null,
         effectivePrompt,
         imagePaths: selectedImagePaths
           .map((file) => resolveInside(workspace, file.relative_path)),
@@ -626,7 +660,9 @@ export class CodexRunner {
         projectRoot: conversation.project_id
           ? this.db.getProjectForUser(conversation.project_id, conversation.user_id)?.root_path ?? this.config.hostKnowledgeRoot
           : this.config.hostKnowledgeRoot,
-        codexThreadId: conversation.codex_thread_id,
+        codexThreadId: engine === "codex" ? nativeThreadId : null,
+        agentSessionId: engine === "antigravity" ? nativeThreadId : undefined,
+        agentAccountId: engine === "antigravity" ? engineAccountId : undefined,
         effectivePrompt,
         imageRelativePaths: selectedImagePaths
           .map((file) => file.relative_path),
@@ -635,22 +671,23 @@ export class CodexRunner {
         accountSkills,
         automation,
       };
-      let remoteThreadId = conversation.codex_thread_id;
+      let remoteThreadId = nativeThreadId;
       const persistenceCallbacks = {
         onThreadStarted: (threadId: string) => {
           // Synchronizing the thread prevents accidental duplicate thread creation. It does
           // not make a started turn or its external side effects safe to replay.
           executionObserved = true;
-          request.codexThreadId = threadId;
-          hostRequest.codexThreadId = threadId;
+          recordEngineNativeId(this.db.sqlite, binding.session.id, threadId);
+          if (engine === "codex") { request.codexThreadId = threadId; hostRequest.codexThreadId = threadId; }
+          else hostRequest.agentSessionId = threadId;
           remoteThreadId = threadId;
           // The read-only Remote observer can publish a brand-new thread a few
           // milliseconds before this controlled run reports thread_started.
           // Claiming atomically merges that observer placeholder and prevents a
           // second visible conversation for the same project/thread.
-          this.db.claimCodexThreadForConversation(conversationId, threadId);
+          if (engine === "codex") this.db.claimCodexThreadForConversation(conversationId, threadId);
           const latest = this.db.getConversation(conversationId);
-          if (remoteWorkerId && latest && latest.title_source !== "default") {
+          if (engine === "codex" && remoteWorkerId && latest && latest.title_source !== "default") {
             void this.remoteWorkers.renameThread(remoteWorkerId, threadId, latest.title).catch(() => undefined);
           }
         },
@@ -705,7 +742,7 @@ export class CodexRunner {
           eventQueue.enqueue(() => persistenceCallbacks.onProgress(payload), payload);
         },
       };
-      if (!remoteWorkerId) {
+      if (!remoteWorkerId && engine === "codex") {
         const codexEgress = await selectCodexEgress({ signal: controller.signal });
         request.codexEgressKind = codexEgress.kind;
         hostRequest.codexEgressKind = codexEgress.kind;
@@ -722,7 +759,7 @@ export class CodexRunner {
         const continuationAttempt = capacityContinuationRequired;
         const attemptUserPrompt = withTaskRecoveryPrompt(capacityRetryPrompt(prompt, continuationAttempt, attemptState?.retryKind), recoveryCheckpoint, continuationAttempt);
         const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
-        const attemptRemotePrompt = appendPersonalContextToUserPrompt(attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)), personalContext);
+        const attemptRemotePrompt = appendPersonalContextToUserPrompt((continuationAttempt ? "" : handoff) + attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)), personalContext);
         const attemptUploads = continuationAttempt ? [] : uploads;
         request.effectivePrompt = attemptEffectivePrompt;
         request.imagePaths = continuationAttempt ? [] : selectedImagePaths
@@ -740,7 +777,8 @@ export class CodexRunner {
             jobId,
             conversationId,
             projectRoot: project.root_path,
-            codexThreadId: remoteThreadId,
+            codexThreadId: engine === "codex" ? remoteThreadId : null,
+            ...(engine === "antigravity" ? { agentSessionId: remoteThreadId, agentAccountId: engineAccountId } : {}),
             prompt: appendWaitAutomationInstructions(attemptRemotePrompt, continuationAttempt ? false : legacyWaitInstructions),
             selection,
             optionalCapabilities,
@@ -771,7 +809,7 @@ export class CodexRunner {
         signal: controller.signal,
         // Capacity waits are persisted and release the worker. Only pre-execution
         // transport failures may retry inside this invocation.
-        canRetry: (error) => !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error),
+        canRetry: (error) => engine === "codex" && !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error),
         onRetry: ({ attempt, maxAttempts, delayMs }) => {
           this.publish(jobId, "status", { status: "retrying", label: "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt, retryMaxAttempts: maxAttempts, retryDelaySeconds: delayMs / 1000,
@@ -843,7 +881,7 @@ export class CodexRunner {
         // from text plus registered files, so collect thread-owned images when the agent
         // did not explicitly copy an image into outputs/ itself.
         const generatedImageThreadId = request.codexThreadId;
-        if (!hasExplicitImageOutput && generatedImageThreadId) {
+        if (engine === "codex" && !hasExplicitImageOutput && generatedImageThreadId) {
           const baseline = generatedImagesBeforeThreadId === generatedImageThreadId
             ? generatedImagesBefore
             : new Map<string, string>();
@@ -898,7 +936,7 @@ export class CodexRunner {
       }
       const continuationRequired = Boolean(attemptState?.continuation || attemptState?.acceptedTurnId || capacityAttemptHadProgress);
       const canContinueRouting = !continuationRequired || Boolean(this.db.getConversation(conversationId)?.codex_thread_id);
-      if (!controller.signal.aborted && attemptState
+      if (engine === "codex" && !controller.signal.aborted && attemptState
         && (isModelCapacityError(error) || (routingFailure && canContinueRouting))) {
         const now = Date.now();
         attemptState.retryKind = routingFailure ? "routing" : "capacity";

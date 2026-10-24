@@ -6,6 +6,64 @@ import test from "node:test";
 import { changedFilePaths, CODEX_QUOTA_REFRESH_INTERVAL_MS, CodexExecution, codexNotificationBelongsToThread, makeUserInput, normalizeCodexQuotaUsage, normalizeContextUsage, normalizeThreadSnapshot, PROJECT_SYNC_SOURCE_KINDS, summarizeCodexItem, waitAutomationEnvironment } from "./codex-client.js";
 import { buildRemoteOptionalCapabilityConfig, buildRemoteTurnPrompt } from "./agent-context.js";
 import { WAIT_DYNAMIC_TOOL_SPEC } from "./wait-dynamic-tool.js";
+import { createRunDirectories, runDirectoryEnvironment } from "./run-directories.js";
+import { collectChangedFiles } from "./changed-files.js";
+
+test("new and resumed managed turns receive output env and collect shell HTML without change events", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-managed-codex-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const capture = path.join(root, "capture.json");
+  const fake = path.join(root, "fake-app-server.js");
+  fs.writeFileSync(fake, `
+    const fs = require("node:fs"), path = require("node:path"), readline = require("node:readline");
+    const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+    const lines = readline.createInterface({ input: process.stdin });
+    lines.on("line", (line) => {
+      const message = JSON.parse(line);
+      if (["thread/start", "thread/resume"].includes(message.method)) {
+        fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify(message));
+        require("node:child_process").execFileSync(process.execPath, ["-e", ${JSON.stringify("const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');const body='<body><button onclick=\"this.textContent=1\">0</button></body>';const file=path.join(process.env.CWW_OUTPUTS_DIR,'shell.html');fs.writeFileSync(file,body);fs.writeFileSync(file+'.pp-agent.json',JSON.stringify({presentation_mode:'web',sha256:crypto.createHash('sha256').update(body).digest('hex')}));")}], { env: { ...process.env, ...message.params.config.shell_environment_policy.set } });
+        send({ id: message.id, result: { thread: { id: "managed-thread" } } });
+      } else if (message.method === "turn/start") {
+        send({ id: message.id, result: { turn: { id: "managed-turn" } } });
+        setTimeout(() => {
+          send({ method: "item/completed", params: { threadId: "managed-thread", item: { type: "agentMessage", text: "done" } } });
+          send({ method: "turn/completed", params: { threadId: "managed-thread", turn: { id: "managed-turn", status: "completed" } } });
+        }, 10);
+      } else if (typeof message.id === "number") send({ id: message.id, result: {} });
+    });
+  `);
+  const previousRuntime = process.env.CODEX_RUNTIME_PATH;
+  const previousOutput = process.env.CWW_OUTPUTS_DIR;
+  process.env.CODEX_RUNTIME_PATH = fake;
+  context.after(() => {
+    if (previousRuntime === undefined) delete process.env.CODEX_RUNTIME_PATH;
+    else process.env.CODEX_RUNTIME_PATH = previousRuntime;
+  });
+  for (const threadId of [null, "managed-thread"]) {
+    const directories = createRunDirectories(root, threadId ? "00000000-0000-4000-8000-000000000002" : "00000000-0000-4000-8000-000000000001");
+    const changed: string[] = [];
+    const execution = new CodexExecution({
+      cwd: project, threadId, prompt: "build HTML", imagePaths: [], model: "gpt-test", reasoningEffort: "low", optionalCapabilities: {}, directories,
+    }, {
+      signal: new AbortController().signal, onThreadStarted: () => {}, onProgress: () => {}, onContextUsage: () => {}, onQuotaUsage: () => {}, onChangedFile: (file) => changed.push(file),
+    });
+    assert.equal(await execution.result, "done");
+    assert.deepEqual(changed, []);
+    const request = JSON.parse(fs.readFileSync(capture, "utf8"));
+    assert.equal(request.method, threadId ? "thread/resume" : "thread/start");
+    assert.deepEqual(request.params.config.shell_environment_policy.set, runDirectoryEnvironment(directories));
+    assert.match(request.params.developerInstructions, /HTML 交付展示类型/);
+    assert.match(request.params.developerInstructions, /pp-agent\.json/);
+    assert.match(request.params.developerInstructions, /默认私有/);
+    const uploaded: string[] = [];
+    await collectChangedFiles(project, changed, async (_, name) => { uploaded.push(name); }, { managedOutputRoot: directories.outputs });
+    assert.deepEqual(uploaded, ["shell.html", "shell.html.pp-agent.json"]);
+  }
+  assert.equal(process.env.CWW_OUTPUTS_DIR, previousOutput);
+});
 
 test("project sync includes non-interactive exec threads", () => {
   assert.deepEqual(PROJECT_SYNC_SOURCE_KINDS, ["cli", "vscode", "exec"]);

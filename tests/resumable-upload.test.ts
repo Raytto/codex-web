@@ -155,7 +155,7 @@ async function permissionFixture(context: test.TestContext) {
   const { listTenantIdentities } = await import("../server/tenant-identities.js");
   const identity = listTenantIdentities()[0];
   const other = listTenantIdentities()[1];
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-tus-permissions-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-tus-permissions-"));
   const instance = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "permissions", passwordHash: bcrypt.hashSync(PASSWORD, 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false, minimumFreeDiskBytes: 1 });

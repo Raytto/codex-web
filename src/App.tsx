@@ -1,4 +1,8 @@
+import { canRunPendingPromptImmediately, modelMenuOptions, modelReasoningOptions, pendingPromptActionMode, reasoningForModel } from "./agent-model-options";
+import { AntigravityUsagePanel } from "./antigravity-usage-panel";
+import { TransientNotice, useNoticeState } from "./transient-notice";
 import { JudgmentWorkspace, JudgmentSidebar } from "./judgments";
+import { isTransientRestoreBlock } from "./conversation-restore-state";
 import { WebPresentation } from "./web-presentation";
 import { FileShareDialog } from "./file-share-dialog";
 import { ExtensionsSidebar } from './extensions-sidebar';
@@ -26,6 +30,7 @@ import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreview
 import { sanitizeAgentMarkdown } from "./agent-content";
 import { chooseComposerPrimaryAction } from "./composer-action";
 import { chooseSelectedConversation, mergeJobEvents } from "./recovery";
+import { conversationLocation, readConversationLocation } from "./conversation-location";
 import { resolveAccountIdentity } from "./account-identity";
 import { accountSelectionStorageKeys, chooseSelectedProject, clearLegacySelectionStorage, readStoredSelection, writeStoredSelection } from "./account-selection-storage";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
@@ -35,6 +40,7 @@ import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelec
 import { mergeMessagePages, preservePrependedScrollTop, resolveUnreadScrollTarget } from "./message-history";
 import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
+import { resolveProcessStatus } from "./process-status";
 import { buildSubagentActivity, subagentStatusLabel, type SubagentActivitySummary, type SubagentView } from "./subagent-activity";
 import { resetProjectConversationPage } from "./project-conversation-page";
 import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "./rollout-capacity";
@@ -344,6 +350,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
   onShareChange: (share: FileShareState) => void;
 }) {
   const menu = useRef<HTMLDetailsElement>(null);
+  const [presentationOpen, setPresentationOpen] = useState(false);
 
   useEffect(() => {
     const closeOutside = (event: globalThis.PointerEvent) => {
@@ -355,9 +362,10 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
     return () => { document.removeEventListener("pointerdown", closeOutside); document.removeEventListener("keydown", closeEscape); };
   }, []);
 
-  return <details ref={menu} className="file-reader-settings-menu">
+  return <><details ref={menu} className="file-reader-settings-menu">
     <summary className="file-reader-settings-button" title="阅读器设置" aria-label="阅读器设置" aria-haspopup="menu"><Settings2 size={18} /></summary>
     <div className="file-reader-settings-popover" role="menu" aria-label="阅读器设置选项">
+      {download && fileReaderKind(file) === "html" && <button className="file-reader-settings-item file-reader-web-action" type="button" role="menuitem" onClick={() => { if (menu.current) { menu.current.open = false; menu.current.querySelector("summary")?.focus(); } setPresentationOpen(true); }}><Play size={16} /><span>以交互网页打开</span></button>}
       {download && <ParaCollectButton fileId={file.id} menuItem onOpen={() => { if (menu.current) menu.current.open = false; }} />}
       {download && <a className="file-reader-settings-item" role="menuitem" href={download} download={file.original_name} onClick={() => { if (menu.current) menu.current.open = false; }}><Download size={15} /><span>下载</span></a>}
       {download && <div className="file-reader-settings-divider" />}
@@ -368,7 +376,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
         <button type="button" aria-label="外观跟随系统" aria-pressed={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => onThemePreferenceChange("system")}><Monitor size={14} /><span>系统</span></button>
       </div>
     </div>
-  </details>;
+  </details>{presentationOpen && <FileShareDialog fileId={file.id} intent="open-web" onClose={() => setPresentationOpen(false)} />}</>;
 }
 
 function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme, themePreference, onThemePreferenceChange }: { fileId: string; userInitials: string; onSessionExpired: () => void; resolvedTheme: ResolvedTheme; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
@@ -994,6 +1002,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const selectionStorageKeys = useMemo(() => accountSelectionStorageKeys(session.accountId!), [session.accountId]);
   const savedProjectIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.project));
   const savedConversationIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.conversation));
+  const [conversationRoute, setConversationRoute] = useState(() => ({ ...readConversationLocation(window.location.href), fromHistory: false }));
+  const resolvingLinkRef = useRef(conversationRoute.explicit);
+  const linkGenerationRef = useRef(0);
+  const explicitConversationRef = useRef<string | null>(conversationRoute.id);
+  const lastLocationRef = useRef(window.location.href);
+  const locationInitializedRef = useRef(false);
+  const [conversationLinkError, setConversationLinkError] = useState("");
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
@@ -1045,7 +1060,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   });
   const [paraBoardId, setParaBoardId] = useState<string | null>(initialKanbanLocation?.board ?? null);
   const [paraProjectId, setParaProjectId] = useState<string | null>(initialKanbanLocation?.project ?? null);
-  const [paraVisible, setParaVisible] = useState(Boolean(initialKanbanLocation));
+  const [paraVisible, setParaVisible] = useState(Boolean(initialKanbanLocation) && !conversationRoute.explicit);
   useEffect(() => {
     try {
       if (features.paraBoard && paraVisible && paraBoardId) window.localStorage.setItem(kanbanLocationKey, JSON.stringify({ board: paraBoardId, project: paraProjectId }));
@@ -1076,7 +1091,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     judgmentDirty.current=false;
     setJudgmentVisible(false);
     if (recurringDirty.current && !window.confirm("放弃周期任务尚未保存的修改？")) return false;
-    recurringDirty.current = false; setRecurringView(null); return true;
+    recurringDirty.current = false; setRecurringView(null);
+    cancelConversationLink();
+    return true;
   }
   function openRecurring(projectId: string, taskId: string | null) {
     if (recurringView?.projectId === projectId && recurringView.taskId === taskId) { setSidebarOpen(false); setProjectMenu(null); return; }
@@ -1110,6 +1127,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const composerScope = selectedId ?? `new:${activeProjectId ?? "default"}`;
   const [conversationSelectionReady, setConversationSelectionReady] = useState(false);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [conversationLoad, setConversationLoad] = useState<{ id: string; state: "loading" | "restoring" | "waiting" | "error" } | null>(null);
+  const conversationPollRef = useRef<number | null>(null);
+  useEffect(() => () => { if (conversationPollRef.current !== null) window.clearTimeout(conversationPollRef.current); }, []);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth);
   const [query, setQuery] = useState("");
@@ -1128,15 +1148,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [removedEditingFileIds, setRemovedEditingFileIds] = useConversationState<string[]>(composerScope, []);
   const [sending, setSending] = useState(false);
   const [submitting, setSubmitting] = useConversationState(composerScope, false);
-  const [composerError, setComposerError] = useConversationState(composerScope, "");
+  const [composerErrorNotice, setComposerErrorNotice] = useConversationState(composerScope, { text: "", revision: 0 });
+  const composerError = composerErrorNotice.text;
+  const setComposerError = useCallback((text: string) => setComposerErrorNotice(current => ({ text, revision: current.revision + 1 })), [setComposerErrorNotice]);
   const [steering, setSteering] = useConversationState(composerScope, false);
   const steeringRef = useRef(new Set<string>());
   const [job, setJob] = useState<Job | null>(null);
   const [activities, setActivities] = useState<JobEvent[]>([]);
   const [activitiesLoading, setActivitiesLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError, errorRevision] = useNoticeState();
   const [cleanupRetry, setCleanupRetry] = useState<Conversation | null>(null);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice, noticeRevision] = useNoticeState();
   const [agentOptions, setAgentOptions] = useState<AgentOptions | null>(null);
   const [executorCatalogEpoch, setExecutorCatalogEpoch] = useState(0);
   const [selectedModel, setSelectedModel] = useState("");
@@ -1209,7 +1231,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const deploymentPhaseRef = useRef<DeploymentPhase>("idle");
   const voiceInputActiveRef = useRef(false);
   const instanceReloadDeferredRef = useRef(false);
-  const conversationSelectionReadyRef = useRef(false);
+  const conversationSelectionReadyRef = useRef(conversationRoute.explicit);
   const creatingConversationProjectsRef = useRef(new Set<string>());
   selectedIdRef.current = selectedId;
   editingPendingRef.current = editingPending;
@@ -1473,6 +1495,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   const refreshDetail = useCallback(async (id: string, activate = false) => {
     if (activate) {
+      if (selectedIdRef.current === id) setConversationLoad({ id, state: "loading" });
       const activation = await api.activateConversation(id);
       if (activation.state !== "local") {
         if (selectedIdRef.current === id) setDetail(null);
@@ -1639,13 +1662,115 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       activeProjectIdRef.current = active;
       setActiveProjectId(active);
       writeStoredSelection(window.localStorage, selectionStorageKeys.project, active);
-      if (!active) {
+      if (!active && !resolvingLinkRef.current) {
         conversationSelectionReadyRef.current = true;
         setConversationSelectionReady(true);
       }
       setProjectsLoaded(true);
     }).catch((reason) => setError(reason instanceof Error ? reason.message : "项目加载失败"));
   }, [selectionStorageKeys.project]);
+  function cancelConversationLink() {
+    linkGenerationRef.current += 1;
+    if (resolvingLinkRef.current) {
+      conversationSelectionReadyRef.current = true;
+      setConversationSelectionReady(true);
+    }
+    resolvingLinkRef.current = false;
+    explicitConversationRef.current = null;
+    setConversationLinkError("");
+  }
+
+  const historyNavigationRef = useRef(() => {});
+  historyNavigationRef.current = () => {
+    if (!leaveRecurring()) {
+      window.history.pushState(null, "", lastLocationRef.current);
+      return;
+    }
+    const route = readConversationLocation(window.location.href);
+    resolvingLinkRef.current = true;
+    conversationSelectionReadyRef.current = true;
+    setConversationSelectionReady(false);
+    setConversationRoute({ ...route, fromHistory: true });
+  };
+  useEffect(() => {
+    const navigate = () => historyNavigationRef.current();
+    window.addEventListener("popstate", navigate);
+    return () => window.removeEventListener("popstate", navigate);
+  }, []);
+
+  useEffect(() => {
+    if (!projectsLoaded || (!conversationRoute.explicit && !conversationRoute.fromHistory)) return;
+    const generation = ++linkGenerationRef.current;
+    resolvingLinkRef.current = true;
+    conversationSelectionReadyRef.current = true;
+    explicitConversationRef.current = conversationRoute.id;
+    setConversationSelectionReady(false);
+    setConversationLinkError("");
+    setParaVisible(false); setOpportunityVisible(false); setJudgmentVisible(false); setRecurringView(null);
+    queryRef.current = ""; setQuery("");
+    selectedIdRef.current = null; setSelectedId(null); setDetail(null);
+    retainedConversationRef.current = null;
+    const finish = () => {
+      resolvingLinkRef.current = false;
+      setConversationSelectionReady(true);
+    };
+    if (!conversationRoute.id) {
+      if (conversationRoute.explicit) setConversationLinkError("会话链接无效，请检查网址或从侧栏选择会话。");
+      finish();
+      return;
+    }
+    void api.conversationNavigation(conversationRoute.id).then(({ conversation }) => {
+      if (generation !== linkGenerationRef.current) return;
+      const projectId = conversation.project_id;
+      retainedConversationRef.current = conversation;
+      retainedConversationNeedsNaturalPageRef.current = null;
+      activeProjectIdRef.current = projectId;
+      setActiveProjectId(projectId);
+      writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
+      if (projectId && projects.some(project => project.id === projectId)) {
+        collapsedProjectsRef.current = { ...collapsedProjectsRef.current, [projectId]: false };
+        setCollapsedProjects(collapsedProjectsRef.current);
+        // Include old conversations beyond the first sidebar page.
+        const page = projectConversationPagesRef.current[projectId];
+        if (page) storeProjectConversationPage(projectId, retainSelectedConversation(page, conversation, projectId));
+        else void loadProjectPage(projectId);
+      }
+      selectedIdRef.current = conversation.id;
+      setSelectedId(conversation.id);
+      finish();
+    }).catch(reason => {
+      if (generation !== linkGenerationRef.current) return;
+      setConversationLinkError(isApiErrorStatus(reason, 404)
+        ? "会话不存在或当前账号无权访问。请检查链接，或从侧栏选择其他会话。"
+        : "暂时无法打开此会话，请重试。");
+      finish();
+    });
+    return () => { if (linkGenerationRef.current === generation) linkGenerationRef.current += 1; };
+  // The current request is also invalidated by manual selections and popstate.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationRoute, projectsLoaded]);
+
+  useEffect(() => {
+    if (!conversationSelectionReady || resolvingLinkRef.current || conversationLinkError) return;
+    const visibleId = paraVisible || opportunityVisible || judgmentVisible || recurringView ? null : selectedId;
+    const href = conversationLocation(window.location.href, visibleId);
+    if (href !== window.location.href) {
+      if (locationInitializedRef.current) window.history.pushState(null, "", href);
+      else window.history.replaceState(null, "", href);
+    }
+    locationInitializedRef.current = true;
+    lastLocationRef.current = href;
+  }, [conversationSelectionReady, selectedId, paraVisible, opportunityVisible, judgmentVisible, recurringView, conversationLinkError]);
+
+  async function copyConversationLink(id: string) {
+    setTaskMenu(null);
+    if (conversationMenuRef.current) conversationMenuRef.current.open = false;
+    try {
+      await copyTextToClipboard(conversationLocation(new URL(`${BASE_PATH || ""}/`, window.location.origin).href, id));
+      setNotice("已复制会话链接");
+    } catch { setError("复制失败，请从浏览器地址栏复制会话链接。"); }
+  }
+
   useEffect(() => {
     if (!projectsLoaded || session.projectMode) return;
     let cancelled = false;
@@ -1836,19 +1961,30 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     return () => window.clearInterval(timer);
   }, [projectIdsKey, refreshList, session.projectMode]);
   useEffect(() => {
+    const refreshModels = () => setExecutorCatalogEpoch((value) => value + 1);
+    window.addEventListener("codex-web-models-changed", refreshModels);
+    return () => window.removeEventListener("codex-web-models-changed", refreshModels);
+  }, []);
+  useEffect(() => {
     if (!projectsLoaded) return;
+    let disposed = false;
     window.localStorage.removeItem("codex-web:model");
     window.localStorage.removeItem("codex-web:reasoning");
     void api.agentOptions(activeProjectId ? { projectId: activeProjectId } : {}).then((options) => {
+      if (disposed) return;
       setAgentOptions(options);
       if (!selectedIdRef.current) {
         setSelectedModel(options.selection.model);
         setReasoningEffort(options.selection.reasoningEffort);
       }
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "模型选项加载失败"));
+    }).catch((reason) => { if (!disposed) setError(reason instanceof Error ? reason.message : "模型选项加载失败"); });
+    return () => { disposed = true; };
   }, [activeProjectId, executorCatalogEpoch, projectsLoaded]);
   useLayoutEffect(() => {
     if (!conversationSelectionReady) return;
+    if (conversationPollRef.current !== null) window.clearTimeout(conversationPollRef.current);
+    conversationPollRef.current = null;
+    setConversationLoad(null);
     autoFollowRef.current = true;
     lastScrollTopRef.current = 0;
     loadingOlderMessagesRef.current = false;
@@ -2281,6 +2417,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   function acceptManualConversationSelection() {
     // A user's selection supersedes startup restoration, including validation
     // that was already in flight when the user clicked a visible search hit.
+    cancelConversationLink();
     conversationSelectionReadyRef.current = true;
     setConversationSelectionReady(true);
   }
@@ -2866,13 +3003,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       // sidebar only for background reconciliation (where ordering/status may
       // have changed), avoiding a duplicate list request during navigation.
       const value = await refreshDetail(id, activate);
-      if (!activate) await refreshList();
       if (selectedIdRef.current !== id) return;
+      if (conversationPollRef.current !== null) window.clearTimeout(conversationPollRef.current);
+      conversationPollRef.current = null;
+      syncConversation(value.conversation);
       if ("restoring" in value) {
-        window.setTimeout(() => { if (selectedIdRef.current === id) void reconcile(id); }, 1_000);
+        const state = value.state === "error" ? "error"
+          : isTransientRestoreBlock(value.conversation.cold_storage_error) ? "waiting" : "restoring";
+        setConversationLoad({ id, state });
+        if (state !== "error") conversationPollRef.current = window.setTimeout(() => {
+          conversationPollRef.current = null;
+          if (selectedIdRef.current === id) void reconcile(id);
+        }, 3_000);
         return;
       }
-      syncConversation(value.conversation);
+      setConversationLoad(null);
+      if (!activate) void refreshList().catch(() => undefined);
       // The detail response already carries the same activity snapshot.  Do
       // not immediately fetch /activity again; the SSE stream is responsible
       // for subsequent changes.
@@ -2884,17 +3030,21 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       }
     } catch (reason) {
       if (selectedIdRef.current !== id) return;
+      if (conversationPollRef.current !== null) window.clearTimeout(conversationPollRef.current);
+      conversationPollRef.current = null;
+      if (explicitConversationRef.current === id) {
+        setConversationLinkError(isApiErrorStatus(reason, 404)
+          ? "会话不存在或当前账号无权访问。请检查链接，或从侧栏选择其他会话。"
+          : "暂时无法打开此会话，请重试。");
+        return;
+      }
       if (isApiErrorStatus(reason, 404)) {
         await recoverMissingConversation(id);
         return;
       }
-      const items = await refreshList().catch(() => [] as Conversation[]);
-      if (!items.some((conversation) => conversation.id === id)) {
-        writeStoredSelection(window.localStorage, selectionStorageKeys.conversation, null);
-        setSelectedId(chooseSelectedConversation(null, items));
-      } else {
-        setError(reason instanceof Error ? reason.message : "状态刷新失败");
-      }
+      // A transient list/network failure must not discard the selected task.
+      setConversationLoad({ id, state: "error" });
+      setError(reason instanceof Error ? reason.message : "状态刷新失败");
     }
   }
 
@@ -3324,7 +3474,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const finishMutation = beginComposerMutation(conversationId);
     const selected = selectedIdRef.current === conversationId;
     if (selected) {
-      setError(""); setNotice(""); setSubmitting(true);
+      setError(""); setComposerError(""); setNotice(""); setSubmitting(true);
       if (!sending) setActivities([{ kind: "status", label: "正在提交语音任务" }]);
     }
     try {
@@ -3358,7 +3508,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function sendVoiceRecording(audio: Blob, fileName: string, context: VoiceInputContext, voiceTranscriptionIds: string[]) {
-    setError(""); setNotice(""); setSubmitting(true);
+    setError(""); setComposerError(""); setNotice(""); setSubmitting(true);
     let finishMutation: (() => void) | undefined;
     let targetId = context.conversationId;
     try {
@@ -3394,7 +3544,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const hasComposerDraftFile = Boolean(!editingPending && composerDraft?.files.length);
     if ((!message.trim() && !askAgentQuote && files.length === 0 && !hasRetainedEditingFile && !hasComposerDraftFile) || submitting || selectionSaving) return;
     if (draftUploads.length > 0) { setNotice("请等待草稿附件上传完成后再发送。"); return; }
-    setComposerError(""); setNotice(""); setSubmitting(true);
+    setError(""); setComposerError(""); setNotice(""); setSubmitting(true);
     if (!sending) setActivities([{ kind: "status", label: files.length ? "正在上传并准备文件" : "正在提交任务" }]);
     let finishMutation: (() => void) | undefined;
     let targetId = selectedId;
@@ -3677,11 +3827,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const options = agentOptions;
     const model = options?.models.find((candidate) => candidate.id === modelId);
     if (!options || !model) return;
-    const nextEffort = reasoningEffort && model.reasoningEfforts.includes(reasoningEffort)
-      ? reasoningEffort
-      : model.reasoningEfforts.includes(options.defaults.reasoningEffort)
-        ? options.defaults.reasoningEffort
-        : model.reasoningEfforts.at(-1)!;
+    const nextEffort = reasoningForModel(options, model.id, selectedModel, reasoningEffort);
     void persistAgentSelection({ model: model.id, reasoningEffort: nextEffort });
   }
 
@@ -3720,11 +3866,18 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         ? message
         : { ...message, files: [...message.files, result.file] }),
     } : current);
+    if (result.warnings?.length) {
+      const notice = `文件已取回为阅读文档：${result.warnings.map(warning => `${warning.fileName}：${warning.reason}`).join("；")}。需要交互时，可从附件的分享面板或阅读器设置选择“以交互网页打开”并校验。`;
+      setError(notice);
+      throw new Error(notice);
+    }
     return result.file;
   }
 
   const filtered = conversations;
   const currentDetail = detail?.conversation.id === selectedId ? detail : null;
+  const showingGeminiMetrics = selectedModel.startsWith("antigravity:") || Boolean(job?.status === "running" && job.agent_model?.startsWith("antigravity:"));
+  const displayedContextUsage = showingGeminiMetrics === (currentDetail?.contextUsage?.engineId === "antigravity") ? currentDetail?.contextUsage : null;
   const currentProject = currentDetail ? projects.find((project) => project.id === currentDetail.conversation.project_id) : undefined;
   const remoteFileFetchEnabled = Boolean(currentProject?.executor_id.startsWith("remote:"));
   const restoringConversationSelection = !conversationSelectionReady;
@@ -3926,7 +4079,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           <button className="account-settings-archive display-settings-trigger" type="button" aria-haspopup="dialog" aria-expanded={displaySettingsDialogOpen} onClick={() => { setAccountSettingsOpen(false); setDisplaySettingsDialogOpen(true); }}><Settings2 size={16} /><span>显示设置</span></button>
           <button className="account-settings-archive" type="button" aria-haspopup="dialog" aria-expanded={featureSelectionOpen} onClick={() => { setAccountSettingsOpen(false); setFeatureSelectionOpen(true); }}><LayoutDashboard size={16} /><span>功能选择</span></button>
           {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setNodeTransfersOpen(true); }}><Share2 size={16} /><span>节点文件传输</span></button>}
-          {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setAccountAuthDialogOpen(true); }}><KeyRound size={16} /><span>Codex 账号管理</span></button>}
+          {session.accountId === HOST_ROOT_ACCOUNT_ID && <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setAccountAuthDialogOpen(true); }}><KeyRound size={16} /><span>账号管理</span></button>}
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setPersonalMemoryDialogOpen(true); }}><BookOpen size={16} /><span>个人知识</span></button>
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setVoiceLexiconDialogOpen(true); }}><Mic size={16} /><span>语音关键词</span></button>
           <button className="account-settings-archive" type="button" onClick={() => { setAccountSettingsOpen(false); setPublicSharesDialogOpen(true); }}><Share2 size={16} /><span>公开分享管理</span></button>
@@ -4005,6 +4158,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       aria-label={`任务 ${taskMenuConversation.title} 操作`}
       style={{ top: taskMenu.top, left: taskMenu.left }}
     >
+      <button type="button" role="menuitem" onClick={() => void copyConversationLink(taskMenuConversation.id)}><Copy size={16} /><span>复制会话链接</span></button>
       <button type="button" role="menuitem" className={taskMenuConversation.pinned_at ? "active" : undefined} onClick={() => { setTaskMenu(null); void toggleConversationPin(taskMenuConversation); }}>{taskMenuConversation.pinned_at ? <PinOff size={16} /> : <Pin size={16} />}<span>{taskMenuConversation.pinned_at ? "取消置顶" : "置顶"}</span></button>
       <button type="button" role="menuitem" onClick={() => { setTaskMenu(null); void renameConversation(taskMenuConversation); }}><Pencil size={16} /><span>重命名</span></button>
       {features.paraBoard && <button type="button" role="menuitem" onClick={() => openConversationProjects(taskMenuConversation)}><LayoutDashboard size={16} /><span>关联项目</span></button>}
@@ -4057,7 +4211,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <header className="workspace-header">
         <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
-          {currentDetail && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
+          {currentDetail && !showingGeminiMetrics && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
             <summary className="icon-button" aria-label={`rollout 容量提醒：${formatRolloutBytes(currentDetail.rolloutBytes!)}`} title="rollout 容量提醒"><HardDrive size={17} /><span /></summary>
             <div className="rollout-warning-panel" role="status">
               <strong>rollout 已达到 {formatRolloutBytes(currentDetail.rolloutBytes!)}</strong>
@@ -4065,10 +4219,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
             </div>
           </details>}
           <button className="icon-button" onClick={() => void newConversation()} aria-label="新建会话" title="新建会话"><SquarePen size={20} /></button>
-          {selectedConversation ? <details className="conversation-menu" ref={conversationMenuRef} onToggle={(event) => setConversationMenuOpen(event.currentTarget.open)}>
+          {selectedConversation ? <details className={`conversation-menu${showingGeminiMetrics ? " has-antigravity-usage" : ""}`} ref={conversationMenuRef} onToggle={(event) => setConversationMenuOpen(event.currentTarget.open)}>
             <summary className="icon-button" aria-label="会话操作" title="会话操作"><MoreHorizontal size={21} /></summary>
             <div className="conversation-menu-panel" role="menu">
               <div className="conversation-menu-actions">
+                <button role="menuitem" onClick={() => void copyConversationLink(selectedConversation.id)}><Copy size={17} /><span>复制会话链接</span></button>
                 {features.paraBoard && <button role="menuitem" onClick={() => openConversationProjects(selectedConversation)}><LayoutDashboard size={17} /><span>关联项目</span></button>}
                 {selectedConversation.archived_at
                 ? <button role="menuitem" onClick={() => void restoreConversation(selectedConversation)}><RotateCcw size={17} /><span>恢复到侧边栏</span></button>
@@ -4084,27 +4239,29 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                 </>}</div>
               <div className="conversation-menu-separator" role="separator" />
               <div className="conversation-menu-info" role="group" aria-label="会话容量信息">
-                <div className="conversation-menu-info-row" title="Codex 在磁盘上维护的当前会话记录文件大小">
+                {!showingGeminiMetrics && <div className="conversation-menu-info-row" title="Codex 在磁盘上维护的当前会话记录文件大小">
                   <HardDrive size={16} /><span><small>Rollout 文件</small><strong>{currentDetail ? currentDetail.rolloutBytes === null ? "暂无数据" : formatRolloutBytes(currentDetail.rolloutBytes) : "读取中…"}</strong></span>
-                </div>
+                </div>}
                 <div className="conversation-menu-info-row" title="最近一次请求使用的输入上下文 / 当前模型上下文窗口">
-                  <Bot size={16} /><span><small>Codex 上下文</small><strong>{currentDetail ? currentDetail.contextUsage ? formatContextUsage(currentDetail.contextUsage.inputTokens, currentDetail.contextUsage.modelContextWindow) : "暂无数据" : "读取中…"}</strong></span>
+                  <Bot size={16} /><span><small>{showingGeminiMetrics ? "Antigravity 上下文" : "Codex 上下文"}</small><strong>{currentDetail ? displayedContextUsage ? formatContextUsage(displayedContextUsage.inputTokens, displayedContextUsage.modelContextWindow) : "暂无数据" : "读取中…"}</strong></span>
                 </div>
-                <div className="conversation-menu-info-row" title="当前 Codex 套餐周期的剩余额度">
+                {!showingGeminiMetrics && <div className="conversation-menu-info-row" title="当前 Codex 套餐周期的剩余额度">
                   <Gauge size={16} /><span><small>套餐额度</small><strong>{currentDetail ? currentDetail.packageQuota ? `${Math.round(currentDetail.packageQuota.remainingPercent)}%` : "暂无数据" : "读取中…"}</strong></span>
-                </div>
+                </div>}
+                {showingGeminiMetrics && conversationMenuOpen && currentProject?.executor_id && <AntigravityUsagePanel key={currentProject.executor_id} executorId={currentProject.executor_id} />}
               </div>
             </div>
           </details> : <button className="icon-button" aria-label="会话操作" title="请先选择会话" disabled><MoreHorizontal size={21} /></button>}
         </div>
       </header>
-      {currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
-        : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} />
+      {conversationLinkError ? <section className="conversation-loading" role="alert"><span>{conversationLinkError}</span><button type="button" onClick={() => { resolvingLinkRef.current = true; setConversationRoute({ ...readConversationLocation(window.location.href), fromHistory: true }); }}>重试打开会话</button></section>
+        : currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
+        : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} state={conversationLoad?.id === selectedId ? conversationLoad.state : undefined} onRetry={() => { if (selectedId) { setError(""); void reconcile(selectedId, true); } }} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
-      {(error || composerError) && <div className="toast"><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></div>}
-      {notice && <div className="toast info" role="status"><span>{notice}</span><button onClick={() => setNotice("")}><X size={16} /></button></div>}
+      {(error || composerError) && <TransientNotice className="toast" role="alert" message={error || composerError} revision={`${errorRevision}:${composerScope}:${composerErrorNotice.revision}`} onDismiss={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button aria-label="关闭错误提示" onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></TransientNotice>}
+      {notice && <TransientNotice className="toast info" message={notice} revision={noticeRevision} onDismiss={() => setNotice("")}><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></TransientNotice>}
       {currentDetail?.conversation.archived_at && <div className="archived-conversation-banner"><Archive size={15} /><span>这是已归档会话，只读查看；消息、附件和 rollout 仍保存在原处。</span><button type="button" onClick={() => void restoreConversation(currentDetail.conversation)}>恢复</button></div>}
-      {conversationSelectionReady && (!selectedId || !selectedConversation?.archived_at) && <ComposerSessions sessionKey={composerScope} onTransfersChange={setVoiceTransfers} accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} pendingBusy={submitting || steering} selectionSaving={selectionSaving}
+      {conversationSelectionReady && !conversationLinkError && (!selectedId || !selectedConversation?.archived_at) && <ComposerSessions sessionKey={composerScope} onTransfersChange={setVoiceTransfers} accountId={session.accountId ?? null} input={input} setInput={setInput} askAgentQuote={askAgentQuote} onClearAskAgentQuote={() => setAskAgentQuote("")} focusRequest={composerFocusRequest} files={files} setFiles={setFiles} draftFiles={composerDraft?.files ?? []} draftUploads={draftUploads} draftSaveState={draftSaveState} sending={sending} submitting={submitting} pendingBusy={submitting || steering} selectionSaving={selectionSaving}
         conversationId={selectedId}
         pendingPrompts={currentDetail?.pendingPrompts ?? []} editingPending={editingPending} removedEditingFileIds={removedEditingFileIds}
         agentOptions={agentOptions} selectedModel={selectedModel} reasoningEffort={reasoningEffort}
@@ -4112,7 +4269,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
         onRetryVoice={async (prompt) => { await api.retryVoiceMessage(prompt.conversation_id, prompt.id); await reconcile(prompt.conversation_id); }}
-        pendingActionMode={job?.status === "running" ? "steer" : "insert"} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
+        pendingActionMode={pendingPromptActionMode(job, selectedModel)} runningModel={job?.status === "running" ? job.agent_model : undefined} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
         onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onPauseDraftUpload={pauseComposerDraftUpload} onResumeDraftUpload={resumeComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
@@ -4125,8 +4282,14 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   </div>;
 }
 
-function ConversationLoading({ restoring = false }: { restoring?: boolean }) {
-  return <section className="conversation-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={23} /><span>{restoring ? "正在恢复上次任务…" : "正在加载任务…"}</span></section>;
+function ConversationLoading({ restoring = false, state, onRetry }: { restoring?: boolean; state?: "loading" | "restoring" | "waiting" | "error"; onRetry?: () => void }) {
+  const failed = state === "error";
+  return <section className="conversation-loading" role={failed ? "alert" : "status"} aria-live="polite">
+    {!failed && <LoaderCircle className="spin" size={23} />}
+    <span>{failed ? "任务或历史加载失败，请重试。" : state === "waiting" ? "正在等待恢复历史" : state === "restoring" ? "正在恢复历史…" : restoring ? "正在恢复上次任务…" : "正在加载任务…"}</span>
+    {state === "waiting" && <span>同账号其他任务正在运行，结束后会自动恢复。</span>}
+    {failed && <button type="button" onClick={onRetry}>重试恢复历史</button>}
+  </section>;
 }
 
 function ArchivedConversationsDialog({ onClose, onSelect, onRestored }: {
@@ -4230,14 +4393,11 @@ function WakePlanDialog({ conversation, onClose, onCreated }: {
   }, [conversation.id]);
 
   const selectedModel = agentOptions?.models.find((option) => option.id === model);
-  const effortOptions = agentOptions?.reasoningEfforts.filter((effort) => selectedModel?.reasoningEfforts.includes(effort.id)) ?? [];
+  const effortOptions = modelReasoningOptions(agentOptions, model);
 
   function changeModel(nextModel: string) {
     setModel(nextModel);
-    const option = agentOptions?.models.find((item) => item.id === nextModel);
-    if (!option?.reasoningEfforts.includes(reasoningEffort)) {
-      setReasoningEffort(option?.reasoningEfforts[0] ?? "");
-    }
+    if (agentOptions) setReasoningEffort(reasoningForModel(agentOptions, nextModel, model, reasoningEffort));
   }
 
   useEffect(() => {
@@ -4270,17 +4430,17 @@ function WakePlanDialog({ conversation, onClose, onCreated }: {
 
   return <div className="project-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
     <form className="project-dialog wake-plan-dialog" role="dialog" aria-modal="true" aria-labelledby="wake-plan-dialog-title" onSubmit={submit}>
-      <header><div><h2 id="wake-plan-dialog-title">安排自动续跑</h2><p>“{conversation.title}”会在时间到达后{newConversation ? "在新会话中" : "回到原会话"}继续。每次触发一次；Codex 可在下一轮按需再次安排。</p></div><button type="button" onClick={onClose} disabled={busy} aria-label="关闭"><X size={18} /></button></header>
+      <header><div><h2 id="wake-plan-dialog-title">安排自动续跑</h2><p>“{conversation.title}”会在时间到达后{newConversation ? "在新会话中" : "回到原会话"}继续。每次触发一次；Agent 可在下一轮按需再次安排。</p></div><button type="button" onClick={onClose} disabled={busy} aria-label="关闭"><X size={18} /></button></header>
       <div className="project-dialog-body wake-plan-fields">
         <label>等待时间<div className="wake-delay-row"><input type="number" min="1" step="0.1" value={delay} onChange={(event) => setDelay(event.target.value)} /><select value={unit} onChange={(event) => setUnit(event.target.value as typeof unit)}><option value="minutes">分钟</option><option value="hours">小时</option><option value="days">天</option></select></div></label>
         <label>显示名称<input value={label} maxLength={120} onChange={(event) => setLabel(event.target.value)} placeholder="例如：两小时后检查" /></label>
         <label className="wake-conversation-toggle"><input type="checkbox" checked={newConversation} onChange={(event) => setNewConversation(event.target.checked)} /><span><strong>新建会话继续</strong><small>{newConversation ? "安排时立即创建新会话，等待和结果都留在新会话。" : "保持关闭时，到点后接着当前会话继续。"}</small></span></label>
         <div className="wake-selection-row">
-          <label>续跑模型<select value={model} disabled={!agentOptions} onChange={(event) => changeModel(event.target.value)}>{agentOptions?.models.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
+          <label>续跑模型<select value={model} disabled={!agentOptions} onChange={(event) => changeModel(event.target.value)}>{agentOptions && model && !selectedModel && <option value={model} disabled>{model}（当前不可用）</option>}{agentOptions?.models.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>
           <label>思考深度<select value={reasoningEffort} disabled={!agentOptions || effortOptions.length === 0} onChange={(event) => setReasoningEffort(event.target.value)}>{effortOptions.map((effort) => <option key={effort.id} value={effort.id}>{effort.label}</option>)}</select></label>
         </div>
         {agentOptions && <p className="wake-selection-summary">本次续跑：{selectedModel?.label ?? model} · {effortOptions.find((effort) => effort.id === reasoningEffort)?.label ?? reasoningEffort}</p>}
-        <label>到点后交给 Codex 的指令<textarea value={prompt} maxLength={20_000} rows={6} onChange={(event) => setPrompt(event.target.value)} /></label>
+        <label>到点后交给 Agent 的指令<textarea value={prompt} maxLength={20_000} rows={6} onChange={(event) => setPrompt(event.target.value)} /></label>
         <p className="wake-plan-note"><Clock size={14} />等待不占用 Worker，也不会用 sleep 保持任务；到点后仍会遵守会话串行和机器容量。</p>
         {error && <div className="project-dialog-error">{error}</div>}
       </div>
@@ -4438,10 +4598,7 @@ function WakePlanDetailsDialog({ conversation, onClose, onChanged }: { conversat
 
   function changeModel(nextModel: string) {
     setModel(nextModel);
-    const option = agentOptions?.models.find((item) => item.id === nextModel);
-    if (option && !option.reasoningEfforts.includes(reasoningEffort)) {
-      setReasoningEffort(option.reasoningEfforts[0] ?? "");
-    }
+    if (agentOptions) setReasoningEffort(reasoningForModel(agentOptions, nextModel, model, reasoningEffort));
   }
 
   async function savePrompts() {
@@ -4498,8 +4655,8 @@ function WakePlanDetailsDialog({ conversation, onClose, onChanged }: { conversat
             <div><dt>等待条件</dt><dd>{plan.mode === "event_or_deadline" ? "外部事件完成，或到达底线时间" : "到达安排的时间"}</dd></div>
             <div><dt>{plan.mode === "event_or_deadline" ? "底线时间" : "唤醒时间"}</dt><dd><div className="wake-plan-deadline-editor"><input type="datetime-local" step="1" aria-label={plan.mode === "event_or_deadline" ? "编辑底线时间" : "编辑唤醒时间"} value={deadlineInput} disabled={Boolean(busy)} onChange={(event) => setDeadlineInput(event.target.value)} /><button type="button" className="wake-plan-inline-save" disabled={Boolean(busy) || !deadlineDirty} onClick={() => void saveDeadline()}>{busy === "reschedule" ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}保存时间</button></div><small className="wake-plan-deadline-hint">早于当前时间时，保存后立即继续。</small></dd></div>
             <div><dt>续跑位置</dt><dd>{plan.new_conversation ? "当前新对话（安排时已创建）" : "继续当前对话"}</dd></div>
-            <div><dt>续跑模型</dt><dd>{editingPrompts ? <SettingMenu menuId="wake-plan-model-menu" className="model wake-plan-setting" label="模型" value={model} options={agentOptions?.models.map((option) => ({ id: option.id, label: option.label, description: option.description })) ?? []} placeholder="加载中" title="选择续跑模型" disabled={!agentOptions || Boolean(busy)} open={openSettingMenu === "model"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenSettingMenu(open ? "model" : openSettingMenu === "model" ? null : openSettingMenu)} onChange={changeModel} /> : plan.agent_model}</dd></div>
-            <div><dt>思考深度</dt><dd>{editingPrompts ? <SettingMenu menuId="wake-plan-effort-menu" className="effort wake-plan-setting" label="思考" value={reasoningEffort} options={agentOptions?.reasoningEfforts.filter((effort) => agentOptions.models.find((option) => option.id === model)?.reasoningEfforts.includes(effort.id)).map((effort) => ({ id: effort.id, label: effort.label })) ?? []} placeholder="加载中" title="选择续跑思考深度" disabled={!agentOptions || Boolean(busy)} open={openSettingMenu === "effort"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenSettingMenu(open ? "effort" : openSettingMenu === "effort" ? null : openSettingMenu)} onChange={(value) => setReasoningEffort(value as ReasoningEffort)} /> : plan.reasoning_effort}</dd></div>
+            <div><dt>续跑模型</dt><dd>{editingPrompts ? <SettingMenu menuId="wake-plan-model-menu" className="model wake-plan-setting" label="模型" value={model} options={modelMenuOptions(agentOptions)} placeholder="加载中" unavailableValueLabel={agentOptions ? `${model}（当前不可用）` : undefined} title="选择续跑模型" disabled={!agentOptions || Boolean(busy)} open={openSettingMenu === "model"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenSettingMenu(open ? "model" : openSettingMenu === "model" ? null : openSettingMenu)} onChange={changeModel} /> : plan.agent_model}</dd></div>
+            <div><dt>思考深度</dt><dd>{editingPrompts ? <SettingMenu menuId="wake-plan-effort-menu" className="effort wake-plan-setting" label="思考" value={reasoningEffort} options={modelReasoningOptions(agentOptions, model)} placeholder="加载中" title="选择续跑思考深度" disabled={!agentOptions || Boolean(busy)} open={openSettingMenu === "effort"} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onOpenChange={(open) => setOpenSettingMenu(open ? "effort" : openSettingMenu === "effort" ? null : openSettingMenu)} onChange={(value) => setReasoningEffort(value as ReasoningEffort)} /> : plan.reasoning_effort}</dd></div>
             <div><dt>安排时间</dt><dd><time dateTime={plan.created_at}>{formatFullDateTime(plan.created_at)}</time></dd></div>
             {plan.last_heartbeat_at && <div><dt>最近心跳</dt><dd><time dateTime={plan.last_heartbeat_at}>{formatFullDateTime(plan.last_heartbeat_at)}</time></dd></div>}
           </dl>
@@ -5023,17 +5180,14 @@ function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading
   if (loading) return <div className="activity-card activity-loading" role="status" aria-live="polite" aria-busy="true">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>正在加载运行记录</strong><span>正在恢复完整上下文，加载完成后显示实时进度</span></div>
   </div>;
-  const latestStatus = activities.findLast((item) => item.type === "status" || item.kind === "status");
-  const queueStatus = activities.findLast((activity) => activity.status === "queued");
-  const queued = Boolean(queueStatus) && !activities.some((activity) => activity.status === "running");
-  const retrying = !queued && latestStatus?.status === "retrying";
+  const { latestStatus, queueStatus, queued, retrying, starting } = resolveProcessStatus(activities);
   const plan = activities.findLast((activity) => activity.kind === "todo" && Boolean(activity.items?.length));
   const journal = buildProcessJournal(activities);
   const subagents = buildSubagentActivity(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
 
   return <div className="activity-card" role="status" aria-live="polite">
-    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus.label : "完成前持续保留，可随时引导"}</span></div>
+    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : "完成前持续保留，可随时引导"}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
@@ -5048,7 +5202,7 @@ function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading
             {["search", "tool", "error", "retry"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
             {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>{activity.actionCount && activity.actionCount > 1 ? `查看 ${activity.actionCount} 个技术步骤` : "查看技术细节"}</summary><code>{activity.groupedDetails?.join("\n\n") || activity.detail}</code></details> : null}
           </div>
-        </div>) : <p className="process-journal-empty">正在建立执行方向…</p>}</div>
+        </div>) : <p className="process-journal-empty">{starting ? "正在准备执行…" : "正在建立执行方向…"}</p>}</div>
   </div>;
 }
 
@@ -5220,10 +5374,11 @@ function FileCard({ file }: { file: WorkFile }) {
   </div>;
 }
 
-function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, onEdit, onDelete, onSteer, onRetryVoice }: {
+function PendingQueue({ prompts, busy, actionMode, runningModel, waitingForWake, onReorder, onEdit, onDelete, onSteer, onRetryVoice }: {
   prompts: PendingPrompt[];
   busy: boolean;
-  actionMode: "steer" | "insert";
+  actionMode: "steer" | "insert" | "queue";
+  runningModel?: string;
   waitingForWake: boolean;
   onReorder: (ordered: PendingPrompt[]) => void;
   onEdit: (prompt: PendingPrompt) => void;
@@ -5234,7 +5389,7 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
   const actionLabel = actionMode === "steer" ? "引导" : "插入";
   const queueSummary = waitingForWake
     ? "等待计划结束后依次发送"
-    : actionMode === "steer" ? "当前任务完成后依次发送" : "即将依次发送";
+    : actionMode !== "insert" ? "当前任务完成后依次发送" : "即将依次发送";
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragTargetId, setDragTargetId] = useState<string | null>(null);
   const touchDragRef = useRef<{ pointerId: number; sourceId: string; targetId: string | null } | null>(null);
@@ -5302,7 +5457,7 @@ function PendingQueue({ prompts, busy, actionMode, waitingForWake, onReorder, on
         </div>
         {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
         <div className="pending-queue-actions">
-          <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>
+          {canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel) && <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
           <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
           <button type="button" disabled={busy} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
@@ -5339,7 +5494,7 @@ function ComposerSessions({ sessionKey, onTransfersChange, ...props }: Component
   </div>)}</>;
 }
 
-function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, onRetryVoice, pendingActionMode, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
+function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, onRetryVoice, pendingActionMode, runningModel, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
   active?: boolean;
   accountId: string | null;
   conversationId: string | null;
@@ -5370,7 +5525,8 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   onDeletePending: (prompt: PendingPrompt) => void;
   onSteerPending: (prompt: PendingPrompt) => void;
   onRetryVoice: (prompt: PendingPrompt) => Promise<void>;
-  pendingActionMode: "steer" | "insert";
+  pendingActionMode: "steer" | "insert" | "queue";
+  runningModel?: string;
   waitingForWake: boolean;
   onCancelPendingEdit: () => void;
   onAddFiles: (files: File[]) => void;
@@ -5613,8 +5769,8 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   }
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds()); } }
   const selectedModelOption = agentOptions?.models.find((model) => model.id === selectedModel);
-  const effortOptions = agentOptions?.reasoningEfforts.filter((effort) => selectedModelOption?.reasoningEfforts.includes(effort.id)) ?? [];
-  const modelOptions = agentOptions?.models.map((model) => ({ id: model.id, label: model.label, description: model.description })) ?? [];
+  const effortOptions = modelReasoningOptions(agentOptions, selectedModel);
+  const modelOptions = modelMenuOptions(agentOptions);
   const hasRetainedEditingFile = Boolean(editingPending?.files.some((file) => !removedEditingFileIds.includes(file.id)));
   const composerExpanded = inputFocused
     || settingMenuIntent
@@ -5650,11 +5806,13 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     : "";
   const pendingQueueGuidance = pendingActionMode === "steer"
     ? "任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。"
+    : pendingActionMode === "queue"
+    ? "任务运行中，新内容会按各自选择的模型进入待发送队列，在当前任务完成后依次发送。"
     : waitingForWake
     ? "会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。"
     : "新内容会进入待发送队列；可选择“插入”立即发送。";
   return <div className={`composer-wrap ${compactWrap ? "compact" : ""}`}>
-    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} waitingForWake={waitingForWake}
+    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} runningModel={runningModel} waitingForWake={waitingForWake}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} onRetryVoice={onRetryVoice} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div ref={composerRef} className={`composer ${composerExpanded ? "expanded" : "compact"}`}
@@ -5682,7 +5840,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     <textarea ref={textareaRef} className={longPressArmed ? "long-press-armed" : undefined} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} onPointerDown={beginLongPress} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={(event) => resetLongPress(event.pointerId)} onBlur={() => resetLongPress()} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
     <ConversationVoicePanel voice={voice} />
     <div className="composer-actions"><div className="composer-primary-actions"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button><input ref={fileInput} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.currentTarget.value = ""; }} />
-      <SettingMenu className="model" label="模型" value={selectedModel} options={modelOptions} placeholder="加载中" title={selectedModelOption?.description || "选择任务使用的模型"} disabled={submitting || selectionSaving || !agentOptions} open={openSettingMenu === "model"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {
+      <SettingMenu className="model" label="模型" value={selectedModel} options={modelOptions} placeholder="加载中" unavailableValueLabel={agentOptions ? `${selectedModel}（当前不可用）` : undefined} title={selectedModelOption?.description || "选择任务使用的模型"} disabled={submitting || selectionSaving || !agentOptions} open={openSettingMenu === "model"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {
         setOpenSettingMenu((current) => open ? "model" : current === "model" ? null : current);
       }} onChange={onModelChange} />
       <SettingMenu className="effort" label="思考" value={reasoningEffort} options={effortOptions} placeholder="加载中" title="选择模型的思考深度" disabled={submitting || selectionSaving || effortOptions.length === 0} open={openSettingMenu === "effort"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {

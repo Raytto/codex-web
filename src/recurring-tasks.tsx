@@ -1,3 +1,4 @@
+import { modelMenuOptions, modelReasoningOptions, reasoningForModel } from "./agent-model-options";
 import { useCallback, useEffect, useId, useState } from "react";
 import { CalendarClock, ChevronDown, Menu, Pause, Play, Plus, RefreshCw, Repeat2, Trash2 } from "lucide-react";
 import { api, type AgentOptions, type Project } from "./api";
@@ -96,9 +97,9 @@ function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onD
   }
   const efforts = options?.models.find(m => m.id === form.model)?.reasoningEfforts ?? [];
   const disabled = busy || !options;
-  const models = options?.models.map(m => ({ id: m.id, label: m.label, description: m.description })) ?? [];
-  if (form.model && !models.some(m => m.id === form.model)) models.unshift({ id: form.model, label: `${form.model}（当前不可用）`, description: "请选择可用模型" });
-  const effortOptions = efforts.map(e => ({ id: e, label: options?.reasoningEfforts.find(v => v.id === e)?.label ?? e }));
+  const models = modelMenuOptions(options);
+  if (form.model && !models.some(m => m.id === form.model)) models.unshift({ id: form.model, label: `${form.model}（当前不可用）`, description: "请选择可用模型", group: undefined });
+  const effortOptions = modelReasoningOptions(options, form.model);
   if (!efforts.includes(form.reasoningEffort)) effortOptions.unshift({ id: form.reasoningEffort, label: `${form.reasoningEffort || "未选择"}（当前不可用）` });
   function retry() {
     if (!dirty || window.confirm("放弃尚未保存的修改并读取最新设置？")) void load();
@@ -115,7 +116,7 @@ function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onD
           <label>任务名称<input aria-label="任务名称" required maxLength={120} value={form.name} onChange={e => field("name", e.target.value)} placeholder="例如：每日项目进展" /></label>
           <label>任务指令<textarea aria-label="任务指令" required maxLength={20000} rows={8} value={form.prompt} onChange={e => field("prompt", e.target.value)} placeholder="每次执行需要完成什么？写清目标、资料位置和交付方式。" /></label>
           <div className="recurring-grid">
-            <RecurringSelect label="模型" value={form.model} options={models} disabled={disabled} onChange={value => { const m = options?.models.find(m => m.id === value); setForm(f => ({ ...f, model: value, reasoningEffort: m?.reasoningEfforts.includes(f.reasoningEffort) ? f.reasoningEffort : m?.reasoningEfforts[0] ?? "" })); }} />
+            <RecurringSelect label="模型" value={form.model} options={models} disabled={disabled} onChange={value => { if (options) setForm(f => ({ ...f, model: value, reasoningEffort: reasoningForModel(options, value, f.model, f.reasoningEffort) })); }} />
             <RecurringSelect label="思考深度" value={form.reasoningEffort} options={effortOptions} disabled={disabled} onChange={value => field("reasoningEffort", value)} />
           </div>
         </section>

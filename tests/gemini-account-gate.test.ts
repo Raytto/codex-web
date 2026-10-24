@@ -1,0 +1,67 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { WebSocket } from "ws";
+import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
+import { loadConfig } from "../server/config.js";
+import { countRunningGeminiJobsForExecutor, countRunningGeminiJobsForExecutorInDatabase, countRunningJobsForExecutorInDatabase } from "../server/executor-job-status.js";
+import { RemoteWorkerGateway } from "../server/remote-worker-gateway.js";
+import { parseServerMessage } from "../remote-worker/src/protocol-validation.js";
+
+test("real database and remote account gate isolate Gemini from Codex, queued jobs and other nodes", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-account-gate-"));
+  const config = loadConfig({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false });
+  const db = new AppDatabase(config.dataRoot, undefined, false);
+  const workerId = crypto.randomUUID(), executorId = `remote:${workerId}`;
+  db.registerRemoteWorker({ id: workerId, machine_name: "fixture", platform: "win32-x64", protocol_version: 5,
+    worker_version: "1.21.0", worker_release: null, worker_commit: null, worker_update_capable: 1, codex_version: "fixture", capacity: 0 });
+  const gateway = new RemoteWorkerGateway(config, db);
+  t.after(() => { gateway.close(); db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const project = db.createProject(crypto.randomUUID(), LEGACY_USER_ID, "Remote", root, executorId);
+  const other = db.createProject(crypto.randomUUID(), LEGACY_USER_ID, "Other", root, "remote:other");
+  const createJob = (projectId: string, model: string, running: boolean) => {
+    const conversation = db.createConversation(crypto.randomUUID(), "Gate fixture", { model, reasoningEffort: "high" }, LEGACY_USER_ID, projectId);
+    const messageId = crypto.randomUUID(), jobId = crypto.randomUUID();
+    db.addMessage({ id: messageId, conversation_id: conversation.id, role: "user", content: "Fixture", created_at: new Date().toISOString() });
+    db.createJob(jobId, conversation.id, messageId, { model, reasoningEffort: "high" });
+    if (running) db.updateJob(jobId, "running");
+    return jobId;
+  };
+  createJob(project.id, "gpt-6-astra", true);
+  createJob(other.id, "antigravity:gemini", true);
+  const queuedGemini = createJob(project.id, "antigravity:gemini", false);
+  assert.equal(countRunningJobsForExecutorInDatabase(path.join(config.dataRoot, "codex-web.sqlite"), executorId), 1, "legacy Codex gate remains unchanged");
+  assert.equal(countRunningGeminiJobsForExecutor(db.sqlite, executorId), 0);
+  assert.equal(countRunningGeminiJobsForExecutorInDatabase(path.join(config.dataRoot, "codex-web.sqlite"), executorId), 0);
+  const sent: string[] = [];
+  const socket = { readyState: WebSocket.OPEN, close() {}, send(raw: string) {
+    assert.equal(parseServerMessage(raw).ok, true, "the actual Worker parser must accept forwarded account requests");
+    const request = JSON.parse(raw); sent.push(request.action);
+    const pending = Reflect.get(gateway, "pendingGeminiAccounts").get(request.requestId);
+    clearTimeout(pending.timer); Reflect.get(gateway, "pendingGeminiAccounts").delete(request.requestId);
+    pending.resolve({ state: { accounts: [], activeAccountId: null, runtimeAvailable: true } });
+  } };
+  Reflect.get(gateway, "connections").set(workerId, { socket, workerId, geminiAccounts: true, activeJobs: new Set(["running-codex"]), migrationOnly: false });
+  await assert.rejects(gateway.geminiAccounts(executorId, { action: "usage" }), /升级 Worker/);
+  assert.equal(sent.length, 0, "old Workers must never receive an unknown action");
+  const accountId = crypto.randomUUID();
+  await gateway.geminiAccounts(executorId, { action: "activate", accountId });
+  await gateway.geminiAccounts(executorId, { action: "delete", accountId });
+  assert.deepEqual(sent, ["activate", "delete"]);
+  db.updateJob(queuedGemini, "running");
+  assert.equal(countRunningGeminiJobsForExecutorInDatabase(path.join(config.dataRoot, "codex-web.sqlite"), executorId), 1);
+  await assert.rejects(gateway.geminiAccounts(executorId, { action: "activate", accountId }), /Gemini 任务执行/);
+  await assert.rejects(gateway.geminiAccounts(executorId, { action: "delete", accountId }), /Gemini 任务执行/);
+  assert.deepEqual(sent, ["activate", "delete"], "blocked mutations must not be sent to the Worker");
+  db.updateJob(queuedGemini, "completed");
+  await gateway.geminiAccounts(executorId, { action: "activate", accountId });
+  db.requestRemoteWorkerUpdate(workerId, crypto.randomUUID(), "1.21.1", "remote-worker-v1.21.1");
+  await assert.rejects(gateway.geminiAccounts(executorId, { action: "activate", accountId }), /停止或升级/);
+  assert.deepEqual(sent, ["activate", "delete", "activate"]);
+  Reflect.get(gateway, "connections").get(workerId).geminiUsage = true;
+  await gateway.geminiAccounts(executorId, { action: "usage", refresh: true, accountId });
+  assert.equal(sent.at(-1), "usage", "read-only usage does not change accounts or interrupt running jobs");
+});

@@ -47,6 +47,8 @@ test("Remote thread deletion treats only the exact already-absent result as idem
   Reflect.set(runner, "db", {
     getConversation: () => ({ id: "conversation", user_id: HOST_ROOT_USER_ID, project_id: "project" }),
     getProjectForUser: () => ({ id: "project", executor_id: "remote:worker-a" }),
+    isCodexThreadUsedByAnotherActiveConversation: () => false,
+    sqlite: { prepare: () => ({ all: () => [] }) }, // legacy conversation has no tracked historical segments
   });
   Reflect.set(runner, "remoteWorkers", {
     archiveThread: async () => { throw new Error(`no rollout found for thread id ${threadId}`); },

@@ -9,7 +9,7 @@ import { cleanupFinalizationDirectory, prepareFinalizationFiles, prepareJobFinal
 import { snapshotDeliverables } from "../server/paths.js";
 
 test("invalid web output preserves the answer, audio and safe attachment with durable warning across recovery", async context => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-partial-delivery-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-partial-delivery-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const data = path.join(root, "data"), db = new AppDatabase(data); context.after(() => db.close());
   const conversation = db.createConversation(crypto.randomUUID(), "delivery");
@@ -43,7 +43,7 @@ test("invalid web output preserves the answer, audio and safe attachment with du
 });
 
 test("malformed or unmatched declarations cannot discard other results or grant execution", async context => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-bad-declaration-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-bad-declaration-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const body = '<button onclick="alert(1)">test</button>';
   const valid = JSON.stringify({ presentation_mode: "web", sha256: crypto.createHash("sha256").update(body).digest("hex") });
@@ -61,7 +61,7 @@ test("malformed or unmatched declarations cannot discard other results or grant 
 });
 
 test("transport and disk failures still abort finalization instead of being hidden as presentation warnings", async context => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-delivery-integrity-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-delivery-integrity-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   function source(name: string, text: string) {
     const id = crypto.randomUUID(), sourcePath = path.join(root, id); fs.writeFileSync(sourcePath, text);
@@ -77,7 +77,7 @@ test("transport and disk failures still abort finalization instead of being hidd
 });
 
 test("managed web declaration survives output collection, recovery journal and atomic database commit", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-web-finalization-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-web-finalization-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const db = new AppDatabase(path.join(root, "data")); context.after(() => db.close());
   const conversation = db.createConversation(crypto.randomUUID(), "web finalization");

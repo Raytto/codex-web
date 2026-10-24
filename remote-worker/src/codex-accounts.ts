@@ -88,7 +88,7 @@ export class RemoteCodexAccountManager {
     return { ...current, accounts: current.accounts.map((account) => ({ ...account, resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
   }
 
-  async consumeResetCredit(accountId: string, attemptId: string): Promise<ResetConsumption> {
+  async consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
     if (!ENTRY_ID.test(accountId)) throw new Error("账号标识无效。");
     const registry = this.ensureRegistry();
     const account = registry.accounts.find((item) => item.id === accountId);
@@ -97,7 +97,7 @@ export class RemoteCodexAccountManager {
       return await consumeAccountResetCredit({ executable: this.options.codexExecutable(),
         authFile: registry.activeAccountId === accountId ? this.authorityFile : this.accountAuthFile(accountId),
         expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.options.stateRoot, "codex-accounts", "usage"),
-        journalRoot: path.join(this.options.stateRoot, "codex-accounts", "reset-receipts", accountId), attemptId,
+        journalRoot: path.join(this.options.stateRoot, "codex-accounts", "reset-receipts", accountId), attemptId, autoExpiresAt,
       });
     } finally { this.usageCache.delete(accountId); }
   }

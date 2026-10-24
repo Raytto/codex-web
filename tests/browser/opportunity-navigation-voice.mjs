@@ -113,7 +113,19 @@ try {
   await mic().click(); await dialog().locator('canvas[aria-label="实时音量波形"]').waitFor(); await until(async () => dialog().locator('canvas').evaluate(c => c.width > 1 && c.getContext('2d').getImageData(0, 0, c.width, c.height).data.some(v => v !== 0)));
   await note().fill('先输入，录音时补充');assert.equal(await dialog().getByRole('button',{name:'保留',exact:true}).isDisabled(),true);
   await stop().click();await until(()=>uploadReceived);assert.equal(await dialog().getByRole('button',{name:'淘汰',exact:true}).isDisabled(),true);
-  uploadGate.resolve();await page.unrouteAll({behavior:'wait'});await dialog().getByText('语音已上传，正在后台识别；可以继续操作，完成后自动保存到此卡片的反馈。',{exact:true}).waitFor();
+  await dialog().locator('.para-voice-composer .voice-panel').getByText('正在上传语音，请稍候…',{exact:true}).waitFor();
+  uploadGate.resolve();await page.unrouteAll({behavior:'wait'});
+  const recognitionStatus=()=>dialog().locator('.para-voice-composer').getByRole('status').filter({hasText:'正在识别中，可以退出或继续保留、暂放、淘汰；完成后自动保存反馈。'});
+  await recognitionStatus().waitFor();
+  for(const width of [1440,768,390,320])for(const theme of ['light','dark']){
+    await page.setViewportSize({width,height:1000});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+    await recognitionStatus().scrollIntoViewIfNeeded();assert.ok(await recognitionStatus().isVisible());
+    assert.ok(await dialog().evaluate(e=>e.scrollWidth<=e.clientWidth),'pending status overflow '+width);
+    if(width===390)await dialog().locator('.para-voice-composer').screenshot({path:output+'/recognition-'+theme+'.png'});
+  }
+  await page.evaluate(()=>document.documentElement.style.fontSize='200%');assert.ok(await dialog().evaluate(e=>e.scrollWidth<=e.clientWidth));await page.evaluate(()=>document.documentElement.style.fontSize='');
+  await page.setViewportSize({width:1440,height:1000});await page.reload();await openTopic(0);await openCard(0);await recognitionStatus().waitFor();
+  report.checks.push('recognition_status_replaces_upload_in_composer_persists_reload_and_fits_mobile');
   await until(async()=>dialog().getByRole('button',{name:'保存反馈',exact:true}).isEnabled());
   for(const name of ['保存反馈','保留','暂放','淘汰','深入研究','转入项目看板','关闭弹窗'])assert.equal(await dialog().getByRole('button',{name,exact:true}).isEnabled(),true,name);
   await dialog().getByRole('button',{name:'淘汰',exact:true}).click();await dialog().waitFor({state:'hidden'});await openTopic(1);await openCard(1);
@@ -122,6 +134,7 @@ try {
   report.checks.push('durable_upload_unlocks_every_action_decision_closes_background_result_stays_on_original_card');save();
   await dialog().getByRole('button',{name:'关闭弹窗',exact:true}).click();await openTopic(0);await workspace().getByRole('button',{name:/已淘汰/}).click();await openCard(0);
   assert.equal(await note().inputValue(),dismissed.idea.note);
+  assert.equal(await recognitionStatus().count(),0);
   await mic().click();await stop().click();await until(()=>gates.length===2);gates[1].resolve();await dialog().getByRole('button',{name:'重试识别语音',exact:true}).waitFor();
   assert.equal(await dialog().getByRole('button',{name:'保留',exact:true}).isEnabled(),true);
   await page.reload();await openTopic(0);await workspace().getByRole('button',{name:/已淘汰/}).click();await openCard(0);

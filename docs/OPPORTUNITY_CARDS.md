@@ -57,3 +57,7 @@ Back up the operator's own database and state before upgrading. Startup migratio
 ## Feedback and research
 
 After a recording is durably uploaded, transcription continues in the background and appends feedback to the original card. Retained failed audio can be retried; revision checks expose concurrent edits. Research opens an editable draft and starts only when you send it. Images may reference archived conversation assets within the same account and authorized project.
+
+## Retained and completed work
+
+Kept and completed cards have separate collections, with complete/reopen actions and all-topic aggregation. Voice recognition stays visible through refresh. Card previews are bounded rather than expanding the entire navigation surface. Existing feedback learning and publication history remain server-persistent.

@@ -35,7 +35,10 @@ function CardImage({ image, eager }: { image: OpportunityImage; eager: boolean }
     {image.caption && <figcaption>{image.caption}</figcaption>}
   </figure>;
 }
-export function OpportunityImages({ idea, eager = false }: { idea: OpportunityIdea; eager?: boolean }) {
+export function OpportunityImages({ idea, eager = false, preview = false }: { idea: OpportunityIdea; eager?: boolean; preview?: boolean }) {
   if (!idea.images?.length) return null;
-  return <div className="opportunity-images" aria-label="思路图解">{idea.images.map(image => <CardImage key={image.id} image={image} eager={eager}/>)}</div>;
+  const images = preview ? idea.images.slice(0, 1) : idea.images;
+  return <div className={`opportunity-images${preview ? ' opportunity-images-preview' : ''}`} aria-label="思路图解">{images.map(image => <CardImage key={image.id} image={image} eager={eager}/>)}
+    {preview && idea.images.length > 1 && <small>共 {idea.images.length} 张图，详情中查看全部</small>}
+  </div>;
 }

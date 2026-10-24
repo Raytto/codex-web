@@ -222,7 +222,7 @@ test('inbox, working, processed and dismissed views separate feedback and keep r
  assert.equal(s.start(u,topic.id,selection,requestKey,created[5].id).conversationId,research.conversationId);assert.equal(s.idea(u,created[5].id).revision,afterResearch.revision);
  const board=new ParaStore(db).createBoard(u,'工作总览测试',null),project=s.toProject(u,created[6].id,board.id,id());
  const inbox=s.view(u,topic.id);assert.deepEqual(new Set(inbox.ideas.map(i=>i.id)),new Set([created[0].id,created[7].id]));
- assert.deepEqual({...inbox.counts},{screen:2,reserve:0,working:3,processed:2,dismissed:2,rejected:1});
+ assert.deepEqual({...inbox.counts},{screen:2,reserve:0,kept:1,completed:0,working:3,processed:2,dismissed:2,rejected:1});
  s.sql.prepare('UPDATE opportunity_ideas SET manual_processed=0 WHERE id=?').run(created[5].id); // Existing research predates the new handling marker.
  assert.equal(s.view(u,topic.id,'today').total,2);assert.equal(s.view(u,topic.id,'unknown').total,2);
  assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,2); // Also excludes legacy research without manual_processed.
@@ -239,6 +239,58 @@ test('inbox, working, processed and dismissed views separate feedback and keep r
  const outsider=id();assert.deepEqual(s.topics(outsider),[]);assert.equal(s.view(outsider,undefined).total,0);assert.equal(Object.values(s.view(outsider,undefined).counts).reduce((a,b)=>a+b,0),0);assert.throws(()=>s.view(outsider,topic.id),/不存在/);
  const second=s.createTopic(u,{name:'another',project_id:p.id,goal:'other'},id());assert.equal(s.view(u,second.id,'working').total,0);assert.equal(s.topics(u).find(t=>t.id===second.id)?.pending_count,0);assert.equal(s.topics(u).find(t=>t.id===topic.id)?.pending_count,3);
  assert.deepEqual(db.sqlite.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
+test('kept cards complete and reopen durably without losing feedback, research or linked projects', t => {
+ const {s,db,root,c,topic}=fixture(t),batch=s.begin(u,topic.id,c.id,null);
+ const cards=s.ingest(u,batch.id,c.id,Array.from({length:3},(_,n)=>({key:'complete-'+n,content:content(800+n)}))).map(v=>v.idea);
+ const change=(iid:string,action:string)=>{const old=s.idea(u,iid);return s.feedback(u,iid,{requestKey:id(),revision:old.revision,action,rating:4,note:'继续制作的原始备注'});};
+ assert.throws(()=>change(cards[0].id,'completed'),/请先保留/);
+ change(cards[0].id,'kept');
+ const research=s.start(u,topic.id,selection,id(),cards[0].id);
+ const board=new ParaStore(db).createBoard(u,'完成验收',null),project=s.toProject(u,cards[0].id,board.id,id());
+ change(cards[0].id,'kept');
+ const old=s.idea(u,cards[0].id),input={requestKey:id(),revision:old.revision,action:'completed',rating:old.rating,note:old.note};
+ const done=s.feedback(u,old.id,input);
+ assert.equal(done.state,'completed');assert.equal(done.para_project_id,project.id);
+ assert.deepEqual(s.feedback(u,old.id,input),done); // Retrying the same click is idempotent.
+ assert.throws(()=>s.feedback(u,old.id,{...input,requestKey:id()}),/已更新/);
+ assert.throws(()=>s.feedback(id(),old.id,{...input,requestKey:id()}),/不存在/);
+ for(const tab of ['screen','reserve','kept','working','processed','dismissed','rejected'])assert.equal(s.view(u,topic.id,tab).ideas.some(i=>i.id===old.id),false,tab);
+ const completed=s.view(u,topic.id,'completed');assert.equal(completed.total,1);assert.equal(completed.counts.completed,1);
+ assert.equal(completed.ideas[0].work?.research?.conversation_id,research.conversationId);
+ assert.equal(completed.ideas[0].work?.research?.status,'interested');assert.equal(completed.ideas[0].work?.project?.stage,'idea');
+ assert.equal(completed.ideas[0].content.title,old.content.title);assert.equal(completed.ideas[0].note,old.note);
+ assert.equal(s.history(u).total,3);assert.ok(!s.context(u,topic.id).inventory.some(i=>i.id===old.id));
+ assert.throws(()=>s.start(u,topic.id,selection,id(),old.id),/恢复为保留/);
+ change(cards[1].id,'kept');change(cards[1].id,'completed');
+ assert.throws(()=>s.toProject(u,cards[1].id,board.id,id()),/恢复为保留/);
+ change(cards[1].id,'rate');assert.equal(s.idea(u,cards[1].id).state,'completed');
+ const reopened=new AppDatabase(root,undefined,false);
+ try{assert.equal(new OpportunityStore(reopened).view(u,undefined,'completed').total,2);}finally{reopened.close();}
+ change(old.id,'undo');assert.equal(s.idea(u,old.id).state,'kept');assert.equal(s.view(u,topic.id,'completed').total,1);
+ change(old.id,'completed');change(old.id,'kept');assert.equal(s.view(u,topic.id,'kept').total,1);
+ assert.equal(s.view(u,topic.id,'kept').ideas[0].work?.project?.id,project.id);
+ change(old.id,'dismissed');assert.throws(()=>change(old.id,'completed'),/请先保留/);
+ assert.deepEqual(db.sqlite.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
+test('kept and completed lists paginate across topics and enforce ownership and topic lifecycle',t=>{
+ const {s,c,p,topic}=fixture(t),other=s.createTopic(u,{name:'第二个工作主题',project_id:p.id,goal:'完成归档'},id());
+ const first=s.begin(u,topic.id,c.id,null),second=s.begin(u,other.id,c.id,null);
+ const seed=(batch:string,start:number,count:number)=>s.ingest(u,batch,c.id,Array.from({length:count},(_,n)=>({key:'pagination-'+(start+n),content:content(900+start+n)}))).map(r=>r.idea.id);
+ const ids=[...seed(first.id,0,25),...seed(second.id,25,18)];
+ const update=s.sql.prepare("UPDATE opportunity_ideas SET state=?,manual_processed=1 WHERE id=?");
+ for(const state of ['kept','completed']){
+  for(const iid of ids)update.run(state,iid);
+  const a=s.view(u,undefined,state),b=s.view(u,undefined,state,40);
+  assert.equal(a.total,43);assert.equal(a.ideas.length,40);assert.equal(b.ideas.length,3);assert.equal(b.nextOffset,null);
+  assert.equal(new Set([...a.ideas,...b.ideas].map(i=>i.id)).size,43);
+  assert.equal(s.view(u,topic.id,state).total,25);assert.equal(s.view(u,other.id,state).total,18);
+  assert.equal(s.view(id(),undefined,state).total,0);assert.throws(()=>s.view(id(),topic.id,state),/不存在/);
+ }
+ s.lifecycle(u,other.id,other.revision,'archive');assert.equal(s.view(u,undefined,'completed').total,43);
+ s.lifecycle(u,other.id,s.topic(u,other.id).revision,'delete');assert.equal(s.view(u,undefined,'completed').total,25);
 });
 
 test('candidate pagination includes older unanswered cards and totals match filtering', t => {

@@ -3,6 +3,14 @@ import crypto from "node:crypto";
 import test from "node:test";
 import { isPersistableWorkerMessage, parseServerMessage } from "./protocol-validation.js";
 
+test("file fetch failures persist an optional typed not-found result without confusing access errors", () => {
+  const base = { type: "file_fetch_result", requestId: crypto.randomUUID(), ok: false, message: "文件不存在或无法访问" };
+  assert.equal(isPersistableWorkerMessage(base), true);
+  assert.equal(isPersistableWorkerMessage({ ...base, errorCode: "NOT_FOUND" }), true);
+  assert.equal(isPersistableWorkerMessage({ ...base, errorCode: "EACCES" }), false);
+  assert.equal(isPersistableWorkerMessage({ ...base, ok: true, errorCode: "NOT_FOUND" }), false);
+});
+
 test("Worker accepts a bounded authenticated server message", () => {
   const parsed = parseServerMessage(JSON.stringify({ type: "authenticated", workerId: crypto.randomUUID(), heartbeatIntervalMs: 15_000 }));
   assert.equal(parsed.ok, true);

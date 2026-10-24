@@ -1,3 +1,5 @@
+import { engineForModel } from "../remote-worker/src/agent-engine.js";
+import { resolveAntigravityModel, type AntigravityAgentOptions } from "../remote-worker/src/antigravity-runtime.js";
 import { operateHostProjectSkill } from "./host-project-skills.js";
 import { NodeTransferEndpoint } from "../remote-worker/src/node-transfer-endpoint.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -19,9 +21,11 @@ import { cleanupJobRuntime, jobRuntimeRoot } from "./python-runtime.js";
 import { acquireSharedCodexAuth, sharedCodexAuthPolicyFromEnv } from "./shared-codex-auth.js";
 import { validateCodexVoiceReviewRequest, type CodexVoiceReviewWorkerEvent } from "./codex-voice-review.js";
 import { validateConversationTitleRequest, type ConversationTitleWorkerEvent } from "./conversation-title.js";
+import { GeminiAccountManager } from "../remote-worker/src/gemini-accounts.js";
+import { assertGeminiAccountChangeAllowed } from "../remote-worker/src/gemini-account-guard.js";
 import { CodexAccountManager } from "./codex-account-manager.js";
 import { defaultColdStorageRoots, restoreColdConversation } from "./conversation-cold-storage.js";
-import { countRunningJobsForExecutorInDatabase } from "./executor-job-status.js";
+import { countRunningJobsForExecutorInDatabase, countRunningGeminiJobsForExecutorInDatabase } from "./executor-job-status.js";
 import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 
 const socketPath = process.env.CODEX_WEB_HOST_SOCKET_PATH?.trim() || "";
@@ -30,9 +34,10 @@ const knowledgeRoot = path.resolve(process.env.CODEX_WEB_KNOWLEDGE_ROOT?.trim() 
 const codexHome = path.resolve(process.env.CODEX_WEB_CODEX_HOME?.trim() || "");
 const webUid = Number(process.env.CODEX_WEB_WEB_UID || "10001");
 const webGid = Number(process.env.CODEX_WEB_WEB_GID || "10001");
-const workers = new Map<string, { child: ChildProcess; socket: Socket; workspace: string; runtimeRoot: string; terminal: boolean; timers: NodeJS.Timeout[] }>();
+const workers = new Map<string, { model: string; child: ChildProcess; socket: Socket; workspace: string; runtimeRoot: string; terminal: boolean; timers: NodeJS.Timeout[] }>();
 const voiceReviewWorkers = new Map<string, ChildProcess>();
 const titleAgentWorkers = new Map<string, ChildProcess>();
+const geminiTitleRequests = new Set<string>();
 let stopping = false;
 const hostDatabasePath = process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite");
 
@@ -57,6 +62,10 @@ const codexAccountManager = new CodexAccountManager({
   policyFile: process.env.CWW_SHARED_CODEX_AUTH_POLICY_FILE || path.join(sharedAuthRoot, "policy.json"),
   codexExecutable: process.env.CODEX_RUNTIME_PATH || "codex",
   assertSwitchAllowed: assertCodexAccountSwitchAllowed,
+});
+const geminiAccountManager = new GeminiAccountManager({
+  root: path.join(path.dirname(sharedAuthRoot), "agent-accounts", "antigravity"),
+  assertSwitchAllowed: assertGeminiAccountSwitchAllowed,
 });
 fs.mkdirSync(path.dirname(socketPath), { recursive: true });
 if (fs.existsSync(socketPath)) fs.rmSync(socketPath, { force: true });
@@ -99,7 +108,8 @@ function handleConnection(socket: Socket): void {
       }
       if (message.type === "run") {
         if (activeJobId) throw new Error("A host job is already attached to this connection");
-        activeJobId = startWorker(socket, message.request);
+        activeJobId = message.request.jobId;
+        void startWorker(socket, message.request).catch(error => { send(socket, { type: "request_failed", message: error instanceof Error ? error.message : String(error) }); socket.end(); });
         return;
       }
       if (message.type === "delete_thread") {
@@ -218,10 +228,19 @@ function handleConnection(socket: Socket): void {
         });
         return;
       }
+      if (message.type === "gemini_accounts") {
+        if (activeJobId) throw new Error("Cannot manage Gemini accounts through an active job connection");
+        validateHostUser(message.userId);
+        void geminiAccountManager.handle(message).then(
+          result => { send(socket, { type: "gemini_accounts_result", requestId: message.requestId, ...result }); socket.end(); },
+          error => sendRequestFailure(socket, message.requestId, error),
+        );
+        return;
+      }
       if (message.type === "codex_account_reset") {
         if (activeJobId) throw new Error("Cannot manage Codex accounts through an active job connection");
         validateHostUser(message.userId);
-        void codexAccountManager.consumeResetCredit(message.accountId, message.attemptId).then(
+        void codexAccountManager.consumeResetCredit(message.accountId, message.attemptId, message.autoExpiresAt).then(
           (result) => { send(socket, { type: "codex_account_reset_result", requestId: message.requestId, result }); socket.end(); },
           (error) => sendRequestFailure(socket, message.requestId, error),
         );
@@ -376,10 +395,17 @@ async function startVoiceReview(socket: Socket, requestId: string, request: impo
 }
 
 async function startTitleAgent(socket: Socket, requestId: string, request: import("./conversation-title.js").ConversationTitleAgentRequest): Promise<void> {
-  if (titleAgentWorkers.has(requestId)) { send(socket, { type: "request_failed", requestId, message: "Duplicate Codex title request" }); socket.end(); return; }
+  if (titleAgentWorkers.has(requestId) || geminiTitleRequests.has(requestId)) { send(socket, { type: "request_failed", requestId, message: "Duplicate title request" }); socket.end(); return; }
   let lease: Awaited<ReturnType<typeof acquireSharedCodexAuth>> | null = null;
+  const isGemini = request.engineId === "antigravity";
+  if (isGemini) geminiTitleRequests.add(requestId);
   try {
-    const sharedAuthPolicy = sharedCodexAuthPolicyFromEnv();
+    const runtime = isGemini ? await geminiAccountManager.getActiveRuntime() : null;
+    const catalog = isGemini ? await geminiAccountManager.getModelCatalog() : null;
+    if (isGemini && (!runtime || !catalog)) throw new Error("当前节点没有可用的 Gemini 命名账号");
+    const trusted = { userId: request.userId, prompt: request.prompt, timeoutMs: request.timeoutMs, engineId: request.engineId,
+      ...(isGemini ? { antigravity: { runtime, catalog } } : {}) };
+    const sharedAuthPolicy = isGemini ? null : sharedCodexAuthPolicyFromEnv();
     if (sharedAuthPolicy) lease = await acquireSharedCodexAuth({ sourceFile: sharedAuthPolicy.sourceFile, lockFile: sharedAuthPolicy.lockFile, targetFile: path.join(codexHome, "auth.json") });
     const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-conversation-title-worker.js")], {
       cwd: process.cwd(),
@@ -402,12 +428,13 @@ async function startTitleAgent(socket: Socket, requestId: string, request: impor
     });
     child.once("error", (error) => { if (!terminal) { terminal = true; send(socket, { type: "request_failed", requestId, message: error.message }); socket.end(); } });
     child.once("exit", (code, signal) => {
-      socket.removeListener("close", cancelOnDisconnect); output.close(); titleAgentWorkers.delete(requestId);
+      socket.removeListener("close", cancelOnDisconnect); output.close(); titleAgentWorkers.delete(requestId); geminiTitleRequests.delete(requestId);
       void releaseAuth().catch((error) => process.stderr.write(`Shared Codex auth commit failed for host title agent: ${error instanceof Error ? error.message : String(error)}\n`));
       if (!terminal) { terminal = true; send(socket, { type: "request_failed", requestId, message: `Codex title worker exited before completion (${signal ?? code ?? "unknown"})` }); socket.end(); }
     });
-    child.stdin!.end(`${JSON.stringify(request)}\n`);
+    child.stdin!.end(`${JSON.stringify(trusted)}\n`);
   } catch (error) {
+    geminiTitleRequests.delete(requestId);
     await lease?.releaseWithoutCommit();
     send(socket, { type: "request_failed", requestId, message: error instanceof Error ? error.message : "Codex title request could not start" }); socket.end();
   }
@@ -499,9 +526,15 @@ async function readHostAgentOptions(executable: string): Promise<AgentOptions> {
   }
 }
 
-function startWorker(socket: Socket, request: HostRootRunRequest): string {
+async function startWorker(socket: Socket, request: HostRootRunRequest): Promise<string> {
   validateRunRequest(request);
-  syncAccountSkills(codexHome, request.accountSkills);
+  const isGemini = engineForModel(request.selection.model) === "antigravity";
+  const geminiRuntime = isGemini ? await geminiAccountManager.getActiveRuntime() : null;
+  if (isGemini && (!geminiRuntime || geminiRuntime.accountId !== request.agentAccountId)) throw new Error("当前节点的 Gemini 登录账号已变化或失效，请刷新账号后重试。");
+  const catalog = isGemini ? await geminiAccountManager.getModelCatalog() : null;
+  if (isGemini && !catalog) throw new Error("无法读取此 Gemini 账号的模型目录，请重新登录。");
+  const resolvedSelection = catalog ? resolveAntigravityModel(catalog as AntigravityAgentOptions, request.selection.model, request.selection.reasoningEffort) : request.selection;
+  syncAccountSkills(isGemini ? path.join(geminiRuntime!.home, ".gemini", "antigravity-cli") : codexHome, request.accountSkills);
   if (workers.has(request.jobId)) throw new Error("Duplicate host job");
   const workspace = expectedWorkspace(request.conversationId);
   if (!fs.statSync(workspace).isDirectory()) throw new Error("CODEX_WEB conversation workspace is unavailable on the host");
@@ -509,6 +542,8 @@ function startWorker(socket: Socket, request: HostRootRunRequest): string {
   const projectRoot = resolveProjectDirectory(request.projectRoot);
   const trusted: HostRootExecutionRequest = {
     ...request,
+    selection: resolvedSelection,
+    antigravityRuntime: geminiRuntime ?? undefined,
     workspace,
     runtimeRoot,
     knowledgeRoot: projectRoot,
@@ -526,7 +561,7 @@ function startWorker(socket: Socket, request: HostRootRunRequest): string {
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "inherit"],
   });
-  const worker = { child, socket, workspace, runtimeRoot, terminal: false, timers: [] as NodeJS.Timeout[] };
+  const worker = { model: request.selection.model, child, socket, workspace, runtimeRoot, terminal: false, timers: [] as NodeJS.Timeout[] };
   workers.set(request.jobId, worker);
   const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
   output.on("line", (line) => {
@@ -558,8 +593,9 @@ function validateRunRequest(request: HostRootRunRequest): void {
   validatePrompt(request.effectivePrompt);
   resolveProjectDirectory(request.projectRoot);
   if (request.codexThreadId !== null && !/^[0-9a-f-]{20,80}$/i.test(request.codexThreadId)) throw new Error("Invalid Codex thread id");
-  if (!/^[a-z0-9][a-z0-9._-]{1,80}$/i.test(request.selection?.model ?? "")) throw new Error("Invalid model selection");
+  if (!/^(?:antigravity:)?[a-z0-9][a-z0-9._/-]{1,90}$/i.test(request.selection?.model ?? "")) throw new Error("Invalid model selection");
   if (!/^[a-z][a-z0-9_-]{0,31}$/i.test(request.selection?.reasoningEffort ?? "")) throw new Error("Invalid reasoning selection");
+  if (request.agentSessionId != null && !/^[a-z0-9][a-z0-9._-]{0,199}$/i.test(request.agentSessionId)) throw new Error("Invalid agent session id");
   if (!isOptionalAgentCapabilities(request.optionalCapabilities)) throw new Error("Invalid optional capabilities");
   if (!isAccountSkillBundle(request.accountSkills)) throw new Error("Invalid account skills");
   if (request.codexEgressKind && !["primary", "backup", "unchanged"].includes(request.codexEgressKind)) throw new Error("Invalid Codex egress");
@@ -605,6 +641,13 @@ function resolveProjectDirectory(rawPath: string): string {
 
 function validateHostUser(userId: string): void {
   if (userId !== HOST_ROOT_USER_ID) throw new Error("This account is not allowed to use the host root bridge");
+}
+
+function assertGeminiAccountSwitchAllowed(): void {
+  let runningGeminiJobs: number;
+  try { runningGeminiJobs = countRunningGeminiJobsForExecutorInDatabase(hostDatabasePath, HOST_EXECUTOR_ID); }
+  catch { throw new Error("无法确认 CODEX_WEB 服务器 Gemini 任务状态，已拒绝更改 Gemini 账号。"); }
+  assertGeminiAccountChangeAllowed({ maintenance: stopping || geminiTitleRequests.size > 0, activeModels: [...workers.values()].map(worker => worker.model), runningGeminiJobs });
 }
 
 function assertCodexAccountSwitchAllowed(): void {
@@ -711,6 +754,7 @@ function stop(): void {
     try { if (process.platform === "win32") child.kill("SIGTERM"); else process.kill(-child.pid, "SIGTERM"); } catch {}
   }
   codexAccountManager.close();
+  geminiAccountManager.close();
   try { if (fs.existsSync(socketPath)) fs.rmSync(socketPath, { force: true }); } catch {}
 }
 

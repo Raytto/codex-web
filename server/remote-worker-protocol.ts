@@ -1,3 +1,4 @@
+import type { GeminiAccountRequest, GeminiAccountResult } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import type { AgentOptions, AgentSelection } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
@@ -32,6 +33,8 @@ export type RemoteRunRequest = {
   conversationId: string;
   projectRoot: string;
   codexThreadId: string | null;
+  agentSessionId?: string | null;
+  agentAccountId?: string;
   prompt: string;
   attachments: RemoteAttachment[];
   transferToken: string;
@@ -121,6 +124,7 @@ export type RemoteWorkerUpdateResult = {
 export type RemoteCodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 
 export type ServerToRemoteWorker =
+  | ({ type: "gemini_accounts"; requestId: string } & GeminiAccountRequest)
   | { type: "node_transfer"; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
   | { type: "credential_replace"; workerId: string; credentialId: string; token: string }
   | { type: "run_release"; jobId: string }
@@ -136,7 +140,7 @@ export type ServerToRemoteWorker =
   | { type: "thread_archive"; requestId: string; threadId: string }
   | { type: "thread_sync"; requestId: string; projectRoot: string; cursor: string | null; limit: number }
   | { type: "file_fetch"; requestId: string; projectRoot: string; path: string; transferToken: string }
-  | { type: "title_agent"; requestId: string; prompt: string; timeoutMs: number }
+  | { type: "title_agent"; requestId: string; prompt: string; timeoutMs: number; engineId?: "codex" | "antigravity" }
   | { type: "runtime_refresh"; requestId: string; checkLatest: boolean }
   | { type: "codex_upgrade"; requestId: string; version: string }
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
@@ -146,8 +150,9 @@ export type ServerToRemoteWorker =
   | { type: "heartbeat_ack"; at: string };
 
 export type RemoteWorkerToServer =
+  | ({ type: "gemini_accounts_result"; requestId: string; ok: boolean; message?: string } & GeminiAccountResult)
   | { type: "credential_saved"; credentialId: string }
-  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean; nodeTransfers?: boolean }; codexVersion: string; capacity: number }
+  | { type: "hello"; protocolVersion: number; workerId: string; machineName: string; enrollmentToken: string; platform: string; workerVersion: string; workerRelease?: string | null; workerCommit?: string | null; capabilities?: { workerUpdate?: boolean; waitAutomation?: boolean; capacityConfig?: boolean; dynamicWaitTool?: boolean; agentTurnContext?: boolean; accountSkills?: boolean; titleAgent?: boolean; geminiTitleAgent?: boolean; deviceCredentials?: boolean; codexAccounts?: boolean; geminiAccounts?: boolean; geminiUsage?: boolean; threadRolloutSize?: boolean; threadLifecycle?: boolean; nodeTransfers?: boolean }; codexVersion: string; capacity: number }
   | { type: "heartbeat"; activeJobs: string[]; retainedJobs?: string[] }
   | { type: "quota_usage"; usage: CodexQuotaUsage; accountId?: string }
   | { type: "thread_activity"; projectId: string; thread: RemoteThreadSnapshot }
@@ -157,7 +162,7 @@ export type RemoteWorkerToServer =
   | { type: "artifact_uploaded"; jobId: string; artifact: RemoteArtifact }
   | { type: "thread_rollout_size_result"; requestId: string; bytes: number | null }
   | { type: "thread_rename_result"; requestId: string; ok: boolean; message?: string }
-  | { type: "file_fetch_result"; requestId: string; ok: boolean; message?: string }
+  | { type: "file_fetch_result"; requestId: string; ok: boolean; message?: string; errorCode?: "NOT_FOUND" }
   | { type: "title_agent_result"; requestId: string; ok: boolean; output?: string; message?: string }
   | ({ type: "runtime_status"; requestId?: string } & RemoteRuntimeStatus)
   | { type: "codex_upgrade_result"; requestId: string; ok: boolean; message?: string; runtime?: RemoteRuntimeStatus }

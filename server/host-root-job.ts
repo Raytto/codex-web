@@ -1,3 +1,5 @@
+import { ensureAntigravityMcpConfig } from "../remote-worker/src/antigravity-runtime.js";
+import { startAntigravityTurn } from "../remote-worker/src/antigravity-client.js";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -59,7 +61,7 @@ input.on("line", (line) => {
         fs.mkdirSync(directory, { recursive: true });
       }
       const sharedPolicy = sharedCodexAuthPolicyFromEnv();
-      if (sharedPolicy) {
+      if (sharedPolicy && !message.request.antigravityRuntime) {
         sharedAuthLease = await acquireSharedCodexAuth({
           sourceFile: sharedPolicy.sourceFile,
           lockFile: sharedPolicy.lockFile,
@@ -89,7 +91,28 @@ input.on("line", (line) => {
           CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
         } : {}),
       };
-      activeExecution = startAppServerTurn({
+      const callbacks = {
+        signal: controller.signal,
+        onAuthReady: commitSharedAuth,
+        onThreadStarted: (threadId: string) => send({ type: "thread_started", threadId }),
+        onContextUsage: (usage: import("./app-server-turn.js").ContextTokenUsage) => send({ type: "context_usage", usage }),
+        onQuotaUsage: (usage: import("./app-server-turn.js").CodexQuotaUsage) => send({ type: "quota_usage", usage }),
+        onProgress: (payload: unknown) => send({ type: "progress", payload }),
+      };
+      const gemini = message.request.antigravityRuntime;
+      if (gemini) ensureAntigravityMcpConfig(gemini.home, fileURLToPath(new URL("./antigravity-platform-mcp.js", import.meta.url)));
+      activeExecution = gemini ? startAntigravityTurn({
+        executablePath: gemini.executable, cwd: message.request.knowledgeRoot,
+        env: gemini.env, threadId: message.request.agentSessionId ?? null,
+        threadInstructions: message.request.threadInstructions,
+        prompt: message.request.effectivePrompt, imagePaths: [], outputSchema: message.request.outputSchema,
+        model: message.request.selection.model, reasoningEffort: message.request.selection.reasoningEffort,
+        shellEnvironment: { ...shellEnvironment, HOME: gemini.home,
+          XDG_CONFIG_HOME: gemini.env.XDG_CONFIG_HOME!, XDG_CACHE_HOME: gemini.env.XDG_CACHE_HOME!,
+          CODEX_WEB_AUTOMATION_RECEIPT_DIR: message.request.automation?.receiptDirectory ?? "" },
+        runtimeWorkspaceRoots: [message.request.knowledgeRoot, message.request.workspace],
+        optionalCapabilities: message.request.optionalCapabilities,
+      }, callbacks) : startAppServerTurn({
         executablePath: process.env.CODEX_RUNTIME_PATH || "/usr/bin/codex",
         cwd: message.request.knowledgeRoot,
         env: { ...process.env, HOME: "/root", CODEX_HOME: message.request.codexHome },

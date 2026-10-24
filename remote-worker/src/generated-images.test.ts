@@ -47,7 +47,7 @@ test("generated image collection rejects invalid threads and applies transfer li
 });
 
 test("generated images respect the remaining result byte budget", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-image-budget-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-image-budget-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const threadId = crypto.randomUUID();
   const directory = path.join(root, "generated_images", threadId);
@@ -61,7 +61,7 @@ test("generated images respect the remaining result byte budget", async (context
 
 
 test("generated images can exceed twenty files and obey the remaining shared count", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-image-count-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-image-count-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const threadId = crypto.randomUUID();
   const directory = path.join(root, "generated_images", threadId);

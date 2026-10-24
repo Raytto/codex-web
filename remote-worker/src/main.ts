@@ -1,3 +1,7 @@
+import { fileURLToPath } from "node:url";
+import { engineForModel } from "./agent-engine.js";
+import { startAntigravityTurn } from "./antigravity-client.js";
+import { ensureAntigravityMcpConfig, resolveAntigravityModel, type AntigravityAgentOptions } from "./antigravity-runtime.js";
 import { REMOTE_TRANSFER_MAX_FILES_PER_JOB, REMOTE_TRANSFER_MAX_FILE_BYTES, REMOTE_TRANSFER_MAX_TOTAL_BYTES_PER_JOB } from "./transfer-policy.js";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
@@ -8,28 +12,32 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { WebSocket, type RawData } from "ws";
-import { archiveThread, CodexExecution, CodexObserver, readProjectThreadPage, setThreadName } from "./codex-client.js";
+import { archiveThread, waitAutomationEnvironment, CodexExecution, CodexObserver, readProjectThreadPage, setThreadName } from "./codex-client.js";
 import { projectFilesystem, resolveDirectory, resolveReadableFile } from "./filesystem.js";
 import { ProjectSyncMonitor } from "./project-sync-monitor.js";
 import { PROTOCOL_VERSION, type RunRequest, type ServerMessage, type WorkerEvent, type WorkerMessage, type WorkerUpdateResult } from "./protocol.js";
 import { RuntimeManager } from "./runtime-manager.js";
 import { WORKER_VERSION } from "./version.js";
 import { hasCapacity, isValidCapacity, normalizeCapacity } from "./capacity.js";
-import { cleanupCurrentRunDirectory, sweepRunDirectories, readRunAttempt, saveRunAttempt, retainedRunIds } from "./run-directories.js";
+import { cleanupCurrentRunDirectory, sweepRunDirectories, readRunAttempt, saveRunAttempt, retainedRunIds, createRunDirectories } from "./run-directories.js";
 import { DurableOutbox } from "./durable-outbox.js";
 import { isPersistableWorkerMessage, MAX_PROTOCOL_ERRORS, parseServerMessage, SERVER_MESSAGE_MAX_BYTES, WORKER_MESSAGE_MAX_BYTES } from "./protocol-validation.js";
 import { collectChangedFiles, type OmittedArtifact } from "./changed-files.js";
 import { collectGeneratedImages, snapshotGeneratedImages } from "./generated-images.js";
-import { buildRemoteSteerPrompt, buildRemoteTurnPrompt } from "./agent-context.js";
+import { buildRemoteSteerPrompt, buildRemoteTurnPrompt, remoteThreadInstructions } from "./agent-context.js";
 import { syncAccountSkills } from "./account-skills.js";
+import { runAntigravityConversationTitle } from "./antigravity-title.js";
 import { runConversationTitleAgent } from "./conversation-title-agent.js";
 import { RolloutSizes } from "./rollout-sizes.js";
 import { localThreadLifecycles } from "./rollout-lifecycle.js";
 import { NodeTransferEndpoint } from "./node-transfer-endpoint.js";
+import { GeminiAccountManager } from "./gemini-accounts.js";
+import { assertGeminiAccountChangeAllowed } from "./gemini-account-guard.js";
 import { RemoteCodexAccountManager } from "./codex-accounts.js";
+import { uploadFile } from "./file-upload.js";
 
 type Config = { serverWsUrl: string; serverHttpUrl: string; enrollmentToken: string; machineName: string; workerId: string; capacity: number; stateRoot?: string; codexRuntimePath?: string; sourceRoot?: string; workerUpdateTaskName?: string };
-type ActiveRun = { request: RunRequest; controller: AbortController; execution?: CodexExecution; changedFiles: Set<string> };
+type ActiveRun = { request: RunRequest; controller: AbortController; execution?: Pick<CodexExecution, "result" | "steer" | "interrupt">; changedFiles: Set<string> };
 type WorkerRelease = { version: string; ref: string | null; commit: string | null };
 const execFileAsync = promisify(execFile);
 const OUTBOX_ACTIVITY_BUDGET = 8 * 1024 * 1024;
@@ -52,6 +60,7 @@ const nodeTransfers = new NodeTransferEndpoint(stateRoot, config.serverHttpUrl);
 const rolloutSizes = new RolloutSizes(codexHome);
 const activeRuns = new Map<string, ActiveRun>();
 const activeTitleAgents = new Map<string, AbortController>();
+const geminiTitleRequests = new Set<string>();
 const codexAccounts = new RemoteCodexAccountManager({
   stateRoot,
   codexHome,
@@ -60,6 +69,13 @@ const codexAccounts = new RemoteCodexAccountManager({
     if (workerUpdateStarting || activeRuns.size > 0 || activeTitleAgents.size > 0 || projectSyncMonitor?.hasRunningThreads()) {
       throw new Error("目标机器仍有 Codex 任务执行，暂不能切换账号。");
     }
+  },
+});
+const geminiAccounts = new GeminiAccountManager({
+  root: path.join(stateRoot, "gemini-accounts"),
+  assertSwitchAllowed: () => {
+    assertGeminiAccountChangeAllowed({ maintenance: workerUpdateStarting || shuttingDown || geminiTitleRequests.size > 0,
+      activeModels: [...activeRuns.values()].map(run => run.request.selection.model) });
   },
 });
 const startupSweep = await sweepRunDirectories(stateRoot, new Set(activeRuns.keys()));
@@ -90,7 +106,7 @@ function connect(): void {
     type: "hello", protocolVersion: PROTOCOL_VERSION, workerId: config.workerId, machineName: config.machineName,
     enrollmentToken: config.enrollmentToken, platform: `${process.platform}-${process.arch}`,
     workerVersion: WORKER_VERSION, workerRelease: workerRelease().ref, workerCommit: workerRelease().commit,
-    capabilities: { nodeTransfers: true, deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
+    capabilities: { nodeTransfers: true, deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, geminiTitleAgent: true, codexAccounts: true, geminiAccounts: true, geminiUsage: true, threadLifecycle: true, threadRolloutSize: true },
     codexVersion: runtimeManager.snapshot().installedVersion, capacity: config.capacity,
   }));
   socket.on("message", (data, isBinary) => {
@@ -189,6 +205,11 @@ async function handle(message: ServerMessage): Promise<void> {
     }
     return;
   }
+  if (message.type === "gemini_accounts") {
+    try { send({ type: "gemini_accounts_result", requestId: message.requestId, ok: true, ...await geminiAccounts.handle(message) }); }
+    catch (error) { send({ type: "gemini_accounts_result", requestId: message.requestId, ok: false, message: error instanceof Error ? error.message : "Gemini 账号操作失败" }); }
+    return;
+  }
   if (message.type === "codex_accounts") {
     try {
       let state;
@@ -201,7 +222,7 @@ async function handle(message: ServerMessage): Promise<void> {
       else if (message.action === "login_cancel") login = codexAccounts.cancelLogin(message.loginId ?? "");
       else if (message.action === "activate") { state = codexAccounts.activate(message.accountId ?? ""); restart = true; }
       else if (message.action === "delete") state = codexAccounts.delete(message.accountId ?? "");
-      else if (message.action === "reset_credit") resetResult = await codexAccounts.consumeResetCredit(message.accountId ?? "", message.attemptId ?? "");
+      else if (message.action === "reset_credit") resetResult = await codexAccounts.consumeResetCredit(message.accountId ?? "", message.attemptId ?? "", message.autoExpiresAt);
       const response: Extract<WorkerMessage, { type: "codex_accounts_result" }> = {
         type: "codex_accounts_result", requestId: message.requestId, ok: true,
       };
@@ -285,17 +306,30 @@ async function handle(message: ServerMessage): Promise<void> {
     if (workerUpdateStarting) { send({ type: "title_agent_result", requestId: message.requestId, ok: false, message: "Worker 已进入升级准备阶段" }); return; }
     const controller = new AbortController();
     activeTitleAgents.set(message.requestId, controller);
-    void runConversationTitleAgent(message.prompt, message.timeoutMs, controller.signal).then(
+    if (message.engineId === "antigravity") geminiTitleRequests.add(message.requestId);
+    const generate = async () => {
+      if (message.engineId === "antigravity") {
+        const runtime = await geminiAccounts.getActiveRuntime();
+        const catalog = await geminiAccounts.getModelCatalog();
+        if (!runtime || !catalog) throw new Error("当前节点没有可用的 Gemini 命名账号");
+        return runAntigravityConversationTitle(message.prompt, message.timeoutMs, { runtime, catalog: catalog as import("./antigravity-runtime.js").AntigravityAgentOptions }, controller.signal);
+      }
+      if (message.engineId && message.engineId !== "codex") throw new Error("Invalid title engine");
+      return runConversationTitleAgent(message.prompt, message.timeoutMs, controller.signal);
+    };
+    void generate().then(
       (output) => send({ type: "title_agent_result", requestId: message.requestId, ok: true, output }),
       (error) => send({ type: "title_agent_result", requestId: message.requestId, ok: false, message: error instanceof Error ? error.message : "Codex title request failed" }),
-    ).finally(() => activeTitleAgents.delete(message.requestId));
+    ).finally(() => { activeTitleAgents.delete(message.requestId); geminiTitleRequests.delete(message.requestId); });
     return;
   }
 }
 
 async function fetchProjectFile(message: Extract<ServerMessage, { type: "file_fetch" }>): Promise<void> {
+  let resolvingPath = true;
   try {
     const file = resolveReadableFile(message.projectRoot, message.path);
+    resolvingPath = false;
     const response = await uploadFile(
       `${config.serverHttpUrl}/api/remote-worker-files/fetch/${encodeURIComponent(message.requestId)}`,
       message.transferToken,
@@ -308,7 +342,9 @@ async function fetchProjectFile(message: Extract<ServerMessage, { type: "file_fe
     }
     send({ type: "file_fetch_result", requestId: message.requestId, ok: true });
   } catch (error) {
-    send({ type: "file_fetch_result", requestId: message.requestId, ok: false, message: error instanceof Error ? error.message : "文件获取失败" });
+    send({ type: "file_fetch_result", requestId: message.requestId, ok: false,
+      ...(resolvingPath && (error as NodeJS.ErrnoException)?.code === "ENOENT" ? { errorCode: "NOT_FOUND" as const } : {}),
+      message: error instanceof Error ? error.message : "文件获取失败" });
   }
 }
 
@@ -350,16 +386,22 @@ async function startRun(request: RunRequest): Promise<void> {
   if (workerUpdateStarting) { sendEvent(request.jobId, { type: "failed", message: "Worker 已进入升级准备阶段，请等待节点重连" }); return; }
   if (!hasCapacity(activeRuns.size, config.capacity)) { sendEvent(request.jobId, { type: "failed", message: "远程电脑并发容量已满" }); return; }
   const controller = new AbortController();
+  const isGemini = engineForModel(request.selection.model) === "antigravity";
   const previousAttempt = readRunAttempt(stateRoot, request.jobId);
   const run: ActiveRun = { request, controller, changedFiles: new Set(previousAttempt?.changedFiles) };
   let deferredFailure: Extract<WorkerEvent, { type: "failed" }> | undefined;
   activeRuns.set(request.jobId, run);
   send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
   try {
-    if (request.accountSkills) syncAccountSkills(codexHome, request.accountSkills);
+    const geminiRuntime = isGemini ? await geminiAccounts.getActiveRuntime() : null;
+    if (isGemini && (!geminiRuntime || geminiRuntime.accountId !== request.agentAccountId)) throw new Error("此节点的 Gemini 登录账号已变化或失效，请重新登录后重试。");
+    const catalog = isGemini ? await geminiAccounts.getModelCatalog() : null;
+    if (isGemini && !catalog) throw new Error("无法读取此 Gemini 账号的模型目录。");
+    const resolvedSelection = catalog ? resolveAntigravityModel(catalog as AntigravityAgentOptions, request.selection.model, request.selection.reasoningEffort) : request.selection;
+    if (request.accountSkills) syncAccountSkills(isGemini ? path.join(geminiRuntime!.home, ".gemini", "antigravity-cli") : codexHome, request.accountSkills);
     const projectRoot = resolveDirectory(request.projectRoot);
-    const uploadRoot = path.join(stateRoot, "runs", request.jobId, "uploads");
-    fs.mkdirSync(uploadRoot, { recursive: true });
+    const directories = createRunDirectories(stateRoot, request.jobId);
+    const uploadRoot = directories.uploads;
     const localAttachments: Array<{ name: string; path: string; mimeType: string }> = [];
     for (const attachment of request.attachments) {
       const destination = path.join(uploadRoot, `${attachment.id}-${safeFileName(attachment.name)}`);
@@ -374,7 +416,7 @@ async function startRun(request: RunRequest): Promise<void> {
       });
       localAttachments.push({ name: attachment.name, path: destination, mimeType: attachment.mimeType });
     }
-    const turnInput = buildRemoteTurnPrompt(request, localAttachments);
+    const turnInput = buildRemoteTurnPrompt(isGemini && request.turnContext ? { ...request, turnContext: { ...request.turnContext, imageInput: "path_only" } } : request, localAttachments);
     const generatedImagesBeforeThreadId = previousAttempt ? previousAttempt.imageThreadId : request.codexThreadId;
     const generatedImagesBefore = previousAttempt ? new Map(previousAttempt.images) : generatedImagesBeforeThreadId
       ? await snapshotGeneratedImages(codexHome, generatedImagesBeforeThreadId)
@@ -383,10 +425,26 @@ async function startRun(request: RunRequest): Promise<void> {
       imageThreadId: generatedImagesBeforeThreadId, images: [...generatedImagesBefore] });
     persistAttempt();
     let generatedImageThreadId = request.codexThreadId;
-    run.execution = new CodexExecution({
+    if (geminiRuntime) ensureAntigravityMcpConfig(geminiRuntime.home, fileURLToPath(new URL("./platform-mcp.js", import.meta.url)));
+    run.execution = geminiRuntime ? startAntigravityTurn({
+      executablePath: geminiRuntime.executable, env: geminiRuntime.env, cwd: projectRoot,
+      threadId: request.agentSessionId ?? null, threadInstructions: remoteThreadInstructions(),
+      prompt: turnInput.prompt, imagePaths: [], model: resolvedSelection.model, reasoningEffort: resolvedSelection.reasoningEffort,
+      directories, runtimeWorkspaceRoots: [projectRoot, directories.uploads, directories.outputs, directories.runtime],
+      shellEnvironment: { ...waitAutomationEnvironment(request.automation ? { baseUrl: config.serverHttpUrl, token: request.automation.token, jobId: request.jobId } : undefined),
+        CODEX_WEB_AUTOMATION_RECEIPT_DIR: path.join(stateRoot, "wake-receipts") },
+      optionalCapabilities: request.optionalCapabilities,
+    }, {
+      signal: controller.signal,
+      onThreadStarted: (threadId) => sendEvent(request.jobId, { type: "thread_started", threadId }),
+      onContextUsage: (usage) => sendEvent(request.jobId, { type: "context_usage", usage }),
+      onProgress: (payload) => sendEvent(request.jobId, { type: "progress", payload }),
+      onChangedFile: (filePath) => { run.changedFiles.add(filePath); persistAttempt(); },
+    }) : new CodexExecution({
       cwd: projectRoot, threadId: request.codexThreadId, prompt: turnInput.prompt,
       imagePaths: turnInput.imagePaths, model: request.selection.model, reasoningEffort: request.selection.reasoningEffort,
       optionalCapabilities: request.optionalCapabilities,
+      directories,
       automation: request.automation ? {
         baseUrl: config.serverHttpUrl, token: request.automation.token, jobId: request.jobId,
         receiptDirectory: path.join(stateRoot, "wake-receipts"), dynamicTool: request.automation.dynamicTool === true,
@@ -400,8 +458,8 @@ async function startRun(request: RunRequest): Promise<void> {
       onChangedFile: (filePath) => { run.changedFiles.add(filePath); persistAttempt(); },
     });
     const finalResponse = await run.execution.result;
-    const changed = await uploadChangedFiles(run, projectRoot);
-    const generated = !changed.hasUploadedImage && generatedImageThreadId
+    const changed = await uploadChangedFiles(run, projectRoot, directories.outputs);
+    const generated = !isGemini && !changed.hasUploadedImage && generatedImageThreadId
       ? await collectGeneratedImages(
         codexHome,
         generatedImageThreadId,
@@ -416,7 +474,7 @@ async function startRun(request: RunRequest): Promise<void> {
     const cancelled = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
     deferredFailure = { type: "failed", message: cancelled ? "任务已停止" : error instanceof Error ? error.message : "远程任务失败", cancelled };
   } finally {
-    try { if (!deferredFailure || deferredFailure.cancelled || !/model (?:is )?at capacity/i.test(deferredFailure.message)) await cleanupCurrentRunDirectory(stateRoot, request.jobId); }
+    try { if (isGemini || !deferredFailure || deferredFailure.cancelled || !/model (?:is )?at capacity/i.test(deferredFailure.message)) await cleanupCurrentRunDirectory(stateRoot, request.jobId); }
     catch (error) { log(`run directory cleanup failed (${request.jobId}): ${error instanceof Error ? error.message : String(error)}`); }
     activeRuns.delete(request.jobId);
     send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
@@ -426,10 +484,10 @@ async function startRun(request: RunRequest): Promise<void> {
   }
 }
 
-async function uploadChangedFiles(run: ActiveRun, projectRoot: string): Promise<{ uploaded: number; uploadedBytes: number; hasUploadedImage: boolean; omitted: OmittedArtifact[] }> {
+async function uploadChangedFiles(run: ActiveRun, projectRoot: string, managedOutputRoot: string): Promise<{ uploaded: number; uploadedBytes: number; hasUploadedImage: boolean; omitted: OmittedArtifact[] }> {
   const result = await collectChangedFiles(projectRoot, run.changedFiles, async (realPath, name) => {
     await uploadResultFile(run, realPath, name);
-  });
+  }, { managedOutputRoot });
   return result;
 }
 
@@ -443,26 +501,6 @@ async function uploadResultFile(run: ActiveRun, realPath: string, name: string):
   if (!response.ok) throw new Error(`结果文件上传失败：${name} (${response.status})`);
 }
 
-async function uploadFile(url: string, transferToken: string, filePath: string, name: string): Promise<Response> {
-  const stat = await fs.promises.stat(filePath);
-  if (!stat.isFile() || stat.size < 0 || stat.size > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("文件大小不符合远程传输限制");
-  const body = fs.createReadStream(filePath);
-  try {
-    return await fetch(url, {
-      method: "PUT",
-      headers: {
-        authorization: `Bearer ${transferToken}`,
-        "content-type": mimeType(name),
-        "content-length": String(stat.size),
-        "x-file-name": encodeURIComponent(name),
-      },
-      body: body as unknown as BodyInit,
-      duplex: "half",
-    } as RequestInit & { duplex: "half" });
-  } finally {
-    if (!body.destroyed) body.destroy();
-  }
-}
 
 async function downloadFile(url: string, transferToken: string, destination: string, expectedSize: number, signal: AbortSignal): Promise<{ size: number; sha256: string }> {
   if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > REMOTE_TRANSFER_MAX_FILE_BYTES) throw new Error("附件声明大小无效");
@@ -681,9 +719,9 @@ function processExists(pid: number): boolean {
 }
 function argument(name: string): string | undefined { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] : undefined; }
 function safeFileName(value: string): string { return path.basename(value).replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_").slice(0, 160) || "attachment.bin"; }
-function mimeType(name: string): string { const ext = path.extname(name).toLowerCase(); return ({ ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json", ".csv": "text/csv", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".pdf": "application/pdf", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".zip": "application/zip" } as Record<string, string>)[ext] || "application/octet-stream"; }
+
 function log(message: string): void { process.stdout.write(`[${new Date().toISOString()}] ${message}\n`); }
-function shutdown(exitCode = 0): void { if (shuttingDown) return; shuttingDown = true; void nodeTransfers.close(); if (heartbeat) clearInterval(heartbeat); if (projectSyncRestartTimer) clearTimeout(projectSyncRestartTimer); projectSyncMonitor?.close(); codexAccounts.close(); for (const run of activeRuns.values()) { run.controller.abort(); run.execution?.interrupt(); } for (const controller of activeTitleAgents.values()) controller.abort(); try { outbox.persist(); } catch (error) { log(`durable outbox persist failed during shutdown: ${error instanceof Error ? error.message : String(error)}`); } socket?.close(1000, "shutdown"); fs.closeSync(lock); fs.rmSync(lockPath, { force: true }); setTimeout(() => process.exit(exitCode), 500).unref(); }
+function shutdown(exitCode = 0): void { if (shuttingDown) return; shuttingDown = true; void nodeTransfers.close(); if (heartbeat) clearInterval(heartbeat); if (projectSyncRestartTimer) clearTimeout(projectSyncRestartTimer); projectSyncMonitor?.close(); codexAccounts.close(); geminiAccounts.close(); for (const run of activeRuns.values()) { run.controller.abort(); run.execution?.interrupt(); } for (const controller of activeTitleAgents.values()) controller.abort(); try { outbox.persist(); } catch (error) { log(`durable outbox persist failed during shutdown: ${error instanceof Error ? error.message : String(error)}`); } socket?.close(1000, "shutdown"); fs.closeSync(lock); fs.rmSync(lockPath, { force: true }); setTimeout(() => process.exit(exitCode), 500).unref(); }
 process.on("SIGINT", () => shutdown());
 process.on("SIGTERM", () => shutdown());
 process.on("exit", () => { try { fs.closeSync(lock); } catch { /* already closed */ } try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ } });

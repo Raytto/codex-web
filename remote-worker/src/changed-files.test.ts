@@ -5,6 +5,69 @@ import path from "node:path";
 import test from "node:test";
 import { collectChangedFiles } from "./changed-files.js";
 
+test("shell-written managed HTML is collected with its declaration without fileChange events", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-managed-output-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  const outputs = path.join(root, "outputs", "current-job");
+  const oldOutputs = path.join(root, "outputs", "other-job");
+  const runtime = path.join(root, "runtime");
+  for (const dir of [project, outputs, oldOutputs, runtime]) fs.mkdirSync(dir, { recursive: true });
+  const html = path.join(outputs, "demo.html");
+  const declaration = `${html}.pp-agent.json`;
+  fs.writeFileSync(html, "<script>document.body.textContent='interactive'</script>");
+  fs.writeFileSync(declaration, '{"presentation_mode":"web","sha256":"declared"}');
+  fs.writeFileSync(path.join(oldOutputs, "private.txt"), "other job");
+  fs.writeFileSync(path.join(runtime, "log.txt"), "runtime log");
+  const uploads: string[] = [];
+  const result = await collectChangedFiles(project, [], async (_, name) => { uploads.push(name); }, { managedOutputRoot: outputs });
+  assert.deepEqual(uploads, ["demo.html", "demo.html.pp-agent.json"]);
+  assert.equal(result.uploaded, 2);
+  assert.deepEqual(result.omitted, []);
+  const deduplicated: string[] = [];
+  await collectChangedFiles(project, [declaration, html], async (_, name) => { deduplicated.push(name); }, { managedOutputRoot: outputs });
+  assert.deepEqual(deduplicated, uploads);
+});
+
+test("project HTML pulls its undeclared-in-events sidecar and reserves the complete pair budget", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-output-pair-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, "demo.html"), "html");
+  fs.writeFileSync(path.join(root, "demo.html.pp-agent.json"), "declaration");
+  const uploaded: string[] = [];
+  const result = await collectChangedFiles(root, ["demo.html"], async (_, name) => { uploaded.push(name); });
+  assert.deepEqual(uploaded, ["demo.html", "demo.html.pp-agent.json"]);
+  assert.equal(result.uploadedBytes, 15);
+  for (const options of [{ maximumFiles: 1 }, { maximumTotalBytes: 14 }]) {
+    const partial: string[] = [];
+    const limited = await collectChangedFiles(root, ["demo.html"], async (_, name) => { partial.push(name); }, options);
+    assert.deepEqual(partial, []);
+    assert.equal(limited.omitted.length, 1);
+    assert.equal(limited.omitted[0].path, "demo.html");
+  }
+});
+
+test("managed outputs reject a substituted root and sidecar symlinks outside collection roots", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-output-containment-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  const outputs = path.join(root, "outputs");
+  fs.mkdirSync(project);
+  fs.mkdirSync(outputs);
+  fs.writeFileSync(path.join(outputs, "demo.html"), "html");
+  const secret = path.join(root, "secret.json");
+  fs.writeFileSync(secret, "private");
+  try { fs.symlinkSync(secret, path.join(outputs, "demo.html.pp-agent.json")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "EPERM") { context.skip("symlinks unavailable"); return; } throw error; }
+  const uploaded: string[] = [];
+  const result = await collectChangedFiles(project, [], async (_, name) => { uploaded.push(name); }, { managedOutputRoot: outputs });
+  assert.deepEqual(uploaded, []);
+  assert.equal(result.omitted[0].reason, "outside_project");
+  const substituted = path.join(root, "substituted");
+  fs.symlinkSync(outputs, substituted, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(() => collectChangedFiles(project, [], async () => undefined, { managedOutputRoot: substituted }), /普通文件夹/);
+});
+
 test("changed file collection cannot escape the real project root and reports omissions", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-worker-changes-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -48,7 +111,7 @@ test("changed file collection caps uploads and emits a bounded manifest summary"
 });
 
 test("changed files share a byte budget and leave oversized batches available for on-demand fetch", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-worker-budget-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-worker-budget-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const [name, body] of [["a.zip", "1234"], ["b.zip", "1234"], ["c.zip", "12"]]) fs.writeFileSync(path.join(root, name), body);
   const uploaded: string[] = [];
@@ -61,7 +124,7 @@ test("changed files share a byte budget and leave oversized batches available fo
 
 
 test("automatic results deliver 256 files and leave overflow intact on the execution computer", async (context) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ppagent-result-count-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-result-count-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const files = Array.from({ length: 257 }, (_, index) => {
     const name = `result-${index}.md`;

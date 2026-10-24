@@ -1,3 +1,4 @@
+import { TransientNotice, useNoticeState } from "./transient-notice";
 import { ExtensionGroup } from './extensions-sidebar';
 import { useFeatureSelection } from "./feature-selection-context";
 import {
@@ -583,7 +584,7 @@ export function ParaWorkspace({
     [addStage, setAddStage] = useState<ParaStage>("idea"),
     [template, setTemplate] = useState(""),
     [resource, setResource] = useState<ParaResource | null>(null);
-  const [notice, setNotice] = useState(""),
+  const [notice, setNotice, noticeRevision] = useNoticeState(),
     [undo, setUndo] = useState<{
       id: string;
       revision: number;
@@ -594,11 +595,6 @@ export function ParaWorkspace({
     scroll = useRef<HTMLDivElement>(null),
     listScroll = useRef(0),
     dragged = useRef<ParaProject | null>(null);
-  useEffect(() => {
-    if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(""), 5000);
-    return () => window.clearTimeout(timer);
-  }, [notice]);
   useEffect(() => {
     if (!undo) return;
     const timer = window.setTimeout(() => setUndo(null), 10000);
@@ -826,10 +822,10 @@ export function ParaWorkspace({
       <div className={`para-scroll ${!pid ? "para-board-scroll" : ""}`} ref={scroll}>
         <ErrorBox error={action.error} />
         {notice && (
-          <div className="para-notice" role="status">
+          <TransientNotice className="para-notice" message={notice} revision={noticeRevision} onDismiss={() => setNotice("")}>
             {notice}
-            <button onClick={() => setNotice("")}>关闭</button>
-          </div>
+            <button aria-label="关闭提示" onClick={() => setNotice("")}>关闭</button>
+          </TransientNotice>
         )}
         {undo && (
           <div className="para-notice" role="status">

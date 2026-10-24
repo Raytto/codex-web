@@ -6,7 +6,9 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import bcrypt from "bcryptjs";
 import request from "supertest";
-import { createApp } from "../server/app.js";
+process.env.CWW_ANTIGRAVITY_TITLE_MODEL = "antigravity:gemini-title-fixture";
+process.env.CWW_ANTIGRAVITY_TITLE_EFFORT = "low";
+const { createApp } = await import("../server/app.js");
 
 async function fixture(context: TestContext) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-title-retry-test-"));
@@ -140,4 +142,35 @@ test("title retry falls back to the new request if the original has no usable te
   assert.equal(calls, 1);
   assert.equal(app.db.getConversation(app.id)?.title, "新任务");
   assert.equal(app.db.getConversation(app.id)?.title_source, "manual");
+});
+
+test("Antigravity titles use the shared retry lifecycle and audit Flash low without renaming a retired Codex thread", async (context) => {
+  const app = await fixture(context);
+  app.db.sqlite.prepare("UPDATE conversations SET agent_model='antigravity:gemini-4-argon',reasoning_effort='high' WHERE id=?").run(app.id);
+  const calls: unknown[][] = [];
+  app.runner.generateConversationTitle = async (...args) => {
+    calls.push(args);
+    if (calls.length === 1) throw new Error("temporary Gemini failure");
+    return JSON.stringify({ title: "整理季度销售" });
+  };
+  let renames = 0;
+  app.runner.renameRemoteThread = async () => { renames++; };
+  await app.submit("整理季度销售表格");
+  await app.drain();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][4], "antigravity");
+  assert.equal(app.db.getLatestConversationTitleAudit(app.id)?.status, "failed");
+  await app.submit("继续");
+  await app.drain();
+  assert.equal(calls.length, 2);
+  assert.match(String(calls[1][2]), /整理季度销售表格/);
+  const audit = app.db.getLatestConversationTitleAudit(app.id)!;
+  assert.equal(audit.model, "antigravity:gemini-title-fixture");
+  assert.equal(audit.reasoning_effort, "low");
+  assert.equal(audit.status, "succeeded");
+  assert.equal(app.db.getConversation(app.id)?.title, "整理季度销售");
+  assert.equal(renames, 0);
+  await app.agent.patch(`/api/conversations/${app.id}`).set("X-CSRF-Token", app.csrf).send({ title: "新任务" }).expect(200);
+  await app.submit("继续"); await app.drain();
+  assert.equal(calls.length, 2);
 });
