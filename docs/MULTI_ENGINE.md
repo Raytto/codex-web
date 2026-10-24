@@ -19,3 +19,5 @@ Gemini automatic naming is disabled until `CWW_ANTIGRAVITY_TITLE_MODEL` and `CWW
 Gemini messages sent during execution queue for the next request. Images are supplied as file paths; this does not claim preloaded visual input. Successful completion requires both a formal result and successful process exit. Started requests are not automatically replayed after uncertain failure. Platform deletion removes local managed records and owned Codex segments; vendor Gemini history requires the official client. Deleting a node-local Gemini account removes that account's local configuration.
 
 The CLI is integrity-pinned; runtime installation and Windows ConPTY packaging are tested separately from real Google login. Automated synthetic tests do not prove a particular subscription's model access or physical-device behavior.
+
+The public cold-storage engine remains format v2. It archives registered conversation files and the current Codex root; it is not a complete backup of historical engine segments or a Google account profile. Historical provider records can remain on their original node. Do not infer full vendor-history recovery from a platform archive.

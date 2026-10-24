@@ -126,3 +126,5 @@ The default `CWW_CODEX_RUNTIME_PATH` now points to `/opt/codex-baked/bin/codex`.
 ## Current feature/dependency accounting
 
 The optional engine does not add an Antigravity CLI to the default server image. Node-pty is an optional Worker dependency required for Windows ConPTY login; the package includes its integrity-locked Windows prebuilds. A temporary dependency extraction is removed by the release packager. Default runtime scripts remain selected explicitly; browsers, tests and documentation stay outside the runtime layer. No backup copies, caches or duplicate installed model CLIs are part of source publication. New source and updated dependencies require fresh image/profile checks; earlier size and speed measurements above remain dated historical evidence.
+
+Worker release archives omit compiled regression test modules. Their source and CI coverage remain in the repository; only executable client modules and production dependencies ship to users.

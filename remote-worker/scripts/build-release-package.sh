@@ -25,6 +25,8 @@ trap cleanup EXIT
 package_root="$staging_root/package"
 mkdir -p "$package_root/scripts" "$output_root"
 cp -a "$worker_root/dist" "$package_root/dist"
+# Compiled regression tests belong to the source/test stage, not end-user packages.
+find "$package_root/dist" -type f \( -name "*.test.js" -o -name "*.test.js.map" \) -delete
 cp -a "$worker_root/node_modules" "$package_root/node_modules"
 cp -a "$worker_root/package.json" "$worker_root/package-lock.json" "$package_root/"
 
