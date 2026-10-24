@@ -45,7 +45,7 @@ try {
     const payload = request.postData() ? JSON.parse(request.postData()) : {};
     const executorId = url.searchParams.get('executorId') || payload.executorId || 'local-host';
     const json = (data, status = 200) => route.fulfill({ status, json: data });
-    if (endpoint === '/executors') return json({ executors: [{ id: 'local-host', machineName: '服务器', kind: 'host', status: 'online', codexAccountManagementCapable: true }, { id: 'other-node', machineName: '另一台测试机器', kind: 'remote_worker', status: 'online', codexAccountManagementCapable: true, worker: { installedVersion: '1.20.0' } }] });
+    if (endpoint === '/executors') return json({ executors: [{ id: 'local-host', machineName: '服务器', kind: 'host_root', status: 'online', codexAccountManagementCapable: true }, { id: 'other-node', machineName: '另一台测试机器', kind: 'remote_worker', status: 'online', codexAccountManagementCapable: true, worker: { installedVersion: '1.20.0' } }] });
     if (endpoint === '/agent-options') return json({ models: [codexModel, ...(gemini.accounts.some(a => a.active && a.authenticated) ? [geminiModel] : [])], reasoningEfforts: [{ id: 'low', label: '低' }, { id: 'high', label: '高' }, { id: 'ultra', label: '极高' }], defaults: { model: codexModel.id, reasoningEffort: 'high' }, selection: { model: codexModel.id, reasoningEffort: 'high' } });
     if (endpoint === '/codex-accounts/reset-history') return json({ records: [], enabled: true, supported: true });
     if (endpoint === '/codex-accounts/refresh-usage') { if (failRefresh) { failRefresh = false; return json({ error: '合成额度刷新失败' }, 503); } return json(codex); }

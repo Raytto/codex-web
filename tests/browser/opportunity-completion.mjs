@@ -14,7 +14,7 @@ const {createApp}=await import(repo+'/dist-server/server/app.js');
 const {OpportunityStore,contentInput}=await import(repo+'/dist-server/server/opportunity-store.js');
 const cache=process.env.PLAYWRIGHT_BROWSERS_PATH||'/root/.cache/ms-playwright';
 process.env.PLAYWRIGHT_BROWSERS_PATH=cache;
-const entry=fs.readdirSync(cache+'/.links').map(n=>fs.readFileSync(cache+'/.links/'+n,'utf8').trim()).find(p=>fs.existsSync(p+'/index.mjs'));
+const entry=process.env.PLAYWRIGHT_MODULE_PATH||fs.readdirSync(cache+'/.links').map(n=>fs.readFileSync(cache+'/.links/'+n,'utf8').trim()).find(p=>fs.existsSync(p+'/index.mjs'));
 const {chromium}=await import(entry+'/index.mjs');
 const app=createApp({projectRoot:repo,dataRoot:root+'/data',tenantRoot:root+'/tenants',username:'pp',passwordHash:require('bcryptjs').hashSync('completion-test',4),sessionSecret:'completion-test-secret-at-least32chars',queueAutoStart:false,basePath:"/codex-web",minimumFreeDiskBytes:0});
 const server=app.app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
