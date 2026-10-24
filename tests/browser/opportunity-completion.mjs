@@ -16,9 +16,9 @@ const cache=process.env.PLAYWRIGHT_BROWSERS_PATH||'/root/.cache/ms-playwright';
 process.env.PLAYWRIGHT_BROWSERS_PATH=cache;
 const entry=fs.readdirSync(cache+'/.links').map(n=>fs.readFileSync(cache+'/.links/'+n,'utf8').trim()).find(p=>fs.existsSync(p+'/index.mjs'));
 const {chromium}=await import(entry+'/index.mjs');
-const app=createApp({projectRoot:repo,dataRoot:root+'/data',tenantRoot:root+'/tenants',username:'pp',passwordHash:require('bcryptjs').hashSync('completion-test',4),sessionSecret:'completion-test-secret-at-least32chars',queueAutoStart:false,phoneLoginRequired:false,minimumFreeDiskBytes:0});
+const app=createApp({projectRoot:repo,dataRoot:root+'/data',tenantRoot:root+'/tenants',username:'pp',passwordHash:require('bcryptjs').hashSync('completion-test',4),sessionSecret:'completion-test-secret-at-least32chars',queueAutoStart:false,basePath:"/codex-web",minimumFreeDiskBytes:0});
 const server=app.app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
-const origin='http://127.0.0.1:'+server.address().port;
+const origin='http://127.0.0.1:'+server.address().port+'/codex-web';
 const report={checks:[],pageErrors:[]};let browser;
 const deadline=setTimeout(()=>{throw new Error('Completion browser test timed out');},180000);
 try{
