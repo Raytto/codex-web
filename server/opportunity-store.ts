@@ -15,7 +15,7 @@ const id = () => crypto.randomUUID(), stamp = () => new Date().toISOString();
 const text = z.string().trim().max(6000), required = text.min(1), uuid = z.string().uuid();
 const knowledgePathInput=z.string().trim().max(500).refine(v=>v===''||(!v.startsWith('/')&&!v.includes('\\')&&!/[\x00-\x1f]/.test(v)&&v.split('/').every(part=>part&&part!=='.'&&part!=='..')&&/\.md$/i.test(v)), '知识库入口须为项目内的相对 Markdown 路径');
 const preferenceInput = z.object({id:uuid.optional(),text:required,kind:z.enum(['explicit','inferred']),scope:z.enum(['topic','project','account']).default('topic'),source:required.max(1000),active:z.boolean().default(true)});
-export const topicInput = z.object({ name: required.max(120), project_id: uuid, goal: required, questions: text.default(''), constraints: text.default(''), limit_count: z.number().int().min(1).max(10).default(3), exploration: z.number().int().min(0).max(40).default(20), read_recent: z.boolean().default(false), knowledge_path: knowledgePathInput.optional() });
+export const topicInput = z.object({ name: required.max(120), project_id: uuid, goal: required, questions: text.default(''), constraints: text.default(''), limit_count: z.number().int().min(1).max(10).default(3), pending_limit: z.number().int().min(0).max(100).nullable().optional(), exploration: z.number().int().min(0).max(40).default(20), read_recent: z.boolean().default(false), knowledge_path: knowledgePathInput.optional() });
 export const contentInput = z.object({
   title: required.max(180), summary: required.max(1200), audience: required, problem: required, mechanism: required, value: required,
   fit: required, facts: required, assumptions: required, doubt: required, validation: required, difference: required,
@@ -30,8 +30,12 @@ type IdeaRow = Omit<OpportunityIdea,'content'|'images'> & { content_json: string
 const ideaView = (r: IdeaRow): OpportunityIdea => { const {content_json,...other}=r; return {...other,content:JSON.parse(content_json)}; };
 const workingIdea = "(i.state IN ('kept','project') OR i.para_project_id IS NOT NULL OR EXISTS(SELECT 1 FROM opportunity_research r WHERE r.idea_id=i.id AND r.user_id=i.user_id))";
 const pendingIdea = `i.state='recommended' AND i.manual_processed=0 AND NOT ${workingIdea}`;
+// A previous recommendation is eligible only after an explicit queue return.
+// Manual decisions and work links always take precedence over queue membership.
+const inventoryIdea = `i.state IN ('pending','reserve') AND i.manual_processed=0 AND NOT ${workingIdea} AND
+  (i.first_recommended_at IS NULL OR EXISTS(SELECT 1 FROM opportunity_queue_events e WHERE e.idea_id=i.id AND e.user_id=i.user_id AND e.action='return_to_reserve'))`;
 export function opportunityPrompt(topic: OpportunityTopic) {
-  return `为「${topic.name}」发现值得尝试的新机会，最多推荐 ${topic.limit_count} 条。`+'\n'+opportunityLearningPrompt(topic.id,topic.knowledge_path);
+  return `为「${topic.name}」发现值得尝试的机会，每日最多推荐 ${topic.limit_count} 条。`+'\n'+opportunityLearningPrompt(topic.id,topic.knowledge_path);
 }
 export class OpportunityStore {
   constructor(readonly db: AppDatabase) {}
@@ -58,6 +62,42 @@ export class OpportunityStore {
     const counts=new Map((this.sql.prepare(`SELECT i.topic_id,COUNT(*) AS n FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id AND t.user_id=i.user_id WHERE i.user_id=? AND t.deleted_at IS NULL AND ${pendingIdea} GROUP BY i.topic_id`).all(user) as {topic_id:string;n:number}[]).map(r=>[r.topic_id,r.n]));
     return (this.sql.prepare('SELECT id FROM opportunity_topics WHERE user_id=? AND deleted_at IS NULL ORDER BY position,created_at,id').all(user) as {id:string}[]).map(r=>({...this.topic(user,r.id),pending_count:counts.get(r.id)??0}));
   }
+  capacity(user:string,topicId:string) {
+    const topic=this.topic(user,topicId);
+    const pendingCount=Number((this.sql.prepare(`SELECT COUNT(*) n FROM opportunity_ideas i WHERE i.user_id=? AND i.topic_id=? AND ${pendingIdea}`).get(user,topicId) as {n:number}).n);
+    const remainingSlots=topic.pending_limit===null?null:Math.max(0,topic.pending_limit-pendingCount);
+    return {pendingCount,pendingLimit:topic.pending_limit,remainingSlots,publishLimit:Math.min(topic.limit_count,remainingSlots??topic.limit_count)};
+  }
+  setBacklogLimit(user:string,topicId:string,raw:unknown) {
+    const v=z.object({requestKey:uuid,revision:z.number().int().positive(),pendingLimit:z.number().int().min(0).max(100).nullable()}).parse(raw);
+    return this.receipt(user,v.requestKey,'backlog-limit:'+topicId+':'+JSON.stringify(v),()=>{
+      const topic=this.topic(user,topicId);this.serverProject(user,topic.project_id);
+      if(topic.revision!==v.revision)fail('主题已更新，请重新读取。',409);
+      this.sql.prepare('UPDATE opportunity_topics SET pending_limit=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=?').run(v.pendingLimit,stamp(),topicId,user);
+      return {topic:this.topic(user,topicId),capacity:this.capacity(user,topicId)};
+    });
+  }
+  queueRevision(user:string,ideaId:string) {
+    return Number((this.sql.prepare('SELECT COALESCE(MAX(rowid),0) n FROM opportunity_queue_events WHERE user_id=? AND idea_id=?').get(user,ideaId) as {n:number}).n);
+  }
+  queueEvents(user:string,ideaId:string) {
+    return this.sql.prepare('SELECT * FROM opportunity_queue_events WHERE user_id=? AND idea_id=? ORDER BY rowid DESC').all(user,ideaId) as OpportunityDetail['queueEvents'];
+  }
+  returnToReserve(user:string,topicId:string,ideaId:string,raw:unknown,actor='user',conversationId:string|null=null) {
+    const v=z.object({requestKey:uuid,revision:z.number().int().positive(),reason:required.max(1200)}).parse(raw);
+    return this.receipt(user,v.requestKey,'return-to-reserve:'+topicId+':'+ideaId+':'+JSON.stringify(v),()=>{
+      const topic=this.topic(user,topicId),old=this.idea(user,ideaId);
+      this.serverProject(user,topic.project_id);
+      if(topic.archived_at)fail('请先恢复主题。',409);
+      if(old.topic_id!==topic.id||old.project_id!==topic.project_id)fail('卡片不属于当前主题或项目。',403);
+      if(old.revision!==v.revision)fail('卡片已更新，请重新读取后再整理。',409);
+      if(!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${pendingIdea}`).get(ideaId))fail('只能退回尚未处理、尚未进入研究或项目的待审核推荐。',409);
+      const time=stamp();
+      this.sql.prepare(`INSERT INTO opportunity_queue_events(id,user_id,topic_id,idea_id,action,conversation_id,actor,reason,previous_json,created_at) VALUES(?,?,?,?,'return_to_reserve',?,?,?,?,?)`).run(id(),user,topicId,ideaId,conversationId,actor,v.reason,JSON.stringify({state:old.state,revision:old.revision,first_recommended_at:old.first_recommended_at,recommended_batch_id:old.recommended_batch_id}),time);
+      this.sql.prepare("UPDATE opportunity_ideas SET state='reserve',revision=revision+1,updated_at=? WHERE id=?").run(time,ideaId);
+      return {idea:this.idea(user,ideaId),capacity:this.capacity(user,topicId)};
+    });
+  }
   reorderTopics(user: string, raw: unknown) {
     const { sourceId, targetId, placement } = z.object({ sourceId: uuid, targetId: uuid, placement: z.enum(['before', 'after']) }).parse(raw);
     return this.transaction(() => {
@@ -81,12 +121,12 @@ export class OpportunityStore {
   }
   createTopic(user:string,raw:unknown,key:string) {
     const b=topicInput.parse(raw);this.serverProject(user,b.project_id);
-    return this.receipt(user,key,'create-topic:'+JSON.stringify(b),()=>{const tid=id(),time=stamp();this.sql.prepare('INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,questions,constraints,limit_count,exploration,read_recent,created_at,updated_at,position,knowledge_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(tid,user,b.project_id,b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,time,time,Number((this.sql.prepare("SELECT COALESCE(MAX(position),-1)+1 AS next FROM opportunity_topics WHERE user_id=?").get(user) as {next:number}).next),b.knowledge_path??'');return this.topic(user,tid);});
+    return this.receipt(user,key,'create-topic:'+JSON.stringify(b),()=>{const tid=id(),time=stamp();this.sql.prepare('INSERT INTO opportunity_topics(id,user_id,project_id,name,goal,questions,constraints,limit_count,exploration,read_recent,created_at,updated_at,position,knowledge_path,pending_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(tid,user,b.project_id,b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,time,time,Number((this.sql.prepare("SELECT COALESCE(MAX(position),-1)+1 AS next FROM opportunity_topics WHERE user_id=?").get(user) as {next:number}).next),b.knowledge_path??'',b.pending_limit??null);return this.topic(user,tid);});
   }
   updateTopic(user:string,topicId:string,raw:unknown) {
     const b=topicInput.extend({revision:z.number().int().positive()}).parse(raw),old=this.topic(user,topicId);this.serverProject(user,b.project_id);
     if(old.project_id!==b.project_id && (old.task_id || this.sql.prepare('SELECT 1 FROM opportunity_batches WHERE topic_id=? LIMIT 1').get(topicId)))fail('已有计划或执行记录的主题不能更换项目。请新建主题。',409);
-    const r=this.sql.prepare('UPDATE opportunity_topics SET name=?,goal=?,questions=?,constraints=?,limit_count=?,exploration=?,read_recent=?,project_id=?,knowledge_path=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=? AND revision=?').run(b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,b.project_id,b.knowledge_path??old.knowledge_path,stamp(),topicId,user,b.revision);
+    const r=this.sql.prepare('UPDATE opportunity_topics SET name=?,goal=?,questions=?,constraints=?,limit_count=?,exploration=?,read_recent=?,project_id=?,knowledge_path=?,pending_limit=?,revision=revision+1,updated_at=? WHERE id=? AND user_id=? AND revision=?').run(b.name,b.goal,b.questions,b.constraints,b.limit_count,b.exploration,+b.read_recent,b.project_id,b.knowledge_path??old.knowledge_path,b.pending_limit===undefined?old.pending_limit:b.pending_limit,stamp(),topicId,user,b.revision);
     if(!r.changes)fail('主题已在其他页面更新，请重新加载。',409);return this.topic(user,topicId);
   }
   lifecycle(user:string,topicId:string,revision:number,action:'archive'|'restore'|'delete') {
@@ -176,8 +216,8 @@ export class OpportunityStore {
   }
   context(user:string,topicId:string) {
     const t=this.topic(user,topicId);this.reconcile(user,topicId);
-    const reserve=(this.sql.prepare("SELECT * FROM opportunity_ideas WHERE user_id=? AND topic_id=? AND state IN ('reserve','pending') AND first_recommended_at IS NULL AND manual_processed=0 ORDER BY score DESC,first_created_at").all(user,topicId) as IdeaRow[]).map(ideaView);
-    return {topic:t,inventory:reserve,history:this.history(user),feedback:this.sql.prepare('SELECT f.* FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=? ORDER BY f.rowid DESC LIMIT 200').all(user,topicId),feedbackLearning:this.feedbackLearning(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId),preferences:t.knowledge_path?[]:this.preferences(user,topicId),knowledge:{entry:t.knowledge_path,projectId:t.project_id},batches:this.batches(user,topicId),instructions:OPPORTUNITY_WORKFLOW};
+    const reserve=(this.sql.prepare(`SELECT i.* FROM opportunity_ideas i WHERE i.user_id=? AND i.topic_id=? AND ${inventoryIdea} ORDER BY i.score DESC,i.first_created_at`).all(user,topicId) as IdeaRow[]).map(r=>({...ideaView(r),queueEvents:this.queueEvents(user,r.id)}));
+    return {topic:t,capacity:this.capacity(user,topicId),inventory:reserve,history:this.history(user),feedback:this.sql.prepare('SELECT f.* FROM opportunity_feedback f JOIN opportunity_ideas i ON i.id=f.idea_id WHERE f.user_id=? AND i.topic_id=? ORDER BY f.rowid DESC LIMIT 200').all(user,topicId),feedbackLearning:this.feedbackLearning(user,topicId),feedbackRevision:this.feedbackRevision(user,topicId),preferences:t.knowledge_path?[]:this.preferences(user,topicId),knowledge:{entry:t.knowledge_path,projectId:t.project_id},batches:this.batches(user,topicId),instructions:OPPORTUNITY_WORKFLOW};
   }
   batches(user:string,topicId?:string){return this.sql.prepare(`SELECT * FROM opportunity_batches WHERE user_id=? ${topicId?'AND topic_id=?':''} ORDER BY day DESC,created_at DESC LIMIT 60`).all(...(topicId?[user,topicId]:[user])) as OpportunityBatch[];}
   reconcile(user:string,topicId?:string) { reconcileOpportunityBatches(this.sql,user,topicId); }
@@ -186,6 +226,17 @@ export class OpportunityStore {
     const c=this.db.getConversationForUser(conversationId,user);if(!c||c.project_id!==t.project_id)fail('请在主题关联的服务器项目会话中操作。',403);
     if(jobId){const j=this.db.getJob(jobId);if(!j||j.conversation_id!==conversationId||j.status!=='running')fail('任务已结束。',401);}
     return t;
+  }
+  researchIdeaForConversation(user:string,topicId:string,conversationId:string) {
+    return (this.sql.prepare('SELECT r.idea_id FROM opportunity_research r JOIN opportunity_ideas i ON i.id=r.idea_id AND i.user_id=r.user_id WHERE r.user_id=? AND r.conversation_id=? AND i.topic_id=?').get(user,conversationId,topicId) as {idea_id:string}|undefined)?.idea_id;
+  }
+  assertResearchJob(user:string,ideaId:string,conversationId:string,jobId?:string) {
+    const idea=this.idea(user,ideaId),topic=this.topic(user,idea.topic_id);
+    this.serverProject(user,topic.project_id);if(topic.archived_at)fail('主题已归档。',409);
+    const c=this.db.getConversationForUser(conversationId,user);
+    if(!c?.project_id||this.researchIdeaForConversation(user,topic.id,conversationId)!==ideaId)fail('当前会话未关联这张卡片的研究。',403);
+    this.serverProject(user,c.project_id);
+    if(jobId){const j=this.db.getJob(jobId);if(!j||j.conversation_id!==conversationId||j.status!=='running')fail('任务已结束。',401);}
   }
   batch(user:string,batchId:string,conversationId?:string){const b=this.sql.prepare('SELECT * FROM opportunity_batches WHERE id=? AND user_id=?').get(batchId,user) as OpportunityBatch|undefined;if(!b)fail('批次不存在。',404);if(conversationId&&b.conversation_id!==conversationId)fail('本批次由另一会话持有。',409);return b;}
   begin(user:string,topicId:string,conversationId:string,jobId:string|null,now=Date.now()) {
@@ -239,7 +290,7 @@ export class OpportunityStore {
     return this.transaction(()=>{const b=this.writableBatch(user,batchId,conversationId);
       this.assertFeedbackLearned(user,b.topic_id);
       for(const r of reviews){const idea=this.idea(user,r.idea_id);
-        if(idea.topic_id!==b.topic_id||idea.first_recommended_at||idea.manual_processed||!['pending','reserve'].includes(idea.state))fail('只能评审本主题尚未正式推荐、未经人工处理的有效候选。',409);
+        if(idea.topic_id!==b.topic_id||!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${inventoryIdea}`).get(idea.id))fail('只能评审本主题未经人工处理的有效候选或明确退回的备选。',409);
         for(const c of r.compared)this.idea(user,c.id);
         const near=this.neighbors(user,idea.content,idea.id).filter(n=>n.similarity>=.35);
         if(near.some(n=>!r.compared.some(c=>c.id===n.id)) && r.verdict==='approve')fail('请逐一比较召回的相似历史，给出实质差异后再通过。',409);
@@ -247,28 +298,48 @@ export class OpportunityStore {
         let state:OpportunityState=r.verdict==='approve'?'reserve':r.verdict==='expired'?'expired':r.verdict==='duplicate'?'duplicate':'internal_rejected';
         if(r.verdict==='duplicate'){if(!r.duplicate_of||r.duplicate_of===idea.id)fail('请指定原想法编号。');const original=this.idea(user,r.duplicate_of);if(original.state==='duplicate')fail('请合并到最终原想法。');this.mergeEvidence(user,original.id,idea.content,conversationId,r.rationale);}
         this.sql.prepare('UPDATE opportunity_ideas SET state=?,score=?,quality=?,review_reason=?,state_reason=?,duplicate_of=?,last_reviewed_at=?,revision=revision+1,updated_at=? WHERE id=?').run(state,r.score,r.quality,r.rationale,r.verdict==='approve'?'':r.rationale,r.duplicate_of??null,stamp(),stamp(),idea.id);
-        this.sql.prepare('INSERT INTO opportunity_reviews VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(batch_id,idea_id) DO UPDATE SET verdict=excluded.verdict,score=excluded.score,rationale=excluded.rationale,compared_json=excluded.compared_json,created_at=excluded.created_at,feedback_revision=excluded.feedback_revision').run(batchId,idea.id,r.verdict,r.score,r.rationale,JSON.stringify(r.compared),stamp(),this.feedbackRevision(user,b.topic_id));
+        this.sql.prepare('INSERT INTO opportunity_reviews(batch_id,idea_id,verdict,score,rationale,compared_json,created_at,feedback_revision,queue_revision) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(batch_id,idea_id) DO UPDATE SET verdict=excluded.verdict,score=excluded.score,rationale=excluded.rationale,compared_json=excluded.compared_json,created_at=excluded.created_at,feedback_revision=excluded.feedback_revision,queue_revision=excluded.queue_revision').run(batchId,idea.id,r.verdict,r.score,r.rationale,JSON.stringify(r.compared),stamp(),this.feedbackRevision(user,b.topic_id),this.queueRevision(user,idea.id));
         this.sql.prepare('UPDATE opportunity_candidates SET outcome=?,reason=? WHERE batch_id=? AND idea_id=?').run(r.verdict,r.rationale,batchId,idea.id);
       }
       this.sql.prepare("UPDATE opportunity_batches SET status='reviewing' WHERE id=?").run(batchId);return {reviewed:reviews.length,inventory:this.context(user,b.topic_id).inventory};});
   }
   publish(user:string,batchId:string,conversationId:string,raw:unknown) {
     const v=z.object({ids:z.array(uuid).max(10),summary:required,feedbackRevision:z.number().int().nonnegative(),contextWatermark:z.number().int().nonnegative().optional()}).parse(raw);
-    return this.transaction(()=>{const old=this.batch(user,batchId);if(old.status==='completed')return {batch:old,ideas:(this.sql.prepare('SELECT * FROM opportunity_ideas WHERE recommended_batch_id=?').all(batchId) as IdeaRow[]).map(ideaView),idempotent:true};
-      const b=this.writableBatch(user,batchId,conversationId),topic=this.topic(user,b.topic_id);
-      if(new Set(v.ids).size!==v.ids.length||v.ids.length>topic.limit_count)fail('精选数量超出主题上限或包含重复项。');
+    return this.transaction(()=>{
+      const old=this.batch(user,batchId,conversationId);
+      this.assertJob(user,old.topic_id,conversationId);
+      const result=(idempotent=false)=>{
+        const events=this.sql.prepare("SELECT idea_id,action FROM opportunity_queue_events WHERE user_id=? AND batch_id=? AND action IN ('recommended','rerecommended') ORDER BY rowid").all(user,batchId) as {idea_id:string;action:string}[];
+        return {batch:this.batch(user,batchId),ideas:events.map(e=>this.idea(user,e.idea_id)),firstRecommendationCount:events.filter(e=>e.action==='recommended').length,returnRecommendationCount:events.filter(e=>e.action==='rerecommended').length,capacity:this.capacity(user,old.topic_id),reserveCount:this.context(user,old.topic_id).inventory.length,idempotent};
+      };
+      if(old.status==='completed')return result(true);
+      const b=this.writableBatch(user,batchId,conversationId),topic=this.topic(user,b.topic_id),capacity=this.capacity(user,b.topic_id);
+      if(new Set(v.ids).size!==v.ids.length||v.ids.length>topic.limit_count)fail('精选数量超出主题每日上限或包含重复项。');
       if(v.feedbackRevision!==this.feedbackRevision(user,b.topic_id))fail('用户反馈已更新，请重新读取并复评后提交。',409);
       this.assertFeedbackLearned(user,b.topic_id);
-      const pool=(this.sql.prepare("SELECT i.id FROM opportunity_ideas i WHERE i.topic_id=? AND i.state IN ('pending','reserve') AND i.first_recommended_at IS NULL AND i.manual_processed=0 AND NOT EXISTS(SELECT 1 FROM opportunity_reviews r WHERE r.batch_id=? AND r.idea_id=i.id AND r.feedback_revision=?)").all(b.topic_id,batchId,v.feedbackRevision) as {id:string}[]);
-      if(pool.length)fail(`还有 ${pool.length} 条历史备用/新候选尚未参与本轮复评，或尚未按最新反馈复评。`,409);
+      // Always validate ownership, even when a competing publication filled the queue.
+      for(const iid of v.ids){const idea=this.idea(user,iid);if(idea.topic_id!==b.topic_id)fail('精选卡片不属于当前主题。',403);}
+      const selected=v.ids.slice(0,capacity.publishLimit);
+      if(capacity.publishLimit>0){
+        const pool=this.sql.prepare(`SELECT i.id FROM opportunity_ideas i WHERE i.user_id=? AND i.topic_id=? AND ${inventoryIdea}
+          AND NOT EXISTS(SELECT 1 FROM opportunity_reviews r WHERE r.batch_id=? AND r.idea_id=i.id AND r.feedback_revision=?
+          AND r.queue_revision=(SELECT COALESCE(MAX(e.rowid),0) FROM opportunity_queue_events e WHERE e.idea_id=i.id AND e.user_id=i.user_id))`).all(user,b.topic_id,batchId,v.feedbackRevision);
+        if(pool.length)fail(`还有 ${pool.length} 条历史备用/新候选尚未参与本轮复评，或尚未按最新反馈及回池记录复评。`,409);
+      }
       const time=stamp();
-      for(const iid of v.ids){const idea=this.idea(user,iid);if(idea.topic_id!==b.topic_id||idea.state!=='reserve'||idea.first_recommended_at||idea.manual_processed||idea.quality<60)fail('精选必须是本主题通过评审且从未正式推荐/人工处理的候选。',409);
+      for(const iid of selected){
+        const idea=this.idea(user,iid);
+        if(idea.state!=='reserve'||idea.quality<60||!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${inventoryIdea}`).get(iid))fail('精选必须是本主题通过评审、未经人工处理的候选或明确退回的备选。',409);
         if(!idea.images?.some(image=>image.state!=='unavailable'))fail('请先为每张精选卡片生成并关联说明图片，再提交推荐。',409);
-        this.sql.prepare("UPDATE opportunity_ideas SET state='recommended',first_recommended_at=?,recommended_batch_id=?,revision=revision+1,updated_at=? WHERE id=?").run(time,batchId,time,iid);}
-      const eligible=Number((this.sql.prepare("SELECT count(*) n FROM opportunity_ideas WHERE topic_id=? AND state='reserve' AND first_recommended_at IS NULL AND manual_processed=0").get(b.topic_id) as {n:number}).n);
-      this.sql.prepare("UPDATE opportunity_batches SET status='completed',summary=?,completed_at=?,context_watermark=? WHERE id=?").run(v.summary,time,v.contextWatermark??b.context_watermark,batchId);
+        this.sql.prepare(`INSERT INTO opportunity_queue_events(id,user_id,topic_id,idea_id,action,batch_id,conversation_id,actor,reason,previous_json,created_at) VALUES(?,?,?,?,?,?,?,'agent',?,?,?)`).run(id(),user,b.topic_id,iid,idea.first_recommended_at?'rerecommended':'recommended',batchId,conversationId,v.summary,JSON.stringify({state:idea.state,revision:idea.revision}),time);
+        this.sql.prepare("UPDATE opportunity_ideas SET state='recommended',first_recommended_at=COALESCE(first_recommended_at,?),recommended_batch_id=COALESCE(recommended_batch_id,?),revision=revision+1,updated_at=? WHERE id=?").run(time,batchId,time,iid);
+      }
+      const limited=capacity.remainingSlots!==null&&capacity.remainingSlots<topic.limit_count;
+      const summary=v.summary+(limited?`\n待审核上限 ${capacity.pendingLimit}，提交时剩余 ${capacity.remainingSlots} 个空位；实际推荐 ${selected.length} 条，其余留在备选池。`:'');
+      this.sql.prepare("UPDATE opportunity_batches SET status='completed',summary=?,completed_at=?,context_watermark=? WHERE id=?").run(summary,time,v.contextWatermark??b.context_watermark,batchId);
       if(v.contextWatermark!==undefined){const max=Number((this.sql.prepare('SELECT COALESCE(MAX(m.rowid),0) n FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.user_id=?').get(user) as {n:number}).n);if(v.contextWatermark>max)fail('对话水位无效。');this.sql.prepare('UPDATE opportunity_topics SET context_watermark=MAX(context_watermark,?) WHERE id=?').run(v.contextWatermark,b.topic_id);}
-      return {batch:this.batch(user,batchId),ideas:v.ids.map(i=>this.idea(user,i)),reserveCount:eligible};});
+      return {...result(),deferredIds:v.ids.slice(selected.length),limitedByBacklog:limited};
+    });
   }
   failBatch(user:string,batchId:string,conversationId:string,reason:string){const b=this.writableBatch(user,batchId,conversationId);this.sql.prepare("UPDATE opportunity_batches SET status='failed',error=?,completed_at=? WHERE id=?").run(required.parse(reason),stamp(),b.id);return this.batch(user,b.id);}
   voiceFeedback(user:string,ideaId:string):OpportunityVoiceFeedback[] {
@@ -277,10 +348,10 @@ export class OpportunityStore {
   }
   detail(user:string,ideaId:string):OpportunityDetail {
     const idea=this.idea(user,ideaId),sourceBatch=this.batch(user,idea.source_batch_id),recommendedBatch=idea.recommended_batch_id?this.batch(user,idea.recommended_batch_id):null;
-    const research=this.sql.prepare('SELECT * FROM opportunity_research WHERE user_id=? AND idea_id=? ORDER BY created_at DESC').all(user,ideaId) as OpportunityResearch[];
+    const research=this.sql.prepare('SELECT r.*,c.project_id FROM opportunity_research r LEFT JOIN conversations c ON c.id=r.conversation_id AND c.user_id=r.user_id WHERE r.user_id=? AND r.idea_id=? ORDER BY r.created_at DESC,r.rowid DESC').all(user,ideaId) as OpportunityResearch[];
     const versions=(this.sql.prepare('SELECT * FROM opportunity_versions WHERE idea_id=? ORDER BY created_at DESC').all(ideaId) as OpportunityDetail['versions']).map(v=>({...v,project_id:this.db.getConversationForUser(v.conversation_id,user)?.project_id??null}));
     const availableConversations=[idea.source_conversation_id,sourceBatch.conversation_id,recommendedBatch?.conversation_id,...research.map(r=>r.conversation_id),...versions.map(v=>v.conversation_id)].filter((cid):cid is string=>!!cid&&!!this.db.getConversationForUser(cid,user));
-    return {idea,sourceBatch,recommendedBatch,availableConversations,versions,research,voiceFeedback:this.voiceFeedback(user,ideaId),feedback:this.sql.prepare('SELECT * FROM opportunity_feedback WHERE user_id=? AND idea_id=? ORDER BY rowid DESC').all(user,ideaId) as OpportunityFeedback[]};
+    return {idea,sourceBatch,recommendedBatch,availableConversations,versions,research,queueEvents:this.queueEvents(user,ideaId),canReturnToReserve:!!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${pendingIdea}`).get(ideaId),voiceFeedback:this.voiceFeedback(user,ideaId),feedback:this.sql.prepare('SELECT * FROM opportunity_feedback WHERE user_id=? AND idea_id=? ORDER BY rowid DESC').all(user,ideaId) as OpportunityFeedback[]};
   }
   feedback(user:string,ideaId:string,raw:unknown,actor='user') {
     const v=z.object({requestKey:uuid,revision:z.number().int().positive(),action:z.enum(['kept','completed','later','dismissed','rate','undo','expired']),reason:z.enum(['','no_time','vague','evidence','duplicate','direction','outdated','other']).default(''),rating:z.number().int().min(1).max(5).nullable().default(null),note:text.default('')}).parse(raw);
@@ -296,6 +367,9 @@ export class OpportunityStore {
       let next={...previous,state:v.action==='rate'?old.state:v.action as OpportunityState,rating:v.rating,note,manual_processed:1,state_reason:v.reason};
       if(v.action==='undo'){const last=this.sql.prepare("SELECT previous_json FROM opportunity_feedback WHERE user_id=? AND idea_id=? AND actor<>'user-voice' ORDER BY rowid DESC LIMIT 1").get(user,ideaId) as {previous_json:string}|undefined;if(!last)fail('没有可撤销的操作。');next=JSON.parse(last.previous_json);
         if(next.revision)for(const speech of this.voiceFeedback(user,ideaId).filter(r=>r.state==='completed'&&r.applied_revision!>next.revision).sort((a,b)=>a.applied_revision!-b.applied_revision!))next.note=next.note?next.note+'\n'+speech.transcript:speech.transcript;}
+      if(next.state==='recommended'&&next.manual_processed===0&&!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${workingIdea}`).get(ideaId)
+        &&!this.sql.prepare(`SELECT 1 FROM opportunity_ideas i WHERE i.id=? AND ${pendingIdea}`).get(ideaId)
+        &&this.capacity(user,old.topic_id).remainingSlots===0)fail('待审核已达上限，请先处理队列中的卡片再恢复。',409);
       this.sql.prepare('INSERT INTO opportunity_feedback VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(id(),user,ideaId,v.requestKey,v.action,v.reason,v.rating,note,actor,JSON.stringify(previous),stamp());
       this.sql.prepare('UPDATE opportunity_ideas SET state=?,rating=?,note=?,manual_processed=?,state_reason=?,revision=revision+1,updated_at=? WHERE id=?').run(next.state,next.rating,next.note,next.manual_processed,next.state_reason,stamp(),ideaId);return this.idea(user,ideaId);});
   }
@@ -324,7 +398,7 @@ export class OpportunityStore {
     const negative="i.state IN ('dismissed','expired','internal_rejected','duplicate','completed')";
     const collections={
       screen:pendingIdea,
-      reserve:`i.state='reserve' AND i.first_recommended_at IS NULL AND i.manual_processed=0 AND NOT ${work}`,
+      reserve:`i.state='reserve' AND ${inventoryIdea}`,
       kept:"i.state='kept'",
       completed:"i.state='completed'",
       working:`NOT (${negative}) AND ${work}`,
@@ -340,7 +414,7 @@ export class OpportunityStore {
       const b=this.sql.prepare("SELECT id FROM opportunity_batches WHERE topic_id=? AND day=? AND status='completed'").get(t.id,day) as {id:string}|undefined;
       return b?[b.id]:[];
     }):[];
-    const filters:Record<string,string>={...collections,today:`${collections.screen} AND i.recommended_batch_id IN (${todayBatches.map(()=>'?').join(',')||'NULL'})`,history:`(i.first_recommended_at IS NOT NULL OR i.manual_processed=1 OR ${work})`};
+    const filters:Record<string,string>={...collections,today:`${collections.screen} AND EXISTS(SELECT 1 FROM opportunity_queue_events e WHERE e.idea_id=i.id AND e.action IN ('recommended','rerecommended') AND e.batch_id IN (${todayBatches.map(()=>'?').join(',')||'NULL'}))`,history:`(i.first_recommended_at IS NOT NULL OR i.manual_processed=1 OR ${work})`};
     const clause=`${scope} AND (${filters[tab]??filters.screen})`,params=[...ownerParams,...(tab==='today'?todayBatches:[])];
     const total=Number((this.sql.prepare(`SELECT count(*) n FROM opportunity_ideas i JOIN opportunity_topics t ON t.id=i.topic_id WHERE ${clause}`).get(...params) as {n:number}).n);
     const start=Math.max(0,Math.floor(offset));
@@ -349,23 +423,24 @@ export class OpportunityStore {
     return {topics,ideas,counts,batches:this.batches(user,topicId),preferences:topicId&&!this.topic(user,topicId).knowledge_path?this.preferences(user,topicId,true):[],learning:topicId?this.feedbackLearning(user,topicId):null,total,nextOffset:start+rows.length<total?start+rows.length:null};
   }
   private workSummary(user:string,idea:OpportunityIdea|IdeaRow) {
-    const research=this.sql.prepare('SELECT * FROM opportunity_research WHERE user_id=? AND idea_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(user,idea.id) as OpportunityResearch|undefined;
+    const research=this.sql.prepare('SELECT r.*,c.project_id FROM opportunity_research r LEFT JOIN conversations c ON c.id=r.conversation_id AND c.user_id=r.user_id WHERE r.user_id=? AND r.idea_id=? ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1').get(user,idea.id) as OpportunityResearch|undefined;
     const project=idea.para_project_id?this.sql.prepare('SELECT id,board_id,title,stage,archived_at FROM para_projects WHERE id=? AND user_id=?').get(idea.para_project_id,user) as {id:string;board_id:string;title:string;stage:string;archived_at:string|null}|undefined:undefined;
-    return {research:research?{status:research.status,result:research.result,conversation_id:research.conversation_id,project_id:idea.project_id,available:!!this.db.getConversationForUser(research.conversation_id,user)}:null,project:project??null};
+    return {research:research?{status:research.status,result:research.result,conversation_id:research.conversation_id,project_id:research.project_id??idea.project_id,available:!!this.db.getConversationForUser(research.conversation_id,user)}:null,project:project??null};
   }
-  start(user:string,topicId:string,selection:StoredAgentSelection,key:string,researchIdeaId?:string,rawDraftFeedback?:unknown) {
+  start(user:string,topicId:string,selection:StoredAgentSelection,key:string,researchIdeaId?:string,rawDraftFeedback?:unknown,researchProjectId?:string) {
     const t=this.topic(user,topicId);this.serverProject(user,t.project_id);if(t.archived_at)fail('请先恢复主题。',409);
-    return this.receipt(user,key,'start:'+topicId+':'+(researchIdeaId??''),()=>{
+    const project=this.serverProject(user,researchIdeaId?(researchProjectId??t.project_id):t.project_id);
+    return this.receipt(user,key,'start:'+topicId+':'+(researchIdeaId??'')+(project.id!==t.project_id?':project:'+project.id:''),()=>{
       if(!researchIdeaId){const day=new Intl.DateTimeFormat('en-CA',{timeZone:t.task?.schedule.timeZone??'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());const b=this.sql.prepare('SELECT * FROM opportunity_batches WHERE topic_id=? AND day=?').get(topicId,day) as OpportunityBatch|undefined;if(b&&b.status!=='failed')return {conversationId:b.conversation_id,projectId:t.project_id,alreadyStarted:true};if(b&&b.attempts>=3)fail('今日已尝试三次，请先检查来源会话。',409);
         const pending=this.sql.prepare("SELECT c.id FROM conversations c JOIN opportunity_requests r ON json_extract(r.result_json,'$.conversationId')=c.id WHERE r.user_id=? AND r.operation=? AND (EXISTS(SELECT 1 FROM pending_prompts p WHERE p.conversation_id=c.id AND p.status='queued') OR EXISTS(SELECT 1 FROM jobs j WHERE j.conversation_id=c.id AND j.status IN ('queued','running')))").get(user,'start:'+topicId+':') as {id:string}|undefined;if(pending)return {conversationId:pending.id,projectId:t.project_id,alreadyStarted:true};}
       const idea=researchIdeaId?this.idea(user,researchIdeaId):null;if(idea&&idea.topic_id!==topicId)fail('卡片不属于当前主题。');
       if(idea?.state==='completed')fail('请先恢复为保留，再发起新的研究。',409);
       const draftFeedback=rawDraftFeedback===undefined?undefined:z.object({rating:z.number().int().min(1).max(5).nullable(),note:z.string().max(6000)}).parse(rawDraftFeedback);
       const cid=id(),selected=t.task?{model:t.task.model,reasoningEffort:t.task.reasoningEffort}:selection;
-      this.db.createConversation(cid,idea?'深入研究 · '+idea.content.title:t.name+' · 发现机会',selected,user,t.project_id);this.sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(cid);
+      this.db.createConversation(cid,idea?'深入研究 · '+idea.content.title:t.name+' · 发现机会',selected,user,project.id);this.sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(cid);
       if(idea){
         const feedback=this.sql.prepare('SELECT * FROM opportunity_feedback WHERE user_id=? AND idea_id=? ORDER BY rowid').all(user,idea.id) as OpportunityFeedback[];
-        this.db.saveComposerDraft(cid,opportunityResearchPrompt(t,idea,feedback,draftFeedback),null);
+        this.db.saveComposerDraft(cid,opportunityResearchPrompt(t,idea,feedback,draftFeedback,project.id!==t.project_id?this.serverProject(user,t.project_id).root_path:undefined),null);
       }else{
         const prompt=(t.task?.prompt??opportunityPrompt(t))+'\n\n'+opportunityLearningPrompt(topicId,t.knowledge_path);
         this.db.createPendingPrompt(id(),cid,prompt,selected);
@@ -375,9 +450,9 @@ export class OpportunityStore {
         this.sql.prepare('INSERT INTO opportunity_research VALUES(?,?,?,?,?,?,?,?,?)').run(id(),user,idea.id,cid,key,'interested','',stamp(),stamp());
         this.sql.prepare('UPDATE opportunity_ideas SET manual_processed=1,revision=revision+1,updated_at=? WHERE id=? AND user_id=?').run(stamp(),idea.id,user);
       }
-      return {conversationId:cid,projectId:t.project_id};});
+      return {conversationId:cid,projectId:project.id};});
   }
-  researchResult(user:string,ideaId:string,conversationId:string,raw:unknown){const v=z.object({status:z.enum(['validated','invalidated','inconclusive']),result:required}).parse(raw),idea=this.idea(user,ideaId);this.assertJob(user,idea.topic_id,conversationId);const r=this.sql.prepare('UPDATE opportunity_research SET status=?,result=?,updated_at=? WHERE user_id=? AND idea_id=? AND conversation_id=?').run(v.status,v.result,stamp(),user,ideaId,conversationId);if(!r.changes)fail('当前会话未关联这张卡片的研究。',403);return this.detail(user,ideaId);}
+  researchResult(user:string,ideaId:string,conversationId:string,raw:unknown){const v=z.object({status:z.enum(['validated','invalidated','inconclusive']),result:required}).parse(raw),idea=this.idea(user,ideaId);this.assertResearchJob(user,idea.id,conversationId);const r=this.sql.prepare('UPDATE opportunity_research SET status=?,result=?,updated_at=? WHERE user_id=? AND idea_id=? AND conversation_id=?').run(v.status,v.result,stamp(),user,ideaId,conversationId);if(!r.changes)fail('当前会话未关联这张卡片的研究。',403);return this.detail(user,ideaId);}
   toProject(user:string,ideaId:string,boardId:string,key:string){
     const para=new ParaStore(this.db);para.board(user,boardId);
     return this.receipt(user,key,'project:'+ideaId+':'+boardId,()=>{const idea=this.idea(user,ideaId);if(idea.para_project_id)return para.project(user,idea.para_project_id);if(idea.state==='completed')fail('请先恢复为保留，再转入项目看板。',409);const p=para.createProject(user,boardId,idea.content.title,'idea');
@@ -388,14 +463,16 @@ export class OpportunityStore {
   }
 }
 export const OPPORTUNITY_WORKFLOW = `工具 action 与 data：
-context: 读取目标/知识库入口/反馈学习进度/库存摘要。topic.knowledge_path 非空时，项目内该 Markdown 入口及其索引是详细要求和原则的唯一权威；先读取，按需检索知识库链接的项目资料、当前变化和信息源。页面目标/边界只是简短摘要，旧页面偏好不再注入。每轮搜索前先学习全部未归纳反馈，直到 pending=0，重新读取 context 后以有效原则指导搜索、生成和评审。feedback_inbox: {} 返回最早未归纳的30条反馈、当前卡片状态、已有含停用原则、watermark/through/feedbackRevision；逐页处理，不限昨天，不能只看 context 最近30条。learn_feedback: {requestKey:UUID,after:本页watermark,through:本页through,feedbackRevision:本页值,summary:本页归纳及取舍说明,knowledgeFiles?:已更新的项目相对Markdown路径数组,principles?:[{id?:更新旧原则ID,text,kind:explicit|inferred,scope:topic,source:本主题反馈ID,active?:false可停用}]}。关联项目知识库时，先用本项目正常文件工具把原则/修正及反馈ID写入知识库，成功后携带 knowledgeFiles 确认进度，不再传 principles；写失败不得确认。文件已写但确认失败时按反馈ID核对，不重复应用。同页原始反馈ID保存在学习记录；原始卡片留在业务库，知识库只保存凝练原则和引用。未关联知识库的主题由 principles 原子保存原则、来源和进度；失败不推进、同key重试不重复写。未读反馈存在时 ingest/review/publish 拒绝。原则优先整合已有项；按当前状态纠正被撤销的旧证据，不复活用户已停用的原则；弱信号/无可推广结论允许 principles:[] 但须说明原因。此学习独立于 read_recent。inventory: {offset,limit} 分页读取所有待评审与备用候选详情（context 只显示前25条摘要，须按 nextInventoryOffset 继续）；history: {offset,limit} 分页读取本账号全历史（含淘汰），先查再生成；detail: {ideaId}。
+context: 读取目标/知识库入口/反馈学习进度/库存摘要及 capacity:{pendingCount,pendingLimit,remainingSlots,publishLimit}。pendingLimit=null 表示未配置总上限；publishLimit=min(每日上限,剩余空位)。总上限优先于旧每日目标，跨天累计。满额仍可研究及储备，publish 允许零新增成功结束；不为补满每日目标反复尝试或 fail。topic.knowledge_path 非空时，项目内该 Markdown 入口及其索引是详细要求和原则的唯一权威；先读取，按需检索知识库链接的项目资料、当前变化和信息源。页面目标/边界只是简短摘要，旧页面偏好不再注入。每轮搜索前先学习全部未归纳反馈，直到 pending=0，重新读取 context 后以有效原则指导搜索、生成和评审。feedback_inbox: {} 返回最早未归纳的30条反馈、当前卡片状态、已有含停用原则、watermark/through/feedbackRevision；逐页处理，不限昨天，不能只看 context 最近30条。learn_feedback: {requestKey:UUID,after:本页watermark,through:本页through,feedbackRevision:本页值,summary:本页归纳及取舍说明,knowledgeFiles?:已更新的项目相对Markdown路径数组,principles?:[{id?:更新旧原则ID,text,kind:explicit|inferred,scope:topic,source:本主题反馈ID,active?:false可停用}]}。关联项目知识库时，先用本项目正常文件工具把原则/修正及反馈ID写入知识库，成功后携带 knowledgeFiles 确认进度，不再传 principles；写失败不得确认。文件已写但确认失败时按反馈ID核对，不重复应用。同页原始反馈ID保存在学习记录；原始卡片留在业务库，知识库只保存凝练原则和引用。未关联知识库的主题由 principles 原子保存原则、来源和进度；失败不推进、同key重试不重复写。未读反馈存在时 ingest/review/publish 拒绝。原则优先整合已有项；按当前状态纠正被撤销的旧证据，不复活用户已停用的原则；弱信号/无可推广结论允许 principles:[] 但须说明原因。此学习独立于 read_recent。inventory: {offset,limit} 分页读取所有待评审与备用候选详情，包括明确退回且保留 first_recommended_at 的旧卡；context 摘要的 queueEvents 提供退回理由/以后再提条件，完整历史由 detail.queueEvents 返回（context 只显示前25条摘要，须按 nextInventoryOffset 继续）；history: {offset,limit} 分页读取本账号全历史（含淘汰），先查再生成；detail: {ideaId}。
 begin: 建立/恢复今日批次。返回 alreadyCompleted=true 则立即停止，不能重复推荐。保留 batch.id 后续使用。
 recent: {after?} 仅授权主题可用，增量返回当前账号相关用户消息及水位；最多翻页十次。
 preferences: {text,kind:explicit|inferred,scope:topic,source:消息或反馈ID|topic-goal,id?,active?}。明确评价才 explicit；无备注淘汰/未读是弱信号，AI 淘汰不算用户负面偏好。按最新状态和时间处理撤销，已撤销的反馈不能继续作为有效负面证据。先查已有偏好，相同来源更新旧项。用户可修正/撤销。
 ingest: {batchId,candidates:[{key:本轮稳定编号,content:{title,summary,audience,problem,mechanism,value,fit,facts,assumptions,doubt,validation,difference,interaction,loop,english,expansion,maturity,category,keywords:[...],sources:[{title,url,date:YYYY-MM-DD,finding}]}}]}。必填文本不可空，互动/循环/英语/扩展/成熟度对小游戏主题必须充分说明。所有新候选先入库，再评审；一次最多30条，一轮最多60条。返回原卡/近似历史；重复项新证据自动入旧卡版本。
 evidence: {ideaId,requestKey:UUID,revision:detail.idea.revision,reason,patch:{sources?,facts?,assumptions?,doubt?,validation?,maturity?}}。补充或更正旧卡证据，sources若提供为完整替换列表，可移除错误引用；记录更正前完整版本及本正常会话。无需begin，不生成候选/批次，不更改标题、核心机制、状态、评分、人工反馈或首次推荐。先detail核对再提交；只在本主题服务器项目运行Job中使用，版本冲突须重读。备用证据变化后需重新评审，不能冒充人工负面反馈。
 review: {batchId,reviews:[{idea_id,verdict:approve|reject|duplicate|expired,score:0..100,quality:0..100,rationale,compared:[{id, difference}],duplicate_of?:原想法ID}]}。独立评审每个新候选及所有历史备用；approve 须质量>=60且有来源，按主题 exploration 比例考虑有理由的探索方向，但不降低质量；近似>=.35逐一解释实质差异，语义相同合并，不只比标题。旧备用复评分数反映最新反馈和证据，过时项给原因。跨主题全历史也避重。相似召回不保证绝对完整，请结合 history 作语义判定。
+return_to_reserve: {ideaId,requestKey:UUID,revision:detail.idea.revision,reason:整理理由及以后再提条件}。仅用户授权的队列整理；只允许本主题尚未处理/未进入研究或项目的待审核推荐。保留ID、创建/首次推荐时间、原推荐批次、所有反馈/评分/备注、图片、证据及关联历史；detail.queueEvents 单独审计，不进入偏好学习。不能用 later 代替，不清空首次推荐时间。旧卡须在回池后按最新条件独立复评，才能再次推荐，不计首次新增。
+backlog_limit: {requestKey:UUID,revision:context.topic.revision,pendingLimit:0..100|null}。仅按用户明确要求配置当前主题；null 为不限。不会自动移动卡片或改变每日上限/日程/模型。
 images: {ideaId,requestKey:UUID,revision:detail.idea.revision,images:[{path:"outputs/图片文件.png",alt:清楚描述核心思路的替代文本,caption?:图解说明}]}。通过评审后，仅为本轮精选生成说明图片，使用 image_gen；优先中文文字说明、核心流程/游戏示例/应用界面，以讲清想法为准可多张。原图放当前正常会话 CWW_OUTPUTS_DIR（即 outputs/），本接口校验图片并替换该卡配图列表，不复制图片。仅支持静态PNG/JPEG/WebP、每张32MB以内，不能用符号链接或其他会话路径。先detail取得最新revision；同requestKey重试幂等。图片跟随来源会话的15天不活跃冷存储，查看时可恢复。历史卡片可用本操作补图，不创建新推荐。无法生成则如实fail，不伪造成功。
-publish: {batchId,ids:[精选稳定ID],summary:排序与多样性取舍/不足原因,feedbackRevision:context返回值,contextWatermark?:recent返回水位}。从全部有效备用+新候选择优，不足可0条；已推荐/人工处理不得进入。未入选合格项自动留备用，首次推荐时间只写一次。库存全部复评、每张精选已关联至少一张说明图片后才可提交。失败用 fail:{batchId,reason}，采集失败不得 publish 伪成功。
+publish: {batchId,ids:[精选稳定ID],summary:排序与多样性取舍/不足原因,feedbackRevision:context返回值,contextWatermark?:recent返回水位}。从全部有效备用+新候选择优，不足可0条；人工处理、研究/项目卡片及未明确退回的已推荐卡不得进入。明确退回旧卡参与复评，首次推荐时间/批次只写一次，再次推荐单独留事件且不算首次新增。返回 firstRecommendationCount / returnRecommendationCount 区分。事务内按每日上限与最新空位截取 ids 顺序；满额可 ids:[] 成功完成且不要求全库存复评。未入选合格项留备用，不补满每日目标、不因限额 fail。存在空位时库存全部按最新反馈和回池记录复评，每张精选已关联至少一张说明图片后才可提交。真实执行失败用 fail:{batchId,reason}，采集失败不得 publish 伪成功。
 research_result:{ideaId,status:validated|invalidated|inconclusive,result} 仅关联研究会话写回。feedback:{ideaId,requestKey:UUID,revision,action:kept|completed|later|dismissed|rate|undo|expired,reason:no_time|vague|evidence|duplicate|direction|outdated|other|空,rating:1..5|null,note} 仅记录用户明确要求，不得把AI评审当人工反馈。completed 仅用于已保留或已进入工作的卡片，表示用户已完成并归档；kept 可恢复为保留。完成不等于验证有效，不推断成功、满意或通用偏好，不自动改变研究结论、看板项目或任务状态。
 所有执行必须留在本服务器项目正常会话内，不使用隐藏模型、远程Worker或另起调度器。正常停止/失败保留原批次与候选，显式重试每日最多3次。`;

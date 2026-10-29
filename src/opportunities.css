@@ -48,6 +48,16 @@
 .opportunity-collections { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; margin: 24px 0; padding-top: 20px; border-top: 1px solid var(--line); }
 .opportunity-collections button { display: flex; align-items: center; gap: 10px; text-align: left; min-width: 0; padding: 12px; }
 .opportunity-collections button > span { flex: 1; overflow-wrap: anywhere; }
+.opportunity-collections small { display: block; margin-top: 4px; font-weight: 400; }
+.opportunity-research-project { display: flex; flex-direction: column; gap: 6px; font-size: var(--dialog-font-secondary); font-weight: 600; }
+.opportunity-research-project select { width: 100%; }
+.opportunity-upload-status { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+.opportunity-upload-status h3 { margin: 0; font-size: var(--dialog-font-heading); }
+.opportunity-upload-status ul { list-style: none; padding: 0; margin: 12px 0; display: grid; gap: 12px; }
+.opportunity-upload-status li { min-width: 0; overflow-wrap: anywhere; border-top: 1px solid var(--line); padding-top: 12px; }
+.opportunity-upload-status [role=status] { display: flex; gap: 8px; align-items: start; }
+.opportunity-upload-status svg { flex-shrink: 0; }
+.opportunity-upload-status .opportunity-actions { margin-top: 8px; }
 .opportunity-collections button > svg { flex: 0 0 auto; }
 .opportunity-collections button[aria-pressed=true] { border-color: var(--indigo); color: var(--indigo); background: var(--indigo-pale); }
 .opportunity-work-overview { display: grid; gap: 14px; }

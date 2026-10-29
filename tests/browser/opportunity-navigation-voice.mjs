@@ -112,8 +112,8 @@ try {
   await page.route('**/api/opportunities/ideas/*/voice-feedback',async route=>{const response=await route.fetch();uploadReceived=true;await uploadGate.promise;await route.fulfill({response});});
   await mic().click(); await dialog().locator('canvas[aria-label="实时音量波形"]').waitFor(); await until(async () => dialog().locator('canvas').evaluate(c => c.width > 1 && c.getContext('2d').getImageData(0, 0, c.width, c.height).data.some(v => v !== 0)));
   await note().fill('先输入，录音时补充');assert.equal(await dialog().getByRole('button',{name:'保留',exact:true}).isDisabled(),true);
-  await stop().click();await until(()=>uploadReceived);assert.equal(await dialog().getByRole('button',{name:'淘汰',exact:true}).isDisabled(),true);
-  await dialog().locator('.para-voice-composer .voice-panel').getByText('正在上传语音，请稍候…',{exact:true}).waitFor();
+  await stop().click();await until(()=>uploadReceived);await until(async()=>dialog().getByRole('button',{name:'淘汰',exact:true}).isEnabled());
+  await dialog().getByRole('region',{name:'语音上传队列'}).getByRole('status').filter({hasText:'正在上传'}).waitFor();
   uploadGate.resolve();await page.unrouteAll({behavior:'wait'});
   const recognitionStatus=()=>dialog().locator('.para-voice-composer').getByRole('status').filter({hasText:'正在识别中，可以退出或继续保留、暂放、淘汰；完成后自动保存反馈。'});
   await recognitionStatus().waitFor();

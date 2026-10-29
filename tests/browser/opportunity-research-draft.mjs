@@ -36,6 +36,7 @@ try {
   const user = session.accountId;
   const project = (await api('GET', '/projects')).projects.find(p => p.executor_id === 'tenant-local');
   const store = new OpportunityStore(instance.db);
+  const target=instance.db.createProject(crypto.randomUUID(),user,'另一个研究工程',root+'/research','tenant-local');
   const topic = (await api('POST', '/opportunities/topics', { requestKey: crypto.randomUUID(), name: '研究草稿验收', project_id: project.id, goal: '独立浏览器验收' })).topic;
   const source = (await api('POST', '/conversations', { projectId: project.id, reuseEmpty: false })).conversation;
   await api('PATCH', '/conversations/' + source.id, { title: '普通会话导航验收' });
@@ -49,16 +50,22 @@ try {
   const openCard = async () => {
     await page.getByRole('region', { name: '机会卡片', exact: true }).locator(`[data-opportunity-topic="${topic.id}"] .project-select`).click();
     const workspace = page.locator('.opportunity-workspace:visible');
-    await workspace.getByRole('button', { name: /工作总览/ }).click();
+    await workspace.getByRole('navigation',{name:'已处理卡片总览'}).getByRole('button', { name: /^已保留/ }).click();
     await workspace.locator(`[data-opportunity-idea="${idea.id}"]`).getByRole('button', { name: '查看详情', exact: true }).click();
     await page.getByRole('dialog').getByRole('textbox', { name: '反馈（可选）' }).waitFor();
   };
   await page.goto(origin);
   await page.locator('[data-extension-group="opportunities"] .extension-toggle').click();
   await openCard();
+  await page.getByRole('dialog').getByRole('combobox',{name:'研究工程',exact:true}).selectOption(target.id);
   let response = page.waitForResponse(r => r.url().endsWith(`/ideas/${idea.id}/research`) && r.request().method() === 'POST');
   await page.getByRole('dialog').getByRole('button', { name: '深入研究', exact: true }).click();
-  const first = (await (await response).json()).conversationId;
+  const firstResponse=await (await response).json();
+  assert.equal(firstResponse.projectId,target.id);
+  const first = firstResponse.conversationId;
+  assert.equal(instance.db.getConversation(first).project_id,target.id);
+  assert.equal(store.detail(user,idea.id).research[0].project_id,target.id);
+  assert.equal(store.view(user,topic.id,'working').ideas[0].work.research.project_id,target.id);
   await input().waitFor();
   await page.waitForFunction(() => document.querySelector('.composer textarea')?.value.includes('已保存思路'));
   const initial = await input().inputValue();

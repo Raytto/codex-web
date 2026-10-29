@@ -353,3 +353,7 @@ Managed interactive HTML attachments run in an isolated sandbox, with explicit u
 ## Recent capabilities
 
 Stable conversation links support browser history. Opportunity cards have kept/completed collections and bounded previews. Managed remote HTML declarations and explicit presentation conversion preserve reader/web intent. Optional [Gemini / Antigravity](docs/MULTI_ENGINE.md) execution shares project context while keeping credentials and native sessions on the selected node; its extra CLI is installed only on explicit account addition. [Usage metrics](docs/ANTIGRAVITY_QUOTA.md), temporary notices and durable expiring Codex-credit logs are included. See [upgrade notes](docs/UPGRADE_20261025.md).
+
+## October 30, 2026 update
+
+Opportunity cards now support a total pending cap and audited returns to reserve, background voice uploads across navigation, and research drafts in another owned server project. First recommendation history and user feedback remain intact; a full queue can finish with zero new cards. [Upgrade and validation](docs/UPGRADE_20261030.md) cover the additive database changes. The base runtime, dependency set and empty optional configuration are unchanged.

@@ -3476,8 +3476,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const user = (res.locals.session as SessionRow).user_id;
       const recordingId = String(req.body?.clientRecordingId ?? '');
       const draftText = typeof req.body?.draftText === 'string' ? req.body.draftText : '';
+      const baseRevision = req.body?.baseRevision === undefined ? undefined : Number(req.body.baseRevision);
+      if (baseRevision !== undefined && (!Number.isSafeInteger(baseRevision) || baseRevision < 1)) return res.status(400).json({ error: '录音关联的卡片版本无效。' });
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recordingId) || draftText.length > 6000) return res.status(400).json({ error: '录音 ID 或反馈长度无效。' });
-      const submission = opportunityVoice.accept({ user, ideaId: String(req.params.id), recordingId, draftText, filePath: file.path, mimeType: file.mimetype.split(';', 1)[0]!, maximumBytes: maximumStoredBytesForUser(user) });
+      const submission = opportunityVoice.accept({ user, ideaId: String(req.params.id), recordingId, draftText, baseRevision, filePath: file.path, mimeType: file.mimetype.split(';', 1)[0]!, maximumBytes: maximumStoredBytesForUser(user) });
       res.status(202).json({ accepted: true, submission });
       scheduleBackground('opportunity_voice', () => opportunityVoice.pump());
     } catch (error) {

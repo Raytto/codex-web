@@ -847,7 +847,25 @@ export class AppDatabase {
         CREATE INDEX opportunity_voice_queue ON opportunity_voice_feedback(state,created_at);
         CREATE INDEX opportunity_voice_idea ON opportunity_voice_feedback(user_id,idea_id,applied_revision);`);
     });
+    this.applyMigration(2026102901, "opportunity-upload-base-revision", () => {
+      this.sqlite.exec('ALTER TABLE opportunity_voice_feedback ADD COLUMN base_revision INTEGER');
+    });
     this.applyMigration(2026102302, "codex-auto-reset-uses", () => migrateAutoReset(this.sqlite));
+    this.applyMigration(2026102801, "opportunity-backlog", () => {
+      this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN pending_limit INTEGER CHECK(pending_limit IS NULL OR pending_limit BETWEEN 0 AND 100);
+        ALTER TABLE opportunity_reviews ADD COLUMN queue_revision INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE opportunity_queue_events (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), topic_id TEXT NOT NULL REFERENCES opportunity_topics(id),
+          idea_id TEXT NOT NULL REFERENCES opportunity_ideas(id) ON DELETE CASCADE,
+          action TEXT NOT NULL CHECK(action IN ('recommended','rerecommended','return_to_reserve')),
+          batch_id TEXT REFERENCES opportunity_batches(id), conversation_id TEXT, actor TEXT NOT NULL,
+          reason TEXT NOT NULL DEFAULT '', previous_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+        CREATE INDEX opportunity_queue_idea ON opportunity_queue_events(user_id,idea_id);
+        CREATE INDEX opportunity_queue_batch ON opportunity_queue_events(batch_id,action);
+        INSERT INTO opportunity_queue_events(id,user_id,topic_id,idea_id,action,batch_id,conversation_id,actor,created_at)
+          SELECT 'initial:'||i.id,i.user_id,i.topic_id,i.id,'recommended',i.recommended_batch_id,b.conversation_id,'migration',i.first_recommended_at
+          FROM opportunity_ideas i LEFT JOIN opportunity_batches b ON b.id=i.recommended_batch_id WHERE i.first_recommended_at IS NOT NULL;`);
+    });
     this.applyMigration(2026102301, "agent-engine-sessions", () => {
       // Existing projects may reference the same Codex thread. Preserve those
       // references while keeping each visible conversation's segments distinct.

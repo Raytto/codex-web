@@ -194,3 +194,7 @@ Follow [the upgrade checklist](UPGRADE_20261020.md) for the additive presentatio
 ## Optional execution engine and this upgrade
 
 Keep the standard base installation and username/password login. Gemini account support is optional, node-local and unavailable until its own OAuth login succeeds; no extra CLI is downloaded during ordinary setup or status polling. Gemini title generation also requires explicit empty-by-default model/effort settings. See [engine configuration](MULTI_ENGINE.md) and [upgrade/migration notes](UPGRADE_20261025.md).
+
+## October 30, 2026 upgrade checks
+
+Follow the [upgrade notes](UPGRADE_20261030.md) for the additive opportunity queue/recording migrations, durable queue history, cross-project research authorization and background upload checks. Use the existing base build/run commands; no environment keys, default dependencies or optional provider setup change. Verify username/password login and `/codex-web` after replacing the application image.

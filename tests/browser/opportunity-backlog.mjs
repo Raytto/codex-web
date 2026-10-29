@@ -1,0 +1,67 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+const repo=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const output=process.env.CWW_BROWSER_TEST_OUTPUT||fs.mkdtempSync(path.join(os.tmpdir(),'backlog-report-'));
+fs.mkdirSync(output,{recursive:true,mode:0o700});
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'backlog-ui-'));
+const require=createRequire(repo+'/package.json');
+const {createApp}=await import(repo+'/dist-server/server/app.js');
+const {OpportunityStore,contentInput}=await import(repo+'/dist-server/server/opportunity-store.js');
+const cache=process.env.PLAYWRIGHT_BROWSERS_PATH||path.join(os.homedir(),'.cache/ms-playwright');
+const playwrightRoot=process.env.PLAYWRIGHT_MODULE_PATH||fs.readdirSync(cache+'/.links').map(n=>fs.readFileSync(cache+'/.links/'+n,'utf8').trim()).find(p=>fs.existsSync(p+'/index.mjs'));
+process.env.PLAYWRIGHT_BROWSERS_PATH=cache;
+const {chromium}=await import(playwrightRoot+'/index.mjs');
+const app=createApp({projectRoot:repo,dataRoot:root+'/data',tenantRoot:root+'/tenants',username:'opportunity-fixture',passwordHash:require('bcryptjs').hashSync('backlog-test',4),sessionSecret:'backlog-test-secret-at-least32chars',queueAutoStart:false,basePath:'/codex-web',minimumFreeDiskBytes:0});
+const server=app.app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
+const origin='http://127.0.0.1:'+server.address().port+'/codex-web';
+const report={checks:[],pageErrors:[]};let browser;
+const deadline=setTimeout(()=>{throw new Error('Completion browser test timed out');},180000);
+try{
+ browser=await chromium.launch({headless:true,ignoreDefaultArgs:['--disable-dev-shm-usage'],args:['--disable-gpu']});
+ const context=await browser.newContext({viewport:{width:1440,height:1000}});
+ const login=await context.request.post(origin+'/api/auth/login',{data:{username:'opportunity-fixture',password:'backlog-test'}});assert.equal(login.status(),200);
+ const session=await login.json(),uid=session.accountId;
+ const api=async(method,url,data)=>{const r=await context.request.fetch(origin+'/api'+url,{method,headers:{Origin:new URL(origin).origin,'X-CSRF-Token':session.csrfToken},...(data===undefined?{}:{data})});assert.ok(r.ok(),url+': '+r.status());return r.json();};
+ const prefs=await api('GET','/user-settings/features');await api('PUT','/user-settings/features',{...prefs,opportunityCards:true});
+ const project=(await api('GET','/projects')).projects.find(p=>p.executor_id==='tenant-local');
+ const source=(await api('POST','/conversations',{projectId:project.id,reuseEmpty:false})).conversation;
+ const store=new OpportunityStore(app.db),topic=store.createTopic(uid,{name:'待审核限额验收',project_id:project.id,goal:'隔离验收'},crypto.randomUUID());
+ const batch=store.begin(uid,topic.id,source.id,null);
+ const cardContent=contentInput.parse({title:'隔离回池卡',summary:'用来验证队列回流。',audience:'验收',problem:'隔离队列',mechanism:'合成机制',value:'验收',fit:'合成',facts:'合成证据',assumptions:'假设',doubt:'疑点',validation:'按钮操作',difference:'独立合成机制',category:'验收',keywords:['测试'],sources:[{title:'Synthetic',url:'https://example.org',date:'2026-10-28',finding:'Test only'}]});
+ const idea=store.ingest(uid,batch.id,source.id,[{key:'fixture',content:cardContent}])[0].idea;
+ store.review(uid,batch.id,source.id,[{idea_id:idea.id,verdict:'approve',score:90,quality:90,rationale:'合成测试',compared:[]}]);
+ app.db.sqlite.prepare('INSERT INTO opportunity_images VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(crypto.randomUUID(),idea.id,uid,source.id,'outputs/fixture.png','image/png',1,'fixture',1,1,'合成图','',0,new Date().toISOString());
+ store.publish(uid,batch.id,source.id,{ids:[idea.id],summary:'隔离初荐',feedbackRevision:store.feedbackRevision(uid,topic.id)});
+ const before=store.detail(uid,idea.id);
+ const page=await context.newPage();page.setDefaultTimeout(12000);page.on('pageerror',e=>report.pageErrors.push(String(e)));
+ await page.goto(origin);await page.locator('[data-extension-group="opportunities"] .extension-toggle').click();
+ const open=async()=>{await page.getByRole('region',{name:'机会卡片',exact:true}).locator(`[data-opportunity-topic="${topic.id}"] .project-select`).click();};
+ const workspace=()=>page.locator('.opportunity-workspace:visible'),dialog=()=>page.getByRole('dialog'),card=()=>workspace().locator(`[data-opportunity-idea="${idea.id}"]`);
+ await open();await workspace().getByRole('button',{name:'主题设置',exact:true}).click();
+ await dialog().getByRole('spinbutton',{name:'待审核总上限',exact:true}).fill('3');await dialog().getByRole('button',{name:'保存主题',exact:true}).click();await dialog().waitFor({state:'hidden'});
+ assert.equal(store.topic(uid,topic.id).pending_limit,3);assert.equal(store.topic(uid,topic.id).limit_count,3);assert.match(await workspace().getByLabel('待审核额度').innerText(),/待审核 1 \/ 3/);
+ report.checks.push('topic_cap_saved_by_real_controls');
+ await card().getByRole('button',{name:'查看与反馈',exact:true}).click();await dialog().getByRole('textbox',{name:'以后再提条件',exact:true}).fill('等实际需求出现再比较');
+ await page.route('**/api/opportunities/ideas/*/return-to-reserve',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'模拟保存失败'})}),{times:1});
+ await dialog().getByRole('button',{name:'退回备选',exact:true}).click();await dialog().getByRole('alert').waitFor();assert.equal(store.idea(uid,idea.id).state,'recommended');
+ await dialog().getByRole('button',{name:'退回备选',exact:true}).click();await dialog().waitFor({state:'hidden'});
+ assert.equal(store.idea(uid,idea.id).state,'reserve');assert.equal(store.queueEvents(uid,idea.id)[0].reason,'等实际需求出现再比较');assert.deepEqual(store.detail(uid,idea.id).feedback,before.feedback);
+ await workspace().getByRole('button',{name:/^备用候选/}).click();await card().waitFor();assert.match(await card().innerText(),/退回备选/);assert.match(await card().innerText(),/首次推荐/);
+ report.checks.push('return_retry_moves_to_reserve_preserving_history_without_feedback');
+ await page.reload();await open();await workspace().getByRole('button',{name:/^备用候选/}).click();await card().waitFor();assert.match(await workspace().getByLabel('待审核额度').innerText(),/待审核 0 \/ 3/);
+ await card().getByRole('button',{name:'查看与反馈',exact:true}).click();await dialog().getByText('历史与评审依据', {exact:false}).click();assert.match(await dialog().innerText(),/退回备选（队列整理）/);assert.match(await dialog().innerText(),/等实际需求出现再比较/);assert.equal(await dialog().getByRole('button',{name:'退回备选',exact:true}).count(),0);await dialog().getByRole('button',{name:'关闭弹窗'}).click();
+ report.checks.push('reload_and_audit_remain_durable');
+ for(const width of [1440,768,390,320])for(const theme of ['light','dark']){
+  await page.setViewportSize({width,height:1000});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+  await workspace().getByRole('button',{name:'主题设置',exact:true}).click();await dialog().getByRole('spinbutton',{name:'待审核总上限',exact:true}).scrollIntoViewIfNeeded();assert.ok(await dialog().evaluate(e=>e.scrollWidth<=e.clientWidth));
+  assert.ok((await dialog().getByRole('button',{name:'保存主题',exact:true}).boundingBox()).height>=44);await dialog().getByRole('button',{name:'关闭弹窗'}).click();assert.ok(await workspace().evaluate(e=>e.scrollWidth<=e.clientWidth));
+ }
+ await page.evaluate(()=>document.documentElement.style.fontSize='200%');await workspace().getByRole('button',{name:'主题设置',exact:true}).click();assert.ok(await dialog().evaluate(e=>e.scrollWidth<=e.clientWidth));
+ report.checks.push('four_widths_both_themes_and_large_text_fit');assert.deepEqual(report.pageErrors,[]);report.ok=true;
+}catch(error){report.ok=false;report.error=String(error.stack||error);throw error;}
+finally{clearTimeout(deadline);fs.writeFileSync(output+'/result.json',JSON.stringify(report,null,2));await browser?.close();app.beginShutdown();await new Promise(r=>server.close(r));app.db.close();fs.rmSync(root,{recursive:true,force:true});console.log(JSON.stringify({ok:report.ok,checks:report.checks,report:output+'/result.json'}));}

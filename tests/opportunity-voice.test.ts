@@ -86,3 +86,48 @@ test('real multipart route acknowledges before recognition, checks CSRF/owner, p
  const result=await agent.get('/api/opportunities/ideas/'+idea.id).expect(200);assert.equal(result.body.idea.state,'dismissed');assert.equal(result.body.idea.note,'typed\nspeech');
  assert.equal(result.body.voiceFeedback[0].state,'completed');assert.equal(result.body.voiceFeedback[0].audio_json,undefined);
 });
+
+for(const arrival of ['before-first-completes','after-first-completes'])test(`parallel recordings keep prior speech and the latest draft when second arrives ${arrival}`,async t=>{
+ const f=fixture(t);let n=0;
+ const service=new OpportunityVoiceService(f.config,f.db,{audioRoot:f.audioRoot,transcribe:async()=>++n===1?'first speech':'second speech'});
+ const first={...f.input,baseRevision:f.idea.revision,draftText:'first draft'},second={...f.input,recordingId:id(),baseRevision:f.idea.revision,draftText:'updated draft'};
+ service.accept(first);
+ if(arrival==='after-first-completes')await service.pump();
+ const accepted=service.accept(second);await service.pump();
+ const result=f.store.detail(user,f.idea.id);
+ assert.equal(result.idea.note,'updated draft\nfirst speech\nsecond speech');assert.equal(result.voiceFeedback.length,2);assert.equal(result.feedback.filter(v=>v.actor==='user-voice').length,2);
+ assert.equal(service.accept(second).id,accepted.id);assert.throws(()=>service.accept({...second,baseRevision:second.baseRevision+1}),/不同内容/);
+ assert.throws(()=>service.accept({...second,recordingId:id(),baseRevision:999}),/版本无效/);
+});
+
+test('late uploads with a recording baseline preserve manual edits, decisions and earlier speech',async t=>{
+ const f=fixture(t),service=new OpportunityVoiceService(f.config,f.db,{audioRoot:f.audioRoot,transcribe:async()=> 'speech'});
+ const recording={...f.input,baseRevision:f.idea.revision};
+ f.store.feedback(user,f.idea.id,{requestKey:id(),revision:f.idea.revision,action:'dismissed',note:'manual replacement'});
+ service.accept(recording);await service.pump();
+ service.accept({...recording,recordingId:id()});await service.pump();
+ assert.equal(f.store.idea(user,f.idea.id).note,'manual replacement\nspeech\nspeech');assert.equal(f.store.idea(user,f.idea.id).state,'dismissed');
+});
+
+test('voice baseline migration preserves legacy queued audio and is repeatable',async t=>{
+ const f=fixture(t),old=new OpportunityVoiceService(f.config,f.db,{audioRoot:f.audioRoot,transcribe:async()=> 'unused'});
+ const accepted=old.accept(f.input);old.stop();
+ f.db.sqlite.exec('ALTER TABLE opportunity_voice_feedback DROP COLUMN base_revision');
+ f.db.sqlite.prepare('DELETE FROM schema_migrations WHERE version=?').run(2026102901);
+ const reopened=new AppDatabase(f.config.dataRoot,undefined,false);
+ try{
+  assert.equal((reopened.sqlite.prepare('SELECT base_revision FROM opportunity_voice_feedback WHERE id=?').get(accepted.id) as {base_revision:null}).base_revision,null);
+  const migrated=new OpportunityVoiceService(f.config,reopened,{audioRoot:f.audioRoot,transcribe:async()=> 'legacy speech'});await migrated.pump();
+  assert.equal(f.store.idea(user,f.idea.id).note,'typed input\nlegacy speech');assert.equal(f.store.voiceFeedback(user,f.idea.id)[0].state,'completed');
+  const again=new AppDatabase(f.config.dataRoot,undefined,false);try{assert.equal(again.sqlite.prepare('SELECT count(*) n FROM schema_migrations WHERE version=2026102901').get()?.n,1);assert.deepEqual(again.sqlite.prepare('pragma foreign_key_check').all(),[]);}finally{again.close();}
+ }finally{reopened.close();}
+});
+
+test('research/state-only revisions do not discard unsaved typing when parallel voices complete',async t=>{
+ const f=fixture(t),service=new OpportunityVoiceService(f.config,f.db,{audioRoot:f.audioRoot,transcribe:async()=> 'speech'});
+ const recording={...f.input,baseRevision:f.idea.revision};
+ f.db.sqlite.prepare('UPDATE opportunity_ideas SET revision=revision+1,manual_processed=1 WHERE id=?').run(f.idea.id);
+ service.accept(recording);await service.pump();
+ service.accept({...recording,recordingId:id(),draftText:'latest unsaved typing'});await service.pump();
+ assert.equal(f.store.idea(user,f.idea.id).note,'latest unsaved typing\nspeech\nspeech');
+});

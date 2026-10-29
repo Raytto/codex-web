@@ -13,7 +13,12 @@ export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticat
       store.serverProject(c.user_id,c.project_id);
       const action=String(req.body?.action??''),topicId=String(req.body?.topicId??''),data=req.body?.data??{},user=c.user_id;
       if(action==='topics')return res.json({topics:store.topics(user)});
-      store.assertJob(user,topicId,c.id,job.id);
+      const researchOnly=c.project_id!==store.topic(user,topicId).project_id;
+      const linkedIdea=researchOnly?store.researchIdeaForConversation(user,topicId,c.id):undefined;
+      if(researchOnly){
+        if(!linkedIdea||!['context','detail','research_result'].includes(action)||(action!=='context'&&data.ideaId!==linkedIdea))throw new OpportunityError(403,'跨工程研究只能读取关联卡片及主题背景，并写回该卡片的研究结论。');
+        store.assertResearchJob(user,linkedIdea,c.id,job.id);
+      }else store.assertJob(user,topicId,c.id,job.id);
       const batchId=String(data.batchId??'');
       if(batchId&&store.batch(user,batchId).topic_id!==topicId)throw new OpportunityError(403,'批次不属于当前主题。');
       if(data.ideaId&&store.idea(user,String(data.ideaId)).topic_id!==topicId)throw new OpportunityError(403,'卡片不属于当前主题。');
@@ -21,13 +26,16 @@ export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticat
       switch(action){
         case 'context': {
           const c=store.context(user,topicId);
-          return res.json({instructions:c.instructions,topic:c.topic,feedbackRevision:c.feedbackRevision,preferences:c.preferences,feedback:c.feedback.slice(0,30),feedbackLearning:c.feedbackLearning,knowledge:c.knowledge,inventory:c.inventory.slice(0,25).map(i=>({id:i.id,state:i.state,score:i.score,title:i.content.title,summary:i.content.summary,mechanism:i.content.mechanism,quality:i.quality,first_created_at:i.first_created_at})),inventoryTotal:c.inventory.length,nextInventoryOffset:c.inventory.length>25?25:null,history:store.history(user,0,25),batches:c.batches.slice(0,5)});
+          if(researchOnly)return res.json({instructions:'当前为用户指定的跨工程研究会话。可用 detail 读取关联卡片，完成后用 research_result 写回该卡；不执行发现、入库、评审、反馈学习或修改其他卡片。research_result:{ideaId,status:validated|invalidated|inconclusive,result}。',topic:c.topic,linkedIdeaId:linkedIdea,preferences:c.preferences,knowledge:c.knowledge,sourceProject:store.serverProject(user,c.topic.project_id)});
+          return res.json({instructions:c.instructions,topic:c.topic,capacity:c.capacity,feedbackRevision:c.feedbackRevision,preferences:c.preferences,feedback:c.feedback.slice(0,30),feedbackLearning:c.feedbackLearning,knowledge:c.knowledge,inventory:c.inventory.slice(0,25).map(i=>({id:i.id,state:i.state,score:i.score,title:i.content.title,summary:i.content.summary,mechanism:i.content.mechanism,quality:i.quality,first_created_at:i.first_created_at,first_recommended_at:i.first_recommended_at,returned:!!i.first_recommended_at,queueEvents:store.queueEvents(user,i.id).slice(0,5)})),inventoryTotal:c.inventory.length,nextInventoryOffset:c.inventory.length>25?25:null,history:store.history(user,0,25),batches:c.batches.slice(0,5)});
         }
         case 'inventory': {const c=store.context(user,topicId),offset=z.number().int().nonnegative().parse(data.offset??0),limit=z.number().int().min(1).max(25).parse(data.limit??10);return res.json({items:c.inventory.slice(offset,offset+limit),total:c.inventory.length,nextOffset:offset+limit<c.inventory.length?offset+limit:null});}
         case 'history':return res.json(store.history(user,Number(data.offset)||0,Number(data.limit)||100));
         case 'detail':return res.json(store.detail(user,String(data.ideaId)));
         case 'images':return res.json(await images.attach(user,c.id,job.id,data));
         case 'evidence':return res.json(store.correctEvidence(user,String(data.ideaId),c.id,job.id,data));
+        case 'return_to_reserve':return res.json(store.returnToReserve(user,topicId,String(data.ideaId),data,'user-via-agent',c.id));
+        case 'backlog_limit':return res.json(store.setBacklogLimit(user,topicId,data));
         case 'begin':return res.json(store.begin(user,topicId,c.id,job.id));
         case 'ingest':return res.json({candidates:store.ingest(user,batchId,c.id,data.candidates).map(r=>({idea:{id:r.idea.id,state:r.idea.state,title:r.idea.content.title},outcome:r.outcome,neighbors:r.neighbors}))});
         case 'review': {const r=store.review(user,batchId,c.id,data.reviews);return res.json({reviewed:r.reviewed,inventoryCount:r.inventory.length,inventory:r.inventory.slice(0,50).map(i=>({id:i.id,title:i.content.title,state:i.state,score:i.score}))});}
@@ -62,7 +70,9 @@ export function mountOpportunityRoutes(api:Router,db:AppDatabase,options:{select
   api.get('/opportunities/ideas/:id/images/:image',handle(async(req,res)=>{const result=await images.bytes(owner(res),String(req.params.id),String(req.params.image));res.setHeader('Content-Type',result.row.mime_type);res.setHeader('X-Content-Type-Options','nosniff');return res.send(result.bytes);}));
   api.post('/opportunities/ideas/:id/images/:image/activate',handle((req,res)=>{const row=images.row(owner(res),String(req.params.id),String(req.params.image));return res.json({state:options.activate(row.conversation_id)});}));
   api.get('/opportunities/ideas/:id',handle((req,res)=>res.json(store.detail(owner(res),String(req.params.id)))));
+  api.post('/opportunities/topics/:id/backlog-limit',handle((req,res)=>res.json(store.setBacklogLimit(owner(res),String(req.params.id),req.body))));
+  api.post('/opportunities/ideas/:id/return-to-reserve',handle((req,res)=>res.json(store.returnToReserve(owner(res),String(req.body?.topicId),String(req.params.id),req.body))));
   api.post('/opportunities/ideas/:id/feedback',handle((req,res)=>res.json({idea:store.feedback(owner(res),String(req.params.id),req.body)})));
-  api.post('/opportunities/ideas/:id/research',handle((req,res)=>{const user=owner(res),idea=store.idea(user,String(req.params.id)),p=store.serverProject(user,idea.project_id),result=store.start(user,idea.topic_id,options.selection(user,p.executor_id),String(req.body?.requestKey),idea.id,req.body?.draftFeedback);options.changed(result.conversationId);return res.status(201).json(result);}));
+  api.post('/opportunities/ideas/:id/research',handle((req,res)=>{const user=owner(res),idea=store.idea(user,String(req.params.id)),projectId=z.string().uuid().optional().parse(req.body?.projectId),p=store.serverProject(user,projectId??idea.project_id),result=store.start(user,idea.topic_id,options.selection(user,p.executor_id),String(req.body?.requestKey),idea.id,req.body?.draftFeedback,p.id);options.changed(result.conversationId);return res.status(201).json(result);}));
   api.post('/opportunities/ideas/:id/project',handle((req,res)=>res.json({project:store.toProject(owner(res),String(req.params.id),String(req.body?.boardId),String(req.body?.requestKey))})));
 }

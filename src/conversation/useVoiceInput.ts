@@ -18,6 +18,9 @@ export type UseVoiceInputOptions = {
   fileNamePrefix?: string;
   unsupportedMessage?: string;
   onUploadRecording?: (audio: Blob, fileName: string, context: VoiceInputContext) => Promise<void>;
+  // Transfers ownership of the durable recording to a queue. Resolves at
+  // handoff, without waiting for the network; the queue must clean up the draft.
+  onQueueRecording?: (draft: VoiceDraftRecord) => Promise<void>;
   onSendRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, transcriptionIds: string[]) => Promise<void>;
   onTranscript?: (text: string, transcriptionId: string, context?: VoiceInputContext) => void;
   onSendAfterTranscription?: (text: string, transcriptionIds: string[], context?: VoiceInputContext) => void;
@@ -101,7 +104,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const attachmentNamesRef = useRef(options.attachmentNames ?? []);
   const optionsRef = useRef(options);
   const sessionRef = useRef<VoiceInputContext | null>(null);
-  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription" | "onSendRecording" | "onUploadRecording"> | null>(null);
+  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription" | "onSendRecording" | "onUploadRecording" | "onQueueRecording"> | null>(null);
   const pendingDraftRef = useRef<VoiceDraftRecord | null>(null);
   const activeDraftRef = useRef<VoiceDraftRecord | null>(null);
   const recordingStartedAtRef = useRef<number | null>(null);
@@ -208,7 +211,9 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     const current = optionsRef.current;
     try {
       const callbacks = sessionCallbacksRef.current ?? current;
-      if (callbacks.onUploadRecording) {
+      if (callbacks.onQueueRecording) {
+        await callbacks.onQueueRecording(draft);
+      } else if (callbacks.onUploadRecording) {
         setUploading(true);
         await callbacks.onUploadRecording(draft.blob, draft.fileName, session);
       } else if (draft.sendAfterTranscription && callbacks.onSendRecording && !session.pendingPromptId) {
@@ -241,7 +246,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
           else callbacks.onSendAfterTranscription?.(text, nextIds, session);
         }
       }
-      if (draft.accountId) {
+      if (draft.accountId && !callbacks.onQueueRecording) {
         try { await deleteVoiceDraft(draft.id); } catch (reason) { setDraftStorageError(reason instanceof Error ? reason.message : "语音草稿清理失败。"); }
       }
       activeDraftRef.current = null;
@@ -377,6 +382,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
       };
       sessionCallbacksRef.current = {
         onUploadRecording: current.onUploadRecording,
+        onQueueRecording: current.onQueueRecording,
         onSendRecording: current.onSendRecording,
         onTranscript: current.onTranscript,
         onSendAfterTranscription: current.onSendAfterTranscription,
@@ -457,7 +463,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     if (sessionRef.current && sessionRef.current.conversationId === (current.conversationId ?? null)
       && (sessionRef.current.pendingPromptId ?? null) === (current.pendingPromptId ?? null)) {
       sessionRef.current = { ...sessionRef.current, draftText: current.draftText, quoteExcerpt: current.quoteExcerpt ?? "", attachmentNames: (current.attachmentNames ?? []).slice(0, 12) };
-      sessionCallbacksRef.current = { onUploadRecording: current.onUploadRecording, onTranscript: current.onTranscript, onSendAfterTranscription: current.onSendAfterTranscription, onSendRecording: current.onSendRecording };
+      sessionCallbacksRef.current = { onUploadRecording: current.onUploadRecording, onQueueRecording: current.onQueueRecording, onTranscript: current.onTranscript, onSendAfterTranscription: current.onSendAfterTranscription, onSendRecording: current.onSendRecording };
     }
     sendAfterRef.current = sendAfterTranscription;
     setUploading(true);

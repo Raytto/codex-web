@@ -120,6 +120,21 @@ test('real routes enforce CSRF, ownership, server executor, live job credential 
  assert.equal(app.db.getConversation(c.id)!.last_active_at,activity);
  app.db.sqlite.prepare("UPDATE conversation_storage SET state='local' WHERE conversation_id=?").run(c.id);
  await a.get(mediaUrl).expect(200);
+ reviewAll(store,tid,batch.id,c.id);publish(store,tid,batch.id,c.id,[idea.id]);
+ const returnBody={topicId:tid,requestKey:id(),revision:store.idea(u,idea.id).revision,reason:'API queue management'};
+ const returnUrl=`/api/opportunities/ideas/${idea.id}/return-to-reserve`;
+ await a.post(returnUrl).send(returnBody).expect(403);
+ await friend.post(returnUrl).set('X-CSRF-Token',fl.body.csrfToken).send(returnBody).expect(404);
+ await a.post(returnUrl).set('X-CSRF-Token',csrf).send({...returnBody,topicId:second.body.topic.id}).expect(403);
+ await request(app.app).post(imageRoute).set('Authorization','Bearer '+token).send({action:'return_to_reserve',topicId:second.body.topic.id,data:{...returnBody,ideaId:idea.id}}).expect(403);
+ const returned=await a.post(returnUrl).set('X-CSRF-Token',csrf).send(returnBody).expect(200);assert.equal(returned.body.idea.state,'reserve');
+ assert.deepEqual((await a.post(returnUrl).set('X-CSRF-Token',csrf).send(returnBody).expect(200)).body,returned.body);
+ const capBody={requestKey:id(),revision:store.topic(u,tid).revision,pendingLimit:3};
+ await a.post(`/api/opportunities/topics/${tid}/backlog-limit`).send(capBody).expect(403);
+ await friend.post(`/api/opportunities/topics/${tid}/backlog-limit`).set('X-CSRF-Token',fl.body.csrfToken).send(capBody).expect(404);
+ await request(app.app).post(imageRoute).set('Authorization','Bearer '+token).send({action:'backlog_limit',topicId:tid,data:capBody}).expect(200);
+ const queueContext=await request(app.app).post(imageRoute).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(200);
+ assert.equal(queueContext.body.capacity.pendingLimit,3);assert.equal(queueContext.body.inventory[0].returned,true);assert.equal(queueContext.body.inventory[0].queueEvents[0].action,'return_to_reserve');
  const rated=store.idea(u,idea.id);store.feedback(u,idea.id,{requestKey:id(),revision:rated.revision,action:'rate',rating:5,note:'优先容易验证的方案'});
  const researchUrl=`/api/opportunities/ideas/${idea.id}/research`,researchBody={requestKey:id(),draftFeedback:{rating:4,note:'验证具体实现步骤'}};
  await a.post(researchUrl).send(researchBody).expect(403);
@@ -373,3 +388,160 @@ test('project knowledge is the single principle source and learning records writ
  db.sqlite.prepare('DELETE FROM conversations WHERE id=?').run(c.id);assert.equal(s.idea(u,idea.id).images![0].state,'unavailable');await assert.rejects(()=>media.bytes(u,idea.id,image.id),/不可用/);
  assert.deepEqual(db.sqlite.prepare('pragma foreign_key_check').all(),[]);
  });
+
+test('queue return preserves provenance and feedback; requires fresh re-review; re-recommendation is not a first recommendation', t=>{
+ const {s,c,topic}=fixture(t),b=s.begin(u,topic.id,c.id,null,day);
+ const iid=s.ingest(u,b.id,c.id,[{key:'returned',content:content(601)}])[0].idea.id;
+ reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,[iid]);
+ const before=s.detail(u,iid),learning=s.feedbackLearning(u,topic.id),revision=s.feedbackRevision(u,topic.id);
+ const command={requestKey:id(),revision:before.idea.revision,reason:'队列整理；有真实需求及新证据后再提'};
+ const returned=s.returnToReserve(u,topic.id,iid,command);
+ assert.equal(returned.idea.state,'reserve');
+ for(const field of ['id','first_created_at','first_recommended_at','recommended_batch_id','source_batch_id','rating','note','content','images','score','quality','manual_processed'] as const)assert.deepEqual(returned.idea[field],before.idea[field]);
+ assert.deepEqual(s.detail(u,iid).feedback,before.feedback);assert.deepEqual(s.feedbackLearning(u,topic.id),learning);assert.equal(s.feedbackRevision(u,topic.id),revision);
+ assert.equal(s.queueEvents(u,iid).length,2);assert.equal(s.queueEvents(u,iid)[0].reason,command.reason);
+ assert.equal(s.view(u,topic.id,'reserve').counts.reserve,1);assert.equal(s.view(u,topic.id).counts.screen,0);assert.equal(s.context(u,topic.id).inventory[0].id,iid);
+ assert.deepEqual(s.returnToReserve(u,topic.id,iid,command),returned);assert.equal(s.queueEvents(u,iid).length,2);
+ assert.throws(()=>s.returnToReserve(u,topic.id,iid,{...command,reason:'changed'}),/请求内容/);
+ const b2=s.begin(u,topic.id,c.id,null,day+86400000);
+ assert.throws(()=>publish(s,topic.id,b2.id,c.id,[iid]),/尚未参与/);
+ reviewAll(s,topic.id,b2.id,c.id);const again=publish(s,topic.id,b2.id,c.id,[iid]);
+ assert.equal(again.firstRecommendationCount,0);assert.equal(again.returnRecommendationCount,1);assert.equal(again.ideas[0].id,iid);
+ assert.equal(again.ideas[0].first_recommended_at,before.idea.first_recommended_at);assert.equal(again.ideas[0].recommended_batch_id,b.id);
+ assert.equal(s.queueEvents(u,iid).length,3);assert.equal(s.queueEvents(u,iid)[0].action,'rerecommended');
+ assert.equal(publish(s,topic.id,b.id,c.id,[]).ideas[0].id,iid);assert.equal(publish(s,topic.id,b2.id,c.id,[]).returnRecommendationCount,1);
+ assert.equal(s.history(u).total,1);
+});
+
+test('backlog cap persists across days; full queue completes with zero and no review loop; undo respects capacity', t=>{
+ const {s,c,topic}=fixture(t);
+ const cap=s.setBacklogLimit(u,topic.id,{requestKey:id(),revision:topic.revision,pendingLimit:3});assert.equal(cap.capacity.remainingSlots,3);
+ const b=s.begin(u,topic.id,c.id,null,day),ideas=s.ingest(u,b.id,c.id,Array.from({length:6},(_,n)=>({key:'cap'+n,content:content(610+n)}))).map(v=>v.idea.id);
+ reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,ideas.slice(0,3));
+ const b2=s.begin(u,topic.id,c.id,null,day+86400000);const full=publish(s,topic.id,b2.id,c.id,ideas.slice(3));
+ assert.equal(full.ideas.length,0);assert.equal(full.batch.status,'completed');assert.equal(full.capacity.pendingCount,3);assert.equal(full.capacity.publishLimit,0);
+ assert.equal(s.begin(u,topic.id,c.id,null,day+86400000).alreadyCompleted,true);
+ const old=s.idea(u,ideas[0]);s.feedback(u,old.id,{requestKey:id(),revision:old.revision,action:'later',rating:5,note:'已有用户备注'});
+ learn(s,topic.id,c.id);assert.equal(s.capacity(u,topic.id).remainingSlots,1);
+ const b3=s.begin(u,topic.id,c.id,null,day+2*86400000);reviewAll(s,topic.id,b3.id,c.id);const one=publish(s,topic.id,b3.id,c.id,ideas.slice(3));
+ assert.equal(one.ideas.length,1);assert.equal(one.capacity.pendingCount,3);
+ const later=s.idea(u,old.id);assert.throws(()=>s.feedback(u,old.id,{requestKey:id(),revision:later.revision,action:'undo'}),/已达上限/);
+ assert.equal(s.idea(u,old.id).note,'已有用户备注');assert.equal(s.idea(u,old.id).state,'later');
+ const spare=s.idea(u,ideas[1]);s.returnToReserve(u,topic.id,spare.id,{requestKey:id(),revision:spare.revision,reason:'队列整理'});
+ const restored=s.feedback(u,old.id,{requestKey:id(),revision:later.revision,action:'undo'});assert.equal(restored.state,'recommended');assert.equal(s.capacity(u,topic.id).pendingCount,3);
+});
+
+test('queue returns reject stale, foreign, processed and working cards without resurrecting dismissed items', t=>{
+ const {s,c,topic,p}=fixture(t);s.updateTopic(u,topic.id,{...topic,read_recent:false,limit_count:10});
+ const b=s.begin(u,topic.id,c.id,null,day),ideas=s.ingest(u,b.id,c.id,Array.from({length:7},(_,n)=>({key:'protect'+n,content:content(630+n)}))).map(v=>v.idea.id);
+ reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,ideas);
+ const other=s.createTopic(u,{name:'Unchanged',project_id:p.id,goal:'Other'},id());assert.equal(other.pending_limit,null);
+ const attempt=(iid:string,tid=topic.id,owner=u,revision=s.idea(u,iid).revision)=>s.returnToReserve(owner,tid,iid,{requestKey:id(),revision,reason:'队列整理'});
+ assert.throws(()=>attempt(ideas[0],topic.id,u,1),/已更新/);assert.throws(()=>attempt(ideas[0],other.id),/不属于/);assert.throws(()=>attempt(ideas[0],topic.id,id()),/不存在/);
+ ['kept','later','dismissed','rate','expired'].forEach((action,n)=>{const i=s.idea(u,ideas[n]);s.feedback(u,i.id,{requestKey:id(),revision:i.revision,action,rating:4,note:'保留原意见'});assert.throws(()=>attempt(i.id),/只能退回/);});
+ const kept=s.idea(u,ideas[0]);s.feedback(u,kept.id,{requestKey:id(),revision:kept.revision,action:'completed'});assert.throws(()=>attempt(kept.id),/只能退回/);
+ s.start(u,topic.id,selection,id(),ideas[5]);assert.throws(()=>attempt(ideas[5]),/只能退回/);
+ assert.equal(s.view(u,topic.id).counts.screen,1);attempt(ideas[6]);
+ assert.deepEqual(s.context(u,topic.id).inventory.map(i=>i.id),[ideas[6]]);
+ for(const iid of ideas.slice(0,6))assert.notEqual(s.idea(u,iid).state,'reserve');
+ assert.equal(s.feedbackLearning(u,topic.id).total,6);
+});
+
+test('topic cap settings are revision protected, idempotent, optional and independent from daily targets',t=>{
+ const {s,c,p,topic,db}=fixture(t),other=s.createTopic(u,{name:'Untouched',project_id:p.id,goal:'Other'},id());
+ const body={requestKey:id(),revision:topic.revision,pendingLimit:3};const applied=s.setBacklogLimit(u,topic.id,body);
+ assert.deepEqual(s.setBacklogLimit(u,topic.id,body),applied);assert.throws(()=>s.setBacklogLimit(u,topic.id,{...body,requestKey:id()}),/已更新/);
+ assert.throws(()=>s.setBacklogLimit(id(),topic.id,{...body,requestKey:id()}),/不存在/);
+ const configured=s.updateTopic(u,topic.id,{...s.topic(u,topic.id),read_recent:false,limit_count:2});assert.equal(configured.limit_count,2);assert.equal(configured.pending_limit,3);
+ assert.equal(new OpportunityStore(db).context(u,topic.id).capacity.publishLimit,2);assert.equal(s.topic(u,other.id).pending_limit,null);
+ const full=s.setBacklogLimit(u,topic.id,{requestKey:id(),revision:configured.revision,pendingLimit:0});assert.equal(full.capacity.publishLimit,0);
+ const b=s.begin(u,topic.id,c.id,null,day);assert.equal(publish(s,topic.id,b.id,c.id,[]).batch.status,'completed');
+});
+
+test('concurrent publishers serialize the last free slot across independent database connections', async t=>{
+ const {s,c,topic,root}=fixture(t);s.setBacklogLimit(u,topic.id,{requestKey:id(),revision:topic.revision,pendingLimit:1});
+ const b1=s.begin(u,topic.id,c.id,null,day),ids=s.ingest(u,b1.id,c.id,[{key:'race-a',content:content(650)},{key:'race-b',content:content(651)}]).map(v=>v.idea.id);
+ const b2=s.begin(u,topic.id,c.id,null,day+86400000);reviewAll(s,topic.id,b1.id,c.id);reviewAll(s,topic.id,b2.id,c.id);ids.forEach(i=>seedImage(s,i,c.id));
+ const {spawn}=await import('node:child_process');
+ const worker=path.join(root,'publish-race.mjs'),dbUrl=new URL('../server/db.ts',import.meta.url).href,storeUrl=new URL('../server/opportunity-store.ts',import.meta.url).href;
+ fs.writeFileSync(worker,`import {AppDatabase} from ${JSON.stringify(dbUrl)}; import {OpportunityStore} from ${JSON.stringify(storeUrl)};
+ const [root,u,topic,b,c,i]=process.argv.slice(2);const db=new AppDatabase(root),s=new OpportunityStore(db);process.stdout.write('ready\\n');
+ process.stdin.once('data',()=>{try{const r=s.publish(u,b,c,{ids:[i],summary:'concurrent test',feedbackRevision:s.feedbackRevision(u,topic)});process.stdout.write(JSON.stringify({count:r.ideas.length,pending:r.capacity.pendingCount})+'\\n');}catch(e){process.stdout.write(JSON.stringify({error:e.message})+'\\n');process.exitCode=1;}finally{db.close();process.stdin.destroy();}});`);
+ function launch(bid:string,iid:string){let out='',ready!:()=>void;const started=new Promise<void>(r=>ready=r),child=spawn(process.execPath,['--import','tsx',worker,root,u,topic.id,bid,c.id,iid],{cwd:process.cwd(),stdio:['pipe','pipe','pipe']});
+ const done=new Promise<{count:number;pending:number}>((resolve,reject)=>{child.stdout.on('data',d=>{out+=d;if(out.includes('ready\n'))ready();});child.on('error',reject);child.on('exit',code=>{try{assert.equal(code,0,out);resolve(JSON.parse(out.trim().split('\n').at(-1)!));}catch(e){reject(e);}});});return {child,started,done};}
+ const a=launch(b1.id,ids[0]),b=launch(b2.id,ids[1]);await Promise.all([a.started,b.started]);a.child.stdin.write('go');b.child.stdin.write('go');
+ const results=await Promise.all([a.done,b.done]);assert.deepEqual(results.map(r=>r.count).sort(),[0,1]);assert.equal(s.capacity(u,topic.id).pendingCount,1);
+ assert.equal(s.batch(u,b1.id).status,'completed');assert.equal(s.batch(u,b2.id).status,'completed');
+});
+
+test('additive migration backfills original recommendation events once and preserves existing user data',t=>{
+ const {s,c,topic,root,db}=fixture(t),b=s.begin(u,topic.id,c.id,null,day);
+ const iid=s.ingest(u,b.id,c.id,[{key:'legacy',content:content(660)}])[0].idea.id;reviewAll(s,topic.id,b.id,c.id);publish(s,topic.id,b.id,c.id,[iid]);
+ const first=s.idea(u,iid);s.feedback(u,iid,{requestKey:id(),revision:first.revision,action:'dismissed',rating:2,note:'原始人工意见'});const before=s.idea(u,iid);
+ db.sqlite.exec('DROP TABLE opportunity_queue_events; ALTER TABLE opportunity_topics DROP COLUMN pending_limit; ALTER TABLE opportunity_reviews DROP COLUMN queue_revision; DELETE FROM schema_migrations WHERE version=2026102801;');
+ const reopened=new AppDatabase(root);try{const upgraded=new OpportunityStore(reopened);assert.deepEqual(upgraded.idea(u,iid),before);assert.equal(upgraded.topic(u,topic.id).pending_limit,null);assert.equal(upgraded.queueEvents(u,iid).length,1);assert.equal(upgraded.queueEvents(u,iid)[0].created_at,before.first_recommended_at);assert.equal(upgraded.queueEvents(u,iid)[0].batch_id,b.id);assert.equal(upgraded.context(u,topic.id).inventory.length,0);assert.deepEqual(reopened.sqlite.prepare('PRAGMA foreign_key_check').all(),[]);}finally{reopened.close();}
+ const again=new AppDatabase(root);try{assert.equal(new OpportunityStore(again).queueEvents(u,iid).length,1);}finally{again.close();}
+});
+
+test('research selects an owned server project and keeps links, drafts, idempotency and source knowledge correct',t=>{
+ const {s,c,topic,db,p,root}=fixture(t),b=s.begin(u,topic.id,c.id,null,day);
+ const idea=s.ingest(u,b.id,c.id,[{key:'move-research',content:content(901)}])[0].idea;
+ db.sqlite.prepare('UPDATE opportunity_topics SET knowledge_path=? WHERE id=?').run('knowledge/topic.md',topic.id);
+ const target=db.createProject(id(),u,'Research target',root+'/research','tenant-local'),key=id();
+ const started=s.start(u,topic.id,selection,key,idea.id,{rating:5,note:'unsaved research plan'},target.id);
+ assert.equal(started.projectId,target.id);assert.equal(db.getConversation(started.conversationId)?.project_id,target.id);
+ assert.equal(db.listPendingPrompts(started.conversationId).length,0);
+ assert.ok(db.getComposerDraft(started.conversationId)?.content.includes(path.join(p.root_path,'knowledge/topic.md')));
+ assert.ok(db.getComposerDraft(started.conversationId)?.content.includes('unsaved research plan'));
+ assert.equal(s.detail(u,idea.id).research[0].project_id,target.id);
+ assert.equal(s.view(u,topic.id,'working').ideas[0].work?.research?.project_id,target.id);
+ assert.equal(s.idea(u,idea.id).project_id,p.id);assert.equal(s.idea(u,idea.id).note,'');
+ assert.equal(s.start(u,topic.id,selection,key,idea.id,undefined,target.id).conversationId,started.conversationId);
+ assert.throws(()=>s.start(u,topic.id,selection,key,idea.id,undefined,p.id),/请求内容已变化/);
+ s.researchResult(u,idea.id,started.conversationId,{status:'inconclusive',result:'cross project result'});
+ assert.equal(s.detail(u,idea.id).research[0].result,'cross project result');
+ assert.throws(()=>s.researchResult(u,idea.id,c.id,{status:'validated',result:'unlinked'}),/未关联/);
+ db.sqlite.prepare("UPDATE projects SET executor_id='remote:fixture' WHERE id=?").run(target.id);
+ assert.throws(()=>s.start(u,topic.id,selection,id(),idea.id,undefined,target.id),/远程/);
+ assert.throws(()=>s.researchResult(u,idea.id,started.conversationId,{status:'validated',result:'remote'}),/远程/);
+ db.sqlite.prepare("UPDATE projects SET executor_id='tenant-local',archived_at=? WHERE id=?").run(new Date().toISOString(),target.id);
+ assert.throws(()=>s.start(u,topic.id,selection,id(),idea.id,undefined,target.id),/归档/);
+ assert.throws(()=>s.start(u,topic.id,selection,id(),idea.id,undefined,id()),/不存在/);
+ db.sqlite.prepare('DELETE FROM conversations WHERE id=?').run(started.conversationId);
+ assert.equal(s.view(u,topic.id,'working').ideas[0].work?.research?.available,false);
+ assert.deepEqual(db.sqlite.prepare('pragma foreign_key_check').all(),[]);
+});
+
+test('cross-project research API permits only linked reads/results, never discovery or another account/project/card',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-research-route-')),secret='cross-project-research-test-secret-32',password='research-test';
+ const app=createApp({projectRoot:root,dataRoot:root+'/data',tenantRoot:root+'/tenants',username:'pp',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,phoneLoginRequired:false,queueAutoStart:false,minimumFreeDiskBytes:0});
+ t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
+ const a=request.agent(app.app),login=await a.post('/api/auth/login').send({username:'pp',password}).expect(200),csrf=login.body.csrfToken;
+ const p=app.db.createProject(id(),u,'Source',root+'/source','tenant-local'),target=app.db.createProject(id(),u,'Target',root+'/target','tenant-local');
+ const store=new OpportunityStore(app.db),topic=store.createTopic(u,{name:'Research routing',project_id:p.id,goal:'test explicit project selection'},id());
+ const c=app.db.createConversation(id(),'Source',selection,u,p.id),b=store.begin(u,topic.id,c.id,null,day);
+ const ideas=store.ingest(u,b.id,c.id,[{key:'first',content:content(910)},{key:'second',content:content(911)}]).map(v=>v.idea);
+ const url='/api/opportunities/ideas/'+ideas[0].id+'/research',body={requestKey:id(),projectId:target.id};
+ await a.post(url).send(body).expect(403);
+ await a.post(url).set('X-CSRF-Token',csrf).send({...body,projectId:'bad'}).expect(400);
+ await a.post(url).set('X-CSRF-Token',csrf).send({...body,projectId:id()}).expect(404);
+ const now=new Date().toISOString(),other=id();app.db.createUser({id:other,username:'other',display_name:'Other',password_hash:bcrypt.hashSync(password,4),role:'member',status:'active',created_at:now,updated_at:now});
+ const foreign=app.db.createProject(id(),other,'Private',root+'/foreign','tenant-local');
+ await a.post(url).set('X-CSRF-Token',csrf).send({...body,projectId:foreign.id}).expect(404);
+ const result=await a.post(url).set('X-CSRF-Token',csrf).send(body).expect(201),cid=result.body.conversationId;
+ assert.equal(result.body.projectId,target.id);
+ assert.equal(app.db.sqlite.prepare('SELECT count(*) n FROM jobs WHERE conversation_id=?').get(cid)?.n,0);
+ const job=app.db.createJob(id(),cid,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(job.id);
+ const token=createJobAutomationToken(secret,job.id,cid);
+ const call=(action:string,data:Record<string,unknown>={})=>request(app.app).post(`/api/automation/jobs/${job.id}/opportunities`).set('Authorization','Bearer '+token).send({action,topicId:topic.id,data});
+ await call('topics').expect(200);
+ const context=await call('context').expect(200);assert.equal(context.body.linkedIdeaId,ideas[0].id);assert.equal(context.body.sourceProject.id,p.id);
+ await call('detail',{ideaId:ideas[0].id}).expect(200);
+ await call('detail',{ideaId:ideas[1].id}).expect(403);
+ await call('research_result',{ideaId:ideas[0].id,status:'inconclusive',result:'linked-only evidence'}).expect(200);
+ await call('research_result',{ideaId:ideas[1].id,status:'validated',result:'wrong card'}).expect(403);
+ for(const action of ['begin','ingest','review','publish','feedback','feedback_inbox','learn_feedback','evidence','images','return_to_reserve','backlog_limit','preferences','recent','history','inventory','fail'])await call(action,{ideaId:ideas[0].id}).expect(403);
+ const unrelated=app.db.createConversation(id(),'Unlinked',selection,u,target.id),unlinked=app.db.createJob(id(),unrelated.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(unlinked.id);
+ await request(app.app).post(`/api/automation/jobs/${unlinked.id}/opportunities`).set('Authorization','Bearer '+createJobAutomationToken(secret,unlinked.id,unrelated.id)).send({action:'context',topicId:topic.id}).expect(403);
+ app.db.sqlite.prepare("UPDATE jobs SET status='completed' WHERE id=?").run(job.id);await call('context').expect(401);
+});

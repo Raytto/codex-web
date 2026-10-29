@@ -6,6 +6,7 @@ export type VoiceDraftRecord = {
   pendingPromptId?: string | null;
   projectId: string | null;
   draftText: string;
+  opportunityBaseRevision?: number;
   quoteExcerpt: string;
   attachmentNames: string[];
   fileName: string;
@@ -71,7 +72,7 @@ export async function saveVoiceDraft(record: VoiceDraftRecord): Promise<void> {
   } finally { database.close(); }
 }
 
-export async function getVoiceDraft(accountId: string, scope: string, conversationId: string | null): Promise<VoiceDraftRecord | null> {
+export async function listVoiceDrafts(accountId: string): Promise<VoiceDraftRecord[]> {
   const database = await openDatabase();
   try {
     const transaction = database.transaction(STORE_NAME, "readonly");
@@ -81,10 +82,14 @@ export async function getVoiceDraft(accountId: string, scope: string, conversati
       request.onerror = () => reject(request.error ?? new Error("无法读取本地语音草稿。"));
     });
     await transactionDone(transaction);
-    const candidates = rows.filter((row) => row.accountId === accountId && row.scope === scope && row.conversationId === conversationId);
-    candidates.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
-    return candidates[0] ?? null;
+    return rows.filter(row => row.accountId === accountId && !isVoiceDraftExpired(row));
   } finally { database.close(); }
+}
+
+export async function getVoiceDraft(accountId: string, scope: string, conversationId: string | null): Promise<VoiceDraftRecord | null> {
+  const candidates = (await listVoiceDrafts(accountId)).filter(row => row.scope === scope && row.conversationId === conversationId);
+  candidates.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+  return candidates[0] ?? null;
 }
 
 export async function deleteVoiceDraft(id: string): Promise<void> {
