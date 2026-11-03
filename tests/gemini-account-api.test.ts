@@ -142,4 +142,31 @@ test("a first queued Gemini request uses its own title engine while Codex naming
     assert.deepEqual(instance.db.listMessages(codexId).map(message => message.content), ["整理季度销售记录", "继续整理销售记录"]);
     assert.deepEqual(instance.db.getPendingPrompt(pendingId), saved, "steering Codex leaves the Gemini request queued");
   });
+  await t.test("AGY steering is rejected before dispatch and preserves its queued message and attachment", async () => {
+    instance.db.updateJob(gemini.body.job.id, "running");
+    const steerCalls = t.mock.method(instance.runner, "steer", async () => "must-not-dispatch");
+    const pending = await owner.post(`/api/conversations/${geminiId}/messages`).set("X-CSRF-Token", csrf)
+      .field("message", "下一轮读取附件").field("model", model).field("reasoningEffort", "high")
+      .attach("files", Buffer.from("preserve-me"), { filename: "context.txt", contentType: "text/plain" }).expect(202);
+    const saved = instance.db.getPendingPrompt(pending.body.pendingPrompt.id)!;
+    const response = await owner.post(`/api/conversations/${geminiId}/pending-prompts/${saved.id}/steer`).set("X-CSRF-Token", csrf).expect(409);
+    assert.equal(response.body.code, "LIVE_STEERING_UNAVAILABLE");
+    assert.match(response.body.error, /Antigravity.*不支持运行中引导/);
+    assert.equal(steerCalls.mock.callCount(), 0);
+    assert.deepEqual(instance.db.getPendingPrompt(saved.id), saved);
+    assert.equal(saved.files.length, 1);
+  });
+  await t.test("a changed effort remains queued instead of being silently ignored by live steering", async () => {
+    const effort = available.body.models.find((entry: { id: string }) => entry.id === codexModel).reasoningEfforts.find((entry: string) => entry !== codexEffort);
+    assert.ok(effort);
+    const steerCalls = t.mock.method(instance.runner, "steer", async () => "must-not-dispatch");
+    const pending = await owner.post(`/api/conversations/${codexId}/messages`).set("X-CSRF-Token", csrf)
+      .send({ message: "用不同深度继续", model: codexModel, reasoningEffort: effort }).expect(202);
+    const saved = instance.db.getPendingPrompt(pending.body.pendingPrompt.id)!;
+    const response = await owner.post(`/api/conversations/${codexId}/pending-prompts/${saved.id}/steer`).set("X-CSRF-Token", csrf).expect(409);
+    assert.match(response.body.error, /思考深度/);
+    assert.equal(steerCalls.mock.callCount(), 0);
+    assert.deepEqual(instance.db.getPendingPrompt(saved.id), saved);
+  });
+
 });

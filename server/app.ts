@@ -1,5 +1,6 @@
 import { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "./conversation-title.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
+import { liveSteeringUnavailableReason } from "../src/agent-steering-capability.js";
 import { AUTO_RESET_INTERVAL_MS, CodexResetAutoUse } from "./codex-reset-auto-use.js";
 import { OpportunityVoiceService } from './opportunity-voice.js';
 import { createColdRestoreScheduler } from "./cold-restore-scheduler.js";
@@ -3881,7 +3882,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (config.queueAutoStart) await pumpQueue();
       return res.json({ ok: true, mode: "insert", job: db.getJob(job.id) ?? job });
     }
-    if (running.agent_model && pending.agent_model !== running.agent_model) return res.status(409).json({ error: "这条待发送请求使用的模型与当前任务不同，将保留在队列中按所选模型执行。" });
+    const steeringUnavailable = liveSteeringUnavailableReason(running, pending);
+    if (steeringUnavailable) return res.status(409).json({ code: "LIVE_STEERING_UNAVAILABLE", error: steeringUnavailable });
     try {
       const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
       const message = db.materializeSteeredPrompt(pending.id, newId());

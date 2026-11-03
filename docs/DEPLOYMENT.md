@@ -34,7 +34,7 @@ docker compose logs --tail=200 app
 curl --fail http://127.0.0.1:37821/codex-web/api/health
 ```
 
-Back up all three named volumes before upgrades. Keep `.env` outside source control.
+Back up the configured `.state/` bind-mount directories and restricted environment file before upgrades. Keep `.env` outside source control.
 
 Recent releases add SQLite columns for continuation targets and selections, plus the `voice_transcription_receipts` table used for idempotent voice retries. Migrations are additive and run on startup, but the pre-upgrade volume backup remains the rollback boundary; do not start an older image against a database already migrated by a newer release unless that version is documented as backward compatible.
 
@@ -198,3 +198,7 @@ Keep the standard base installation and username/password login. Gemini account 
 ## October 30, 2026 upgrade checks
 
 Follow the [upgrade notes](UPGRADE_20261030.md) for the additive opportunity queue/recording migrations, durable queue history, cross-project research authorization and background upload checks. Use the existing base build/run commands; no environment keys, default dependencies or optional provider setup change. Verify username/password login and `/codex-web` after replacing the application image.
+
+## Current application update
+
+Live steering now requires Codex with the same model and reasoning effort as the active turn. Antigravity additions stay queued; the composer explains image-file handling and the bounded cross-engine context handoff. Login and conversation menus scroll on short displays, chat text keeps the chosen size, and opportunity sidebar navigation stays in its section menu. This update has no new database migration, environment key, default dependency or Worker protocol. Follow [upgrade checks](UPGRADE_20261104.md); username/password login stays available.

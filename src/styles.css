@@ -65,9 +65,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .login-page {
   position: relative;
   height: 100%;
+  height: var(--app-viewport-height, 100dvh);
   display: grid;
-  place-items: center;
-  overflow: hidden;
+  place-items: safe center;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 24px;
   background: var(--navy);
 }
@@ -428,7 +432,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .conversation-menu > summary { list-style: none; }
 .conversation-menu > summary::-webkit-details-marker { display: none; }
 .conversation-menu[open] > summary { color: var(--indigo); background: var(--indigo-pale); }
-.conversation-menu-panel { position: absolute; top: calc(100% + 7px); right: 0; z-index: 30; width: 220px; padding: 6px; border: 1px solid rgba(57, 70, 137, .14); border-radius: 12px; background: rgba(255, 255, 255, .99); box-shadow: 0 16px 38px rgba(15, 17, 32, .17), 0 3px 10px rgba(15, 17, 32, .06); backdrop-filter: blur(12px); }
+.conversation-menu-panel { position: absolute; top: calc(100% + 7px); right: 0; z-index: 30; width: 220px; max-height: calc(100dvh - 120px); overflow-y: auto; overscroll-behavior: contain; padding: 6px; border: 1px solid rgba(57, 70, 137, .14); border-radius: 12px; background: rgba(255, 255, 255, .99); box-shadow: 0 16px 38px rgba(15, 17, 32, .17), 0 3px 10px rgba(15, 17, 32, .06); backdrop-filter: blur(12px); }
 .conversation-menu-actions button { width: 100%; min-height: 48px; display: flex; align-items: center; gap: 10px; padding: 7px 10px; border: 0; border-radius: 8px; color: #30364e; background: transparent; cursor: pointer; font-size: 13px; line-height: 1.25; text-align: left; }
 .conversation-menu-actions button:hover { color: var(--indigo); background: var(--indigo-pale); }
 .conversation-menu-actions button.wake-menu-item.active { color: var(--indigo); background: var(--indigo-pale); }
@@ -442,7 +446,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .conversation-menu-info-row > span { min-width: 0; display: grid; gap: 2px; }
 .conversation-menu-info-row small { color: #858999; font-size: 10px; font-weight: 650; letter-spacing: .02em; }
 .conversation-menu-info-row strong { overflow: hidden; color: #30364e; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 720; font-variant-numeric: tabular-nums; }
-.conversation-menu.has-antigravity-usage .conversation-menu-panel { width: min(340px, calc(100vw - 32px)); max-height: calc(100dvh - 120px); overflow-y: auto; overscroll-behavior: contain; }
+.conversation-menu.has-antigravity-usage .conversation-menu-panel { width: min(340px, calc(100vw - 32px)); }
 .antigravity-usage { min-width: 0; padding: 10px; color: var(--ink); font-size: var(--dialog-font-body, .9375rem); line-height: 1.6; }
 .antigravity-usage-heading, .antigravity-usage-heading > span, .antigravity-usage-bucket > div, .antigravity-usage-credits { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .antigravity-usage-heading { font-weight: 650; }
@@ -560,7 +564,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .message-reference > svg { flex: 0 0 auto; color: var(--indigo); }
 .message-reference > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .message-reference strong { margin-right: 6px; color: #343c70; font-size: 10px; }
-.message.user .message-body > p, .message.assistant .markdown { font-size: var(--chat-font-size, 16px); }
+.message.user .message-body > p, .message.assistant .markdown {
+  font-size: var(--chat-font-size, 16px);
+  /* Keep differently sized chat blocks on the chosen text scale, including
+     after mobile orientation changes. Browser page/pinch zoom stays available. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 .markdown { line-height: 1.72; overflow-wrap: anywhere; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -944,6 +954,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .wake-plan-actions button.danger { color: #94424b; }
 .wake-plan-actions button:disabled { cursor: default; opacity: .5; }
 .activity-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: #29356f; font-size: 12px; }
+.activity-title > strong, .activity-title > svg { flex-shrink: 0; }
 .activity-title > span { margin-left: auto; color: #9599aa; font-size: 10px; font-weight: 500; }
 .process-section-title { display: flex; align-items: center; justify-content: space-between; margin: 10px 1px 6px; color: #555b71; font-size: 10px; }
 .process-section-title > span { color: #999dac; font-weight: 600; }
@@ -1122,6 +1133,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .composer-note { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 8px 0 0; color: #8c8f9c; text-align: center; font-size: 10px; }
 .composer-note button { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .composer-note button:disabled { opacity: .45; cursor: default; }
+.composer-note.engine-capability-note, .composer-note.engine-switch-note { display: block; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .pending-files { display: flex; gap: 7px; overflow-x: auto; padding: 2px 4px 8px; }
 .editing-pending-files { display: flex; gap: 7px; overflow-x: auto; padding: 2px 4px 8px; }
 .pending-files > span, .editing-pending-files > span { max-width: 240px; flex: 0 0 auto; display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 8px; border: 1px solid #d9dce8; border-radius: 9px; color: #374071; background: #f7f8fc; white-space: nowrap; font-size: 11px; }

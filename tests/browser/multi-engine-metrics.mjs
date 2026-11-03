@@ -54,6 +54,34 @@ try {
   assert.equal(await menu.getByText('套餐额度', { exact: true }).count(), 0); assert.equal(await menu.getByText('Rollout 文件', { exact: true }).count(), 0); await menu.getByTitle('最近一次请求使用的输入上下文 / 当前模型上下文窗口', { exact: true }).getByText('暂无数据', { exact: true }).waitFor(); report.checks.push('gemini_selection_hides_codex_quota_rollout_and_stale_codex_usage');
   usage = { ...usage, inputTokens: 42000, engineId: 'antigravity' }; await page.evaluate(() => window.dispatchEvent(new Event('codex-web-executor-quota-changed'))); await page.waitForFunction(() => document.querySelector('.conversation-menu-info')?.textContent.includes('42K / 100K')); report.checks.push('gemini_usage_requires_explicit_engine_provenance');
   await close(); await page.locator('.composer textarea').focus(); await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); await page.getByRole('option', { name: new RegExp(baseline.models.find(model => model.id === baseline.selection.model).label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).click(); await open(); await menu.getByText('Codex 上下文', { exact: true }).waitFor(); await menu.getByText('83%', { exact: true }).waitFor(); await menu.getByTitle('最近一次请求使用的输入上下文 / 当前模型上下文窗口', { exact: true }).getByText('暂无数据', { exact: true }).waitFor(); report.checks.push('return_to_codex_restores_quota_without_relabeling_gemini_usage');
+  // Keep native execution synthetic, but exercise the real UI and authenticated queue API.
+  const fixtureJob = await api(`/conversations/${id}/messages`, 'POST', { message: 'Capability regression fixture', model: baseline.defaults.model, reasoningEffort: baseline.defaults.reasoningEffort });
+  instance.db.sqlite.prepare("UPDATE jobs SET agent_model=?,reasoning_effort=?,status='running' WHERE id=?").run(geminiModel.id, 'default', fixtureJob.job.id);
+  instance.db.appendEvent(fixtureJob.job.id, 'status', { status: 'running' });
+  const pending = instance.db.createPendingPrompt(crypto.randomUUID(), id, 'Queued Gemini supplement', { model: geminiModel.id, reasoningEffort: 'default' });
+  selection = { model: geminiModel.id, reasoningEffort: 'default' };
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 960 }); await page.reload();
+    await page.locator('.engine-capability-note').waitFor();
+    await page.locator('.pending-queue').waitFor();
+    assert.equal(await page.getByRole('button', { name: '引导', exact: true }).count(), 0);
+    await page.waitForFunction(() => document.querySelector('.activity-title')?.textContent.includes('Antigravity 不支持运行中引导'));
+    assert.equal(await page.getByText('完成前持续保留，可随时引导', { exact: true }).count(), 0);
+    await page.locator('.composer textarea').focus();
+    await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click();
+    await page.locator('.engine-switch-note').waitFor();
+    const codexOption = page.getByRole('option').filter({ hasText: baseline.models[0].label }).first();
+    assert.equal(await codexOption.isEnabled(), true);
+    await page.keyboard.press('Escape');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+    await page.screenshot({ path: `${output}/capabilities-${width}.png` });
+  }
+  const rejected = await context.request.post(`${origin}/api/conversations/${id}/pending-prompts/${pending.id}/steer`, { headers: { 'X-CSRF-Token': session.csrfToken } });
+  assert.equal(rejected.status(), 409); assert.equal((await rejected.json()).code, 'LIVE_STEERING_UNAVAILABLE');
+  assert.equal(instance.db.getPendingPrompt(pending.id).content, 'Queued Gemini supplement');
+  report.checks.push('desktop_mobile_agy_has_no_steer_and_explains_queue_images_and_engine_handoff', 'authenticated_steer_rejection_preserves_pending_prompt');
+  instance.db.updateJob(fixtureJob.job.id, 'completed'); instance.db.sqlite.prepare('DELETE FROM pending_prompts WHERE id=?').run(pending.id);
+  selection = baseline.selection; await page.setViewportSize({ width: 1440, height: 960 }); await page.reload(); await page.locator('.composer textarea').focus();
   await close(); holdNextCatalog = true; await page.evaluate(() => window.dispatchEvent(new Event('codex-web-models-changed'))); await heldCatalogStarted;
   const heldRevision = catalogRevision; catalogModels = baseline.models;
   const freshResponse = page.waitForResponse(response => response.headers()['x-fixture-catalog-revision'] === String(heldRevision + 1));

@@ -21,3 +21,9 @@ Gemini messages sent during execution queue for the next request. Images are sup
 The CLI is integrity-pinned; runtime installation and Windows ConPTY packaging are tested separately from real Google login. Automated synthetic tests do not prove a particular subscription's model access or physical-device behavior.
 
 The public cold-storage engine remains format v2. It archives registered conversation files and the current Codex root; it is not a complete backup of historical engine segments or a Google account profile. Historical provider records can remain on their original node. Do not infer full vendor-history recovery from a platform archive.
+
+## Live steering and visible capabilities
+
+Live steering now requires Codex with the same model and reasoning effort as the active turn. Antigravity additions stay queued; the composer explains image-file handling and the bounded cross-engine context handoff. Login and conversation menus scroll on short displays, chat text keeps the chosen size, and opportunity sidebar navigation stays in its section menu.
+
+The model menu keeps both engines selectable. Changes apply to the next request and share project files plus at most 20 previous messages / about 24,000 characters; this is not a full native-context transfer. Pending messages and attachments survive a rejected steer. While a request runs, metrics follow its engine rather than the next selected model. Remote refresh imports Codex client history only.

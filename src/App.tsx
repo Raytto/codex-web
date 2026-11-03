@@ -1,4 +1,4 @@
-import { canRunPendingPromptImmediately, modelMenuOptions, modelReasoningOptions, pendingPromptActionMode, reasoningForModel } from "./agent-model-options";
+import { canRunPendingPromptImmediately, hasMultipleEngines, modelMenuOptions, modelReasoningOptions, pendingPromptActionMode, reasoningForModel } from "./agent-model-options";
 import { AntigravityUsagePanel } from "./antigravity-usage-panel";
 import { TransientNotice, useNoticeState } from "./transient-notice";
 import { JudgmentWorkspace, JudgmentSidebar } from "./judgments";
@@ -3686,7 +3686,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   async function deleteConversation(conversation: Conversation, retry = false) {
-    if (!retry && !window.confirm(`删除“${conversation.title}”？\n\n会话会先立即隐藏并停止入队，然后清理远端线程、本机工作文件、结果文件和关联记录。操作完成后无法恢复。`)) return;
+    if (!retry && !window.confirm(`删除“${conversation.title}”？\n\n会话会先立即隐藏并停止入队，然后清理受管 Codex 线程、本机工作文件、结果文件和关联记录。Antigravity 原生历史需在 Google 官方客户端管理。操作完成后无法恢复。`)) return;
     setError("");
     try {
       await api.deleteConversation(conversation.id);
@@ -3876,7 +3876,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   const filtered = conversations;
   const currentDetail = detail?.conversation.id === selectedId ? detail : null;
-  const showingGeminiMetrics = selectedModel.startsWith("antigravity:") || Boolean(job?.status === "running" && job.agent_model?.startsWith("antigravity:"));
+  const showingGeminiMetrics = Boolean((job?.status === "running" ? job.agent_model : selectedModel)?.startsWith("antigravity:"));
   const displayedContextUsage = showingGeminiMetrics === (currentDetail?.contextUsage?.engineId === "antigravity") ? currentDetail?.contextUsage : null;
   const currentProject = currentDetail ? projects.find((project) => project.id === currentDetail.conversation.project_id) : undefined;
   const remoteFileFetchEnabled = Boolean(currentProject?.executor_id.startsWith("remote:"));
@@ -4143,7 +4143,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         role="menuitem"
         disabled={projectMenuProject.executor_status !== "online" || syncingProjects[projectMenuProject.id]}
         onClick={() => { setProjectMenu(null); void syncProject(projectMenuProject); }}
-      ><RefreshCw size={16} className={syncingProjects[projectMenuProject.id] ? "spin" : ""} /><span>{syncingProjects[projectMenuProject.id] ? "正在刷新" : "刷新任务"}</span></button>}
+      title="导入此节点的 Codex 客户端会话；暂不导入 Antigravity 原生历史"
+      ><RefreshCw size={16} className={syncingProjects[projectMenuProject.id] ? "spin" : ""} /><span>{syncingProjects[projectMenuProject.id] ? "正在刷新" : "刷新 Codex 任务"}</span></button>}
       <button type="button" role="menuitem" disabled={markingProjectsSeen[projectMenuProject.id]} onClick={() => void markProjectSeen(projectMenuProject)}><Check size={16} /><span>{markingProjectsSeen[projectMenuProject.id] ? "正在去掉未读" : "去掉所有未读"}</span></button>
       <button type="button" role="menuitem" onClick={() => openRecurring(projectMenuProject.id, null)}><Clock size={16} /><span>管理定时任务</span></button>
       <button type="button" role="menuitem" disabled={projectMenuProject.executor_id.startsWith("remote:")} title={projectMenuProject.executor_id.startsWith("remote:") ? "远端项目暂不支持网页管理技能" : "管理项目技能"} onClick={() => { setProjectMenu(null); setProjectSkillsDialogProject(projectMenuProject); }}><Pencil size={16} /><span>管理项目技能{projectMenuProject.executor_id.startsWith("remote:") ? "（远端暂不支持）" : ""}</span></button>
@@ -4269,7 +4270,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onReorderPending={(ordered) => void reorderPendingPrompts(ordered)} onEditPending={(prompt) => void beginPendingEdit(prompt)}
         onDeletePending={(prompt) => void deletePendingPrompt(prompt)} onSteerPending={(prompt) => void steerPendingPrompt(prompt)}
         onRetryVoice={async (prompt) => { await api.retryVoiceMessage(prompt.conversation_id, prompt.id); await reconcile(prompt.conversation_id); }}
-        pendingActionMode={pendingPromptActionMode(job, selectedModel)} runningModel={job?.status === "running" ? job.agent_model : undefined} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
+        pendingActionMode={pendingPromptActionMode(job, selectedModel, reasoningEffort)} runningModel={job?.status === "running" ? job.agent_model : undefined} runningEffort={job?.reasoning_effort} waitingForWake={Boolean(currentDetail?.wakePlan)} onCancelPendingEdit={() => void cancelPendingEdit()}
         onAddFiles={(incoming) => void addComposerFiles(incoming)} onCancelDraftUpload={cancelComposerDraftUpload} onPauseDraftUpload={pauseComposerDraftUpload} onResumeDraftUpload={resumeComposerDraftUpload} onRemoveDraftFile={(file) => void removeComposerDraftFile(file)} onClearDraft={() => void clearComposerDraft()}
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
@@ -5137,7 +5138,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
           <div className="message-avatar"><CircleAlert size={16} /></div>
           <div className="message-body"><div className="message-meta"><span className="message-name">任务错误</span>{detail.latestJob?.updated_at && <time dateTime={detail.latestJob.updated_at} title={formatFullDateTime(detail.latestJob.updated_at)}>{formatMessageDateTime(detail.latestJob.updated_at)}</time>}</div><ErrorBubble content={latestJobError} /></div>
         </article>}
-        {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={`${detail.conversation.id}:${detail.remoteTurnId ?? "job"}`} activities={activities} loading={activitiesLoading} /></div></article>}
+        {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={`${detail.conversation.id}:${detail.remoteTurnId ?? "job"}`} activities={activities} loading={activitiesLoading} runningModel={detail.activeJob?.agent_model} /></div></article>}
         {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} onEdit={onEditWake} />}
         <div />
       </>}
@@ -5176,7 +5177,7 @@ function WakePlanCard({ plan, onCancel, onPostpone, onTrigger, onEdit }: { plan:
   </article>;
 }
 
-function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading: boolean }) {
+function ProcessPanel({ activities, loading, runningModel }: { activities: JobEvent[]; loading: boolean; runningModel?: string }) {
   if (loading) return <div className="activity-card activity-loading" role="status" aria-live="polite" aria-busy="true">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>正在加载运行记录</strong><span>正在恢复完整上下文，加载完成后显示实时进度</span></div>
   </div>;
@@ -5187,7 +5188,7 @@ function ProcessPanel({ activities, loading }: { activities: JobEvent[]; loading
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
 
   return <div className="activity-card" role="status" aria-live="polite">
-    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : "完成前持续保留，可随时引导"}</span></div>
+    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : (runningModel?.startsWith("antigravity:") ? "Antigravity 不支持运行中引导，补充消息将在完成后发送" : runningModel ? "完成前持续保留，可随时引导" : "完成前持续保留，补充消息可加入队列")}</span></div>
     {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
@@ -5374,11 +5375,12 @@ function FileCard({ file }: { file: WorkFile }) {
   </div>;
 }
 
-function PendingQueue({ prompts, busy, actionMode, runningModel, waitingForWake, onReorder, onEdit, onDelete, onSteer, onRetryVoice }: {
+function PendingQueue({ prompts, busy, actionMode, runningModel, runningEffort, waitingForWake, onReorder, onEdit, onDelete, onSteer, onRetryVoice }: {
   prompts: PendingPrompt[];
   busy: boolean;
   actionMode: "steer" | "insert" | "queue";
   runningModel?: string;
+  runningEffort?: string;
   waitingForWake: boolean;
   onReorder: (ordered: PendingPrompt[]) => void;
   onEdit: (prompt: PendingPrompt) => void;
@@ -5457,7 +5459,7 @@ function PendingQueue({ prompts, busy, actionMode, runningModel, waitingForWake,
         </div>
         {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
         <div className="pending-queue-actions">
-          {canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel) && <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
+          {canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel, prompt.reasoning_effort, runningEffort) && <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
           <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
           <button type="button" disabled={busy} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
@@ -5494,7 +5496,7 @@ function ComposerSessions({ sessionKey, onTransfersChange, ...props }: Component
   </div>)}</>;
 }
 
-function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, onRetryVoice, pendingActionMode, runningModel, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
+function Composer({ active = true, accountId, conversationId, input, setInput, askAgentQuote, onClearAskAgentQuote, focusRequest, files, setFiles, draftFiles, draftUploads, draftSaveState, sending, submitting, pendingBusy, selectionSaving, pendingPrompts, editingPending, removedEditingFileIds, agentOptions, selectedModel, reasoningEffort, onModelChange, onReasoningChange, onReorderPending, onEditPending, onDeletePending, onSteerPending, onRetryVoice, pendingActionMode, runningModel, runningEffort, waitingForWake, onCancelPendingEdit, onAddFiles, onCancelDraftUpload, onPauseDraftUpload, onResumeDraftUpload, onRemoveDraftFile, onClearDraft, onRemoveEditingFile, onRestoreEditingFile, onVoiceActivityChange, onSend, onVoiceTranscript, onVoiceSendAfterTranscription, onVoiceSendRecording, onCancel }: {
   active?: boolean;
   accountId: string | null;
   conversationId: string | null;
@@ -5527,6 +5529,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   onRetryVoice: (prompt: PendingPrompt) => Promise<void>;
   pendingActionMode: "steer" | "insert" | "queue";
   runningModel?: string;
+  runningEffort?: string;
   waitingForWake: boolean;
   onCancelPendingEdit: () => void;
   onAddFiles: (files: File[]) => void;
@@ -5807,12 +5810,12 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   const pendingQueueGuidance = pendingActionMode === "steer"
     ? "任务运行中，新内容会先进入待发送队列；也可选择“引导”立即调整当前任务。"
     : pendingActionMode === "queue"
-    ? "任务运行中，新内容会按各自选择的模型进入待发送队列，在当前任务完成后依次发送。"
+    ? (runningModel?.startsWith("antigravity:") ? "Antigravity 不支持运行中引导；补充消息将在当前任务完成后依次发送。" : "任务运行中，新内容会按所选模型和思考深度排队，当前任务完成后依次发送。")
     : waitingForWake
     ? "会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。"
     : "新内容会进入待发送队列；可选择“插入”立即发送。";
   return <div className={`composer-wrap ${compactWrap ? "compact" : ""}`}>
-    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} runningModel={runningModel} waitingForWake={waitingForWake}
+    {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} runningModel={runningModel} runningEffort={runningEffort} waitingForWake={waitingForWake}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} onRetryVoice={onRetryVoice} />}
     {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
     <div ref={composerRef} className={`composer ${composerExpanded ? "expanded" : "compact"}`}
@@ -5854,7 +5857,10 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
           : <button type="button" className="send-button" onClick={() => voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds())} disabled={submitting || selectionSaving || draftUploads.length > 0 || voice.state === "transcribing" || (voice.state !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voice.state === "recording" ? "发送语音" : "发送"} aria-label={voice.state === "recording" ? "发送语音" : "发送"}>{submitting || voice.state === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
-  </div>{composerExpanded && <p className="composer-note"><span>{draftStatusLabel || pendingQueueGuidance}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p>}</div>;
+  </div>
+    {selectedModel.startsWith("antigravity:") && <p className="composer-note engine-capability-note">Antigravity 不支持运行中引导；补充消息将在当前任务完成后发送。图片仅作为文件提供，能否识别取决于模型及读图工具。</p>}
+    {openSettingMenu === "model" && hasMultipleEngines(agentOptions) && <p className="composer-note engine-switch-note">可在同一会话切换 Codex 与 Antigravity。切换从下一条请求生效，交接最近 20 条消息（最多约 24,000 字符）并共用项目文件；更早历史请先生成交接摘要。</p>}
+    {composerExpanded && <p className="composer-note"><span>{draftStatusLabel || pendingQueueGuidance}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p>}</div>;
 }
 
 function clipboardTimestamp(date: Date): string {

@@ -471,8 +471,8 @@ test("remote Worker capacity zero means unlimited and is displayed explicitly", 
 test("mobile wake plan cards give copy and actions their own responsive rows", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /pendingActionMode=\{pendingPromptActionMode\(job, selectedModel\)\}/);
-  assert.match(appSource, /canRunPendingPromptImmediately\(actionMode, prompt\.agent_model, runningModel\) && <button[^\n]+className="steer-action"/);
+  assert.match(appSource, /pendingActionMode=\{pendingPromptActionMode\(job, selectedModel, reasoningEffort\)\}/);
+  assert.match(appSource, /canRunPendingPromptImmediately\(actionMode, prompt\.agent_model, runningModel, prompt\.reasoning_effort, runningEffort\) && <button[^\n]+className="steer-action"/);
   assert.match(appSource, /const actionLabel = actionMode === "steer" \? "引导" : "插入"/);
   assert.match(appSource, /会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。/);
   assert.match(appSource, /WakePlanCard[\s\S]*onEditWake/);
@@ -1147,7 +1147,7 @@ test("mobile Safari restores the non-fixed app viewport after the software keybo
   assert.doesNotMatch(styles, /body \{[^}]*100dvh/);
   assert.doesNotMatch(styles, /body \{[^}]*position: fixed;/);
   assert.match(styles, /#root \{[^}]*width: 100%;/);
-  assert.match(styles, /\.login-page \{[^}]*position: relative;[^}]*height: 100%;[^}]*overflow: hidden;/);
+  assert.match(styles, /\.login-page \{[^}]*position: relative;[^}]*height: 100%;[^}]*height: var\(--app-viewport-height, 100dvh\);[^}]*overflow-x: hidden;[^}]*overflow-y: auto;/);
   assert.match(styles, /\.shell \{[^}]*height: 100%;[^}]*overflow: hidden;/);
   assert.match(styles, /\.messages \{[^}]*overflow-y: auto;[^}]*overscroll-behavior-y: contain;[^}]*-webkit-overflow-scrolling: touch;/);
   assert.match(mainSource, /installMobileViewportRecovery\(\);/);

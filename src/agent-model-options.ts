@@ -1,4 +1,5 @@
 import type { AgentModelOption, AgentOptions, ReasoningEffort } from "./api";
+import { liveSteeringUnavailableReason } from "./agent-steering-capability";
 
 export function modelEngine(model: AgentModelOption): string {
   return model.engineId ?? (model.id.startsWith("antigravity:") ? "antigravity" : "codex");
@@ -37,12 +38,18 @@ export function modelMenuOptions(options: AgentOptions | null | undefined) {
   }));
 }
 
-export function pendingPromptActionMode(job: { status: string; agent_model?: string } | null | undefined, selectedModel: string): "insert" | "steer" | "queue" {
+export function pendingPromptActionMode(job: { status: string; agent_model?: string; reasoning_effort?: string } | null | undefined, selectedModel: string, selectedEffort = job?.reasoning_effort): "insert" | "steer" | "queue" {
   if (job?.status !== "running") return "insert";
-  if (job.agent_model?.startsWith("antigravity:") || (job.agent_model && job.agent_model !== selectedModel)) return "queue";
+  if (liveSteeringUnavailableReason(job, { agent_model: selectedModel, reasoning_effort: selectedEffort })) return "queue";
   return "steer";
 }
 
-export function canRunPendingPromptImmediately(actionMode: "insert" | "steer" | "queue", promptModel: string, runningModel?: string): boolean {
-  return actionMode === "insert" || (actionMode === "steer" && !promptModel.startsWith("antigravity:") && (!runningModel || promptModel === runningModel));
+export function canRunPendingPromptImmediately(actionMode: "insert" | "steer" | "queue", promptModel: string, runningModel?: string, promptEffort?: string, runningEffort?: string): boolean {
+  return actionMode === "insert" || (actionMode === "steer" && !liveSteeringUnavailableReason(
+    { agent_model: runningModel, reasoning_effort: runningEffort }, { agent_model: promptModel, reasoning_effort: promptEffort },
+  ));
+}
+
+export function hasMultipleEngines(options: AgentOptions | null | undefined): boolean {
+  return new Set(options?.models.map(modelEngine)).size > 1;
 }

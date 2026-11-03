@@ -50,5 +50,14 @@ test("running requests never accept a queued prompt for a different model or eng
   assert.equal(canRunPendingPromptImmediately("queue", "codex-model", "codex-model"), false);
   assert.equal(canRunPendingPromptImmediately("insert", "antigravity:gemini"), true);
   assert.equal(pendingPromptActionMode(null, "antigravity:gemini"), "insert");
-  assert.equal(pendingPromptActionMode({ status: "running" }, "codex-model"), "steer");
+  assert.equal(pendingPromptActionMode({ status: "running" }, "codex-model"), "queue");
+});
+
+
+test("steering fails closed for unknown engines and never ignores a queued effort change", () => {
+  assert.equal(pendingPromptActionMode({ status: "running", agent_model: "codex-model", reasoning_effort: "high" }, "codex-model", "low"), "queue");
+  assert.equal(canRunPendingPromptImmediately("steer", "codex-model"), false);
+  assert.equal(canRunPendingPromptImmediately("steer", "codex-model", "antigravity:gemini"), false);
+  assert.equal(canRunPendingPromptImmediately("steer", "codex-model", "codex-model", "high", "low"), false);
+  assert.equal(canRunPendingPromptImmediately("steer", "codex-model", "codex-model", "high", "high"), true);
 });

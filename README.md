@@ -10,6 +10,8 @@ An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persi
 
 The default build prioritizes a small, usable installation: one Codex CLI and one base Python runtime, with office tools available through the optional `documents` profile. Runtime images exclude browser acceptance scripts, backup copies and retired duplicate tool trees. See [building and storage](docs/BUILD_AND_STORAGE.md) for setup and dated capacity measurements.
 
+Live steering now requires Codex with the same model and reasoning effort as the active turn. Antigravity additions stay queued; the composer explains image-file handling and the bounded cross-engine context handoff. Login and conversation menus scroll on short displays, chat text keeps the chosen size, and opportunity sidebar navigation stays in its section menu. [Upgrade notes](docs/UPGRADE_20261104.md).
+
 ## What it includes
 
 - A responsive React chat interface for Codex CLI

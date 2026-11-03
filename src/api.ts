@@ -217,7 +217,7 @@ export type ComposerDraft = {
   created_at: string;
   updated_at: string;
 };
-export type Job = { id: string; status: string; conversation_id: string; agent_model?: string; error?: string | null; updated_at?: string; queuePosition?: number };
+export type Job = { id: string; status: string; conversation_id: string; agent_model?: string; reasoning_effort?: ReasoningEffort; error?: string | null; updated_at?: string; queuePosition?: number };
 export type WakePlan = {
   id: string;
   conversation_id: string;

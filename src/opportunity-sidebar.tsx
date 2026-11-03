@@ -49,6 +49,7 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
   const drag = useRef<{ source: string; x: number; y: number; pointer: number; target?: string; placement?: Placement } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null), trigger = useRef<HTMLButtonElement | null>(null);
   const search = query.trim().toLocaleLowerCase();
+  // Render every matching topic; archived/search-excluded topics are not collapsed items.
   const shown = topics.filter(t => (archives || !t.archived_at) && t.name.toLocaleLowerCase().includes(search));
   const sortable = !search && !moving;
   const refresh = useCallback(async () => {
@@ -159,8 +160,6 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
     </div>)}
     {(error || actionError) && <div className="opportunity-sidebar-error" role="alert"><span>{actionError || error}</span><button type="button" onClick={() => { setActionError(''); void refresh(); }}>重试读取主题</button></div>}
     {!loading && !error && !shown.length && (search ? <div className="project-empty">没有匹配的机会主题</div> : <button className="para-sidebar-empty" onClick={onCreate}>新建第一个主题</button>)}
-    <button className="para-sidebar-empty" aria-current={selected === '' ? 'page' : undefined} onClick={() => onOpen('')}>查看全部主题</button>
-    {topics.some(t => t.archived_at) && <button className="para-sidebar-empty" aria-pressed={archives} onClick={() => setArchives(!archives)}>{archives ? '隐藏归档主题' : '查看归档主题'}</button>}
     {menu && (menuTopic || menu.id === 'section') && createPortal(<div ref={menuRef} className="project-menu-panel opportunity-topic-menu" role="menu" aria-label="主题操作" style={{ top: menu.top, left: menu.left }}>
       {menuTopic ? <><button type="button" role="menuitem" onClick={() => showAction(menuTopic, 'rename')}><Pencil size={16} /><span>改名</span></button>
       <button type="button" role="menuitem" className={menuTopic.archived_at ? '' : 'danger'} onClick={() => showAction(menuTopic, menuTopic.archived_at ? 'restore' : 'archive')}>{menuTopic.archived_at ? <RotateCcw size={16} /> : <Archive size={16} />}<span>{menuTopic.archived_at ? '恢复主题' : '归档主题'}</span></button></> : <><button role="menuitem" onClick={() => {setMenu(null); onCreate();}}><Plus size={16}/><span>新建机会主题</span></button><button role="menuitem" onClick={() => {setMenu(null); onOpen('');}}><Lightbulb size={16}/><span>查看全部主题</span></button><button role="menuitem" onClick={() => {setMenu(null); setArchives(!archives);}}><Archive size={16}/><span>{archives ? '隐藏归档主题' : '查看归档主题'}</span></button></>}

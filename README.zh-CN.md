@@ -10,6 +10,8 @@ Codex Web 是一个非官方、自托管的 OpenAI Codex CLI 网页工作台。�
 
 默认是基础运行镜像；LibreOffice、字体、Poppler 与 Python 文档库通过 `documents` 构建目标选装。基础镜像保留 FFmpeg 与 Python/uv；任务可按需安装临时 Python 包。构建使用专用 builder 并自动收尾，运行镜像只带必需的启动和工具脚本，不携带浏览器验收脚本、备份副本或旧版重复运行环境。镜像常驻、构建峰值、缓存、swap 和用户数据须分开计算，详见[构建、容量与安全清理](docs/BUILD_AND_STORAGE.md)。2026-10-14 的 Linux amd64 干净安装实测：基础镜像约 1.53 GB，收尾后的应用安装约 1.87 GB，构建时 Docker 目录观测峰值约 6.01 GB；不含 OS、Docker 安装、swap、备份和用户数据。
 
+运行中引导只接受与当前 Codex 任务相同模型、相同思考深度的请求；Antigravity 补充消息继续排队，输入区说明图片文件及跨引擎有限历史交接。矮屏登录页和会话菜单可滚动，聊天字号保持所选大小，机会侧栏入口集中在分区菜单。 [Upgrade notes](docs/UPGRADE_20261104.md).
+
 ## 快速开始
 
 面向新云服务器的完整部署、登录、备份、更新与验收步骤，请参阅 [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)。想先按“基础版 → 逐项询问扩展”的方式搭建，请阅读[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。公开版网页登录始终使用 `.env` 中的 `APP_USERNAME` 与 `APP_PASSWORD_HASH`；本仓库不提供手机号或短信登录。
