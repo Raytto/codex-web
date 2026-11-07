@@ -2,9 +2,9 @@
 
 [中文（默认）](README.md) · **English**
 
-A self-hosted browser workspace for Codex CLI. Start tasks from a computer or phone, work with projects and files, and return later to inspect their results.
+A self-hosted AI workspace built on Codex CLI: **speak your requests, run tasks on your own computers, and automate recurring work.**
 
-Conversations, drafts, attachments, queued requests and execution records persist on your server. The base installation uses username/password login and runs Codex under a separate, unprivileged tenant identity. Configure extensions individually when you need other computers, voice transcription or remote cold storage.
+Use it from a desktop or mobile browser, with conversations, files and execution records stored on your own server. Configure voice input, remote computers and other extensions as needed.
 
 > Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
 
@@ -12,24 +12,19 @@ Conversations, drafts, attachments, queued requests and execution records persis
 
 ## What you can do
 
-| Use case | Current capabilities |
-| --- | --- |
-| Continue working over time | Persistent conversations and drafts, editable/reorderable pending prompts, live work journals, interruption summaries, archive and restore |
-| Long-running work and automation | One-shot timed/event-driven continuation; project schedules, time zones and execution history; live steering for Codex |
-| Project work | Project directories, conversation moves, project skills and cross-project search; optional boards, opportunity cards and judgment book |
-| Files and reading | Attachments and resumable uploads, Markdown/HTML/PDF/EPUB previews, questions about selected document text, math, revocable public links and sandboxed interactive HTML |
-| Desktop and mobile | Responsive layout, draft restoration across devices, unread results, theme and text-size settings |
-| Additional executors | Explicitly configured host bridges, Remote Workers and Gemini / Antigravity on supported nodes |
+- **Voice input**: Speak a request; the recording is transcribed and sent to the agent.
+- **Remote computers**: Send work to your own computers, use their files and tools, and retrieve results from the browser.
+- **Scheduled tasks**: Run daily, weekly or at intervals for routine checks, research and reports.
+- **Opportunity cards**: Discover and shortlist ideas by topic, refine recommendations with feedback, and research promising cards.
+- **Task continuation**: Continue at a scheduled time or after an event, and return later to check progress.
+- **Follow-up instructions**: Add requirements while a task runs; edit or reorder work that has not started.
+- **Document Q&A**: Read uploaded material, ask about selected text, and preview or share generated reports.
+- **Multiple engines**: Choose Codex, Gemini or Antigravity for each task in the same workspace.
+- **Project workspaces**: Organize conversations, files and skills by project, and continue across desktop and mobile.
 
-Models and reasoning levels come from the selected executor's authenticated catalog. Live Codex steering requires the same model and reasoning level as the active request. Gemini / Antigravity additions remain queued for the next request. Switching engines transfers bounded conversation context, not the complete native session.
+> **PP Dot · Long-term coordinator (not yet in the public edition)**: Coordinate long-term goals, delegate work across projects and follow up on results. This module has not yet been brought into the public repository.
 
-```mermaid
-flowchart LR
-    browser["Browser: desktop / mobile"] --> app["Codex Web: UI, API, queue"]
-    app <--> state[("Persistent state: SQLite, files, conversations")]
-    app --> tenant["Isolated tenant → Codex CLI"]
-    app -. "Explicit configuration" .-> remote["Host bridge / Remote Worker"]
-```
+Voice requires a configured transcription service; remote computers need an installed and authorized Remote Worker; opportunity cards must be enabled for the account; Gemini / Antigravity need supported, configured executors. See [optional capabilities](#optional-capabilities).
 
 ## Quick start
 
@@ -141,12 +136,22 @@ CODEX_WEB_BUILD_TARGET=documents ./scripts/build-image.sh
 
 The build helper reads exported shell variables, not the Compose `.env`. The example's `transcription-model` and `memory-model` are placeholders: replace them with models your provider supports. See the [deployment-options guide](docs/DEPLOYMENT_OPTIONS.md) for complete setup and acceptance checks.
 
+Models and reasoning levels come from the selected executor's authenticated catalog. Live Codex steering requires the same model and reasoning level as the active request. Gemini / Antigravity additions remain queued for the next request. Switching engines transfers bounded conversation context, not the complete native session.
+
 ## Task and data persistence
 
 - Each conversation is serial; different conversations may run concurrently. Regular-account jobs are subject to global, per-user and per-executor limits such as `MAX_GLOBAL_RUNNING_JOBS`, `MAX_RUNNING_JOBS_PER_USER` and `MAX_RUNNING_JOBS_PER_EXECUTOR`.
 - Closing a browser does not delete server-side queued work, drafts or files. Continuation plans survive service restarts. A forcibly interrupted model process leaves recovery records; arbitrary processes are not guaranteed to resume automatically from their interruption point.
 - Default state lives under `.state/data` and `.state/tenants`, including SQLite, account-isolated files and Codex login/session state. Back up these directories independently of source code.
 - Default Compose mounts no Docker socket or host project directory and starts no host-root bridge. Read the [security model](docs/SECURITY.md) before enabling trusted executors.
+
+```mermaid
+flowchart LR
+    browser["Browser: desktop / mobile"] --> app["Codex Web: UI, API, queue"]
+    app <--> state[("Persistent state: SQLite, files, conversations")]
+    app --> tenant["Isolated tenant → Codex CLI"]
+    app -. "Explicit configuration" .-> remote["Host bridge / Remote Worker"]
+```
 
 The browser handles interaction, the server persists state, and the selected executor runs the work. See [architecture](docs/ARCHITECTURE.md) for details.
 
