@@ -6,3 +6,5 @@
 - Run `npm test` before submitting changes.
 
 - For new or redesigned dialogs, follow `docs/UI_DIALOG_GUIDELINES.md` and reuse the semantic typography tokens and `ui-dialog` baseline in `src/dialog-tokens.css`.
+
+- Keep `README.md` as the canonical Chinese overview and `README.en.md` as its English counterpart. `README.zh-CN.md` is a compatibility entry. Update both full overviews against current public code; keep release history in the linked guides.

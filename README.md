@@ -1,361 +1,194 @@
-# Codex Web
+﻿# Codex Web
 
-> Branch notice: the former `master` branch is no longer maintained and has been removed. Use the `main` branch for all clones, updates, and contributions.
+**中文** · [English](README.en.md)
 
-An unofficial, self-hosted web workspace for the OpenAI Codex CLI. It adds persistent conversations and unsent drafts, file uploads and deliverables, server-side task queues, live steering, durable timed or event-driven continuation, resumable interruption history, conversation archiving, automatic titles, adjustable reading size, light/dark/system appearance modes, and optional voice transcription.
+把 Codex CLI 变成可以在浏览器中使用的自托管工作台：在电脑或手机上发起任务，管理项目、文件和执行记录，关闭页面后仍可回来查看结果。
 
-> Codex Web is an independent community project. It is not affiliated with, endorsed by, or supported by OpenAI.
+会话、草稿、附件、队列和执行记录保存在你自己的服务器上。基础部署使用用户名与密码登录，Codex 在独立的低权限租户进程中执行。需要连接其他电脑、使用语音或启用云端冷存储时，再分别配置扩展。
 
-[中文说明](README.zh-CN.md)
+> 本项目由社区独立开发，与 OpenAI 无隶属关系，未获得 OpenAI 的背书或支持。
 
-The default build prioritizes a small, usable installation: one Codex CLI and one base Python runtime, with office tools available through the optional `documents` profile. Runtime images exclude browser acceptance scripts, backup copies and retired duplicate tool trees. See [building and storage](docs/BUILD_AND_STORAGE.md) for setup and dated capacity measurements.
+[快速开始](#快速开始) · [可选能力](#可选能力) · [文档导航](#文档导航) · [云服务器部署手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
 
-Live steering now requires Codex with the same model and reasoning effort as the active turn. Antigravity additions stay queued; the composer explains image-file handling and the bounded cross-engine context handoff. Login and conversation menus scroll on short displays, chat text keeps the chosen size, and opportunity sidebar navigation stays in its section menu. [Upgrade notes](docs/UPGRADE_20261104.md).
+## 主要能力
 
-## What it includes
+| 场景 | 当前支持 |
+| --- | --- |
+| 持续处理任务 | 会话与草稿持久化、可编辑和重排的待发送队列、实时工作记录、停止后的中断摘要、归档与恢复 |
+| 长流程与自动化 | 一次性定时或外部事件续跑；项目周期任务、时区与执行记录；运行中向 Codex 补充指令 |
+| 项目工作 | 项目目录、会话移动、项目技能、跨项目搜索；可选项目看板、机会卡片与判断簿 |
+| 文件交付与阅读 | 附件和大文件续传、Markdown/HTML/PDF/EPUB 等预览、文档选区提问、公式、可撤销的公开分享、受控交互 HTML |
+| 电脑与手机 | 响应式界面、草稿跨设备恢复、未读结果、主题和字号设置 |
+| 扩展执行能力 | 显式配置的宿主桥、Remote Worker，以及受支持节点上的 Gemini / Antigravity 引擎 |
 
-- A responsive React chat interface for Codex CLI
-- Server-persistent queued prompts with reorder, edit, delete, and steer actions
-- Persistent attachments, cancellable/resumable uploads, generated-image capture, and compact server thumbnails
-- Authenticated Markdown reading, sandboxed HTML previews, explicit UTF-8 text responses, and direct original-file downloads
-- Reader Agent panel for asking about the current document, with browser-owned text selection and removable quoted references
-- Reader selection remains owned by the browser during mobile Safari viewport/loupe changes, while the preview header keeps navigation, title, and actions in stable columns
-- PDF and EPUB readers use bounded paginated rendering; selections, highlights, and notes rebind to durable text anchors across page turns, remounts, and Safari/WebKit text-layer quirks
-- A consistent preview action for Markdown, HTML, images, PDF, plain text, and CSV deliverables
-- Opt-in fixed public links for finished Markdown/HTML reports, with safe same-delivery image rewriting and revocation
-- Self-contained responsive HTML as the default format for reports and other long-form reading
-- Lazy-loaded LaTeX math rendering in Markdown readers, with fenced and inline code left untouched
-- Server-persistent unsent text, quotes, and attachments, restored across conversations, browsers, and devices
-- Codex thread persistence across browser restarts
-- Soft-deleted conversation audit records while workspace files are removed
-- Archive and restore completed conversations without deleting their history or files
-- Cancellation that retains a concise history of completed work so the next turn can resume from it
-- Explicit interrupted-task messages after an unexpected service restart, without unsafe automatic retries
-- Graceful container shutdown that drains in-flight Codex work and leaves queued tasks persisted
-- Automatic short task titles from a dedicated low-reasoning Codex Luna worker, with manual titles taking precedence and SQLite audit records for every naming attempt
-- A durable live work journal with retained stage feedback and grouped command steps
-- Live child-Agent status with parent/child turn isolation, retained paths, and terminal summaries
-- Running work journals expand inline with the page instead of creating a nested vertical scroller
-- Unread-result markers for completed conversations until their detail is viewed
-- Opening an unread conversation positions the reader at the matching user prompt, not only the reply
-- Distinct running and queued indicators, plus a stable overflow menu for task actions
-- One-shot timed or external-event continuation plans that survive browser and service restarts, with same/new-conversation targeting and a persisted model/reasoning selection
-- Agent-created continuation plans inherit the current job selection unless the user explicitly requests a model or reasoning override
-- Pending prompts remain queued while a continuation plan is armed; users can explicitly insert one early or steer a currently running turn
-- A 500 MiB Codex rollout warning that suggests archiving very long conversations
-- Per-conversation context-window usage and current Codex package quota in the capacity menu
-- Light, dark, and system-following appearance modes
-- Select message text and attach it as a removable, server-persisted reference to a new Agent question
-- Copy an assistant reply from its compact message action without selecting the whole bubble
-- Load only the latest 30 messages initially, then fetch older pages at the top without moving the reader's position
-- Optional Alibaba Cloud DashScope voice transcription
-- A ten-minute recording-limit notice and a 650 ms long-press shortcut on an empty mobile composer
-- Bounded automatic retries for transient voice-transcription connection and upstream failures
-- Failed voice uploads keep the complete recording in browser IndexedDB for 24 hours, with an explicit retry/delete action; UUID receipts make a retry safe after a lost response
-- Bounded transcription context from drafts, attachment names, text-file heads, recent messages, and a small number of images
-- A fixed mobile app shell with inner scrolling for more reliable iPhone/iPad Safari behavior
-- Touch reordering for pending prompts, bounded session-restore retries, and resilient asynchronous math loading
-- Mobile session restoration keeps the loading surface visible until the saved conversation is selected, avoiding a transient welcome-screen flash
-- Repeated “new task” clicks reuse a truly empty conversation and temporarily promote it to the top; later activity naturally takes priority
-- Capacity-only failures retry until user cancellation: no-progress failures retry the request, while an already-started task continues in the same thread without replaying its original prompt or attachments
-- Scheduled prompts use a distinct clock identity, and relative postponements accumulate from the plan's current deadline
-- A dedicated Unix identity for the Codex worker inside the container
-- A managed local spreadsheet skill backed by the pinned openpyxl/pandas runtime; detailed Excel rules are injected only for matching attachments
-- A managed `html-report` skill with its style guide, self-contained report template, and validator; new tenants receive it automatically with the managed skills
-- Optional Apps, connectors, and Goals remain off unless the conversation explicitly asks for them; multi-agent is available by default and follows the user's instruction when single-agent work is preferred
-- Project mode, project sidebar, cross-project conversation moves, and project-scoped Skills
-- Optional host/root bridge and Remote Worker gateway for explicitly trusted executors
-- Optional account management and shared Codex authentication policy (credentials stay in operator state)
-- Optional personal context and editable memory files (the repository ships empty templates only)
-- Optional encrypted cold storage for conversations and voice recordings; it is inert without a configured provider and key files
-- Queue-aware self-publish coordinator and matching `skills/self-publish` instructions for operators who choose to install them
-
-## Deployment choices
-
-Start with the base Compose profile, then opt in to extensions one at a time.
-Voice, personal-memory extraction, the host/root bridge, Remote Worker, cold
-storage, shared Codex authentication, and self-publish are all shipped as
-optional modules but remain inert until their configuration is present. The
-[deployment options guide](docs/DEPLOYMENT_OPTIONS.md) gives the yes/no
-questionnaire, authority and data disclosures, prerequisites, acceptance tests,
-and reversible disable steps. The [full AI runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
-applies the same sequence to a new Ubuntu server.
-
-## How the system fits together
-
-Codex Web is the reusable, self-hosted core of a larger personal Agent workstation design. The core turns the Codex CLI into a durable web service: the browser can disappear, but conversations, drafts, queued prompts, attachments, progress events, thread IDs, and finished files remain on the server.
-
-The full Codex Web deployment pattern can add a second execution tier for an administrator. Restricted member accounts still run inside isolated Docker tenants, while an administrator can route project work either to a trusted server-side executor or to a Remote Worker on another computer. The optional modules are shipped as reusable code, but their sockets, tokens, provider endpoints, cloud binaries, and credentials are disabled by default and must be configured by each operator.
-
-### Roles and execution boundaries
-
-| Role | Execution location | Accessible state | Intended use |
-| --- | --- | --- | --- |
-| Restricted member | Non-root tenant worker inside Docker | Its own conversations, library, uploads, outputs, and Codex Home | A friend or team member who should not access the host or another tenant |
-| Public owner | The same isolated tenant model | Its own self-hosted workspace and service settings | The default single-owner setup in this repository |
-| Codex Web administrator | Explicitly selected local or remote project executor | Projects the administrator has added, plus their retained task history | Managing trusted server projects and Codex sessions on connected computers |
+模型及思考深度以所选执行器的实际账号目录为准。Codex 的运行中引导要求与当前任务使用相同模型和思考深度；Gemini / Antigravity 的补充消息排队等待下一轮。切换引擎会传递有界的历史上下文，不等于迁移整个原生会话。
 
 ```mermaid
-flowchart TB
-    member["Restricted member"] --> web
-    owner["Public owner"] --> web
-    admin["Codex Web administrator"] --> web
-
-    subgraph core["Public Codex Web core"]
-        web["React UI + Express API"]
-        db[("SQLite<br/>users, conversations, queue, events")]
-        queue["Durable task dispatcher"]
-        supervisor["Local supervisor"]
-        tenant["Tenant worker<br/>dedicated non-root UID"]
-        tenantState[("Tenant volumes<br/>library, files, Codex Home")]
-
-        web --> db
-        web --> queue --> supervisor --> tenant
-        tenant <--> tenantState
-    end
-
-    tenant --> tenantCodex["Codex CLI"]
-
-    subgraph extension["Codex Web administrator extension"]
-        router["Project + executor router"]
-        hostBridge["Trusted local host bridge"]
-        gateway["Remote Worker WSS gateway"]
-    end
-
-    admin -. "project mode" .-> router
-    router --> hostBridge --> hostCodex["Server-side Codex"]
-    router --> gateway
-    remoteWorker["Remote Worker"] -. "opens authenticated WSS" .-> gateway
-    gateway -->|"structured requests"| remoteWorker
-    remoteWorker --> appServer["Local codex app-server"]
-    appServer <--> remoteState[("Remote project<br/>and user Codex Home")]
-
-    classDef extensionNode fill:#fff7e8,stroke:#d89b35,color:#583b0a;
-    class router,hostBridge,gateway,hostCodex,remoteWorker,appServer,remoteState extensionNode;
+flowchart LR
+    browser["浏览器：电脑 / 手机"] --> app["Codex Web：界面、API、队列"]
+    app <--> state[("本机持久状态：SQLite、文件、会话")]
+    app --> tenant["隔离租户 → Codex CLI"]
+    app -. "显式配置后" .-> remote["宿主桥 / Remote Worker"]
 ```
 
-The important boundary is the executor, not the browser account alone. A restricted account cannot turn a web request into host access: its job is validated, handed to a fixed Unix identity, and confined to that tenant's paths. Administrator project mode is a separate, explicit trust decision and is therefore kept out of the public default deployment.
+## 快速开始
 
-### Remote computer execution
+以下是 **Linux + Docker 的基础部署**，在可使用 Docker 的 Bash 终端执行。需要 Git、Docker Engine、Compose v2、Buildx，以及能够登录 Codex CLI 的账号；宿主无需安装 Node.js 或 npm 开发依赖。
 
-A Remote Worker does not expose an inbound shell, RDP endpoint, or generic tunnel. It initiates an application-level WSS connection to the server, advertises its runtime capabilities, and executes only requests addressed to a registered project. Codex runs under the interactive user on that computer, with the real project directory as `cwd` and that user's normal Codex Home, so web-started and desktop-started threads share the same local Codex history.
+建议至少准备 4 GB 内存，文档处理等较重任务使用 8 GB 或更多。构建、升级和回滚还需要额外磁盘空间；[构建与容量指南](docs/BUILD_AND_STORAGE.md)区分了镜像、构建峰值和用户数据，旧测量不代表当前安装大小。
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor A as Administrator
-    participant API as Codex Web API
-    participant G as Worker gateway
-    participant W as Remote Worker
-    participant C as Local codex app-server
-    participant P as Remote project + Codex Home
+### 1. 获取源码并构建
 
-    W->>G: Establish outbound authenticated WSS
-    A->>API: Open project and submit a task
-    API->>API: Persist prompt and queue state
-    API->>G: Dispatch to selected executor
-    G->>W: Start or resume the project thread
-    W->>C: Run with the project's real cwd
-    C->>P: Read/write files and thread state
-    C-->>W: Stream progress and final response
-    W-->>G: Forward structured events
-    G-->>API: Persist events, messages, and thread ID
-    API-->>A: Live journal over SSE
-    A->>API: Refresh tasks created by the desktop app
-    API->>G: Request thread/list and thread/read
-    G->>W: Read matching cwd threads
-    W->>C: List and read matching threads
-    C-->>W: Return thread, turn, and item data
-    W-->>G: Return paged thread updates
-    G-->>API: Merge idempotently, newest first
+```bash
+git clone --branch main https://github.com/Raytto/codex-web.git
+cd codex-web
+./scripts/build-image.sh
+cp .env.example .env
+chmod 600 .env
 ```
 
-Remote synchronization is deliberately explicit rather than pretending to be a distributed filesystem. Thread, turn, and item identifiers make imports idempotent; offline machines keep their project history visible, while new work waits until the executor is available. An archived project is hidden without deleting its tasks and stops receiving explicit synchronization until the same executor and folder are added again.
+请使用 `main`。构建脚本从选定 Git 提交导出源码，使用有资源上限的临时 Buildx builder，并在结束时清理自己的构建缓存。默认生成 `codex-web:local` 基础镜像；已有本地修改应先提交或妥善保留。
 
-### Durable task lifecycle
+### 2. 生成登录密码哈希和会话密钥
 
-The browser is a control surface, not the owner of task state. Drafts and their attachments are saved before submission; queued prompts can be edited, reordered, deleted, or converted into live steering. Different conversations may run concurrently, while each conversation remains serial. Progress is compacted into a bounded journal with important stage feedback retained; the journal grows with the main page and disappears when the final Agent response is stored.
+在终端输入至少 12 个字符的网页登录密码，输入不会回显：
 
-```mermaid
-stateDiagram-v2
-    [*] --> Draft
-    Draft --> Queued: submit
-    Queued --> Queued: edit / reorder
-    Queued --> Running: executor available
-    Running --> Running: progress / steer
-    Running --> Completed: final response persisted
-    Running --> Cancelled: user stops task
-    Cancelled --> Queued: continue from retained summary
-    Completed --> Archived: archive
-    Archived --> Completed: restore
-    Completed --> [*]
+```bash
+read -r -s -p 'Web password (at least 12 characters): ' web_password
+printf '\n'
+printf '%s' "$web_password" | docker run --rm -i --network none \
+  --entrypoint node codex-web:local scripts/hash-password.mjs
+unset web_password
 ```
 
-This architecture separates four kinds of durable state:
+再生成独立的随机会话密钥：
 
-- application state in SQLite: identities, sessions, conversations, messages, drafts, jobs, events, ordering, and thread references;
-- tenant knowledge and files: each user's library, uploads, outputs, and immutable deliverables;
-- Codex state: login credentials and thread history inside the executor's own Codex Home;
-- runtime state: short-lived per-job directories and processes that can be reconstructed after a restart.
+```bash
+docker run --rm --network none --entrypoint node codex-web:local \
+  -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
 
-Long-running workflows may explicitly register a one-shot continuation plan. The scheduler and external event receipts are durable, but the Agent turn itself is never kept alive with `sleep`; see [Durable continuation](docs/WAKE_AUTOMATION.md).
+### 3. 编辑私有 `.env`
 
-The default Compose file has no host bridge mount, Remote Worker enrollment token, cloud provider, or shared-auth credential. Enabling any extension is an explicit trust decision; review [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) before mounting sockets or adding credentials.
+| 配置 | 填写方式 |
+| --- | --- |
+| `APP_USERNAME` | 网页登录名，例如 `admin`。若以后启用宿主桥或 Remote Worker，普通账号不要使用保留名 `owner` |
+| `APP_DISPLAY_NAME` | 网页显示名称 |
+| `APP_PASSWORD_HASH` | 上一步生成的 bcrypt 哈希；在 `.env` 中用单引号包住完整值，避免 `$` 被 Compose 插值 |
+| `SESSION_SECRET` | 上一步生成的随机会话密钥 |
+| `PUBLIC_BASE_URL` | 本机试用保留 `http://localhost:37821/codex-web`；公网部署改成包含 `/codex-web` 的实际 HTTPS 地址 |
 
-## Requirements
+网页登录与 Codex 授权是两回事。`.env` 只保存在自己的安装环境，不提交到 Git；未使用的语音、个人记忆、宿主桥等配置保持空值。
 
-- Docker Engine with Docker Compose v2
-- At least 4 GB RAM; 8 GB is recommended for document-heavy tasks
-- A Codex account that can sign in through the Codex CLI
-- Git and Docker Buildx; Node.js 22+ only for local development/tests
+### 4. 初始化权限并启动
 
-The measured Linux amd64 base image is about 1.53 GB; a clean installation after build cleanup is about 1.87 GB, including retained build tooling. The observed Docker build peak was 6.01 GB. These figures exclude OS/Docker installation, swap, backups and user data; see [measurement boundaries and closeout](docs/BUILD_AND_STORAGE.md#measured-clean-install-example-2026-10-14).
+```bash
+sudo chown 10001:10001 .env
+sudo chmod 600 .env
+sudo docker network inspect codex-web-egress >/dev/null 2>&1 \
+  || sudo docker network create codex-web-egress
+sudo docker compose config --quiet
+sudo docker compose up -d --no-build
+sudo docker compose ps
+```
 
-## Quick start
+后续编辑 `.env` 使用有权限的编辑器，Compose 命令使用 `sudo` 或宿主 root。`init-state` 会先初始化数据目录权限，再启动应用；Web 进程读取私有配置，租户执行进程使用不同的 Unix 身份。
 
-> Deploying Codex Web on a new cloud server? Follow the [AI cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md) and its [deployment options guide](docs/DEPLOYMENT_OPTIONS.md). They cover SSH administration, the base owner account, Codex authentication, Docker, Nginx, optional domain/TLS, backups, updates, and the yes/no flow for each extension. The steps below are the minimal local quick start.
+等待应用健康后检查：
 
-1. Build the reviewed `main` commit with a temporary, isolated builder:
+```bash
+curl --fail http://127.0.0.1:37821/codex-web/api/health
+```
 
-   ```bash
-   ./scripts/build-image.sh
-   cp .env.example .env
-   chmod 600 .env
-   ```
+### 5. 为基础租户登录 Codex
 
-2. Generate the password hash from this image using the [stdin password command](docs/BUILD_AND_STORAGE.md#new-production-installation). No host `npm ci` is needed. Store it in `APP_PASSWORD_HASH`, set a random `SESSION_SECRET` of at least 32 characters, and set `APP_USERNAME`/`APP_DISPLAY_NAME` in `.env`.
+```bash
+sudo docker compose exec --user 11001:11001 \
+  -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
+  -e CODEX_HOME=/app/tenants/00000000-0000-4000-8000-000000000001/codex-home \
+  app codex login --device-auth
+```
 
-3. After editing `.env`, run `sudo chown 10001:10001 .env && sudo chmod 600 .env` so only the web UID can read it. Create the network and start the image:
+按命令输出完成设备授权，再打开 **http://localhost:37821/codex-web/**，使用第 3 步的网页登录名和第 2 步输入的原始密码登录。先运行一个简单任务，并验证文件上传、下载和重启后的历史保留。
 
-   ```bash
-   docker network inspect codex-web-egress >/dev/null 2>&1 \
-     || docker network create codex-web-egress
-   sudo docker compose up -d --no-build
-   ```
+如果服务装在远程服务器上，`localhost` 指那台服务器。可以先用 SSH 端口转发进行试用：
 
-4. Follow the [build, optional tools, capacity and cleanup guide](docs/BUILD_AND_STORAGE.md). The default base image excludes office tools; choose `documents` if needed. The build helper removes its own build/test cache. Application footprint, build peak, OS, swap and user data are separate budgets.
+```bash
+ssh -L 37821:127.0.0.1:37821 user@your-server
+```
 
-5. Sign the isolated owner worker into Codex:
+公网访问请按[部署说明](docs/DEPLOYMENT.md#reverse-proxy)设置 HTTPS 反向代理，保留 `/codex-web/` 路径及 SSE/WebSocket 支持。默认端口仅绑定回环地址。
 
-   ```bash
-   sudo docker compose exec --user 11001:11001 \
-     -e HOME=/app/tenants/00000000-0000-4000-8000-000000000001 \
-     -e CODEX_HOME=/app/tenants/00000000-0000-4000-8000-000000000001/codex-home \
-     app codex login --device-auth
-   ```
+## 可选能力
 
-6. Open [http://localhost:37821/codex-web/](http://localhost:37821/codex-web/).
+基础镜像只提供主应用、一个固定版本的 Codex CLI、Python/uv、Git 和 FFmpeg 等基础运行工具。扩展按需配置；仓库包含实现不代表已经启用。
 
-State is stored in bind-mounted directories under `.state/` by default. Closing the browser does not remove queued work, attachments, unsent composer drafts, or archived conversations.
+| 能力 | 启用条件与说明 |
+| --- | --- |
+| Office、PDF 转换及文档库 | 构建 `documents` 镜像，增加 LibreOffice、Poppler、字体和 Python 文档/数据包；见[构建指南](docs/BUILD_AND_STORAGE.md) |
+| 语音转写 | 配置自己的 `DASHSCOPE_API_KEY`、HTTPS `DASHSCOPE_BASE_URL`、可用的 `DASHSCOPE_ASR_MODEL` 和 HTTPS `PUBLIC_BASE_URL`；音频和有界上下文会发送到所配置的服务 |
+| 个人记忆提取 | 配置 `PERSONAL_MEMORY_API_KEY`、`PERSONAL_MEMORY_BASE_URL` 及模型；未配置时不调用外部提取服务 |
+| 宿主桥 / Remote Worker | 显式选择可信执行器、配置身份和路径；详见[分层部署](docs/DEPLOYMENT_OPTIONS.md)与[Worker 指南](remote-worker/README.md) |
+| Gemini / Antigravity | 在已配置的受支持节点上显式添加账号并授权；基础镜像不附带额外模型 CLI；见[多引擎说明](docs/MULTI_ENGINE.md) |
+| 冷存储 / 共享 Codex 认证 | 分别配置存储供应商与加密密钥，或认证来源与策略；默认不附带云盘、密钥或登录态 |
+| 项目看板、机会卡片、判断簿 | 按账号在功能选择中启用；公开仓库不预置私人项目、主题或业务记录 |
 
-For an auditable source-based publish, enqueue a clean commit with
-`deploy/codex-web-request-rebuild` and let `deploy/codex-web-rebuild-coordinator`
-consume it, or install the optional `codex-web-self-maintain.service` and
-`.path` templates. Queue, status, and rollback evidence stay in the operator's
-state root and are never committed.
+需要文档工具时，使用相同构建入口：
 
-## Optional voice transcription
+```bash
+CODEX_WEB_BUILD_TARGET=documents ./scripts/build-image.sh
+```
 
-Set your own `DASHSCOPE_API_KEY`, HTTPS `DASHSCOPE_BASE_URL` and HTTPS `PUBLIC_BASE_URL` in `.env` to enable voice transcription. Choose a compatible model with `DASHSCOPE_ASR_MODEL`; empty credentials or endpoint keep voice disabled. Microphone access requires a secure browser context.
+构建脚本读取导出的 shell 环境变量，不能只修改 `.env` 就假定它会选择 `documents`。语音模板中的 `transcription-model`、记忆模板中的 `memory-model` 是占位值，启用时应替换为供应商实际支持的模型。完整配置与验收步骤见[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。
 
-Audio is uploaded to your server first and then sent to the DashScope endpoint configured by `DASHSCOPE_BASE_URL`. Leave the key empty to disable the feature completely.
+## 任务和数据如何保存
 
-Sending a recording from the main task composer durably accepts it before cloud recognition. Progress, transcript and failure/retry stay in one pending-task queue item, including after refresh; a single ordinary chat message appears only when the task is dispatched. See [durable voice submission](docs/VOICE_SEND.md).
+- 同一会话串行，多会话可并行；普通账号调度受全局、用户、执行器等限制，相关配置包括 `MAX_GLOBAL_RUNNING_JOBS`、`MAX_RUNNING_JOBS_PER_USER` 和 `MAX_RUNNING_JOBS_PER_EXECUTOR`。
+- 关闭浏览器不会删除服务器上的队列、草稿或文件。持久续跑计划可以跨服务重启保留；强制中断的模型执行会留下恢复记录，不保证任意进程能够从中断点自动继续。
+- 默认状态位于 `.state/data` 和 `.state/tenants`，包括应用数据库、账号隔离的文件及 Codex 登录/会话状态。它们需要单独备份，不属于源码。
+- 默认 Compose 不挂载 Docker socket 或宿主项目目录，也不启动宿主 root bridge。启用可信执行器前先阅读[安全模型](docs/SECURITY.md)。
 
-For the stop-and-proofread workflow, before an upload starts, the browser stores the complete recording in a per-user, per-conversation IndexedDB draft. If the network disappears while the request is in flight, the composer keeps the recording and shows a retry action instead of discarding it. A retry reuses the same client recording UUID; the server records the audio hash/size and returns the original transcription when the first request already completed. Receipts and browser drafts are pruned after 24 hours; deleting the draft is always available locally.
+浏览器负责交互，服务器持久化状态，所选执行器负责实际运行；更完整的关系见[架构说明](docs/ARCHITECTURE.md)。
 
-The optional spelling/topic context is bounded to about 500 tokens by default and shared across the draft, attachment names, the first 16 KiB of text attachments, recent messages, fixed technical terms, and up to two small images. Large unsent files are never copied wholesale into the transcription request. Tune the limits with `TRANSCRIPTION_CONTEXT_TOKEN_BUDGET`, `TRANSCRIPTION_CONTEXT_MAX_IMAGES`, and `TRANSCRIPTION_CONTEXT_MAX_IMAGE_BYTES`.
+## 升级与开发
 
-## Reverse proxy
+升级前备份状态目录和 `.env`，阅读对应[部署与迁移说明](docs/DEPLOYMENT.md#updating)。在干净的 `main` 工作树中：
 
-The container binds to loopback by default. Proxy `/codex-web/` to `http://127.0.0.1:37821/codex-web/` and preserve WebSocket/SSE-friendly buffering settings. See [Deployment](docs/DEPLOYMENT.md).
+```bash
+git pull --ff-only
+./scripts/build-image.sh
+sudo docker compose up -d --no-build
+```
 
-## Development
+需要受管发布时，可选用 `deploy/codex-web-request-rebuild` 与 `deploy/codex-web-rebuild-coordinator`，或安装 `codex-web-self-maintain.service` / `.path` 模板；这些不会随基础安装自动启用。发布队列、状态及回滚材料留在部署者的状态目录。
+
+本地开发需要 **Node.js ≥ 22.13.0**。填写本地 `.env` 后：
 
 ```bash
 npm ci
+npm run lint
 npm test
 npm run dev
 ```
 
-The default development URL is `http://127.0.0.1:5173/codex-web/`.
+开发页面默认位于 `http://127.0.0.1:5173/codex-web/`。`npm test` 构建并运行应用测试；Worker 有独立的 `npm run test:worker` 入口，需要先安装 `remote-worker` 的依赖。贡献方式见[CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## Security model
+## 文档导航
 
-Codex runs as a dedicated non-root Unix user by default. The default profile has
-no Docker socket, host filesystem bridge, host-root process, desktop Worker, or
-cloud provider credentials. Optional trusted-executor modules are present in the
-source but require an explicit operator decision and remain fail-closed without
-their socket, token, endpoint, provider CLI, and policy files. Review
-[Security](docs/SECURITY.md) and [Deployment choices](docs/DEPLOYMENT_OPTIONS.md)
-before exposing an instance to the internet.
+| 需要了解 | 文档 |
+| --- | --- |
+| 新云服务器从零部署 | [AI 云服务器部署与运维手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md) |
+| 镜像选择、构建、容量与清理 | [构建与存储](docs/BUILD_AND_STORAGE.md) |
+| 部署、反向代理、升级与备份 | [部署说明](docs/DEPLOYMENT.md) · [可选功能](docs/DEPLOYMENT_OPTIONS.md) |
+| 权限与系统结构 | [安全模型](docs/SECURITY.md) · [架构说明](docs/ARCHITECTURE.md) |
+| 定时续跑与项目计划 | [持久续跑](docs/WAKE_AUTOMATION.md) · [项目周期任务](docs/PROJECT_RECURRING_TASKS.md) |
+| 项目与个人辅助功能 | [项目看板](docs/features/PERSONAL_KANBAN.md) · [机会卡片](docs/OPPORTUNITY_CARDS.md) · [判断簿](docs/JUDGMENT_BOOK.md) |
+| 文档阅读与分享 | [阅读器](docs/READER_PROGRESSIVE_LOADING.md) · [公开分享](docs/PUBLIC_FILE_SHARING.md) · [交互 HTML](docs/WEB_PRESENTATIONS.md) |
+| 其他执行器与模型 | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
+| 最近一轮公开功能升级 | [2026-11-04 升级说明](docs/UPGRADE_20261104.md) |
 
-## License
+本页按当前公开 `main` 的实现维护；历史更新和迁移细节放在专题文档中。
+
+## 许可证
 
 [MIT](LICENSE)
-
-## Reliability updates (September 2026)
-
-- Capacity retries persist across restarts, release execution slots, retain process files and early outputs, and resume accepted input without repeating it. Internal continuation prompts stay out of chat.
-- Agent-generated commands and paths keep their original text. Chat file selections survive toolbar updates; reader selections retain their brightness in both themes and long quotes fit the composer.
-- Optional Remote Worker 1.19.3 adds independent device credentials, rotation/revocation, bounded startup cancellation and stale account-lock reconciliation on the selected executor.
-- Optional cold-storage maintenance processes every eligible item in a finite batch, isolates failures and retains verified encryption and the seven-day local grace period.
-- New task defaults prefer `gpt-6-astra` with `high` reasoning when supported by the executor catalog. Saved selections remain intact; unsupported choices use catalog fallback.
-
-Read [retry and device upgrade instructions](docs/JOB_RETRY_AND_DEVICE_CREDENTIALS.md), [cold-storage operations](docs/CONVERSATION_COLD_STORAGE.md), and [content fidelity](docs/AGENT_CONTENT_FIDELITY.md). Username/password Web login, `/codex-web`, and the default non-root tenant profile remain the public deployment contract.
-
-
-## Reader, project and recovery updates (September 30, 2026)
-
-- Empty, account-owned [PARA boards](docs/features/PARA_BOARD.md) organize ideas, projects, areas and durable resources. Collect messages/files, link conversations, and prepare a draft with a versioned project brief and explicitly selected material. Unified sidebar search covers boards, projects and conversations while preserving manual selection and normal pagination.
-- PDF/EPUB offer paged or continuous reading, page/chapter navigation and progress restoration. HTML/Markdown native selections survive the first drag, long gestures and React refreshes. Browser tabs use the article or conversation title followed by Codex Web.
-- [Durable task handoffs](docs/TASK_RECOVERY.md) preserve interrupted goals and bounded evidence across cancellation, capacity waits and restarts. Consecutive tasks wait for the prior Codex writer to exit; hidden answer streaming cannot displace visible progress.
-- Configured account administrators can inspect and explicitly redeem [reset credits](docs/CODEX_RESET_CREDITS.md). Worker 1.19.7 adds validated account refresh and bounded rollout-size queries; no account, credentials or device data is bundled.
-- Voice waits for Safari's final audio chunk, supports ten-minute recordings (30 MiB request ceiling), rejects incomplete streamed transcripts, and retains explicit keyword suppression. The configured provider remains an operator choice.
-
-The default Compose remains a low-privilege tenant deployment with username/password login at `/codex-web`. PARA starts with no data and can be disabled using `CWW_PARA_ENABLED=false`; integrations still require their own explicit configuration. See the [upgrade checklist](docs/DEPLOYMENT.md#september-30-2026-upgrade-checks).
-
-## Project boards, share expiry and reader loading (October 3, 2026)
-
-- [Project boards](docs/features/PERSONAL_KANBAN.md) replace the earlier PARA navigation with ideas, preparation, active work, review and completion, plus a distinct stopped state. Waiting, pause reasons, review dates and completion evidence remain under user control; a finished Agent task never completes a project automatically. Compact stage badges and a single scrolling sidebar work on narrow screens.
-- [Account feature selection](docs/features/FEATURE_SELECTION.md) hides project boards by default. Enable them in personal settings; the preference syncs across the account's devices. Hiding preserves data and existing project context. `CWW_PARA_ENABLED=false` remains the separate server route switch.
-- [Public shares](docs/PUBLIC_FILE_SHARING.md) expire after 30 days. Renewal starts a new 30-day period from now and keeps the URL. Existing unlimited shares receive a one-time 30-day migration grace period. Optional, separately configured cold storage can merge expired local leftovers with a verified older archive.
-- [Draft reconciliation](docs/COMPOSER_SYNC.md) ignores stale reads after submission. Voice input while editing a queued prompt uses that prompt's submission path and retains the independent ordinary draft.
-- [HTML/Markdown reading](docs/READER_PROGRESSIVE_LOADING.md) shows text before loading images in document order. Failed images do not block later ones; original downloads remain unchanged. Account dialogs use reusable [typography and layout guidance](docs/UI_DIALOG_GUIDELINES.md).
-
-Read the [October upgrade checks](docs/DEPLOYMENT.md#october-3-2026-upgrade-checks). Username/password login, `/codex-web`, default container capabilities and external-module opt-in remain unchanged.
-
-## Reader navigation (October 6, 2026)
-
-Reader links open in the current tab and show a **Back to workspace** control. Alt-click opens a separate tab; ordinary links retain the browser's Ctrl/Cmd-click and middle-click behavior. Remote file previews reserve an Alt-clicked tab before the transfer and close it on failure. Directly opened readers return to `/codex-web` when no previous page within the application is known. See [reader navigation](docs/READER_NAVIGATION.md) and [upgrade checks](docs/DEPLOYMENT.md#october-6-2026-reader-navigation-checks).
-
-## Project schedules and node transfers
-
-- [Recurring project tasks](docs/PROJECT_RECURRING_TASKS.md) support fixed intervals, daily/weekly/monthly schedules, IANA time zones, optional run limits, pause/resume, and durable run history. Each run creates a separate project conversation; stopping one conversation preserves future runs. Missed/overlapping runs do not accumulate a queue. One-shot conversation waits remain separate.
-- Project menus expose schedule management and local project skills. An explicitly configured host administrator can also manage skills in owned host projects. Remote project skills are still maintained on their own machines. The account footer stays fixed while project content scrolls.
-- [Node file transfers](docs/NODE_TRANSFERS.md) are an optional administrator capability in Worker 1.20.0: server-persisted tasks, authenticated direct connections with encrypted memory relay fallback, SHA-256 verification, atomic target publication, and explicit cleanup receipts. No endpoint is enabled by the default Compose configuration.
-- Remote file and attachment transfers now accept up to 2 GiB per file, with aligned bounded result batches and 30-minute transfer deadlines. This does not increase reader/public-share limits or disable storage quotas.
-- Composer writes release their input lock after durable confirmation, before background refresh. A timeout preserves the input and does not automatically resend it. The bundled Codex SDK is pinned to 0.162.1.
-
-Username/password login, `/codex-web`, isolated tenant workers and empty optional integrations remain the deployment defaults. See [deployment](docs/DEPLOYMENT.md) before enabling host or remote capabilities.
-
-
-## Recent product updates / 近期更新
-
-- [Durable voice submission / 语音先发送](docs/VOICE_SEND.md): uploaded recordings are acknowledged before cloud transcription and use idempotent retries. Recognition, results and failure/retry stay in one queue item across refresh; dispatch creates one chat message. Conversation composers keep their own recording/upload state. Provider keys and HTTPS endpoints remain optional and empty by default.
-- [Opportunity cards / 机会卡片](docs/OPPORTUNITY_CARDS.md): optional and off by default, with empty topics/history. Discovery uses normal server-project conversations and native recurring tasks; evidence corrections are versioned. Topic navigation/order/actions, pending counts, separate candidate/work/history collections and incremental feedback learning use the same normal project workflow; an optional relative Markdown knowledge entry keeps project requirements authoritative. No private business topics, credentials or pre-created schedules are shipped.
-- Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
-- [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
-- Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.
-
-## Recent capabilities
-
-Managed interactive HTML attachments run in an isolated sandbox, with explicit user export and versioned, private-by-default sharing. Optional [judgment books](docs/JUDGMENT_BOOK.md) preserve your probabilities, evidence and confirmations. Project schedules support daily time windows and one-time checks; new conversations may use a saved per-account model choice. Opportunity voice feedback continues and saves after upload. Project menus can acknowledge current unread results. [Transient routing recovery](docs/UPSTREAM_RETRY.md) and SQLite-safe finalization preserve committed work. See [upgrade notes](docs/UPGRADE_20261020.md).
-
-## Recent capabilities
-
-Stable conversation links support browser history. Opportunity cards have kept/completed collections and bounded previews. Managed remote HTML declarations and explicit presentation conversion preserve reader/web intent. Optional [Gemini / Antigravity](docs/MULTI_ENGINE.md) execution shares project context while keeping credentials and native sessions on the selected node; its extra CLI is installed only on explicit account addition. [Usage metrics](docs/ANTIGRAVITY_QUOTA.md), temporary notices and durable expiring Codex-credit logs are included. See [upgrade notes](docs/UPGRADE_20261025.md).
-
-## October 30, 2026 update
-
-Opportunity cards now support a total pending cap and audited returns to reserve, background voice uploads across navigation, and research drafts in another owned server project. First recommendation history and user feedback remain intact; a full queue can finish with zero new cards. [Upgrade and validation](docs/UPGRADE_20261030.md) cover the additive database changes. The base runtime, dependency set and empty optional configuration are unchanged.

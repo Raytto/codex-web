@@ -99,8 +99,10 @@ The following matrix is the short version. The detailed procedures are below.
 
 Voice is usable only when both `DASHSCOPE_API_KEY` and
 `DASHSCOPE_BASE_URL` are non-empty. Set an HTTPS `PUBLIC_BASE_URL`; browsers
-will not grant microphone access on an insecure, non-local origin. The default
-model is `qwen3.5-omni-plus`, or set `DASHSCOPE_ASR_MODEL`.
+will not grant microphone access on an insecure, non-local origin. Set
+`DASHSCOPE_ASR_MODEL` to a model supported by your configured provider.
+The `.env.example` value `transcription-model` is a placeholder; leaving the
+variable unset instead uses the fallback in `server/config.ts`.
 
 The browser first stores the complete recording in account/conversation-scoped
 IndexedDB. If connectivity disappears during upload, the composer keeps the
