@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
+import { constrainedCodexArguments } from "./constrained-codex.js";
+import { validatePersonalMemoryRequest } from "./codex-personal-memory.js";
+import { spawnCodexRuntime } from "./codex-lifecycle-lock.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { applyCodexProxyEnvironment, selectCodexEgress } from "./codex-egress.js";
+import { extractTitleRequestText } from "./title-request.js";
+export { extractTitleRequestText } from "./title-request.js";
 
 import type { AgentEngineId } from "../remote-worker/src/agent-engine.js";
 export { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "../remote-worker/src/antigravity-title.js";
@@ -12,10 +17,10 @@ export const CONVERSATION_TITLE_REASONING_EFFORT = "low";
 export const CONVERSATION_TITLE_PROMPT_VERSION = "codex-title-v1";
 export const CONVERSATION_TITLE_TIMEOUT_MS = 60_000;
 const TITLE_LIMIT = 10;
-const REQUEST_LIMIT = 12_000;
 
 export type ConversationTitleAgentRequest = {
   userId: string;
+  task?: "personal_memory";
   engineId?: AgentEngineId;
   prompt: string;
   timeoutMs: number;
@@ -89,19 +94,12 @@ export function parseConversationTitleOutput(output: string): string | null {
 }
 
 export function codexConversationTitleArguments(schemaPath: string, outputPath: string): string[] {
-  return [
-    "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
-    "--sandbox", "read-only", "--model", CONVERSATION_TITLE_CODEX_MODEL,
-    "--config", `model_reasoning_effort=${JSON.stringify(CONVERSATION_TITLE_REASONING_EFFORT)}`,
-    "--config", "web_search=\"disabled\"", "--config", "tools.web_search=false",
-    "--config", "tools.view_image=false", "--config", "features.shell_tool=false",
-    "--config", "features.unified_exec=false", "--config", "agents.enabled=false",
-    "--config", "approval_policy=\"never\"", "--config", "history.persistence=\"none\"",
-    "--output-schema", schemaPath, "--output-last-message", outputPath, "--json", "-",
-  ];
+  return constrainedCodexArguments(CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_REASONING_EFFORT, schemaPath, outputPath);
 }
 
 export function validateConversationTitleRequest(request: ConversationTitleAgentRequest, expectedUserId?: string): void {
+  if (request?.task === "personal_memory") { validatePersonalMemoryRequest(request, expectedUserId); return; }
+  if (request?.task !== undefined) throw new Error("Invalid auxiliary task");
   if (request?.engineId !== undefined && request.engineId !== "codex" && request.engineId !== "antigravity") throw new Error("Invalid title engine");
   if (!request || typeof request !== "object") throw new Error("Invalid Codex title request");
   if (!/^[0-9a-f-]{36}$/i.test(request.userId) || (expectedUserId && request.userId !== expectedUserId)) throw new Error("Codex title user mismatch");
@@ -169,14 +167,6 @@ async function runCodexProcess(
     });
     child.stdin.end(request.prompt, "utf8");
   });
-}
-
-export function extractTitleRequestText(value: string): string {
-  let text = value.replace(/\r\n?/g, "\n");
-  const explicitQuestion = text.match(/(?:^|\n)我的问题：\s*([\s\S]*)$/u)?.[1]?.trim();
-  if (explicitQuestion) text = explicitQuestion;
-  return text.replace(/```[\s\S]*?```/g, " ").replace(/^>.*$/gm, " ").replace(/https?:\/\/\S+/gi, " ")
-    .replace(/<[^>]{1,200}>/g, " ").replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim().slice(0, REQUEST_LIMIT);
 }
 
 export function normalizeConversationTitle(value: unknown): string | null {

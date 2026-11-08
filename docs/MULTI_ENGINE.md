@@ -20,7 +20,7 @@ Gemini messages sent during execution queue for the next request. Images are sup
 
 The CLI is integrity-pinned; runtime installation and Windows ConPTY packaging are tested separately from real Google login. Automated synthetic tests do not prove a particular subscription's model access or physical-device behavior.
 
-The public cold-storage engine remains format v2. It archives registered conversation files and the current Codex root; it is not a complete backup of historical engine segments or a Google account profile. Historical provider records can remain on their original node. Do not infer full vendor-history recovery from a platform archive.
+Cold storage now includes recursive Codex lineage archives (v3, with v1/v2 restore compatibility) and an optional chunk lifecycle. It does not claim automatic recovery of an unmanaged Google profile; configure explicit backup sources and verify recovery. See [storage setup](STORAGE_LIFECYCLE.md).
 
 ## Live steering and visible capabilities
 

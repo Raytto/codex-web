@@ -1,3 +1,5 @@
+import { HOST_ROOT_USER_ID } from "./host-root-user.js";
+import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 import crypto from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
@@ -56,7 +58,7 @@ export function judgmentCheckBeforeFire(sql: DatabaseSync, taskId: string, now: 
   const c = sql.prepare(`SELECT c.id,c.state,j.id AS judgment_id,j.kind,j.mode,j.state AS judgment_state FROM judgment_checks c JOIN judgments j ON j.id=c.judgment_id WHERE c.task_id=?`).get(taskId) as {id:string;state:string;judgment_id:string;kind:string;mode:string;judgment_state:string}|undefined;
   if (!c) return null;
   if (c.state !== 'armed' || ['resolved','indeterminate','withdrawn'].includes(c.judgment_state)) return 'blocked';
-  const eligible=sql.prepare(`SELECT 1 FROM recurring_tasks t JOIN projects p ON p.id=t.project_id JOIN users u ON u.id=t.user_id WHERE t.id=? AND p.user_id=t.user_id AND p.archived_at IS NULL AND u.status='active' AND p.executor_id=CASE WHEN u.id='00000000-0000-4000-8000-000000000004' THEN 'host-root' ELSE 'tenant-local' END`).get(taskId);
+  const eligible=sql.prepare(`SELECT 1 FROM recurring_tasks t JOIN projects p ON p.id=t.project_id JOIN users u ON u.id=t.user_id WHERE t.id=? AND p.user_id=t.user_id AND p.archived_at IS NULL AND u.status='active' AND p.executor_id=CASE WHEN u.id=? THEN ? ELSE 'tenant-local' END`).get(taskId,HOST_ROOT_USER_ID,HOST_EXECUTOR_ID);
   if(!eligible){sql.prepare("UPDATE judgment_checks SET state='cancelled' WHERE id=?").run(c.id);return 'blocked';}
   const manual = c.kind === 'idea' || c.mode === 'private';
   sql.prepare('UPDATE judgment_checks SET state=? WHERE id=?').run(manual?'feedback':'fired',c.id);

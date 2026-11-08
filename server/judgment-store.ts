@@ -1,3 +1,5 @@
+import { isHostRootUser } from "./host-root-user.js";
+import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import type { AppDatabase, StoredAgentSelection } from './db.js';
@@ -31,7 +33,7 @@ export class JudgmentStore {
     if(!this.sql.prepare("SELECT 1 FROM users WHERE id=? AND status='active'").get(user))throw new JudgmentError(403,'当前账号不可用。');
     const p=this.db.getActiveProjectForUser(id,user);
     if(!p)throw new JudgmentError(404,'所属项目不存在或已归档。');
-    if(p.executor_id!==(user==='00000000-0000-4000-8000-000000000004'?'host-root':'tenant-local'))throw new JudgmentError(400,'第一版判断簿使用服务器文件夹项目，请选择服务器项目。');
+    if(p.executor_id!==(isHostRootUser(user)?HOST_EXECUTOR_ID:'tenant-local'))throw new JudgmentError(400,'第一版判断簿使用服务器文件夹项目，请选择服务器项目。');
     return p;
   }
   private writable(actor:JudgmentActor,id:string,revision:unknown){

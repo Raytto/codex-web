@@ -102,7 +102,7 @@ test('external maintenance shares same slot and idempotency, no shadow queue',t=
 });
 test('HTTP workflow status/close scoped to live Job; list requires authentication',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-api-'));const secret='workflow-test-secret-with-more-than-32-characters';
- const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
+ const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
  t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
  const c=app.db.createConversation(id(),'task');const j=app.db.createJob(id(),c.id,undefined,selection);app.db.updateJob(j.id,'running');
  const token=createJobAutomationToken(secret,j.id,c.id,Date.now(),86400000,app.db.workflows.assertJob(j.id).epoch);const url=`/api/automation/jobs/${j.id}/workflow`;
@@ -115,7 +115,7 @@ test('HTTP workflow status/close scoped to live Job; list requires authenticatio
 
 test('same Job retry rejects an earlier run token before any automation side effects',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-epoch-'));const secret='workflow-test-secret-with-more-than-32-characters';
- const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
+ const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
  t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
  const c=app.db.createConversation(id(),'task');const j=app.db.createJob(id(),c.id,undefined,selection);app.db.updateJob(j.id,'running');
  const old=createJobAutomationToken(secret,j.id,c.id,Date.now(),86400000,app.db.workflows.assertJob(j.id).epoch);
@@ -127,7 +127,7 @@ test('same Job retry rejects an earlier run token before any automation side eff
 
 test('active workflow permits draft editing but protects conversation deletion and archiving',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-controls-'));
- const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,maxActiveWorkflows:1,username:'fixture',passwordHash:bcrypt.hashSync('Workflow-Test-Password-2026!',8),sessionSecret:'workflow-test-secret-with-more-than-32-characters',minimumFreeDiskBytes:1});
+ const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,maxActiveWorkflows:1,username:'fixture',passwordHash:bcrypt.hashSync('Workflow-Test-Password-2026!',8),sessionSecret:'workflow-test-secret-with-more-than-32-characters',minimumFreeDiskBytes:1});
  t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
  const agent=request.agent(app.app);const login=await agent.post('/api/auth/login').send({username:'fixture',password:'Workflow-Test-Password-2026!'}).expect(200);const csrf=login.body.csrfToken;
  const created=await agent.post('/api/conversations').set('X-CSRF-Token',csrf).expect(201);const c=created.body.conversation;
@@ -139,7 +139,7 @@ test('active workflow permits draft editing but protects conversation deletion a
 
 test('real queue pump retains closing owner until runner returns, then launches exactly one follower',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-pump-'));
- const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
+ const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,maxActiveWorkflows:1,minimumFreeDiskBytes:1});
  t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
  const jobs=[0,1,2].map(()=>{const c=app.db.createConversation(id(),'modify');const m=id();app.db.addMessage({id:m,conversation_id:c.id,role:'user',content:'verify',created_at:new Date().toISOString()});return app.db.createJob(id(),c.id,m,selection);});
  const started:string[]=[];const exits=new Map<string,()=>void>();
@@ -191,7 +191,7 @@ test('B migration number normalization preserves workflow rows and is idempotent
 
 test('unlimited mode rejects epochless credentials for new attempts but preserves adopted epoch-zero tokens',async t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-legacy-token-'));const secret='workflow-test-secret-with-more-than-32-characters';
- const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:-1,minimumFreeDiskBytes:1});
+ const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,sessionSecret:secret,maxActiveWorkflows:-1,minimumFreeDiskBytes:1});
  t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
  const c=app.db.createConversation(id(),'task'),j=app.db.createJob(id(),c.id,undefined,selection);app.db.updateJob(j.id,'running');
  const token=createJobAutomationToken(secret,j.id,c.id),url=`/api/automation/jobs/${j.id}/workflow`;

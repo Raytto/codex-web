@@ -1,3 +1,7 @@
+import { migrateStorageLifecycle } from "./storage-lifecycle-schema.js";
+import { migrateJobEventSequence, nextJobEventSequence } from "./job-event-sequence.js";
+import { migrateConversationVoice } from "./conversation-voice-schema.js";
+import { migrateDot } from "./dot-schema.js";
 import { WorkflowStore } from "./workflow-store.js";
 import { migrateAutoReset } from "./codex-reset-auto-use.js";
 import { migrateJudgments } from "./judgment-schema.js";
@@ -23,6 +27,7 @@ import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, R
 import { isModelCapacityContinuationPrompt } from "./internal-messages.js";
 import { buildTaskRecoveryCheckpoint, stripTaskRecoveryPrompt, type TaskRecoveryCheckpoint } from "./task-recovery.js";
 import { isPublicShareActive, PUBLIC_SHARE_LIFETIME_MS } from "../src/public-share.js";
+import { remotePreviewTitle } from "./title-request.js";
 
 export const LEGACY_USER_ID = "00000000-0000-4000-8000-000000000001";
 const SUPPRESSED_CONTROLLED_ACTIVITY_KIND = "_codex_web_controlled";
@@ -37,6 +42,7 @@ export class PublicShareStorageBusyError extends Error {
 }
 
 export type JobAttemptState = {
+  resourceWait?: "MEMORY_WAIT" | "MEMORY_GUARD_UNAVAILABLE";
   retryKind?: "capacity" | "routing";
   retries: number;
   capacityStartedAt: number | null;
@@ -62,6 +68,7 @@ export type UserRow = {
 
 export type ConversationRow = {
   id: string;
+  is_dot_coordinator?: number;
   user_id: string;
   project_id: string | null;
   title: string;
@@ -740,6 +747,7 @@ const remoteItemFallsWithinJob = (remoteCreatedAt: string, jobCreatedAt: string,
 };
 const conversationSelect = `
   conversations.*,
+  EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.user_id=conversations.user_id AND dot.conversation_id=conversations.id) AS is_dot_coordinator,
   COALESCE(conversations.last_active_at, conversations.updated_at) AS last_active_at,
   COALESCE((SELECT state FROM conversation_storage WHERE conversation_id=conversations.id), 'local') AS cold_storage_state,
   COALESCE((SELECT generation FROM conversation_storage WHERE conversation_id=conversations.id), 0) AS cold_storage_generation,
@@ -839,6 +847,9 @@ export class AppDatabase {
         UNIQUE(idea_id,position)); CREATE INDEX opportunity_images_conversation ON opportunity_images(conversation_id);`);
     });
     this.applyMigration(2026101801, "judgment-book-v1", () => migrateJudgments(this.sqlite));
+    this.applyMigration(2026110501, "pp-dot-v1", () => migrateDot(this.sqlite));
+    WorkflowStore.normalizeLegacyMigration(this.sqlite);
+    this.applyMigration(2026110701, "conversation-voice", () => migrateConversationVoice(this));
     this.applyMigration(2026101901, "opportunity-background-voice-feedback", () => {
       this.sqlite.exec(`CREATE TABLE opportunity_voice_feedback (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), idea_id TEXT NOT NULL REFERENCES opportunity_ideas(id) ON DELETE CASCADE,
@@ -882,6 +893,13 @@ export class AppDatabase {
           session_id TEXT NOT NULL REFERENCES agent_engine_sessions(id) ON DELETE CASCADE);`);
     });
     WorkflowStore.normalizeLegacyMigration(this.sqlite);
+    this.applyMigration(2026110702, "job-event-sequence-retention", () => migrateJobEventSequence(this.sqlite));
+    this.applyMigration(2026110703, "storage-lifecycle-v1", () => migrateStorageLifecycle(this.sqlite));
+    this.applyMigration(2026110801, "personal-memory-codex-audit", () => {
+      this.sqlite.exec(`ALTER TABLE personal_memory_runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'aliyun';
+        ALTER TABLE personal_memory_runs ADD COLUMN reasoning_effort TEXT;
+        ALTER TABLE personal_memory_runs ADD COLUMN runtime_verified INTEGER NOT NULL DEFAULT 0;`);
+    });
     this.applyMigration(2026110802, "durable-complete-workflows", () => WorkflowStore.migrate(this.sqlite));
     this.applyMigration(2026110803, "workflow-execution-ack", () => {
       this.sqlite.exec("DROP TRIGGER IF EXISTS workflow_claim");
@@ -910,7 +928,7 @@ export class AppDatabase {
           if (remoteLease) continue;
           const error = "服务重启，原运行任务已中断";
           this.captureJobRecovery(job.id, "interrupted", error);
-          const event = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(job.id) as { seq: number };
+          const event = { seq: nextJobEventSequence(this.sqlite, job.id) };
           this.sqlite.prepare(`
             UPDATE jobs
             SET status='interrupted',error=COALESCE(error,?),
@@ -2429,6 +2447,9 @@ export class AppDatabase {
     const parameters: Array<string | number> = [userId];
     if (options.projectId) { where.push("project_id=?"); parameters.push(options.projectId); }
     const query = options.query?.trim().slice(0, 100);
+    // The bound coordinator has its own extension entry. Keep direct access and
+    // search intact; only ordinary project pages (including totals) omit it.
+    if (options.projectId && !query) where.push("NOT EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.user_id=conversations.user_id AND dot.conversation_id=conversations.id)");
     if (query) { where.push("title LIKE ? ESCAPE '\\' COLLATE NOCASE"); parameters.push(`%${query.replace(/[\\%_]/g, "\\$&")}%`); }
     const clause = where.join(" AND ");
     const total = Number((this.sqlite.prepare(`SELECT count(1) AS count FROM conversations WHERE ${clause}`).get(...parameters) as { count: number }).count);
@@ -2505,6 +2526,7 @@ export class AppDatabase {
       SELECT project.*, count(conversation.id) AS conversation_count
       FROM projects project LEFT JOIN conversations conversation
         ON conversation.project_id=project.id AND conversation.deleted_at IS NULL AND conversation.archived_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.user_id=conversation.user_id AND dot.conversation_id=conversation.id)
       WHERE project.user_id=? AND project.archived_at IS NULL GROUP BY project.id
       ORDER BY project.sort_order, project.id
     `).all(userId) as Array<ProjectRow & { conversation_count: number }>;
@@ -2549,9 +2571,14 @@ export class AppDatabase {
     return this.getProject(id)!;
   }
 
+  projectHasDotCoordinator(id: string, userId: string): boolean {
+    return Boolean(this.sqlite.prepare(`SELECT 1 FROM dot_sessions dot JOIN conversations c ON c.id=dot.conversation_id AND c.user_id=dot.user_id WHERE c.project_id=? AND dot.user_id=?`).get(id, userId));
+  }
+
   archiveProjectForUser(id: string, userId: string): ProjectRow | undefined {
     const now = new Date().toISOString();
-    const result = this.sqlite.prepare("UPDATE projects SET archived_at=?,updated_at=? WHERE id=? AND user_id=? AND archived_at IS NULL")
+    const result = this.sqlite.prepare(`UPDATE projects SET archived_at=?,updated_at=? WHERE id=? AND user_id=? AND archived_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM dot_sessions dot JOIN conversations c ON c.id=dot.conversation_id AND c.user_id=dot.user_id WHERE c.project_id=projects.id AND dot.user_id=projects.user_id)`)
       .run(now, now, id, userId);
     return result.changes ? this.getProjectForUser(id, userId) : undefined;
   }
@@ -2947,6 +2974,7 @@ export class AppDatabase {
         AND rollout_bytes IS NULL AND context_input_tokens IS NULL AND context_window_tokens IS NULL
         AND context_usage_updated_at IS NULL AND personal_context_revision=0
         AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state='active'
+        AND NOT EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.conversation_id=conversations.id AND dot.user_id=conversations.user_id)
         AND NOT EXISTS (SELECT 1 FROM para_conversations WHERE para_conversations.conversation_id=conversations.id)
         AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.conversation_id=conversations.id)
         AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.conversation_id=conversations.id)
@@ -3082,8 +3110,14 @@ export class AppDatabase {
     const now = new Date().toISOString();
     const remoteCreatedAt = thread.createdAt > 0 ? new Date(thread.createdAt * 1000).toISOString() : now;
     const remoteUpdatedAt = thread.updatedAt > 0 ? new Date(thread.updatedAt * 1000).toISOString() : remoteCreatedAt;
-    const title = thread.name.trim().slice(0, 200) || "本机任务";
     let conversation = this.getConversationByCodexThread(projectId, thread.id);
+    const firstUserMessage = conversation ? this.getFirstUserMessage(conversation.id) : undefined;
+    const title = thread.nameSource === "preview" || thread.nameSource === "fallback"
+      ? remotePreviewTitle([
+        ...(firstUserMessage ? [firstUserMessage.content] : []),
+        ...thread.messages.filter((message) => message.role === "user").map((message) => message.content),
+      ], thread.name, conversation?.sync_origin === "codex_web" ? "新任务" : "本机任务")
+      : thread.name.trim().slice(0, 200) || "本机任务";
     // Retired native segments belong to the same visible conversation, but an
     // observer replay must not overwrite its current title/status/transcript.
     const lastEngine = conversation ? this.sqlite.prepare("SELECT engine_id,native_id FROM agent_engine_sessions WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1").get(conversation.id) as { engine_id: string; native_id: string | null } | undefined : undefined;
@@ -3674,6 +3708,7 @@ export class AppDatabase {
     const result = this.sqlite.prepare(`
       UPDATE conversations SET archived_at=?,pinned_at=NULL
       WHERE id=? AND user_id=? AND deleted_at IS NULL AND archived_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.conversation_id=conversations.id AND dot.user_id=conversations.user_id)
     `).run(now, id, userId);
     return result.changes ? this.getConversationForUser(id, userId) : undefined;
   }
@@ -4145,6 +4180,7 @@ export class AppDatabase {
       JOIN conversations conversation ON conversation.id=message.conversation_id
       WHERE conversation.user_id=? AND conversation.deleted_at IS NULL
         AND message.role='user' AND message.created_at>=?
+        AND NOT EXISTS (SELECT 1 FROM dot_sessions ds WHERE ds.conversation_id=conversation.id)
     `).run(userId, since).changes);
   }
 
@@ -4157,6 +4193,7 @@ export class AppDatabase {
       JOIN messages message ON message.id=outbox.message_id
       JOIN conversations conversation ON conversation.id=message.conversation_id
       WHERE outbox.user_id=? AND outbox.status='pending' AND conversation.deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM dot_sessions ds WHERE ds.conversation_id=conversation.id)
         AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at<=?)
         AND outbox.created_at<=?
         AND NOT EXISTS (
@@ -4205,6 +4242,9 @@ export class AppDatabase {
     messageIds: string[];
     model: string;
     promptVersion: string;
+    provider?: string;
+    reasoningEffort?: string;
+    runtimeVerified?: boolean;
     status: "succeeded" | "failed";
     candidateCount: number;
     error?: string | null;
@@ -4213,11 +4253,12 @@ export class AppDatabase {
   }): void {
     this.sqlite.prepare(`
       INSERT INTO personal_memory_runs(
-        id,user_id,message_ids_json,model,prompt_version,status,candidate_count,error,created_at,completed_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        id,user_id,message_ids_json,model,prompt_version,status,candidate_count,error,created_at,completed_at,provider,reasoning_effort,runtime_verified
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       input.id, input.userId, JSON.stringify(input.messageIds), input.model, input.promptVersion,
       input.status, input.candidateCount, input.error?.slice(0, 1_000) ?? null, input.createdAt, input.completedAt,
+      input.provider ?? "aliyun", input.reasoningEffort ?? null, input.runtimeVerified ? 1 : 0,
     );
     if (input.status === "succeeded") this.sqlite.prepare(`
       INSERT INTO personal_memory_state(user_id,revision,snapshot_hash,last_published_at,last_successful_run_at)
@@ -5670,6 +5711,7 @@ export class AppDatabase {
         INSERT INTO jobs(id,conversation_id,message_id,agent_model,reasoning_effort,queue_seq,status,created_at,updated_at)
         VALUES(?,?,?,?,?,?,'queued',?,?)
       `).run(jobId, prompt.conversation_id, messageId, prompt.agent_model, prompt.reasoning_effort, next.value, now, now);
+      this.sqlite.prepare('UPDATE conversation_voice_operations SET job_id=? WHERE conversation_id=? AND pending_id=?').run(jobId,prompt.conversation_id,pendingId);
       // Keep the background accepted when this queued prompt was submitted.
       this.sqlite.prepare("DELETE FROM para_job_context WHERE job_id=?").run(jobId);
       this.sqlite.prepare("INSERT INTO para_job_context(job_id,snapshot) SELECT ?,snapshot FROM para_pending_context WHERE pending_id=?").run(jobId, pendingId);
@@ -5744,12 +5786,13 @@ export class AppDatabase {
   }
 
   getFeatureSelection(userId: string): FeatureSelection {
+    const dotDefault = isHostRootUser(userId) ? { ppDot: true } : {};
     const row = this.sqlite.prepare("SELECT value FROM user_settings WHERE user_id=? AND key='feature_selection'").get(userId) as { value: string } | undefined;
     try {
       const value: unknown = JSON.parse(row?.value ?? "null");
-      if (isFeatureSelection(value)) return { ...value, opportunityCards: value.opportunityCards === true };
-    } catch { /* An absent or invalid preference keeps optional features hidden. */ }
-    return { ...DEFAULT_FEATURE_SELECTION };
+      if (isFeatureSelection(value)) return { ...dotDefault, ...value, opportunityCards: value.opportunityCards === true };
+    } catch { /* An absent or invalid preference uses account defaults. */ }
+    return { ...DEFAULT_FEATURE_SELECTION, ...dotDefault };
   }
 
   setFeatureSelection(userId: string, value: FeatureSelection): FeatureSelection | null {
@@ -5762,7 +5805,9 @@ export class AppDatabase {
         this.sqlite.exec("ROLLBACK");
         return null;
       }
-      const next = { paraBoard: value.paraBoard, opportunityCards: value.opportunityCards ?? current.opportunityCards ?? false, ...(value.judgmentBook !== undefined || current.judgmentBook !== undefined ? {judgmentBook:value.judgmentBook ?? current.judgmentBook ?? false} : {}), revision: current.revision + 1 };
+      // Omitted fields from older clients preserve the current explicit choice.
+      const dotPreference = value.ppDot ?? current.ppDot;
+      const next = { ...(dotPreference === undefined ? {} : { ppDot: dotPreference }), paraBoard: value.paraBoard, opportunityCards: value.opportunityCards ?? current.opportunityCards ?? false, ...(value.judgmentBook !== undefined || current.judgmentBook !== undefined ? {judgmentBook:value.judgmentBook ?? current.judgmentBook ?? false} : {}), revision: current.revision + 1 };
       this.sqlite.prepare(`
         INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'feature_selection',?,?)
         ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
@@ -5964,6 +6009,19 @@ export class AppDatabase {
     this.sqlite.prepare(`INSERT INTO job_attempt_state(job_id,next_attempt_at,state_json) VALUES(?,?,?)
       ON CONFLICT(job_id) DO UPDATE SET next_attempt_at=excluded.next_attempt_at,state_json=excluded.state_json`)
       .run(jobId, state.nextAttemptAt, JSON.stringify(state));
+  }
+
+  deferJobForMemory(jobId: string, state: JobAttemptState): boolean {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.getJob(jobId);
+      if (!job || job.status !== "running") { this.sqlite.exec("ROLLBACK"); return false; }
+      this.saveJobAttemptState(jobId, state);
+      this.updateJob(jobId, "queued");
+      this.updateConversation(job.conversation_id, { status: "idle" });
+      this.sqlite.exec("COMMIT");
+      return true;
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
   }
 
   deferJobForCapacity(jobId: string, state: JobAttemptState): boolean {
@@ -6220,6 +6278,7 @@ export class AppDatabase {
         INSERT OR IGNORE INTO messages(id,conversation_id,role,content,quote_excerpt,created_at)
         VALUES(?,?,?,?,?,?)
       `).run(payload.message.id, conversationId, payload.message.role, payload.message.content, payload.message.quote_excerpt ?? null, payload.message.created_at);
+      this.sqlite.prepare('INSERT OR IGNORE INTO conversation_voice_results SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM conversation_voice_state WHERE conversation_id=?)').run(id,payload.message.id,conversationId,conversationId);
       const insertFile = this.sqlite.prepare(`
         INSERT OR IGNORE INTO files(
           id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,
@@ -6373,7 +6432,7 @@ export class AppDatabase {
     // then retry without duplicating events or leaving sequence gaps.
     this.sqlite.exec("SAVEPOINT append_job_event");
     try {
-      const row = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(jobId) as { seq: number };
+      const row = { seq: nextJobEventSequence(this.sqlite, jobId) };
       const now = new Date().toISOString();
       this.sqlite.prepare("INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)").run(jobId, row.seq, eventType, JSON.stringify(payload), now);
       this.sqlite.prepare("UPDATE jobs SET updated_at=? WHERE id=?").run(now, jobId);

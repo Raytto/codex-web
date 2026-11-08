@@ -62,8 +62,8 @@ try {
   selection = { model: geminiModel.id, reasoningEffort: 'default' };
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 960 }); await page.reload();
-    await page.locator('.engine-capability-note').waitFor();
     await page.locator('.pending-queue').waitFor();
+    assert.equal(await page.locator('.engine-capability-note').count(), 0);
     assert.equal(await page.getByRole('button', { name: '引导', exact: true }).count(), 0);
     await page.waitForFunction(() => document.querySelector('.activity-title')?.textContent.includes('Antigravity 不支持运行中引导'));
     assert.equal(await page.getByText('完成前持续保留，可随时引导', { exact: true }).count(), 0);
@@ -79,7 +79,7 @@ try {
   const rejected = await context.request.post(`${origin}/api/conversations/${id}/pending-prompts/${pending.id}/steer`, { headers: { 'X-CSRF-Token': session.csrfToken } });
   assert.equal(rejected.status(), 409); assert.equal((await rejected.json()).code, 'LIVE_STEERING_UNAVAILABLE');
   assert.equal(instance.db.getPendingPrompt(pending.id).content, 'Queued Gemini supplement');
-  report.checks.push('desktop_mobile_agy_has_no_steer_and_explains_queue_images_and_engine_handoff', 'authenticated_steer_rejection_preserves_pending_prompt');
+  report.checks.push('desktop_mobile_agy_has_no_composer_capability_note_and_preserves_queue_and_engine_handoff', 'authenticated_steer_rejection_preserves_pending_prompt');
   instance.db.updateJob(fixtureJob.job.id, 'completed'); instance.db.sqlite.prepare('DELETE FROM pending_prompts WHERE id=?').run(pending.id);
   selection = baseline.selection; await page.setViewportSize({ width: 1440, height: 960 }); await page.reload(); await page.locator('.composer textarea').focus();
   await close(); holdNextCatalog = true; await page.evaluate(() => window.dispatchEvent(new Event('codex-web-models-changed'))); await heldCatalogStarted;

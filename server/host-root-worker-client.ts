@@ -1,5 +1,6 @@
 import { ExecutionUncertainError } from "./execution-ownership.js";
 import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
+import { taskMemoryError, type TenantMemoryTarget, type TaskMemoryScopeResult } from "./task-memory.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
 import net, { type Socket } from "node:net";
@@ -45,6 +46,18 @@ export class HostRootWorkerClient {
     });
   }
 
+  protectTenantMemory(target: TenantMemoryTarget): Promise<boolean> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({ type: "memory_scope_attach", requestId, target },
+      message => message.type === "memory_scope_ready" && message.requestId === requestId ? true : undefined);
+  }
+
+  finishTenantMemory(userId: string, token: string): Promise<TaskMemoryScopeResult> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({ type: "memory_scope_finish", requestId, userId, token },
+      message => message.type === "memory_scope_result" && message.requestId === requestId ? message.result : undefined);
+  }
+
   startNodeTransfer(userId: string, spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec): Promise<boolean> {
     const requestId = crypto.randomUUID();
     return this.singleRequest({ type: "node_transfer", requestId, userId, spec },
@@ -72,13 +85,21 @@ export class HostRootWorkerClient {
     });
   }
 
+  deleteConversationRecords(userId: string, conversationId: string): Promise<number> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest<number>(
+      { type: "delete_conversation_records", requestId, userId, conversationId },
+      (message) => message.type === "delete_thread_result" && message.requestId === requestId ? message.removed : undefined,
+    );
+  }
+
   deleteThread(userId: string, threadId: string): Promise<number> {
     const requestId = crypto.randomUUID();
     return new Promise<number>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       const lines = this.readLines(socket);
       let settled = false;
-      const timer = setTimeout(() => finish(new Error("CODEX_WEB 宿主会话删除请求超时")), 60_000);
+      const timer = setTimeout(() => finish(new Error("宿主会话删除请求超时")), 60_000);
       const finish = (error?: Error, removed?: number) => {
         if (settled) return;
         settled = true;
@@ -93,7 +114,7 @@ export class HostRootWorkerClient {
         try { message = JSON.parse(line) as HostRootServerMessage; }
         catch { return; }
         if (message.type === "delete_thread_result" && message.requestId === requestId) finish(undefined, message.removed);
-        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(new Error(message.message));
+        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(taskMemoryError(message.resourceCode, message.message));
       });
       socket.once("connect", () => this.send(socket, { type: "delete_thread", requestId, userId, threadId }));
       socket.once("error", (error) => finish(error));
@@ -112,13 +133,47 @@ export class HostRootWorkerClient {
     );
   }
 
-  restoreColdConversation(userId: string, conversationId: string): Promise<boolean> {
+  restoreColdConversation(userId: string, conversationId: string, threadId?:string): Promise<boolean> {
     const requestId = crypto.randomUUID();
     return this.singleRequest<boolean>(
-      { type: "restore_cold_conversation", requestId, userId, conversationId },
+      { type: "restore_cold_conversation", requestId, userId, conversationId, threadId },
       (message) => message.type === "restore_cold_conversation_result" && message.requestId === requestId ? message.restored : undefined,
       (message) => message.type === "restore_cold_conversation_result" && message.requestId === requestId,
       6 * 60 * 60_000,
+    );
+  }
+
+  restoreStorage(userId:string,id:string,kind:'file'|'item'|'native'):Promise<boolean> {
+    const requestId=crypto.randomUUID();
+    return this.singleRequest<boolean>(kind==='file'?{type:'restore_storage_file',requestId,userId,fileId:id}:kind==='native'?{type:'restore_storage_native',requestId,userId,unitId:id}:{type:'restore_storage_item',requestId,userId,itemId:id},
+      m=>m.type==='restore_storage_result' && m.requestId===requestId?m.restored:undefined,
+      m=>m.type==='restore_storage_result' && m.requestId===requestId,6*60*60_000);
+  }
+
+  readStorageEvents(userId:string,input:import('./storage-event-reader.js').EventReadRequest):Promise<import('./storage-event-reader.js').EventHistoryPage & {retryAfterSeconds?:number}> {
+    const requestId=crypto.randomUUID();
+    return this.singleRequest({type:'read_storage_events',requestId,userId,input},
+      m=>m.type==='storage_events_result' && m.requestId===requestId?m.result:undefined,
+      m=>m.type==='storage_events_result' && m.requestId===requestId,30_000);
+  }
+
+  restoreReaderVersion(userId: string, versionId: string): Promise<boolean> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest<boolean>(
+      { type: "restore_reader_version", requestId, userId, versionId },
+      (message) => message.type === "restore_reader_version_result" && message.requestId === requestId ? message.restored : undefined,
+      (message) => message.type === "restore_reader_version_result" && message.requestId === requestId,
+      6 * 60 * 60_000,
+    );
+  }
+
+  removeReaderResources(userId: string, conversationId: string): Promise<boolean> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest<boolean>(
+      { type: "remove_reader_resources", requestId, userId, conversationId },
+      (message) => message.type === "remove_reader_resources_result" && message.requestId === requestId ? message.removed : undefined,
+      (message) => message.type === "remove_reader_resources_result" && message.requestId === requestId,
+      10 * 60_000,
     );
   }
 
@@ -171,6 +226,15 @@ export class HostRootWorkerClient {
       (message) => message.type === "title_agent_result" && message.requestId === requestId ? message.output : undefined,
       undefined,
       timeoutMs + 15_000,
+    );
+  }
+
+  extractPersonalMemory(userId: string, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest<string>(
+      { type: "title_agent", requestId, request: { userId, prompt, timeoutMs, task: "personal_memory" } },
+      message => message.type === "title_agent_result" && message.requestId === requestId ? message.output : undefined,
+      undefined, timeoutMs + 15_000, signal,
     );
   }
 
@@ -282,22 +346,27 @@ export class HostRootWorkerClient {
     return this.singleRequest({type:"workflow_verify",requestId,userId,evidence}, response => response.type==="workflow_verify_result" && response.requestId===requestId ? response.verified : undefined);
   }
 
-  private singleRequest<T>(message: HostRootClientMessage, pick: (message: HostRootServerMessage) => T | undefined, matches?: (message: HostRootServerMessage) => boolean, timeoutMs = 60_000): Promise<T> {
+  private singleRequest<T>(message: HostRootClientMessage, pick: (message: HostRootServerMessage) => T | undefined, matches?: (message: HostRootServerMessage) => boolean, timeoutMs = 60_000, signal?: AbortSignal): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       const lines = this.readLines(socket);
       let settled = false;
-      const timer = setTimeout(() => finish(new Error(`CODEX_WEB 宿主 RPC 在 ${Math.ceil(timeoutMs / 1000)} 秒内未完成`)), timeoutMs);
+      const timer = setTimeout(() => finish(new Error(`宿主 RPC 在 ${Math.ceil(timeoutMs / 1000)} 秒内未完成`)), timeoutMs);
       const finish = (error?: Error, value?: T) => {
         if (settled) return;
-        settled = true; lines.close(); socket.end();
+        settled = true; lines.close();
+        if (signal) socket.destroy(); else socket.end();
+        signal?.removeEventListener("abort", abort);
         clearTimeout(timer);
         if (error) reject(error); else resolve(value as T);
       };
+      const abort = () => finish(new Error("personal_memory_cancelled"));
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
       lines.on("line", (line) => {
         let response: HostRootServerMessage;
         try { response = JSON.parse(line) as HostRootServerMessage; } catch { return; }
-        if (response.type === "request_failed" && (!("requestId" in message) || !response.requestId || response.requestId === message.requestId)) finish(new Error(response.message));
+        if (response.type === "request_failed" && (!("requestId" in message) || !response.requestId || response.requestId === message.requestId)) finish(taskMemoryError(response.resourceCode, response.message));
         else if (matches?.(response)) finish(undefined, pick(response));
         else { const value = pick(response); if (value !== undefined) finish(undefined, value); }
       });
@@ -321,7 +390,7 @@ export class HostRootWorkerClient {
         let message: HostRootServerMessage;
         try { message = JSON.parse(line); } catch { return; }
         if (message.type === "project_skills_result" && message.requestId === requestId) finish(undefined, message.result);
-        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(new Error(message.message));
+        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(taskMemoryError(message.resourceCode, message.message));
       });
       socket.once("connect", () => this.send(socket, { type: "project_skills", requestId, userId, projectId, action, name, content, enabled }));
       socket.once("error", error => finish(error));
@@ -335,7 +404,7 @@ export class HostRootWorkerClient {
       const socket = net.createConnection(this.socketPath);
       const lines = this.readLines(socket);
       let settled = false;
-      const timer = setTimeout(() => finish(new Error("CODEX_WEB 宿主文件系统请求超时")), 30_000);
+      const timer = setTimeout(() => finish(new Error("宿主文件系统请求超时")), 30_000);
       const finish = (error?: Error, result?: HostProjectFsResult) => {
         if (settled) return;
         settled = true;
@@ -352,7 +421,7 @@ export class HostRootWorkerClient {
         if (message.type === "project_fs_result" && message.requestId === requestId) {
           finish(undefined, { directory: message.directory, parent: message.parent, directories: message.directories });
         }
-        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(new Error(message.message));
+        if (message.type === "request_failed" && (!message.requestId || message.requestId === requestId)) finish(taskMemoryError(message.resourceCode, message.message));
       });
       socket.once("connect", () => this.send(socket, { type: "project_fs", requestId, userId, action, path: directory, name, content }));
       socket.once("error", (error) => finish(error));
@@ -367,7 +436,19 @@ export class HostRootWorkerClient {
     const pending = this.jobs.get(jobId);
     if (!pending) return;
     if (message.type === "request_failed") {
-      this.failJob(jobId, new Error(message.message));
+      // A control request can fail while the original execution is healthy
+      // (for example, steer arrived before worker readiness). Late replies to
+      // expired control requests must not terminate that execution either.
+      if (message.requestId) {
+        const steer = this.steers.get(message.requestId);
+        if (steer?.jobId === jobId) {
+          clearTimeout(steer.timer);
+          this.steers.delete(message.requestId);
+          steer.reject(taskMemoryError(message.resourceCode, message.message));
+        }
+        return;
+      }
+      this.failJob(jobId, taskMemoryError(message.resourceCode, message.message));
       return;
     }
     if (message.type !== "event" || message.jobId !== jobId) return;
@@ -396,7 +477,7 @@ export class HostRootWorkerClient {
       pending.resolve(event.finalResponse);
     }
     if (event.type === "failed") {
-      const error = new Error(event.message);
+      const error = taskMemoryError(event.resourceCode, event.message);
       if (event.cancelled) error.name = "AbortError";
       this.failJob(jobId, error);
     }

@@ -1,14 +1,96 @@
-.extensions-sidebar{padding-bottom:12px;border-bottom:1px solid var(--border);margin-bottom:8px}.extensions-sidebar>.project-label{margin-bottom:8px}.extension-heading{min-height:42px}.extension-heading .project-actions{opacity:1}.extension-toggle{min-width:0;gap:9px}.extension-toggle>span{flex:1;text-align:left}.extension-toggle>svg:last-child{transition:transform .15s}.extension-toggle[aria-expanded=false]>svg:last-child{transform:rotate(-90deg)}.extension-heading .touch-drag-handle{opacity:.55;touch-action:none}.extension-body{padding-left:0}.extension-body[hidden]{display:none}.extension-body .para-sidebar,.extension-body .opportunity-sidebar{border:0;padding:0;margin:0}.extension-body .para-sidebar-empty{padding-left:31px;font-size:12px}.extension-body .opportunity-topic-row .project-select,.extension-body .para-sidebar-item{padding:7px 6px 7px 14px;font-size:13.5px;font-weight:500}.extension-body .opportunity-topic-row .project-select>span{font-size:13.5px;font-weight:500}.extension-body .para-board-grip{margin-left:2px}.extension-heading.dragging{opacity:.6}.extension-group .project-actions{flex-shrink:0}@media(max-width:700px){.extension-heading{min-height:44px}.extension-heading button{min-height:44px}.extension-body{padding-left:0}.extension-body .para-sidebar-row{min-height:44px}}
+.extensions-sidebar {
+  --extension-icon-left: 10px;
+  --project-content-left: 34px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.extensions-sidebar > .project-label { margin-bottom: 8px; }
+.extension-section-actions { display: flex; align-items: center; gap: 4px; }
+.extension-section-actions .extension-sort-done { display: flex; width: auto; gap: 3px; padding: 0 5px; color: var(--amber); font-size: 12px; }
+.extension-heading { position: relative; }
+.extension-heading .project-actions { opacity: 1; }
+.extension-heading .extension-toggle { min-width: 0; gap: 8px; padding-left: var(--extension-icon-left); }
+.extension-toggle > svg:first-child { width: 16px; height: 16px; }
+.extension-toggle > span { flex: 1; text-align: left; }
+.extension-toggle > svg:last-child { transition: transform .15s; }
+.extension-toggle[aria-expanded=false] > svg:last-child { transform: rotate(-90deg); }
+.extension-heading.dragging { opacity: .6; }
+.extension-group .project-actions { flex-shrink: 0; }
+.extensions-sidebar .extension-body[hidden] { display: none; }
+.extensions-sidebar .extension-body .para-sidebar { border: 0; padding: 0; margin: 0; }
 
-.extension-heading .touch-drag-handle{display:grid;place-items:center;width:18px;flex:0 0 18px;align-self:stretch;margin-left:2px;padding:0;color:#84899d;cursor:grab;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.extension-heading .touch-drag-handle:active{cursor:grabbing;color:#62a9ff}
-.extension-heading .touch-drag-handle{border:0;background:transparent;border-radius:6px}.extension-heading .touch-drag-handle:hover{background:#ffffff0b;opacity:1}.extension-heading .touch-drag-handle:focus-visible{outline:2px solid var(--amber);outline-offset:-2px}
-
-@media (hover:none),(pointer:coarse){.extension-body .opportunity-topic-row .project-select,.extension-body .para-sidebar-item{padding-left:34px}}
-
-/* Topic children use the same row box as folder conversations, including on touch screens. */
-.extension-body .opportunity-topic-row {
+/* Match folder conversations: inset, typography and compact row box. */
+.extensions-sidebar .extension-body :is(.opportunity-topic-row, .para-sidebar-row, .judgment-sidebar-link) {
   min-height: 0;
   margin: 1px 0;
   border: 1px solid transparent;
   border-radius: 8px;
+}
+.extensions-sidebar .extension-body .opportunity-topic-row .project-select,
+.extensions-sidebar .extension-body .para-sidebar-item,
+.extensions-sidebar .extension-body .judgment-sidebar-link {
+  padding: 7px 6px 7px var(--project-content-left);
+  font-size: 13.5px;
+  font-weight: 500;
+  color: #e4e6ef;
+}
+.extensions-sidebar .extension-body .opportunity-topic-row .project-select > span { font-size: 13.5px; font-weight: 500; }
+.extensions-sidebar .extension-body .para-sidebar-more { width: 27px; height: 28px; flex-basis: 27px; margin-right: 3px; color: #bfc2cf; opacity: 0; pointer-events: none; }
+.extensions-sidebar .extension-body .para-sidebar-row:is(:hover, :focus-within, .selected) > .para-sidebar-more,
+.extensions-sidebar .extension-body .para-sidebar-more[aria-expanded=true] { opacity: 1; pointer-events: auto; }
+.extensions-sidebar .extension-body .para-sidebar-empty { padding-left: calc(var(--project-content-left) + 1px); font-size: 12px; }
+.extensions-sidebar .extension-body .list-loading { padding-left: calc(var(--project-content-left) + 1px); }
+.extensions-sidebar .extension-body .judgment-sidebar-link small { color: #9ea3b7; font-variant-numeric: tabular-nums; }
+.extensions-sidebar .extension-body .judgment-sidebar-link:hover { background: rgba(255, 255, 255, .065); }
+.extensions-sidebar .extension-body .judgment-sidebar-link.active { color: var(--amber); background: rgba(240, 170, 60, .14); }
+.extensions-sidebar .extension-body .para-sidebar-row.selected .para-sidebar-item { color: var(--amber); }
+
+/* Handles overlay the icon/indent slot instead of reserving a column.
+   Touch users reveal them via “调整顺序”; keyboard focus and mouse hover
+   preserve the existing sorting shortcuts without shifting labels. */
+.extensions-sidebar .extension-group :is(.touch-drag-handle, .para-board-grip) {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--extension-icon-left) - 4px);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #84899d;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.extensions-sidebar .extension-group :is(.touch-drag-handle, .para-board-grip):active { color: #62a9ff; cursor: grabbing; }
+.extensions-sidebar .extension-group :is(.touch-drag-handle, .para-board-grip):disabled { opacity: 0; pointer-events: none; }
+.extensions-sidebar .extension-group :is(.touch-drag-handle, .para-board-grip):focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+.extensions-sidebar.is-arranging :is(.touch-drag-handle, .para-board-grip):not(:disabled),
+.extensions-sidebar .extension-group :is(.touch-drag-handle, .para-board-grip):focus-visible { opacity: 1; pointer-events: auto; }
+.extensions-sidebar.is-arranging .extension-toggle > svg:first-child,
+.extension-heading:has(> .touch-drag-handle:focus-visible) .extension-toggle > svg:first-child { visibility: hidden; }
+@media (hover: hover) and (pointer: fine) {
+  .extensions-sidebar :is(.extension-heading, .opportunity-topic-row, .para-sidebar-row):hover > :is(.touch-drag-handle, .para-board-grip):not(:disabled) { opacity: 1; pointer-events: auto; }
+  .extension-heading:has(> .touch-drag-handle:not(:disabled)):hover .extension-toggle > svg:first-child { visibility: hidden; }
+}
+@media (hover: none), (pointer: coarse) {
+  /* Align with the folder tree's touch inset without a permanent grip. */
+  .extensions-sidebar { --extension-icon-left: 30px; --project-content-left: 54px; }
+  .extensions-sidebar.is-arranging :is(.touch-drag-handle, .para-board-grip) { left: 6px; width: 44px; }
+}
+@media (max-width: 700px) {
+  .extension-heading { min-height: 44px; }
+  .extension-heading .extension-toggle, .extension-heading .project-actions button { min-height: 44px; }
 }

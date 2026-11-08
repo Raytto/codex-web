@@ -122,7 +122,7 @@ test('managed evidence attachments retain ownership and protect source deletion 
 });
 test('real routes enforce authentication, CSRF, tenant and project ownership, job lifetime and generic schedule guard',async t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'judgment-api-')),secret='judgment-fixture-secret-longer-than-thirty-two',password='fixture-pass';
-  const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'pp',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,minimumFreeDiskBytes:0});
+  const app=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'pp',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,minimumFreeDiskBytes:0});
   t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});
   const agent=request.agent(app.app),login=await agent.post('/api/auth/login').send({username:'pp',password}).expect(200),csrf=login.body.csrfToken;
   const p=app.db.createProject(id(),user,'API',root,'tenant-local'),store=new JudgmentStore(app.db),a:JudgmentActor={user,kind:'user'};

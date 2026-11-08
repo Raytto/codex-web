@@ -8,7 +8,7 @@ import { loadProductionConfig } from "./config.js";
 // Configuration must fail closed before createApp creates directories, opens
 // SQLite, performs migrations, or starts any background refresh.
 const startupConfig = loadProductionConfig();
-const { app, db, config, remoteWorkers, nodeTransfers, runner, resumableUploads, beginShutdown, waitForBackgroundTasks } = createApp(startupConfig);
+const { app, db, config, dotLive, remoteWorkers, nodeTransfers, runner, resumableUploads, personalMemory, beginShutdown, waitForBackgroundTasks } = createApp(startupConfig);
 fs.mkdirSync(path.join(config.dataRoot, "logs"), { recursive: true });
 const logger = pino(pino.destination({ dest: path.join(config.dataRoot, "logs", "app.log"), sync: false }));
 
@@ -29,6 +29,7 @@ const server = app.listen(config.port, config.host, () => {
 });
 // The default five-minute request deadline is too short for large uploads.
 server.requestTimeout = REMOTE_TRANSFER_TIMEOUT_MS;
+dotLive.attach(server);
 remoteWorkers.attach(server);
 nodeTransfers.attach(server);
 
@@ -75,9 +76,11 @@ async function shutdown(signal: string): Promise<void> {
     logger.error({ remainingJobs, activeExecutions: runner.activeJobCount }, "Shutdown drain timed out");
     process.exit(1);
   }
+  await personalMemory.waitForIdle();
   await waitForBackgroundTasks();
   await publicationRecovery;
   logger.info("Running jobs drained; closing network services");
+  await dotLive.close();
   remoteWorkers.close();
   server.close(() => {
     db.close();

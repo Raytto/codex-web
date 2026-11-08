@@ -90,12 +90,19 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026102302, name: "codex-auto-reset-uses" },
     { version: 2026102801, name: "opportunity-backlog" },
     { version: 2026102901, name: "opportunity-upload-base-revision" },
+    { version: 2026110501, name: "pp-dot-v1" },
+    { version: 2026110701, name: "conversation-voice" },
+    { version: 2026110702, name: "job-event-sequence-retention" },
+    { version: 2026110703, name: "storage-lifecycle-v1" },
+    { version: 2026110801, name: "personal-memory-codex-audit" },
     { version: 2026110802, name: "durable-complete-workflows" },
     { version: 2026110803, name: "workflow-execution-ack" },
   ]);
+  assert.deepEqual((first.sqlite.prepare("PRAGMA table_info(personal_memory_runs)").all() as Array<{name:string}>).filter(column => ["provider", "reasoning_effort", "runtime_verified"].includes(column.name)).map(column => column.name), ["provider", "reasoning_effort", "runtime_verified"]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
   assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, migrations.length);
+  assert.ok((reopened.sqlite.prepare("PRAGMA table_info(conversation_voice_state)").all() as Array<{name:string}>).some(column => column.name === "delegated_seq"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(job_recovery_checkpoints)").all() as Array<{ name: string }>).some((column) => column.name === "checkpoint_json"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>).some((column) => column.name === "finalization_state"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(remote_worker_credentials)").all() as Array<{ name: string }>).some((column) => column.name === "token_hash"));

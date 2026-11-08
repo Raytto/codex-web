@@ -18,9 +18,10 @@ export function retainSelectedConversation(
   page: ConversationPage,
   selected: Conversation | null,
   projectId?: string,
-  options: { append?: boolean } = {},
+  options: { append?: boolean; excludeDotCoordinator?: boolean } = {},
 ): ConversationPage {
   if (!selected || (projectId && selected.project_id !== projectId)) return page;
+  if (options.excludeDotCoordinator && selected.is_dot_coordinator) return page;
   if (page.conversations.some((conversation) => conversation.id === selected.id)) return page;
   // Preserve the selected detail while natural pagination reveals its row.
   if (options.append === false) return page;

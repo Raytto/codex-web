@@ -82,8 +82,8 @@ test("a transient missing directory listing is retried before unnecessary mkdir"
   fs.writeFileSync(program, `#!/usr/bin/env node
 const fs = require('node:fs'); const p = ${JSON.stringify(counter)};
 const n = fs.existsSync(p) ? Number(fs.readFileSync(p)) : 0; fs.writeFileSync(p, String(n+1));
-if (process.argv[2] !== 'tree') process.exit(9);
-if (n > 0) console.log('/archive');
+if (process.argv[2] !== 'ls') process.exit(9);
+if (n > 0) console.log('当前目录: /archive');
 `, { mode: 0o700 });
   ensureRemotePath(defaultColdStorageRoots({ aliyunpan: program }), "/archive");
   assert.equal(Number(fs.readFileSync(counter)), 2);

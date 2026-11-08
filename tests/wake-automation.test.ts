@@ -89,7 +89,7 @@ test("armed waits hold ordinary pending prompts and put their continuation first
 
 test("manual insert materializes a selected pending prompt without cancelling an armed wait", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-manual-insert-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot: path.join(root, "tenants"),
@@ -143,7 +143,7 @@ test("manual insert materializes a selected pending prompt without cancelling an
 
 test("absolute wake reschedule accepts future times and immediately triggers past times", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-reschedule-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot: path.join(root, "tenants"),
@@ -194,7 +194,7 @@ test("absolute wake reschedule accepts future times and immediately triggers pas
 
 test("relative wake reschedule adds each delay to the existing deadline", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-relative-wake-reschedule-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot: path.join(root, "tenants"),
@@ -401,7 +401,7 @@ test("the live scheduler recovers a due wait while maintenance keeps the continu
   const dataRoot = path.join(root, "data");
   fs.mkdirSync(dataRoot, { recursive: true });
   fs.writeFileSync(path.join(dataRoot, ".codex-update-maintenance"), "active\n", "utf8");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot,
     tenantRoot: path.join(root, "tenants"),
@@ -436,7 +436,7 @@ test("the live scheduler recovers a due wait while maintenance keeps the continu
 test("job-scoped automation API redacts event secrets and accepts idempotent completion receipts", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-wake-api-"));
   const secret = "wake-test-session-secret-that-is-longer-than-thirty-two-characters";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot: path.join(root, "tenants"),

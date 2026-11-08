@@ -89,7 +89,7 @@ test("startup interruption captures recovery before runtime cleanup; legacy fail
 for (const endpoint of ["conversation", "job"] as const) {
   test(`${endpoint} cancel preserves capacity-waiting handoff, summary, errors and excludes unstarted queue entries`, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "recovery-http-"));
-    const instance = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
+    const instance = createApp({ basePath: "", projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
       username: "demo", passwordHash: bcrypt.hashSync("fixture-password", 8), sessionSecret: "fixture-session-secret-with-at-least-32-characters" });
     t.after(async () => { instance.beginShutdown(); instance.remoteWorkers.close(); await instance.waitForBackgroundTasks(); instance.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
     const a = request.agent(instance.app); const login = await a.post("/api/auth/login").send({ username: "demo", password: "fixture-password" }).expect(200);

@@ -48,7 +48,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; completeWorkflows: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; geminiTitleAgent: boolean; codexAccounts: boolean; geminiAccounts: boolean; geminiUsage: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; lastMessageAt: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; completeWorkflows: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; geminiTitleAgent: boolean; codexAccounts: boolean; geminiAccounts: boolean; geminiUsage: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -203,6 +203,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       try { pathname = new URL(request.url ?? "/", "http://localhost").pathname; }
       catch { socket.destroy(); return; }
       if (pathname === `${this.config.basePath}/api/node-transfers/connect`) return;
+      if (pathname === `${this.config.basePath}/api/dot/live`) return; // Owned by the authenticated Dot gateway.
       if (pathname !== `${this.config.basePath}/api/remote-workers/connect`) { socket.destroy(); return; }
       this.server.handleUpgrade(request, socket, head, (ws) => this.server.emit("connection", ws, request));
     });
@@ -618,7 +619,10 @@ export class RemoteWorkerGateway extends EventEmitter {
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => { this.pendingTitleAgents.delete(requestId); reject(new Error("远程 Codex 命名请求超时")); }, timeoutMs + 15_000);
       this.pendingTitleAgents.set(requestId, { workerId, resolve, reject, timer });
-      this.send(connection.socket, { type: "title_agent", requestId, prompt, timeoutMs, engineId });
+      // Codex is the original wire default. Older title-capable Workers reject
+      // unknown fields, so only send an engine selector when it is required.
+      this.send(connection.socket, { type: "title_agent", requestId, prompt, timeoutMs,
+        ...(engineId === "codex" ? {} : { engineId }) });
     });
   }
 
@@ -971,6 +975,10 @@ export class RemoteWorkerGateway extends EventEmitter {
       }
       const current = this.connections.get(authenticatedWorkerId);
       if (!current || current.socket !== socket) return;
+      // A slow history stream can queue heartbeats behind valid snapshots.
+      // Only validated traffic from the current authenticated socket proves
+      // liveness; heartbeat data still exclusively reconciles active jobs.
+      current.lastMessageAt = Date.now();
       this.handleMessage(authenticatedWorkerId, message);
     });
     socket.on("close", () => {
@@ -1065,6 +1073,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       workerId: hello.workerId,
       capacity: worker.capacity,
       lastHeartbeat: Date.now(),
+      lastMessageAt: Date.now(),
       activeJobs: new Set(),
       heartbeatSeen: false,
       waitAutomation: Boolean(hello.capabilities?.waitAutomation),
@@ -1477,7 +1486,7 @@ export class RemoteWorkerGateway extends EventEmitter {
   private checkHeartbeats(): void {
     const cutoff = Date.now() - 45_000;
     for (const connection of this.connections.values()) {
-      if (connection.lastHeartbeat < cutoff) connection.socket.terminate();
+      if (connection.lastMessageAt < cutoff) connection.socket.terminate();
     }
     const now = Date.now();
     for (const update of this.db.listRemoteWorkerUpdates()) {

@@ -1,5 +1,7 @@
 # Architecture
 
+Current capability/configuration walkthrough: [中文](SETUP_GUIDE.zh-CN.md) · [English](SETUP_GUIDE.en.md). New Dot/Live/memory/storage boundaries and migration checks: [full update](UPGRADE_20261108.md).
+
 Codex Web is a single-owner self-hosted application. Express serves the API and built React assets. SQLite stores users, sessions, conversations, messages, job events, settings, and server-side queue state.
 
 The web process runs as UID 10001. A local supervisor launches Codex work as UID 11001 with a tenant-specific `HOME`, `CODEX_HOME`, conversation workspace, and library. The worker has no access to the application database. Files shared between the web process and worker use explicit filesystem ACLs.

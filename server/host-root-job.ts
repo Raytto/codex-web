@@ -90,8 +90,9 @@ input.on("line", (line) => {
           CODEX_WEB_AUTOMATION_TOKEN: message.request.automation.token,
           CODEX_WEB_AUTOMATION_JOB_ID: message.request.jobId,
           CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
-    PPAGENT_WORKFLOW_CLI: fileURLToPath(new URL("./workflow-job-cli.js", import.meta.url)),
+          PPAGENT_WORKFLOW_CLI: fileURLToPath(new URL("./workflow-job-cli.js", import.meta.url)),
           CODEX_WEB_JUDGMENT_CLI: fileURLToPath(new URL("./judgment-cli.js", import.meta.url)),
+          CODEX_WEB_STORAGE_CLI: fileURLToPath(new URL("./storage-cli.js", import.meta.url)),
           CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
         } : {}),
       };
@@ -107,7 +108,7 @@ input.on("line", (line) => {
       if (gemini) ensureAntigravityMcpConfig(gemini.home, fileURLToPath(new URL("./antigravity-platform-mcp.js", import.meta.url)));
       activeExecution = gemini ? startAntigravityTurn({
         executablePath: gemini.executable, cwd: message.request.knowledgeRoot,
-        env: gemini.env, threadId: message.request.agentSessionId ?? null,
+        env: {...gemini.env,CODEX_WEB_AUTOMATION_JOB_ID:message.request.jobId}, threadId: message.request.agentSessionId ?? null,
         threadInstructions: message.request.threadInstructions,
         prompt: message.request.effectivePrompt, imagePaths: [], outputSchema: message.request.outputSchema,
         model: message.request.selection.model, reasoningEffort: message.request.selection.reasoningEffort,
@@ -119,7 +120,7 @@ input.on("line", (line) => {
       }, callbacks) : startAppServerTurn({
         executablePath: process.env.CODEX_RUNTIME_PATH || "/usr/bin/codex",
         cwd: message.request.knowledgeRoot,
-        env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: message.request.codexHome },
+        env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: message.request.codexHome, CODEX_WEB_AUTOMATION_JOB_ID:message.request.jobId },
         threadId: message.request.codexThreadId,
         threadInstructions: message.request.threadInstructions,
         prompt: message.request.effectivePrompt,

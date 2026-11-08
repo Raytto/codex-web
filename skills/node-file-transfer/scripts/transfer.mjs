@@ -6,7 +6,7 @@ try{
  const v=JSON.parse(fs.readFileSync(args[1],'utf8').replace(/^\uFEFF/,''));
  const action=v.action;if(!['nodes','create','list','get','cancel'].includes(action))throw new Error('Invalid action');
  const env=name=>{const value=process.env[name];if(!value)throw new Error(`当前回合没有 ${name}，请使用 Codex Web 发起的任务`);return value;};
- const base=env('PPAGENT_AUTOMATION_BASE_URL').replace(/\/$/,''),job=env('PPAGENT_AUTOMATION_JOB_ID'),token=env('PPAGENT_AUTOMATION_TOKEN');
+ const base=env('CODEX_WEB_AUTOMATION_BASE_URL').replace(/\/$/,''),job=env('CODEX_WEB_AUTOMATION_JOB_ID'),token=env('CODEX_WEB_AUTOMATION_TOKEN');
  let suffix=action==='nodes'?'/nodes':'',method='GET',body;
  if(['get','cancel'].includes(action)){if(!/^[a-f0-9-]{36}$/.test(v.id))throw new Error('Invalid id');suffix=`/${v.id}`;}
  if(action==='cancel'){method='POST';suffix+='/cancel';body={};}

@@ -1,5 +1,7 @@
 # Security
 
+Current capability/configuration walkthrough: [中文](SETUP_GUIDE.zh-CN.md) · [English](SETUP_GUIDE.en.md). New Dot/Live/memory/storage boundaries and migration checks: [full update](UPGRADE_20261108.md).
+
 - Keep `.env` private and use a unique password plus a random session secret.
 - The default tenant identities are generic `owner`, `member-a`, and `member-b`
   examples only; replace their UID/GID mapping during provisioning and never

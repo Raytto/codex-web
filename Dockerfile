@@ -26,7 +26,7 @@ RUN mkdir -p /etc/ssl/certs \
     && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
     && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl git python3 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl age git python3 \
     && rm -rf /var/lib/apt/lists/* \
     && npm --prefix remote-worker ci \
     && npm run verify

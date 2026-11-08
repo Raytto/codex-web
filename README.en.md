@@ -10,6 +10,8 @@ Use it from a desktop or mobile browser, with conversations, files and execution
 
 [Quick start](#quick-start) · [Optional capabilities](#optional-capabilities) · [Documentation](#documentation) · [Cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
 
+[Complete setup guide](docs/SETUP_GUIDE.en.md) · [Upgrade checks](docs/UPGRADE_20261108.md)
+
 ## What you can do
 
 - **Voice input**: Speak a request; the recording is transcribed and sent to the agent.
@@ -22,9 +24,11 @@ Use it from a desktop or mobile browser, with conversations, files and execution
 - **Multiple engines**: Choose Codex, Gemini or Antigravity for each task in the same workspace.
 - **Project workspaces**: Organize conversations, files and skills by project, and continue across desktop and mobile.
 
-> **PP Dot · Long-term coordinator (not yet in the public edition)**: Coordinate long-term goals, delegate work across projects and follow up on results. This module has not yet been brought into the public repository.
+> **PP Dot · persistent coordinator** is included: cross-project/node delegation, task ledger, source-linked memory and result review. It requires an explicitly authorized host account; continuous voice is configured separately.
 
 Voice requires a configured transcription service; remote computers need an installed and authorized Remote Worker; opportunity cards must be enabled for the account; Gemini / Antigravity need supported, configured executors. See [optional capabilities](#optional-capabilities).
+
+Continuous project calls, PP Dot coordination and encrypted lifecycle recovery are available as optional integrations. See the complete setup guide for required accounts, costs, configuration, verification and how to disable each capability.
 
 ## Quick start
 
@@ -134,7 +138,7 @@ To include document tools:
 CODEX_WEB_BUILD_TARGET=documents ./scripts/build-image.sh
 ```
 
-The build helper reads exported shell variables, not the Compose `.env`. The example's `transcription-model` and `memory-model` are placeholders: replace them with models your provider supports. See the [deployment-options guide](docs/DEPLOYMENT_OPTIONS.md) for complete setup and acceptance checks.
+The build helper reads exported shell variables, not the Compose `.env`. The example's Speech and memory models are blank by default and must be explicitly selected: replace them with models your provider supports. See the [deployment-options guide](docs/DEPLOYMENT_OPTIONS.md) for complete setup and acceptance checks.
 
 Models and reasoning levels come from the selected executor's authenticated catalog. Live Codex steering requires the same model and reasoning level as the active request. Gemini / Antigravity additions remain queued for the next request. Switching engines transfers bounded conversation context, not the complete native session.
 
@@ -190,7 +194,7 @@ The development URL is `http://127.0.0.1:5173/codex-web/`. `npm test` builds and
 | Project and personal tools | [Project boards](docs/features/PERSONAL_KANBAN.md) · [Opportunity cards](docs/OPPORTUNITY_CARDS.md) · [Judgment book](docs/JUDGMENT_BOOK.md) |
 | Reading and sharing | [Reader](docs/READER_PROGRESSIVE_LOADING.md) · [Public sharing](docs/PUBLIC_FILE_SHARING.md) · [Interactive HTML](docs/WEB_PRESENTATIONS.md) |
 | Other executors and models | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
-| Most recent public feature update | [November 4, 2026 upgrade notes](docs/UPGRADE_20261104.md) |
+| Most recent public feature update | [November 4, 2026 upgrade notes](docs/UPGRADE_20261108.md) |
 
 This page follows the implementation on public `main`. Historical updates and migration details live in the linked guides.
 

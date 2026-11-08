@@ -27,6 +27,7 @@ function fakeAliyun(root: string, cloud: string): string {
   return executable(root, "aliyunpan", `
 const fs = require("node:fs"); const path = require("node:path"); const args = process.argv.slice(2); const cloud = ${JSON.stringify(cloud)}; const cmd = args[0];
 const remote = (value) => path.join(cloud, String(value).replace(/^\\/+/, ""));
+if (cmd === "ls") { const dir = args.at(-1); if (!fs.existsSync(remote(dir))) process.exit(1); console.log("当前目录: " + dir); process.exit(0); }
 if (cmd === "tree") { const dir = args.at(-1); const target = remote(dir); if (!fs.existsSync(target)) process.exit(1); console.log(dir); for (const name of fs.readdirSync(target)) console.log(path.posix.join(dir, name) + " -> " + path.posix.join(dir, name)); process.exit(0); }
 if (cmd === "mkdir") { const dir = args.at(-1); fs.mkdirSync(remote(dir), { recursive: true }); console.log(dir); process.exit(0); }
 if (cmd === "upload") { const files = args.filter((value) => fs.existsSync(value) && fs.statSync(value).isFile()); const source = files.at(-1); const dir = args.at(-1); if (!source || !dir) process.exit(2); fs.mkdirSync(remote(dir), { recursive: true }); fs.copyFileSync(source, path.join(remote(dir), path.basename(source))); process.exit(0); }

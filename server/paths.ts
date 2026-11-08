@@ -258,7 +258,7 @@ export function isDeliverablePath(relativePath: string): boolean {
 export function isPersistedDeliverablePath(relativePath: string): boolean {
   const parts = normalizeStoredRelativePath(relativePath).split("/");
   return parts.length === 3 && parts[0] === "deliverables" && /^[0-9a-f-]{36}$/i.test(parts[1])
-    && parts.every((part) => part !== "." && part !== ".." && !part.startsWith("."));
+    && parts[2].length > 0 && parts[2] !== "." && parts[2] !== "..";
 }
 
 function persistedDeliverablePath(fileId: string, originalPath: string): string {

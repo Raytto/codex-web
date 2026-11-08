@@ -1,3 +1,5 @@
+import { garbageCollectConversationRecords } from "./conversation-cold-storage.js";
+import { taskMemoryError, taskMemoryErrorCode, TASK_MEMORY_POLL_MS } from "./task-memory.js";
 import { ExecutionUncertainError } from "./execution-ownership.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { bindEngineSession, recordEngineNativeId, engineHandoffContext } from "./agent-engine-sessions.js";
@@ -38,6 +40,7 @@ import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
 import { MODEL_CAPACITY_CONTINUATION_PROMPT, UPSTREAM_ROUTING_CONTINUATION_PROMPT } from "./internal-messages.js";
 import { withTaskRecoveryPrompt } from "./task-recovery.js";
 import { SqliteJobEventQueue, retrySqliteWrite } from "./sqlite-job-events.js";
+import { createAntigravityStageFeedback } from "./antigravity-progress.js";
 
 export { MODEL_CAPACITY_CONTINUATION_PROMPT, isModelCapacityContinuationPrompt } from "./internal-messages.js";
 
@@ -111,6 +114,12 @@ export class CodexRunner {
   constructor(private readonly config: AppConfig, private readonly db: AppDatabase, private readonly publish: Publish, private readonly remoteWorkers: RemoteWorkerGateway) {
     this.workerClient = config.tenantWorkerIsolation ? new TenantWorkerClient() : undefined;
     this.hostWorkerClient = new HostRootWorkerClient(config.hostRootSocketPath);
+  }
+
+  extractPersonalMemory(userId: string, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+    if (isHostRootUser(userId)) return this.hostWorkerClient.extractPersonalMemory(userId, prompt, timeoutMs, signal);
+    if (!this.workerClient) return Promise.reject(new Error("personal_memory_executor_offline"));
+    return this.workerClient.extractPersonalMemory(userId, prompt, timeoutMs, signal);
   }
 
   reviewVoiceLexicon(userId: string, prompt: string, timeoutMs: number): Promise<string> {
@@ -277,8 +286,17 @@ export class CodexRunner {
       }
       return removed;
     }
-    if (!isHostRootUser(userId)) return null;
-    return this.hostWorkerClient.deleteThread(userId, threadId);
+    if (isHostRootUser(userId) || (this.workerClient && this.config.hostRootSocketPath)) {
+      return this.hostWorkerClient.deleteConversationRecords(userId, conversationId);
+    }
+    // The low-privilege web process cannot inspect another UID's native store.
+    // A configured host bridge performs the full lineage/tombstone operation.
+    if (this.workerClient) return null;
+    return garbageCollectConversationRecords({
+      databasePath: this.db.sqlite.location()!, dataRoot: this.config.dataRoot,
+      tenantRoot: this.config.tenantRoot, hostRootCodexHome: this.config.hostRootCodexHome,
+      isolationRoot: path.join(path.dirname(this.config.dataRoot), "cold-storage", "isolated"),
+    }, conversationId, userId);
   }
 
   async conversationRolloutBytes(conversationId: string): Promise<number | null> {
@@ -294,9 +312,27 @@ export class CodexRunner {
     return this.hostWorkerClient.threadRolloutBytes(conversation.user_id, conversation.codex_thread_id);
   }
 
-  async restoreColdConversation(userId: string, conversationId: string): Promise<void> {
-    const restored = await this.hostWorkerClient.restoreColdConversation(userId, conversationId);
+  async restoreColdConversation(userId: string, conversationId: string,threadId?:string): Promise<void> {
+    const restored = await this.hostWorkerClient.restoreColdConversation(userId, conversationId,threadId);
     if (!restored) throw new Error("冷存储恢复未完成");
+  }
+
+  async restoreStorage(userId:string,id:string,kind:'file'|'item'|'native'='file'):Promise<void> {
+    if(!await this.hostWorkerClient.restoreStorage(userId,id,kind))throw new Error('文件恢复未完成');
+  }
+
+  readStorageEvents(userId:string,input:import('./storage-event-reader.js').EventReadRequest) {
+    return this.hostWorkerClient.readStorageEvents(userId,input);
+  }
+
+  async restoreReaderVersion(userId: string, versionId: string): Promise<void> {
+    const restored = await this.hostWorkerClient.restoreReaderVersion(userId, versionId);
+    if (!restored) throw new Error("阅读资源恢复未完成");
+  }
+
+  async removeReaderResources(userId: string, conversationId: string): Promise<void> {
+    const removed = await this.hostWorkerClient.removeReaderResources(userId, conversationId);
+    if (!removed) throw new Error("阅读资源清理未完成");
   }
 
   projectDirectories(userId: string, executorId: string, directory: string) {
@@ -546,6 +582,11 @@ export class CodexRunner {
       const hostRoot = isHostRootUser(conversation.user_id);
       const project = conversation.project_id ? this.db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
       const remoteWorkerId = project ? workerIdFromExecutor(project.executor_id) : null;
+      if(this.config.storageLifecycleEnabled && !remoteWorkerId){
+        // Resume only the native unit and this job's explicit attachments.
+        // Other originals remain independently addressable cold objects.
+        for(const file of uploads)await this.restoreStorage(conversation.user_id,file.id);
+      }
       if (engine === "antigravity" && !hostRoot) throw new Error("当前账号尚未配置 Gemini 执行权限。");
       const executorId = project?.executor_id ?? (hostRoot ? HOST_EXECUTOR_ID : TENANT_LOCAL_EXECUTOR_ID);
       // Keep Codex's existing account-switch/resume behavior; Gemini profiles are separately bound.
@@ -558,11 +599,20 @@ export class CodexRunner {
         if (!state?.activeAccountId || !state.accounts.some((account) => account.id === state.activeAccountId && account.authenticated)) throw new Error("当前节点没有已登录的 Gemini 账号，请在账号管理中登录后重试。");
         engineAccountId = state.activeAccountId;
       }
+      const dotSession = this.db.sqlite.prepare('SELECT reset_pending FROM dot_sessions WHERE conversation_id=?').get(conversationId) as {reset_pending:number}|undefined;
+      // A forgotten memory starts a fresh native segment on the NEXT admitted job.
+      // The currently running writer is never interrupted or rebound.
+      if (dotSession?.reset_pending && !this.db.sqlite.prepare('SELECT 1 FROM agent_job_sessions WHERE job_id=?').get(jobId)) {
+        this.db.sqlite.prepare('INSERT INTO agent_engine_sessions VALUES(?,?,?,?,?,?,?)').run(crypto.randomUUID(), conversationId, engine, executorId, engineAccountId, null, new Date().toISOString());
+        this.db.sqlite.prepare('UPDATE dot_sessions SET reset_pending=0 WHERE conversation_id=?').run(conversationId);
+        this.db.sqlite.prepare('UPDATE conversations SET codex_thread_id=NULL WHERE id=?').run(conversationId);
+      }
       const binding = bindEngineSession(this.db.sqlite, { conversationId, jobId, engine, executorId, accountId: engineAccountId, legacyCodexThreadId: conversation.codex_thread_id });
       const nativeThreadId = binding.session.native_id;
+      if(this.config.storageLifecycleEnabled && !remoteWorkerId && engine==='codex' && nativeThreadId)await this.restoreColdConversation(conversation.user_id,conversationId,nativeThreadId);
       if (binding.handoff && !nativeThreadId) this.db.sqlite.prepare("UPDATE conversations SET context_input_tokens=NULL,context_window_tokens=NULL,context_usage_updated_at=NULL WHERE id=?").run(conversationId);
-      const handoff = binding.handoff ? engineHandoffContext(this.db.sqlite, conversationId, jobId) : "";
-      const personalContextSnapshot = attemptState?.contextRevision !== null && attemptState?.contextRevision !== undefined ? null : loadPersonalContextForTurn(
+      const handoff = binding.handoff && !dotSession ? engineHandoffContext(this.db.sqlite, conversationId, jobId) : "";
+      const personalContextSnapshot = dotSession ? null : attemptState?.contextRevision !== null && attemptState?.contextRevision !== undefined ? null : loadPersonalContextForTurn(
         tenant.library, nativeThreadId, binding.handoff ? undefined : conversation.personal_context_revision,
         this.db.getPersonalMemoryState(conversation.user_id).revision, prompt,
       );
@@ -583,11 +633,15 @@ export class CodexRunner {
       attemptState ??= { retries: 0, capacityStartedAt: null, nextAttemptAt: null, continuation: false,
         acceptedTurnId: null, contextRevision: null, outputs: [...before], images: [...generatedImagesBefore], imageThreadId: generatedImagesBeforeThreadId };
       attemptState.nextAttemptAt = null;
+      delete attemptState.resourceWait;
       this.db.saveJobAttemptState(jobId, attemptState);
       runtimeRoot = prepareJobRuntime(workspace, jobId);
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
       const recoveryCheckpoint = this.db.getTaskRecoveryForTurn(conversationId, jobId);
+      if(this.config.storageLifecycleEnabled && !remoteWorkerId && recoveryCheckpoint){
+        for(const link of this.db.sqlite.prepare("SELECT item_id FROM storage_item_links WHERE user_id=? AND kind='checkpoint' AND subject_id=?").all(conversation.user_id,recoveryCheckpoint.jobId))await this.restoreStorage(conversation.user_id,String(link.item_id),'item');
+      }
       const recoveredPrompt = handoff + withTaskRecoveryPrompt(prompt, recoveryCheckpoint) + this.db.workflows.instructions(jobId);
       const storedCapabilities = this.db.getConversationOptionalCapabilities(conversationId);
       const optionalCapabilities = storedCapabilities
@@ -609,6 +663,7 @@ export class CodexRunner {
       const imageInputDecision = engine === "antigravity" ? { ...decideImageInput(attachments), preload: false } : decideImageInput(attachments);
       const baseEffectivePrompt = buildAgentTurnPrompt({
         managedWebDelivery: Boolean(remoteWorkerId),
+        storageLifecycleEnabled: Boolean(this.config.storageLifecycleEnabled && !remoteWorkerId),
         userPrompt: recoveredPrompt + paraJobPrompt(this.db.sqlite, jobId),
         attachments,
         personalContext,
@@ -625,6 +680,7 @@ export class CodexRunner {
       const effectivePrompt = appendWaitAutomationInstructions(baseEffectivePrompt, legacyWaitInstructions);
       const continuationEffectivePrompt = buildAgentTurnPrompt({
         managedWebDelivery: Boolean(remoteWorkerId),
+        storageLifecycleEnabled: Boolean(this.config.storageLifecycleEnabled && !remoteWorkerId),
         userPrompt: withTaskRecoveryPrompt(capacityRetryPrompt(prompt, true, attemptState.retryKind), recoveryCheckpoint, true) + this.db.workflows.instructions(jobId),
         attachments: [],
         personalContext,
@@ -681,6 +737,7 @@ export class CodexRunner {
         automation,
       };
       let remoteThreadId = nativeThreadId;
+      const stageFeedback = engine === "antigravity" ? createAntigravityStageFeedback() : null;
       const persistenceCallbacks = {
         onThreadStarted: (threadId: string) => {
           // Synchronizing the thread prevents accidental duplicate thread creation. It does
@@ -712,6 +769,9 @@ export class CodexRunner {
         onProgress: (payload: unknown) => {
           executionObserved = true;
           if (isMeaningfulExecutionProgress(payload)) capacityAttemptHadProgress = true;
+          if (containsPersonalContext(payload)) return;
+          const feedback = stageFeedback?.(payload);
+          if (feedback) this.publish(jobId, "progress", feedback);
           if (payload && typeof payload === "object" && "kind" in payload && payload.kind === "input_accepted") {
             const accepted = payload as { threadId?: string; turnId?: string };
             if (attemptState && accepted.threadId === remoteThreadId && typeof accepted.turnId === "string") {
@@ -725,7 +785,6 @@ export class CodexRunner {
             }
             return;
           }
-          if (containsPersonalContext(payload)) return;
           if (payload && typeof payload === "object" && "kind" in payload && payload.kind === "error") {
             const event = payload as { label?: string; detail?: string; message?: string };
             for (const value of [event.label, event.detail, event.message]) if (value) reportedErrors.add(value);
@@ -810,6 +869,7 @@ export class CodexRunner {
         }
         if (hostRoot) return eventQueue.waitFor(this.hostWorkerClient.run(hostRequest, callbacks));
         if (this.workerClient) return eventQueue.waitFor(this.workerClient.run(request, callbacks));
+        if (this.config.taskMemoryGuard) throw taskMemoryError("MEMORY_GUARD_UNAVAILABLE");
         const execution = startTenantTurn(request, { signal: controller.signal, ...callbacks });
         this.directExecutions.set(jobId, execution);
         try { return await eventQueue.waitFor(execution.result); }
@@ -818,7 +878,7 @@ export class CodexRunner {
         signal: controller.signal,
         // Capacity waits are persisted and release the worker. Only pre-execution
         // transport failures may retry inside this invocation.
-        canRetry: (error) => engine === "codex" && !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error) && !(error instanceof ExecutionUncertainError),
+        canRetry: (error) => engine === "codex" && !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error) && !taskMemoryErrorCode(error) && !(error instanceof ExecutionUncertainError),
         onRetry: ({ attempt, maxAttempts, delayMs }) => {
           this.publish(jobId, "status", { status: "retrying", label: "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt, retryMaxAttempts: maxAttempts, retryDelaySeconds: delayMs / 1000,
@@ -939,6 +999,16 @@ export class CodexRunner {
         this.remoteWorkers.release(jobId);
         return;
       }
+      const resourceCode = taskMemoryErrorCode(error);
+      if (!controller.signal.aborted && !executionObserved && attemptState
+        && (resourceCode === "MEMORY_WAIT" || resourceCode === "MEMORY_GUARD_UNAVAILABLE")) {
+        attemptState.resourceWait = resourceCode;
+        attemptState.nextAttemptAt = new Date(Date.now() + TASK_MEMORY_POLL_MS).toISOString();
+        if (this.db.deferJobForMemory(jobId, attemptState)) {
+          this.publish(jobId, "status", { status: "queued", label: errorMessage, resourceCode });
+          return;
+        }
+      }
       const routingFailure = isUpstreamRoutingError(error);
       if (!routingFailure && !controller.signal.aborted && !reportedErrors.has(errorMessage)) {
         try { this.publish(jobId, "progress", { kind: "error", label: errorMessage }); }
@@ -946,7 +1016,7 @@ export class CodexRunner {
       }
       const continuationRequired = Boolean(attemptState?.continuation || attemptState?.acceptedTurnId || capacityAttemptHadProgress);
       const canContinueRouting = !continuationRequired || Boolean(this.db.getConversation(conversationId)?.codex_thread_id);
-      if (engine === "codex" && !controller.signal.aborted && attemptState
+      if (engine === "codex" && !controller.signal.aborted && !resourceCode && attemptState
         && (isModelCapacityError(error) || (routingFailure && canContinueRouting))) {
         const now = Date.now();
         attemptState.retryKind = routingFailure ? "routing" : "capacity";
@@ -986,7 +1056,7 @@ export class CodexRunner {
       }
       this.remoteWorkers.release(jobId);
       try {
-        this.publish(jobId, cancelled ? "done" : "failed", { status: cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message });
+        this.publish(jobId, cancelled ? "done" : "failed", { status: cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message, ...(resourceCode ? { resourceCode } : {}) });
       } catch {
         // The database may already be unavailable; the service must stay alive for recovery and diagnostics.
       }
@@ -1126,7 +1196,7 @@ function remoteOmissionReason(reason: NonNullable<Extract<TenantWorkerEvent, { t
 export function remoteArtifactDeliveryName(name: string): string | null {
   const normalized = normalizeStoredRelativePath(name);
   const deliveryName = path.posix.basename(normalized);
-  if (!deliveryName || /[\u0000-\u001f\u007f]/.test(deliveryName)) return null;
+  if (!deliveryName || deliveryName.startsWith(".") || /[\u0000-\u001f\u007f]/.test(deliveryName)) return null;
   const probeId = "00000000-0000-4000-8000-000000000000";
   return isPersistedDeliverablePath(path.posix.join("deliverables", probeId, deliveryName)) ? deliveryName : null;
 }

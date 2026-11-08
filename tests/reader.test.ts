@@ -5,6 +5,14 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import {execFileSync} from 'node:child_process';
+import {StorageCatalog} from '../server/storage-catalog.js';
+import {StorageChunkStore,sha256Path} from '../server/storage-chunks.js';
+import {StorageFileLifecycle} from '../server/storage-file-lifecycle.js';
+import {storagePolicy} from '../server/storage-lifecycle-policy.js';
+import {storageRoot} from '../server/storage-inventory.js';
+import {defaultColdStorageRoots} from '../server/conversation-cold-storage.js';
+import {importLegacyResource} from '../server/storage-legacy-resources.js';
 import { BlobWriter, TextReader, ZipWriter } from "@zip.js/zip.js";
 import { loadConfig, READER_V1_MAX_CONCURRENT_READS, READER_V1_MAX_FILE_BYTES, READER_V1_MAX_RANGE_BYTES, READER_V1_RETENTION_DAYS } from "../server/config.js";
 import { AppDatabase, LEGACY_USER_ID, type FileRow } from "../server/db.js";
@@ -255,7 +263,7 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   assert.ok(!builtIndex.includes(readerStyles[0]));
   assert.ok(!builtIndex.includes(pdfRuntimes[0]));
   assert.ok(!builtIndex.includes(pdfWorkers[0]));
-  for (const stylesheet of Array.from(builtIndex.matchAll(/href="\/codex-web\/assets\/([^"]+\.css)"/g), (match) => match[1])) {
+  for (const stylesheet of Array.from(builtIndex.matchAll(/href="(?:\.\/|\/)assets\/([^"]+\.css)"/g), (match) => match[1])) {
     assert.doesNotMatch(sources.get(stylesheet) ?? "", /\.reader-(?:pdf|epub|paginator|document-shell)/);
   }
   assert.ok(fs.statSync(path.join(assetsRoot, readerScripts[0])).size < 32 * 1024, "the lightweight reader shell should stay below 32 KiB minified");
@@ -408,6 +416,7 @@ function fakeAliyun(root: string, cloud: string): string {
   return executable(root, "aliyunpan", `
 const fs = require("node:fs"); const path = require("node:path"); const args = process.argv.slice(2); const cloud = ${JSON.stringify(cloud)}; const cmd = args[0];
 const remote = (value) => path.join(cloud, String(value).replace(/^\\/+/, ""));
+if (cmd === "ls") { const dir = args.at(-1); if (!fs.existsSync(remote(dir))) process.exit(1); console.log("当前目录: " + dir); process.exit(0); }
 if (cmd === "tree") { const dir = args.at(-1); const target = remote(dir); if (!fs.existsSync(target)) process.exit(1); console.log(dir); for (const name of fs.readdirSync(target)) console.log(path.posix.join(dir, name) + " -> " + path.posix.join(dir, name)); process.exit(0); }
 if (cmd === "mkdir") { const dir = args.at(-1); fs.mkdirSync(remote(dir), { recursive: true }); console.log(dir); process.exit(0); }
 if (cmd === "upload") { const source = args.filter((value) => fs.existsSync(value) && fs.statSync(value).isFile()).at(-1); const dir = args.at(-1); if (!source || !dir) process.exit(2); fs.mkdirSync(remote(dir), { recursive: true }); fs.copyFileSync(source, path.join(remote(dir), path.basename(source))); process.exit(0); }
@@ -578,4 +587,39 @@ test("direct PDF version manifests respect conversation cold-storage activation"
     });
     await assert.rejects(service.getManifest(fixture.version.id, LEGACY_USER_ID), (error: unknown) => error instanceof ReaderUnavailableError);
   } finally { db.close(); }
+});
+
+test('granular legacy EPUB conversion keeps the directory local and restores only the requested chapter',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'reader-lifecycle-')),dataRoot=path.join(root,'data'),tenantRoot=path.join(root,'tenants'),db=new AppDatabase(dataRoot,undefined,false);
+ try{
+  const fixture=addReaderFixture(db,root),versionId=fixture.version.id,owner=LEGACY_USER_ID;
+  const resource=path.join(dataRoot,fixture.version.normalized_root!),stage=path.join(root,'stage'),cloud=path.join(root,'cloud');
+  fs.mkdirSync(stage);fs.mkdirSync(cloud);fs.writeFileSync(path.join(resource,'units','1.html'),'<p>Another chapter</p>');
+  const units=db.listReadingUnits(versionId,owner);db.replaceReadingUnits(versionId,owner,[...units,{id:uuid(),version_id:versionId,ordinal:1,kind:'spine',href:'second.xhtml',title:'second',media_type:'application/xhtml+xml',content_path:'units/1.html',byte_size:22,text_content:'Another chapter',metadata_json:null}]);
+  fs.cpSync(resource,path.join(stage,'resources'),{recursive:true});
+  const entries=['units/0.html','units/1.html'].map(relativePath=>({relativePath,size:fs.statSync(path.join(resource,relativePath)).size,sha256:sha256Path(path.join(resource,relativePath))}));
+  const manifest=JSON.stringify({format:'reader-normalized-v1',versionId,sourceId:fixture.source.id,userId:owner,generation:1,normalizedRoot:fixture.version.normalized_root,entries});
+  fs.writeFileSync(path.join(stage,'manifest.json'),manifest);
+  const key=path.join(root,'key'),recipient=path.join(root,'recipient'),tar=path.join(root,'legacy.tar'),encrypted=path.join(root,'legacy.age');
+  execFileSync('age-keygen',['-o',key],{stdio:'ignore'});fs.writeFileSync(recipient,execFileSync('age-keygen',['-y',key]));
+  execFileSync('tar',['-cf',tar,'-C',stage,'.']);execFileSync('age',['-R',recipient,'-o',encrypted,tar]);
+  db.sqlite.prepare("UPDATE reading_source_versions SET storage_state='cold',storage_generation=1,storage_manifest_json=?,storage_manifest_sha256=?,storage_archive_sha256=?,storage_archive_bytes=?,storage_verified_at=?,remote_drive_id='drive',remote_path='/legacy/reader.age' WHERE id=?")
+   .run(manifest,crypto.createHash('sha256').update(manifest).digest('hex'),sha256Path(encrypted),fs.statSync(encrypted).size,new Date().toISOString(),versionId);
+  fs.rmSync(resource,{recursive:true});fs.unlinkSync(path.join(tenantRoot,owner,'conversations',fixture.file.conversation_id,fixture.file.relative_path));
+  const roots={dataRoot,tenantRoot,hostRootCodexHome:path.join(root,'host'),hostUserId:uuid()},catalog=new StorageCatalog(db.sqlite);
+  let downloads=0,legacyReads=0;
+  const policy={...storagePolicy({STORAGE_LIFECYCLE_ENABLED:'1',STORAGE_INSTANCE_ID:'test',STORAGE_REMOTE_ROOT:'/test',STORAGE_DRIVE_ID:'drive',STORAGE_AGE_RECIPIENT:recipient,STORAGE_AGE_IDENTITY:key}),chunkBytes:64*1024,scratchBytes:4*1024**2};
+  const chunks=new StorageChunkStore(catalog,policy,path.join(root,'scratch'),{put:async(file,remote)=>{fs.copyFileSync(file,path.join(cloud,path.basename(remote)));},get:async(remote,file)=>{downloads++;fs.copyFileSync(path.join(cloud,path.basename(remote)),file);}});
+  const input={catalog,chunks,roots,legacyRoots:defaultColdStorageRoots({...roots,databasePath:path.join(dataRoot,'codex-web.sqlite'),isolationRoot:path.join(root,'legacy-isolation')}),kind:'reader' as const,id:versionId,userId:owner,
+   read:async()=>{legacyReads++;return fs.createReadStream(encrypted);}};
+  assert.equal((await importLegacyResource(input)).members,2);assert.equal((await importLegacyResource(input)).alreadyImported,true);assert.equal(legacyReads,1);
+  const lifecycle=new StorageFileLifecycle(catalog,chunks,path.join(root,'isolation'),(user,key)=>storageRoot(catalog,roots,user,key),()=>undefined);
+  const service=new ReaderService({db,config:loadConfig({projectRoot:root,dataRoot,tenantRoot}),resolveFilePath:()=>{throw new Error('must not read original ZIP');},resolveExistingFilePath:()=>{throw new Error('must not probe original ZIP');},
+   ensureResourceAvailable:async(_version,relative,user)=>{const item=catalog.linked(user,'reader',versionId).find(x=>JSON.parse(x.locator_json).path===relative)!;await lifecycle.restore(user,item.id,'user-read');}});
+  const before=downloads;
+  assert.equal((await service.openFile(fixture.file,owner)).units.length,2);assert.equal((await service.getManifest(versionId,owner))!.units.length,2);assert.equal(downloads,before);assert.equal(fs.existsSync(resource),false);
+  assert.equal((await service.readUnit(versionId,units[0].id,owner))!.content,'<p>unit</p>');assert.equal(downloads,before+1);
+  assert.equal(fs.existsSync(path.join(resource,'units/1.html')),false);assert.equal(await service.readUnit(versionId,units[0].id,uuid()),null);
+  service.stop();await service.waitForBackgroundTasks();
+ }finally{db.close();fs.rmSync(root,{recursive:true,force:true});}
 });

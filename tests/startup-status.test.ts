@@ -7,6 +7,7 @@ import bcrypt from "bcryptjs";
 import request from "supertest";
 import { createApp } from "../server/app.js";
 import { resolveProcessStatus } from "../src/process-status.js";
+import type { JobAttemptState } from "../server/db.js";
 import type { JobEvent } from "../src/api.js";
 
 test("immediate admission and engine preparation render as processing", () => {
@@ -42,7 +43,7 @@ test("legacy waits remain visible and resumed or retried executions use the late
 
 async function fixture(context: { after(fn: () => unknown): void }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-startup-status-"));
-  const instance = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"),
+  const instance = createApp({ basePath: "", projectRoot: process.cwd(), dataRoot: path.join(root, "data"),
     tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "pp", passwordHash: bcrypt.hashSync("Startup-Test-2026!", 8),
     sessionSecret: "startup-test-session-secret-longer-than-thirty-two-characters" });
@@ -59,7 +60,7 @@ async function fixture(context: { after(fn: () => unknown): void }) {
   const login = await agent.post("/api/auth/login").send({ username: "pp", password: "Startup-Test-2026!" }).expect(200);
   const created = await agent.post("/api/conversations").set("X-CSRF-Token", login.body.csrfToken).expect(201);
   const conversationId = created.body.conversation.id;
-  return { instance, agent, conversationId, releases, root,
+  return { instance, agent, conversationId, releases, root, cookie: login.headers["set-cookie"], setAvailable: (value: number) => { available = value; },
     send: (useComposerDraft = false) => agent.post(`/api/conversations/${conversationId}/messages`)
       .set("X-CSRF-Token", login.body.csrfToken).send({ message: "startup test", ...(useComposerDraft ? { useComposerDraft: "true" } : {}) }).expect(202) };
 }
@@ -122,13 +123,14 @@ for (const blocker of ["maintenance"]) {
   });
 }
 
-test("a persisted capacity retry remains a real wait until its retry time", async context => {
-  const { instance, send } = await fixture(context);
+for (const retryKind of [undefined, "capacity", "routing"] as const) {
+test(`a persisted ${retryKind ?? "legacy capacity"} retry keeps its reason across queue, reload and live events`, async context => {
+  const { instance, agent, conversationId, cookie, send } = await fixture(context);
   const submitted = await send();
   const jobId = submitted.body.job.id;
   const started: string[] = [];
   instance.runner.run = async (id, conversationId) => { started.push(id); instance.db.finishJob(id, conversationId, "completed"); };
-  const state = { retries: 1, capacityStartedAt: new Date().toISOString(),
+  const state: JobAttemptState = { retryKind, retries: 1, capacityStartedAt: new Date().toISOString(),
     nextAttemptAt: new Date(Date.now() + 60_000).toISOString(), continuation: false,
     acceptedTurnId: null, contextRevision: null, outputs: [], images: [], imageThreadId: null };
   instance.db.saveJobAttemptState(jobId, state);
@@ -138,9 +140,57 @@ test("a persisted capacity retry remains a real wait until its retry time", asyn
   const events = instance.db.listEvents(jobId).map(row => JSON.parse(row.payload) as JobEvent);
   assert.equal(events.at(-1)?.starting, false);
   assert.equal(resolveProcessStatus(events).queued, true);
-  assert.match(events.at(-1)!.label!, /模型容量等待中/);
+  const expected = retryKind === "routing" ? /上游路由连接暂时不可用/ : /模型容量等待中/;
+  assert.match(events.at(-1)!.label!, expected);
+  assert.match(events.at(-1)!.label!, /北京时间.*自动继续/);
+  const activity = await agent.get(`/api/conversations/${conversationId}/activity`).expect(200);
+  assert.match(resolveProcessStatus(activity.body.jobEvents).queueStatus!.label!, expected);
+  const reload = await agent.get(`/api/conversations/${conversationId}/activity`).expect(200);
+  assert.deepEqual(reload.body.jobEvents, activity.body.jobEvents);
+
+  // Subscribe after the persisted snapshot, then observe a new queue event over
+  // the actual SSE endpoint. No mock payloads: pumpQueue publishes the label.
+  const server = instance.app.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => server.once("listening", resolve));
+  const address = server.address() as { port: number };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  context.after(() => { clearTimeout(timeout); controller.abort(); server.closeAllConnections(); server.close(); });
+  const response = await fetch(`http://127.0.0.1:${address.port}/api/jobs/${jobId}/events?after=${instance.db.listEvents(jobId).at(-1)!.seq}`, {
+    headers: { Cookie: (Array.isArray(cookie) ? cookie : [cookie]).map(value => value.split(";")[0]).join("; ") }, signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body!.getReader();
+  let streamed = "";
+  while (!streamed.includes("replay_complete")) streamed += new TextDecoder().decode((await reader.read()).value);
+  streamed = "";
+  await instance.pumpQueue();
+  while (!streamed.includes('"status":"queued"')) streamed += new TextDecoder().decode((await reader.read()).value);
+  assert.match(streamed, expected);
+  if (retryKind === "routing") assert.doesNotMatch(streamed, /模型容量等待中/);
+  await reader.cancel();
+  clearTimeout(timeout);
   instance.db.saveJobAttemptState(jobId, { ...state, nextAttemptAt: new Date(Date.now() - 1_000).toISOString() });
   await instance.pumpQueue();
   await instance.waitForBackgroundTasks();
   assert.deepEqual(started, [jobId]);
 });
+
+}
+
+for (const blocker of ["MEMORY_WAIT", "MEMORY_GUARD", "maintenance"] as const) {
+  test(`routing retry preserves ${blocker} guidance priority`, async context => {
+    const { instance, root, send } = await fixture(context);
+    const submitted = await send();
+    instance.db.saveJobAttemptState(submitted.body.job.id, { retries: 1, capacityStartedAt: new Date().toISOString(),
+      nextAttemptAt: new Date(Date.now() + 60_000).toISOString(), retryKind: "routing",
+      ...(blocker === "maintenance" ? {} : { resourceWait: blocker }), continuation: false,
+      acceptedTurnId: null, contextRevision: null, outputs: [], images: [], imageThreadId: null });
+    if (blocker === "maintenance") fs.writeFileSync(path.join(root, "data", ".codex-update-maintenance"), "active\n");
+    await instance.pumpQueue();
+    const events = instance.db.listEvents(submitted.body.job.id).map(row => JSON.parse(row.payload) as JobEvent);
+    const label = resolveProcessStatus(events).queueStatus!.label!;
+    assert.doesNotMatch(label, /上游路由|模型容量/);
+    assert.match(label, blocker === "maintenance" ? /维护|更新/ : /内存/);
+  });
+}

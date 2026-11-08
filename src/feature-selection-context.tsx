@@ -9,6 +9,7 @@ const FeatureSelectionContext = createContext({
   applyFeatures: (_value: FeatureSelection) => {},
   changeParaBoard: async (_enabled: boolean) => {},
   changeOpportunityCards: async (_enabled: boolean) => {},
+  changePpDot: async (_enabled: boolean) => {},
   changeJudgmentBook: async (_enabled: boolean) => {},
 });
 
@@ -74,8 +75,9 @@ export function FeatureSelectionProvider({ initial, children }: { initial?: Feat
       try { await refresh(); } catch { /* Keep the last confirmed value. */ }
     } finally { savingRef.current = false; setSaving(false); }
   };
+  const changePpDot = (ppDot: boolean) => change({ ppDot });
   const changeParaBoard = (paraBoard: boolean) => change({ paraBoard });
   const changeJudgmentBook = (judgmentBook: boolean) => change({ judgmentBook });
   const changeOpportunityCards = (opportunityCards: boolean) => change({ opportunityCards });
-  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changeParaBoard, changeOpportunityCards, changeJudgmentBook }}>{children}</FeatureSelectionContext.Provider>;
+  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changePpDot, changeParaBoard, changeOpportunityCards, changeJudgmentBook }}>{children}</FeatureSelectionContext.Provider>;
 }

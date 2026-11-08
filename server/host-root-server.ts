@@ -1,21 +1,27 @@
-import { loadInstancePaths } from './instance-config.js';
-import { publicInstanceEnvironment } from './instance-environment.js';
+import { publicInstanceEnvironment } from "./instance-environment.js";
+import { loadInstancePaths } from "./instance-config.js";
 import { DatabaseSync } from "node:sqlite";
 import { WorkflowStore } from "./workflow-store.js";
 import { verifyWorkflowEvidence } from "./workflow-evidence.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { resolveAntigravityModel, type AntigravityAgentOptions } from "../remote-worker/src/antigravity-runtime.js";
+import { spawnMemoryWorker } from "./memory-worker.js";
+import { taskMemoryEnabled, assertTaskMemoryAvailable, taskMemoryErrorCode, MEMORY_LIMIT_MESSAGE } from "./task-memory.js";
+import { createTaskMemoryScope, finishTaskMemoryScope, resolveTenantMemoryPid } from "./task-memory-scope.js";
 import { operateHostProjectSkill } from "./host-project-skills.js";
 import { NodeTransferEndpoint } from "../remote-worker/src/node-transfer-endpoint.js";
+import { spawnCodexRuntime } from "./codex-lifecycle-lock.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import readline from "node:readline";
+import { guardHostSocket } from "./host-socket.js";
 import { HOST_ROOT_USER_ID } from "./host-root-user.js";
+import { tenantIdentityForUser } from "./tenant-identities.js";
 import type { HostRootClientMessage, HostRootExecutionRequest, HostRootJobInput, HostRootRunRequest, HostRootServerMessage } from "./host-root-protocol.js";
 import { isOptionalAgentCapabilities } from "./optional-capabilities.js";
-import { codexThreadRolloutBytes, removeCodexThreadFiles } from "./paths.js";
+import { codexThreadRolloutBytes } from "./paths.js";
 import type { TenantWorkerEvent } from "./tenant-worker-protocol.js";
 import { buildHostThreadInstructions } from "./agent-context.js";
 import { installProjectInstructions } from "./project-instructions.js";
@@ -29,11 +35,19 @@ import { validateConversationTitleRequest, type ConversationTitleWorkerEvent } f
 import { GeminiAccountManager } from "../remote-worker/src/gemini-accounts.js";
 import { assertGeminiAccountChangeAllowed } from "../remote-worker/src/gemini-account-guard.js";
 import { CodexAccountManager } from "./codex-account-manager.js";
-import { defaultColdStorageRoots, restoreColdConversation } from "./conversation-cold-storage.js";
+import { defaultColdStorageRoots } from "./conversation-cold-storage.js";
+import { readerRoots } from "./reader-cold-storage.js";
+import { HostStorageJobs } from "./host-storage-jobs.js";
+import {StorageCatalog} from './storage-catalog.js';
+import {readEventHistory} from './storage-event-reader.js';
+import {storageRoot} from './storage-inventory.js';
+import {safeStorageMember} from './storage-file-lifecycle.js';
+import {storageProcessIdentity} from './storage-host.js';
 import { countRunningJobsForExecutorInDatabase, countRunningGeminiJobsForExecutorInDatabase } from "./executor-job-status.js";
 import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 
 const hostPaths = loadInstancePaths(publicInstanceEnvironment(process.env, process.cwd()), process.cwd());
+// Root authority is opt-in. Missing configuration never selects a production instance.
 for (const key of ['CODEX_WEB_HOST_SOCKET_PATH', 'CODEX_WEB_HOST_TENANT_ROOT', 'CODEX_WEB_KNOWLEDGE_ROOT', 'CODEX_WEB_CODEX_HOME', 'CWW_DATABASE_PATH', 'CODEX_WEB_HOST_HOME']) {
   if (!process.env[key]) throw new Error(`Host bridge requires explicit ${key}`);
 }
@@ -43,28 +57,36 @@ const knowledgeRoot = hostPaths.hostKnowledgeRoot;
 const codexHome = hostPaths.hostRootCodexHome;
 const webUid = Number(process.env.CODEX_WEB_WEB_UID || "10001");
 const webGid = Number(process.env.CODEX_WEB_WEB_GID || "10001");
-const workers = new Map<string, { model: string; child: ChildProcess; socket: Socket; workspace: string; runtimeRoot: string; terminal: boolean; timers: NodeJS.Timeout[] }>();
+if (![webUid, webGid].every(n => Number.isSafeInteger(n) && n > 0)) throw new Error('Invalid bridge web UID/GID');
+const hostDatabasePath = hostPaths.hostDatabasePath;
+const workers = new Map<string, { model: string; child: ChildProcess; socket: Socket; workspace: string; runtimeRoot: string; terminal: boolean; terminalEvent?: TenantWorkerEvent; ready: boolean; timers: NodeJS.Timeout[] }>();
 const voiceReviewWorkers = new Map<string, ChildProcess>();
 const titleAgentWorkers = new Map<string, ChildProcess>();
 const geminiTitleRequests = new Set<string>();
+const tenantMemoryScopes = new Map<string, string>();
 let stopping = false;
-const hostDatabasePath = hostPaths.hostDatabasePath;
-if (![webUid, webGid].every(n => Number.isSafeInteger(n) && n > 0)) throw new Error("Invalid bridge web UID/GID");
-
-if (!socketPath || !process.env.CODEX_WEB_HOST_TENANT_ROOT || !process.env.CODEX_WEB_KNOWLEDGE_ROOT || !process.env.CODEX_WEB_CODEX_HOME) {
-  throw new Error("Host bridge is disabled until CODEX_WEB_HOST_SOCKET_PATH, CODEX_WEB_HOST_TENANT_ROOT, CODEX_WEB_KNOWLEDGE_ROOT, and CODEX_WEB_CODEX_HOME are configured");
-}
-if (process.platform !== "win32" && process.getuid?.() !== 0) throw new Error("CODEX_WEB host bridge must run as root");
-for (const directory of [hostTenantRoot, knowledgeRoot, codexHome]) {
-  if (!fs.statSync(directory).isDirectory()) throw new Error(`Required CODEX_WEB host directory is unavailable: ${directory}`);
-}
+const storageJobs = new HostStorageJobs();
 const nodeTransfers = new NodeTransferEndpoint(path.join(path.dirname(hostDatabasePath), "host-transfer-state"), process.env.PUBLIC_BASE_URL || "");
+
+function hostColdStorageRoots() {
+  return readerRoots({ ...defaultColdStorageRoots({
+    databasePath: hostDatabasePath,
+    tenantRoot: hostTenantRoot,
+    hostRootCodexHome: codexHome,
+    dataRoot: path.dirname(hostDatabasePath),
+  }), readerOwnerUid: webUid, readerOwnerGid: webGid });
+}
+
+if (process.platform !== "win32" && process.getuid?.() !== 0) throw new Error("Codex Web host bridge must run as root");
+for (const directory of [hostTenantRoot, knowledgeRoot, codexHome]) {
+  if (!fs.statSync(directory).isDirectory()) throw new Error(`Required Codex Web host directory is unavailable: ${directory}`);
+}
 syncManagedSkills(codexHome);
 const hostLibraryRoot = path.join(hostTenantRoot, HOST_ROOT_USER_ID, "library");
 ensureAccountSkillLibrary(hostLibraryRoot, HOST_ROOT_USER_ID);
 syncAccountSkills(codexHome, loadAccountSkillBundle(hostLibraryRoot));
 const sharedAuthPolicy = sharedCodexAuthPolicyFromEnv();
-if (!sharedAuthPolicy) throw new Error("CODEX_WEB host bridge requires shared Codex authentication");
+if (!sharedAuthPolicy) throw new Error("Codex Web host bridge requires shared Codex authentication");
 const sharedAuthRoot = path.dirname(path.dirname(sharedAuthPolicy.sourceFile));
 const codexAccountManager = new CodexAccountManager({
   authorityFile: sharedAuthPolicy.sourceFile,
@@ -84,17 +106,18 @@ const server = net.createServer((socket) => handleConnection(socket));
 server.listen(socketPath, () => {
   fs.chmodSync(socketPath, 0o660);
   if (process.platform !== "win32") fs.chownSync(socketPath, 0, webGid);
-  process.stdout.write(`CODEX_WEB host bridge listening on ${socketPath}\n`);
+  process.stdout.write(`Codex Web host bridge listening on ${socketPath}\n`);
 });
 
 server.on("error", (error) => {
-  process.stderr.write(`CODEX_WEB host bridge error: ${error.message}\n`);
+  process.stderr.write(`Codex Web host bridge error: ${error.message}\n`);
   process.exitCode = 1;
 });
 
 function handleConnection(socket: Socket): void {
   let activeJobId: string | null = null;
   const input = readline.createInterface({ input: socket, crlfDelay: Infinity });
+  guardHostSocket(socket, input);
   input.on("line", (line) => {
     if (Buffer.byteLength(line, "utf8") > 2_000_000) {
       send(socket, { type: "request_failed", message: "Host request is too large" });
@@ -109,6 +132,31 @@ function handleConnection(socket: Socket): void {
       return;
     }
     try {
+      if (message.type === "memory_scope_attach") {
+        if (activeJobId || stopping || !taskMemoryEnabled()) throw new Error("Task memory protection unavailable");
+        const target = message.target;
+        if (tenantMemoryScopes.has(target.token)) throw new Error("Duplicate memory scope");
+        tenantMemoryScopes.set(target.token, target.userId);
+        void resolveTenantMemoryPid(target).then(pid => createTaskMemoryScope(pid, target.token, { tenant: true })).then(async () => {
+          if (socket.destroyed) { await finishTaskMemoryScope(target.token); tenantMemoryScopes.delete(target.token); return; }
+          send(socket, { type: "memory_scope_ready", requestId: message.requestId }); socket.end();
+        }, async error => {
+          tenantMemoryScopes.delete(target.token);
+          await finishTaskMemoryScope(target.token).catch(() => undefined);
+          send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "Task memory protection unavailable", resourceCode: taskMemoryErrorCode(error) ?? "MEMORY_GUARD_UNAVAILABLE" }); socket.end();
+        });
+        return;
+      }
+      if (message.type === "memory_scope_finish") {
+        if (activeJobId || tenantMemoryScopes.get(message.token) !== message.userId) throw new Error("Unknown task memory scope");
+        void finishTaskMemoryScope(message.token).then(result => {
+          tenantMemoryScopes.delete(message.token);
+          send(socket, { type: "memory_scope_result", requestId: message.requestId, result }); socket.end();
+        }, error => {
+          send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "Task memory cleanup failed" }); socket.end();
+        });
+        return;
+      }
       if (message.type === "node_transfer") {
         if (message.userId !== HOST_ROOT_USER_ID || stopping) throw new Error("Unauthorized node transfer");
         void nodeTransfers.start(message.spec).then(() => {
@@ -119,17 +167,26 @@ function handleConnection(socket: Socket): void {
       if (message.type === "run") {
         if (activeJobId) throw new Error("A host job is already attached to this connection");
         activeJobId = message.request.jobId;
-        void startWorker(socket, message.request).catch(error => { send(socket, { type: "request_failed", message: error instanceof Error ? error.message : String(error) }); socket.end(); });
+        void startWorker(socket, message.request).catch(error => {
+          send(socket, { type: "request_failed", message: error instanceof Error ? error.message : "Host worker could not start", resourceCode: taskMemoryErrorCode(error) });
+          socket.end();
+        });
+        return;
+      }
+      if (message.type === "delete_conversation_records") {
+        if (activeJobId) throw new Error("Cannot collect records through an active job connection");
+        validateReaderUser(message.userId);
+        void storageJobs.run({ operation: "collect_records", roots: hostColdStorageRoots(), id: message.conversationId, userId: message.userId }).then(
+          removed => { send(socket, { type: "delete_thread_result", requestId: message.requestId, removed: removed ?? 0 }); socket.end(); },
+          error => sendRequestFailure(socket, message.requestId, error),
+        );
         return;
       }
       if (message.type === "delete_thread") {
         if (activeJobId) throw new Error("Cannot delete a thread through an active job connection");
         validateHostUser(message.userId);
         if (!/^[0-9a-f-]{20,80}$/i.test(message.threadId)) throw new Error("Invalid Codex thread id");
-        const removed = removeCodexThreadFiles(codexHome, message.threadId);
-        send(socket, { type: "delete_thread_result", requestId: message.requestId, removed });
-        socket.end();
-        return;
+        throw new Error("Conversation tombstone required; use delete_conversation_records");
       }
       if (message.type === "thread_rollout_size") {
         if (activeJobId) throw new Error("Cannot inspect a thread through an active job connection");
@@ -139,18 +196,60 @@ function handleConnection(socket: Socket): void {
         socket.end();
         return;
       }
+      if(message.type==='read_storage_events'){
+        if(activeJobId || process.env.STORAGE_LIFECYCLE_ENABLED!=='1')throw new Error('Storage history is unavailable');
+        validateReaderUser(message.userId);
+        const db=new DatabaseSync(hostDatabasePath);db.exec('PRAGMA busy_timeout=10000');const catalog=new StorageCatalog(db);
+        const roots={...hostColdStorageRoots(),hostUserId:HOST_ROOT_USER_ID,lifecycleRoot:process.env.STORAGE_LIFECYCLE_ROOT};
+        void readEventHistory(catalog,message.userId,message.input,item=>{
+          const loc=JSON.parse(item.locator_json);return safeStorageMember(storageRoot(catalog,roots,item.user_id,loc.root),loc.path);
+        },storageProcessIdentity()).then(result=>{
+          if(result.state==='cold' && result.itemId && (!result.blockedReason || (result.retryAfterSeconds??0)<=5)){
+            void storageJobs.run({operation:'restore_item',roots:hostColdStorageRoots(),id:result.itemId,userId:message.userId}).catch(()=>{/* worker persists failure */});
+          }
+          send(socket,{type:'storage_events_result',requestId:message.requestId,result:{...result,retryAfterSeconds:result.state==='cold'?(result.retryAfterSeconds??5):undefined}});socket.end();
+        },error=>sendRequestFailure(socket,message.requestId,error)).finally(()=>db.close());
+        return;
+      }
+      if (message.type === "restore_storage_file" || message.type === "restore_storage_item" || message.type === "restore_storage_native") {
+        if(activeJobId)throw new Error('Cannot restore storage through an active job connection');
+        validateReaderUser(message.userId);
+        const id=message.type==='restore_storage_file'?message.fileId:message.type==='restore_storage_native'?message.unitId:message.itemId;
+        if(!/^[0-9a-f-]{36}$/i.test(id))throw new Error('Invalid storage identity');
+        void storageJobs.run({operation:message.type==='restore_storage_file'?'restore_file':message.type==='restore_storage_native'?'restore_native':'restore_item',roots:hostColdStorageRoots(),id,userId:message.userId}).then(
+          ()=>{send(socket,{type:'restore_storage_result',requestId:message.requestId,restored:true});socket.end();},
+          error=>sendRequestFailure(socket,message.requestId,error));
+        return;
+      }
       if (message.type === "restore_cold_conversation") {
         if (activeJobId) throw new Error("Cannot restore cold conversation through an active job connection");
         if (!/^[0-9a-f-]{36}$/i.test(message.userId) || !/^[0-9a-f-]{36}$/i.test(message.conversationId)) throw new Error("Invalid cold conversation identity");
-        const roots = defaultColdStorageRoots({
-          databasePath: process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite"),
-          tenantRoot: hostTenantRoot,
-          hostRootCodexHome: codexHome,
-          dataRoot: path.dirname(process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite")),
-        });
-        void Promise.resolve().then(() => restoreColdConversation(roots, message.conversationId, message.userId)).then(
+        const roots = hostColdStorageRoots();
+        void storageJobs.run({ operation: "restore_conversation", roots, id: message.conversationId, userId: message.userId, threadId:message.threadId }).then(
           () => { send(socket, { type: "restore_cold_conversation_result", requestId: message.requestId, conversationId: message.conversationId, restored: true }); socket.end(); },
           (error) => { send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "冷存储恢复失败" }); socket.end(); },
+        );
+        return;
+      }
+      if (message.type === "restore_reader_version") {
+        if (activeJobId) throw new Error("Cannot restore reader resources through an active job connection");
+        validateReaderUser(message.userId);
+        if (!/^[0-9a-f-]{36}$/i.test(message.versionId)) throw new Error("Invalid reader version identity");
+        const roots = hostColdStorageRoots();
+        void storageJobs.run({ operation: "restore_reader", roots, id: message.versionId, userId: message.userId }).then(
+          () => { send(socket, { type: "restore_reader_version_result", requestId: message.requestId, versionId: message.versionId, restored: true }); socket.end(); },
+          (error) => { send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "阅读资源恢复失败" }); socket.end(); },
+        );
+        return;
+      }
+      if (message.type === "remove_reader_resources") {
+        if (activeJobId) throw new Error("Cannot remove reader resources through an active job connection");
+        validateReaderUser(message.userId);
+        if (!/^[0-9a-f-]{36}$/i.test(message.conversationId)) throw new Error("Invalid reader conversation identity");
+        const roots = hostColdStorageRoots();
+        void storageJobs.run({ operation: "remove_reader", roots, id: message.conversationId, userId: message.userId }).then(
+          () => { send(socket, { type: "remove_reader_resources_result", requestId: message.requestId, conversationId: message.conversationId, removed: true }); socket.end(); },
+          (error) => { send(socket, { type: "request_failed", requestId: message.requestId, message: error instanceof Error ? error.message : "阅读资源清理失败" }); socket.end(); },
         );
         return;
       }
@@ -232,9 +331,9 @@ function handleConnection(socket: Socket): void {
         const workflowDb = new DatabaseSync(hostDatabasePath, { readOnly: true });
         try {
           const setting = workflowDb.prepare("SELECT capacity FROM workflow_settings WHERE id=1").get() as {capacity:number}|undefined;
-          if (setting && setting.capacity > 0) throw new Error("Use a complete maintenance workflow for runtime upgrades when admission is limited");
+          if (setting && setting.capacity > 0) throw new Error("本实例启用完整修改队列，请在维护会话中安排 Codex 升级与验收；不能从独立入口绕过队列");
         } finally { workflowDb.close(); }
-        if (activeJobId || workers.size > 0 || voiceReviewWorkers.size > 0 || titleAgentWorkers.size > 0) throw new Error("CODEX_WEB 仍有任务执行，暂不能升级 Codex");
+        if (activeJobId || workers.size > 0 || voiceReviewWorkers.size > 0 || titleAgentWorkers.size > 0) throw new Error("Codex Web 仍有任务执行，暂不能升级 Codex");
         validateHostUser(message.userId);
         if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(message.version)) throw new Error("目标 Codex 版本无效");
         void runCodexUpdater().then(async () => {
@@ -312,15 +411,17 @@ function handleConnection(socket: Socket): void {
       const worker = workers.get(activeJobId);
       if (!worker || !worker.child.stdin?.writable) throw new Error("当前任务已经结束");
       if (message.type === "cancel") {
+        if (!worker.ready) { worker.child.kill("SIGTERM"); return; }
         writeWorker(worker.child, { type: "cancel" });
         scheduleForcedCancellation(activeJobId, worker.child);
         return;
       }
+      if (!worker.ready) throw new Error("当前任务尚未开始，请稍后引导");
       const prompt = validatePrompt(message.prompt);
       const imagePaths = message.imageRelativePaths.map((relativePath) => resolveWorkspaceFile(worker.workspace, relativePath));
       writeWorker(worker.child, { type: "steer", requestId: message.requestId, prompt, imagePaths });
     } catch (error) {
-      send(socket, { type: "request_failed", requestId: "requestId" in message ? message.requestId : undefined, message: error instanceof Error ? error.message : "Host request failed" });
+      send(socket, { type: "request_failed", requestId: "requestId" in message ? message.requestId : undefined, message: error instanceof Error ? error.message : "Host request failed", resourceCode: taskMemoryErrorCode(error) });
     }
   });
   socket.on("close", () => {
@@ -328,6 +429,7 @@ function handleConnection(socket: Socket): void {
     if (!activeJobId) return;
     const worker = workers.get(activeJobId);
     if (!worker || worker.terminal) return;
+    if (!worker.ready) { worker.child.kill("SIGTERM"); return; }
     writeWorker(worker.child, { type: "cancel" });
     scheduleForcedCancellation(activeJobId, worker.child);
   });
@@ -349,7 +451,7 @@ async function startVoiceReview(socket: Socket, requestId: string, request: impo
         targetFile: path.join(codexHome, "auth.json"),
       });
     }
-    const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-voice-review-worker.js")], {
+    const protectedWorker = spawnMemoryWorker(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-voice-review-worker.js")], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -361,7 +463,9 @@ async function startVoiceReview(socket: Socket, requestId: string, request: impo
       },
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "inherit"],
-    });
+    }, { protect: (pid, token) => createTaskMemoryScope(pid, token), finish: finishTaskMemoryScope });
+    const child = protectedWorker.child;
+
     voiceReviewWorkers.set(requestId, child);
     let terminal = false;
     const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
@@ -408,16 +512,20 @@ async function startVoiceReview(socket: Socket, requestId: string, request: impo
         socket.end();
       }
     });
+    await protectedWorker.ready;
     child.stdin!.end(`${JSON.stringify(request)}\n`);
   } catch (error) {
     await lease?.releaseWithoutCommit();
-    send(socket, { type: "request_failed", requestId, message: error instanceof Error ? error.message : "Codex voice review could not start" });
+    send(socket, { type: "request_failed", requestId, message: error instanceof Error ? error.message : "Codex voice review could not start", resourceCode: taskMemoryErrorCode(error) });
     socket.end();
   }
 }
 
 async function startTitleAgent(socket: Socket, requestId: string, request: import("./conversation-title.js").ConversationTitleAgentRequest): Promise<void> {
   if (titleAgentWorkers.has(requestId) || geminiTitleRequests.has(requestId)) { send(socket, { type: "request_failed", requestId, message: "Duplicate title request" }); socket.end(); return; }
+  if (request.task === "personal_memory" && (workers.size || voiceReviewWorkers.size || titleAgentWorkers.size)) {
+    send(socket, { type: "request_failed", requestId, message: "personal_memory_resources_busy" }); socket.end(); return;
+  }
   let lease: Awaited<ReturnType<typeof acquireSharedCodexAuth>> | null = null;
   const isGemini = request.engineId === "antigravity";
   if (isGemini) geminiTitleRequests.add(requestId);
@@ -425,15 +533,18 @@ async function startTitleAgent(socket: Socket, requestId: string, request: impor
     const runtime = isGemini ? await geminiAccountManager.getActiveRuntime() : null;
     const catalog = isGemini ? await geminiAccountManager.getModelCatalog() : null;
     if (isGemini && (!runtime || !catalog)) throw new Error("当前节点没有可用的 Gemini 命名账号");
-    const trusted = { userId: request.userId, prompt: request.prompt, timeoutMs: request.timeoutMs, engineId: request.engineId,
+    const trusted = { task: request.task, userId: request.userId, prompt: request.prompt, timeoutMs: request.timeoutMs, engineId: request.engineId,
       ...(isGemini ? { antigravity: { runtime, catalog } } : {}) };
     const sharedAuthPolicy = isGemini ? null : sharedCodexAuthPolicyFromEnv();
     if (sharedAuthPolicy) lease = await acquireSharedCodexAuth({ sourceFile: sharedAuthPolicy.sourceFile, lockFile: sharedAuthPolicy.lockFile, targetFile: path.join(codexHome, "auth.json") });
-    const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-conversation-title-worker.js")], {
+    if (stopping || socket.destroyed) throw new Error("personal_memory_cancelled");
+    const protectedWorker = spawnMemoryWorker(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-conversation-title-worker.js")], {
       cwd: process.cwd(),
       env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome, CWW_TENANT_USER_ID: HOST_ROOT_USER_ID, CWW_TENANT_UID: String(process.getuid?.() ?? 0), CWW_TENANT_GID: String(process.getgid?.() ?? 0) },
       detached: process.platform !== "win32", stdio: ["pipe", "pipe", "inherit"],
-    });
+    }, { protect: (pid, token) => createTaskMemoryScope(pid, token), finish: finishTaskMemoryScope });
+    const child = protectedWorker.child;
+
     titleAgentWorkers.set(requestId, child);
     let terminal = false;
     const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
@@ -454,11 +565,12 @@ async function startTitleAgent(socket: Socket, requestId: string, request: impor
       void releaseAuth().catch((error) => process.stderr.write(`Shared Codex auth commit failed for host title agent: ${error instanceof Error ? error.message : String(error)}\n`));
       if (!terminal) { terminal = true; send(socket, { type: "request_failed", requestId, message: `Codex title worker exited before completion (${signal ?? code ?? "unknown"})` }); socket.end(); }
     });
+    await protectedWorker.ready;
     child.stdin!.end(`${JSON.stringify(trusted)}\n`);
   } catch (error) {
     geminiTitleRequests.delete(requestId);
     await lease?.releaseWithoutCommit();
-    send(socket, { type: "request_failed", requestId, message: error instanceof Error ? error.message : "Codex title request could not start" }); socket.end();
+    send(socket, { type: "request_failed", requestId, message: error instanceof Error ? error.message : "Codex title request could not start", resourceCode: taskMemoryErrorCode(error) }); socket.end();
   }
 }
 
@@ -478,7 +590,7 @@ function runCodexUpdater(): Promise<void> {
 }
 
 async function readHostRuntime(checkLatest: boolean): Promise<ExecutorRuntimeStatus> {
-  const executable = process.env.CODEX_RUNTIME_PATH || "/usr/bin/codex";
+  const executable = process.env.CODEX_RUNTIME_PATH || "codex";
   const versionOutput = spawnSync(executable, ["--version"], { encoding: "utf8", timeout: 15_000 });
   if (versionOutput.status !== 0) throw new Error((versionOutput.stderr || "Codex 版本读取失败").trim());
   const installedVersion = /(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(versionOutput.stdout)?.[1] ?? versionOutput.stdout.trim();
@@ -510,7 +622,7 @@ async function readHostAgentOptions(executable: string): Promise<AgentOptions> {
   }) : null;
   try {
     return await new Promise((resolve, reject) => {
-    const child = spawn(executable, ["app-server", "--listen", "stdio://"], { env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome }, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnCodexRuntime(executable, ["app-server", "--listen", "stdio://"], { env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome }, stdio: ["pipe", "pipe", "pipe"] });
     const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
     let nextId = 1;
     let stderr = "";
@@ -530,7 +642,7 @@ async function readHostAgentOptions(executable: string): Promise<AgentOptions> {
     });
     const finish = () => { output.close(); child.stdin?.end(); if (!child.killed) child.kill("SIGTERM"); };
     child.once("error", reject);
-    void request("initialize", { clientInfo: { name: "codex-web-host-bridge", title: "Codex Web Host Bridge", version: "1.0.0" }, capabilities: { experimentalApi: true } })
+    void request("initialize", { clientInfo: { name: "pp-agent-host-bridge", title: "Codex Web Host Bridge", version: "1.0.0" }, capabilities: { experimentalApi: true } })
       .then(() => {
         child.stdin?.write(`${JSON.stringify({ method: "initialized" })}\n`);
         return request("model/list", { includeHidden: false, limit: 100 });
@@ -555,6 +667,7 @@ async function startWorker(socket: Socket, request: HostRootRunRequest): Promise
     const workflow = new WorkflowStore(ownershipDb).assertJob(request.jobId);
     if (workflow.epoch !== request.workflowEpoch) throw new Error("Expired complete-workflow execution generation");
   } finally { ownershipDb.close(); }
+  if (taskMemoryEnabled()) assertTaskMemoryAvailable();
   const isGemini = engineForModel(request.selection.model) === "antigravity";
   const geminiRuntime = isGemini ? await geminiAccountManager.getActiveRuntime() : null;
   if (isGemini && (!geminiRuntime || geminiRuntime.accountId !== request.agentAccountId)) throw new Error("当前节点的 Gemini 登录账号已变化或失效，请刷新账号后重试。");
@@ -564,7 +677,7 @@ async function startWorker(socket: Socket, request: HostRootRunRequest): Promise
   syncAccountSkills(isGemini ? path.join(geminiRuntime!.home, ".gemini", "antigravity-cli") : codexHome, request.accountSkills);
   if (workers.has(request.jobId)) throw new Error("Duplicate host job");
   const workspace = expectedWorkspace(request.conversationId);
-  if (!fs.statSync(workspace).isDirectory()) throw new Error("CODEX_WEB conversation workspace is unavailable on the host");
+  if (!fs.statSync(workspace).isDirectory()) throw new Error("Codex Web conversation workspace is unavailable on the host");
   const runtimeRoot = path.join(workspace, ".runtime", "jobs", request.jobId);
   const projectRoot = resolveProjectDirectory(request.projectRoot);
   const trusted: HostRootExecutionRequest = {
@@ -582,35 +695,51 @@ async function startWorker(socket: Socket, request: HostRootRunRequest): Promise
       receiptDirectory: path.join(workspace, ".automation", "wake-receipts"),
     } : undefined,
   };
-  const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "host-root-job.js")], {
+  const protectedWorker = spawnMemoryWorker(process.execPath, [path.join(process.cwd(), "dist-server", "server", "host-root-job.js")], {
     cwd: process.cwd(),
     env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome },
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "inherit"],
-  });
-  const worker = { model: request.selection.model, child, socket, workspace, runtimeRoot, terminal: false, timers: [] as NodeJS.Timeout[] };
+  }, { protect: (pid, token) => createTaskMemoryScope(pid, token), finish: finishTaskMemoryScope });
+  const child = protectedWorker.child;
+  const worker: (typeof workers extends Map<string, infer W> ? W : never) = { model: request.selection.model, child, socket, workspace, runtimeRoot, terminal: false, ready: false, timers: [] };
   workers.set(request.jobId, worker);
   const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
   output.on("line", (line) => {
     let event: TenantWorkerEvent;
     try { event = JSON.parse(line) as TenantWorkerEvent; }
     catch { return; }
-    if (event.type === "completed" || event.type === "failed") worker.terminal = true;
+    if (event.type === "completed" || event.type === "failed") { worker.terminal = true; worker.terminalEvent = event; return; }
     send(socket, { type: "event", jobId: request.jobId, event });
   });
   child.on("error", (error) => send(socket, { type: "request_failed", message: error.message }));
-  child.on("exit", (code, signal) => {
+  child.on("close", async (code, signal) => {
     output.close();
     clearTimers(worker);
+    const memory = await protectedWorker.finished;
+    const startupError = memory.startError;
     workers.delete(request.jobId);
-    // A child exit ends an attempt, not necessarily its logical Job.
     repairWorkspaceOwnership(workspace);
-    if (!worker.terminal) {
-      send(socket, { type: "event", jobId: request.jobId, event: { type: "failed", message: `CODEX_WEB 宿主任务异常退出（${signal ?? code ?? "unknown"}）`, cancelled: signal === "SIGTERM" || signal === "SIGKILL" } });
+    if (startupError) {
+      send(socket, { type: "request_failed", message: startupError instanceof Error ? startupError.message : "Task memory protection unavailable", resourceCode: taskMemoryErrorCode(startupError) });
+    } else if (memory?.oom) {
+      send(socket, { type: "event", jobId: request.jobId, event: { type: "failed", message: MEMORY_LIMIT_MESSAGE, resourceCode: "MEMORY_LIMIT" } });
+    } else if (worker.terminalEvent) {
+      send(socket, { type: "event", jobId: request.jobId, event: worker.terminalEvent });
+    } else {
+      send(socket, { type: "event", jobId: request.jobId, event: { type: "failed", message: `宿主任务异常退出（${signal ?? code ?? "unknown"}）`, cancelled: signal === "SIGTERM" || signal === "SIGKILL" } });
     }
     socket.end();
   });
-  writeWorker(child, { type: "run", request: trusted });
+  try {
+    await protectedWorker.ready;
+    worker.ready = true;
+    writeWorker(child, { type: "run", request: trusted });
+  } catch {
+    child.kill("SIGKILL");
+    // The close listener reports the typed startup failure after scope cleanup
+    // and removing the active Job. A queued retry must not race this attempt.
+  }
   return request.jobId;
 }
 
@@ -670,25 +799,34 @@ function validateHostUser(userId: string): void {
   if (userId !== HOST_ROOT_USER_ID) throw new Error("This account is not allowed to use the host root bridge");
 }
 
+/** Reader cold-storage files for tenant accounts also live on the host.  The
+ * web app still enforces ownership before issuing this RPC; this second
+ * boundary only permits the fixed set of identities provisioned for the
+ * service, never an arbitrary caller-supplied path or user ID. */
+function validateReaderUser(userId: string): void {
+  if (userId === HOST_ROOT_USER_ID || tenantIdentityForUser(userId)) return;
+  throw new Error("This account is not configured for reader host storage");
+}
+
 function assertGeminiAccountSwitchAllowed(): void {
   let runningGeminiJobs: number;
   try { runningGeminiJobs = countRunningGeminiJobsForExecutorInDatabase(hostDatabasePath, HOST_EXECUTOR_ID); }
-  catch { throw new Error("无法确认 CODEX_WEB 服务器 Gemini 任务状态，已拒绝更改 Gemini 账号。"); }
+  catch { throw new Error("无法确认 Codex Web 服务器 Gemini 任务状态，已拒绝更改 Gemini 账号。"); }
   assertGeminiAccountChangeAllowed({ maintenance: stopping || geminiTitleRequests.size > 0, activeModels: [...workers.values()].map(worker => worker.model), runningGeminiJobs });
 }
 
 function assertCodexAccountSwitchAllowed(): void {
   if (workers.size > 0 || voiceReviewWorkers.size > 0 || titleAgentWorkers.size > 0) {
-    throw new Error("CODEX_WEB 仍有任务执行，暂不能切换全局 Codex 账号。");
+    throw new Error("Codex Web 仍有任务执行，暂不能切换全局 Codex 账号。");
   }
-  const database = process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite");
+  const database = hostDatabasePath;
   let runningJobs: number;
   try {
     runningJobs = countRunningJobsForExecutorInDatabase(database, HOST_EXECUTOR_ID);
   } catch {
-    throw new Error("无法确认 CODEX_WEB 服务器任务状态，已拒绝切换全局 Codex 账号。");
+    throw new Error("无法确认 Codex Web 服务器任务状态，已拒绝切换全局 Codex 账号。");
   }
-  if (runningJobs > 0) throw new Error("CODEX_WEB 服务器仍有任务执行，暂不能切换全局 Codex 账号；任务完成后可立即重试。");
+  if (runningJobs > 0) throw new Error("Codex Web 服务器仍有任务执行，暂不能切换全局 Codex 账号；任务完成后可立即重试。");
 }
 
 function validatePrompt(prompt: string): string {
@@ -700,7 +838,7 @@ function expectedWorkspace(conversationId: string): string {
   const tenant = path.join(hostTenantRoot, HOST_ROOT_USER_ID);
   const workspace = path.resolve(tenant, "conversations", conversationId);
   const expectedParent = path.resolve(tenant, "conversations");
-  if (!workspace.startsWith(`${expectedParent}${path.sep}`)) throw new Error("Host workspace escapes the CODEX_WEB tenant");
+  if (!workspace.startsWith(`${expectedParent}${path.sep}`)) throw new Error("Host workspace escapes the Codex Web tenant");
   return workspace;
 }
 
@@ -753,12 +891,14 @@ function repairWorkspaceOwnership(workspace: string): void {
     ["chmod", ["-R", "u+rwX", "--", workspace]],
   ] as const) {
     const result = spawnSync(command, args, { stdio: "ignore" });
-    if (result.status !== 0) process.stderr.write(`Failed to repair CODEX_WEB workspace with ${command}\n`);
+    if (result.status !== 0) process.stderr.write(`Failed to repair Codex Web workspace with ${command}\n`);
   }
 }
 
 function send(socket: Socket, message: HostRootServerMessage): void {
-  if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`);
+  if (!socket.destroyed && socket.writable && !socket.writableEnded) {
+    try { socket.write(`${JSON.stringify(message)}\n`); } catch { socket.destroy(); }
+  }
 }
 
 function sendRequestFailure(socket: Socket, requestId: string, error: unknown): void {
@@ -769,6 +909,7 @@ function sendRequestFailure(socket: Socket, requestId: string, error: unknown): 
 function stop(): void {
   if (stopping) return;
   stopping = true;
+  storageJobs.stop();
   void nodeTransfers.close();
   server.close();
   for (const [jobId, worker] of workers) signalWorker(jobId, worker.child, "SIGTERM");

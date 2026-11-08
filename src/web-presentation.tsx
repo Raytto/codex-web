@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import {FileRestoreStatus} from "./storage-restore-progress";
 import { api, BASE_PATH } from "./api";
 
 type Runtime = { title: string; ticket: string; src: string };
@@ -49,7 +50,7 @@ export function WebPresentation({ fileId, publicView = false }: { fileId: string
   }
   return <main className="web-presentation">
     {runtime ? <iframe ref={frame} title={runtime.title} src={runtime.src} sandbox="allow-scripts" referrerPolicy="no-referrer" />
-      : <div className="web-presentation-state" role="status">{error || "正在准备网页；冷文件将从阿里云盘恢复…"}</div>}
+      : <div className="web-presentation-state" role="status">{error || <FileRestoreStatus fileId={fileId} publicView={publicView}/>}</div>}
     {exportRequest && <div className="file-share-backdrop"><section className="file-share-panel ui-dialog" role="dialog" aria-modal="true" aria-label="保存网页导出文件"><h2 className="dialog-title">保存导出文件</h2><p>{exportRequest.name}</p><div className="file-share-actions"><button onClick={saveExport}>下载文件</button><button onClick={() => setExportRequest(null)}>取消</button></div></section></div>}
   </main>;
 }

@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
-import { BookOpenCheck, LayoutDashboard, Lightbulb, LoaderCircle, SlidersHorizontal, X } from "lucide-react";
+import { BookOpenCheck, LayoutDashboard, Lightbulb, LoaderCircle, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { useFeatureSelection } from "./feature-selection-context";
 
-export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
-  const { features, saving, error, changeParaBoard, changeOpportunityCards, changeJudgmentBook } = useFeatureSelection();
+export function FeatureSelectionDialog({ onClose, dotEligible = false }: { onClose: () => void; dotEligible?: boolean }) {
+  const { features, saving, error, changeParaBoard, changeOpportunityCards, changeJudgmentBook, changePpDot } = useFeatureSelection();
   const closeButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -34,6 +34,11 @@ export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
           <span className="display-settings-card-copy"><strong>判断簿</strong><small id="judgment-feature-description">保留预测与长期想法，按时核对和复盘。隐藏入口保留全部记录，已安排的检查继续执行。</small></span>
           <input type="checkbox" aria-label="判断簿" aria-describedby="judgment-feature-description" checked={features.judgmentBook===true} aria-disabled={saving} aria-busy={saving} onChange={e=>{if(!saving)void changeJudgmentBook(e.target.checked);}}/>
         </label>
+        {dotEligible && <label className="feature-selection-option">
+          <span className="feature-selection-icon"><Sparkles size={22} /></span>
+          <span className="display-settings-card-copy"><strong>PP Dot</strong><small id="dot-feature-description">持续聊天并协调事务。隐藏入口会保留会话、任务和记忆；已打开的会话与通话控制仍可使用。</small></span>
+          <input type="checkbox" aria-label="PP Dot" aria-describedby="dot-feature-description" checked={features.ppDot !== false} aria-disabled={saving} aria-busy={saving} onChange={e => { if (!saving) void changePpDot(e.target.checked); }} />
+        </label>}
         <p className="feature-selection-status" role="status">{saving ? <><LoaderCircle size={14} className="spin" />正在保存…</> : "勾选后显示，取消勾选后隐藏。"}</p>
         {error && <p className="feature-selection-error" role="alert">{error}</p>}
       </div>

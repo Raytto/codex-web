@@ -1,3 +1,4 @@
+import type { TaskMemoryErrorCode } from "./task-memory.js";
 import type { AgentSelection } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import type { JobRuntimeCleanupTarget } from "./python-runtime.js";
@@ -42,7 +43,7 @@ export type TenantWorkerEvent =
     path: string;
     reason: "count_limit" | "outside_project" | "missing" | "not_file" | "too_large" | "total_size_limit" | "manifest_limit";
   }> }
-  | { type: "failed"; message: string; cancelled?: boolean };
+  | { type: "failed"; message: string; cancelled?: boolean; resourceCode?: TaskMemoryErrorCode };
 
 export type WebToSupervisorMessage =
   | { kind: "tenant_run"; jobId: string; userId: string; request: TenantWorkerRunRequest }
@@ -50,11 +51,12 @@ export type WebToSupervisorMessage =
   | { kind: "tenant_cancel"; jobId: string }
   | { kind: "tenant_runtime_cleanup"; requestId: string; targets: JobRuntimeCleanupTarget[] }
   | { kind: "tenant_voice_review"; requestId: string; request: CodexVoiceReviewRequest }
+  | { kind: "tenant_title_cancel"; requestId: string }
   | { kind: "tenant_title_agent"; requestId: string; request: ConversationTitleAgentRequest };
 
 export type SupervisorToWebMessage =
   | { kind: "tenant_event"; jobId: string; event: TenantWorkerEvent }
-  | { kind: "tenant_worker_exit"; jobId: string; message: string }
+  | { kind: "tenant_worker_exit"; jobId: string; message: string; resourceCode?: TaskMemoryErrorCode }
   | {
     kind: "tenant_runtime_cleanup_result";
     requestId: string;

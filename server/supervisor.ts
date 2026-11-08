@@ -1,3 +1,6 @@
+import { spawnMemoryWorker } from "./memory-worker.js";
+import { taskMemoryEnabled, assertTaskMemoryAvailable, taskMemoryErrorCode, MEMORY_LIMIT_MESSAGE } from "./task-memory.js";
+import { HostRootWorkerClient } from "./host-root-worker-client.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
@@ -19,6 +22,7 @@ const voiceReviewWorkers = new Map<string, ChildProcess>();
 const pendingVoiceReviews = new Set<string>();
 const titleAgentWorkers = new Map<string, ChildProcess>();
 const pendingTitleAgents = new Set<string>();
+const cancelledTitleAgents = new Set<string>();
 let stopping = false;
 
 const web = spawn(process.execPath, [path.join(projectRoot, "dist-server", "server", "index.js")], {
@@ -81,6 +85,12 @@ web.on("message", (message: WebToSupervisorMessage) => {
     void startTenantVoiceReview(message);
     return;
   }
+  if (message.kind === "tenant_title_cancel") {
+    if (pendingTitleAgents.has(message.requestId)) cancelledTitleAgents.add(message.requestId);
+    const child = titleAgentWorkers.get(message.requestId);
+    if (child?.pid) { try { process.kill(-child.pid, "SIGTERM"); } catch {} }
+    return;
+  }
   if (message.kind === "tenant_title_agent") {
     void startTenantTitleAgent(message);
     return;
@@ -97,10 +107,20 @@ web.on("exit", (code, signal) => {
   }
 });
 
+function spawnTenantTask(executable: string, args: string[], options: import("node:child_process").SpawnOptions, userId: string) {
+  const host = new HostRootWorkerClient(process.env.CODEX_WEB_HOST_SOCKET_PATH || "");
+  return spawnMemoryWorker(executable, args, options, {
+    protect: (pid, token) => host.protectTenantMemory({ userId, pid, token }),
+    finish: token => host.finishTenantMemory(userId, token),
+  });
+}
+
 async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind: "tenant_run" }>): Promise<void> {
   if (workers.has(message.jobId) || pendingWorkers.has(message.jobId) || message.request.jobId !== message.jobId || message.request.userId !== message.userId) {
     return sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: "Invalid or duplicate tenant job" });
   }
+  try { if (taskMemoryEnabled()) assertTaskMemoryAvailable(); }
+  catch (error) { return sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: error instanceof Error ? error.message : "Task memory unavailable", resourceCode: taskMemoryErrorCode(error) }); }
   pendingWorkers.add(message.jobId);
   const identity = tenantIdentityForUser(message.userId);
   if (!identity) {
@@ -153,7 +173,9 @@ async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind
       message: error instanceof Error ? error.message : "Shared Codex auth preparation failed",
     });
   }
-  const worker = spawn(process.execPath, [path.join(projectRoot, "dist-server", "server", "tenant-worker.js")], {
+  let protectedWorker: ReturnType<typeof spawnTenantTask>;
+  try {
+    protectedWorker = spawnTenantTask(process.execPath, [path.join(projectRoot, "dist-server", "server", "tenant-worker.js")], {
     cwd: projectRoot,
     env: {
       ...process.env,
@@ -168,10 +190,17 @@ async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind
     gid: identity.gid,
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "inherit"],
-  });
+  }, identity.userId);
+  } catch (error) {
+    pendingWorkers.delete(message.jobId);
+    await lease?.releaseWithoutCommit();
+    sharedAuthLeases.delete(message.jobId);
+    return sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: error instanceof Error ? error.message : "Task memory protection unavailable", resourceCode: taskMemoryErrorCode(error) });
+  }
+  const worker = protectedWorker.child;
   pendingWorkers.delete(message.jobId);
   workers.set(message.jobId, worker);
-  let terminalEvent = false;
+  let terminalEvent: TenantWorkerEvent | undefined;
   const output = readline.createInterface({ input: worker.stdout!, crlfDelay: Infinity });
   output.on("line", (line) => {
     try {
@@ -180,7 +209,7 @@ async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind
         void commitSharedAuth(message.jobId);
         return;
       }
-      if (event.type === "completed" || event.type === "failed") terminalEvent = true;
+      if (event.type === "completed" || event.type === "failed") { terminalEvent = event; return; }
       sendToWeb({ kind: "tenant_event", jobId: message.jobId, event });
     } catch {
       // Ignore non-protocol stdout without exposing it to the browser or logs.
@@ -190,8 +219,9 @@ async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind
     void commitSharedAuth(message.jobId);
     sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: error.message });
   });
-  worker.on("exit", (code, signal) => {
+  worker.on("close", async (code, signal) => {
     clearCancellationTimers(message.jobId);
+    const memory = await protectedWorker.finished;
     workers.delete(message.jobId);
     output.close();
     void commitSharedAuth(message.jobId);
@@ -200,21 +230,23 @@ async function startTenantWorker(message: Extract<WebToSupervisorMessage, { kind
       conversationId: message.request.conversationId,
       jobId: message.jobId,
     }]);
-    if (terminalEvent) {
-      void cleanup.then((result) => logCleanupFailures("tenant worker exit fallback", result));
-      return;
+    await cleanup.then(result => logCleanupFailures("tenant worker exit", result));
+    if (memory.startError) {
+      sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: memory.startError instanceof Error ? memory.startError.message : "Task memory protection unavailable", resourceCode: taskMemoryErrorCode(memory.startError) ?? "MEMORY_GUARD_UNAVAILABLE" });
+    } else if (memory.oom) {
+      sendToWeb({ kind: "tenant_event", jobId: message.jobId, event: { type: "failed", message: MEMORY_LIMIT_MESSAGE, resourceCode: "MEMORY_LIMIT" } });
+    } else if (terminalEvent) {
+      sendToWeb({ kind: "tenant_event", jobId: message.jobId, event: terminalEvent });
+    } else {
+      sendToWeb({ kind: "tenant_worker_exit", jobId: message.jobId, message: `Tenant worker exited before completion (${signal ?? code ?? "unknown"})` });
     }
-    void cleanup.then((result) => {
-      logCleanupFailures("abnormal tenant worker exit", result);
-      sendToWeb({
-        kind: "tenant_worker_exit",
-        jobId: message.jobId,
-        message: `Tenant worker exited before completion (${signal ?? code ?? "unknown"})`,
-      });
-    });
   });
-  const input: TenantWorkerInput = { type: "run", request: message.request };
-  worker.stdin!.write(`${JSON.stringify(input)}\n`);
+  try {
+    await protectedWorker.ready;
+    const input: TenantWorkerInput = { type: "run", request: message.request };
+    worker.stdin!.write(`${JSON.stringify(input)}\n`);
+  } catch { /* The exit listener persists the typed startup failure. */ }
+
 }
 
 async function startTenantVoiceReview(message: Extract<WebToSupervisorMessage, { kind: "tenant_voice_review" }>): Promise<void> {
@@ -241,7 +273,7 @@ async function startTenantVoiceReview(message: Extract<WebToSupervisorMessage, {
         targetGid: identity.gid,
       });
     }
-    const child = spawn(process.execPath, [path.join(projectRoot, "dist-server", "server", "codex-voice-review-worker.js")], {
+    const protectedWorker = spawnTenantTask(process.execPath, [path.join(projectRoot, "dist-server", "server", "codex-voice-review-worker.js")], {
       cwd: projectRoot,
       env: {
         ...process.env,
@@ -255,7 +287,9 @@ async function startTenantVoiceReview(message: Extract<WebToSupervisorMessage, {
       gid: identity.gid,
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "inherit"],
-    });
+    }, identity.userId);
+    const child = protectedWorker.child;
+
     voiceReviewWorkers.set(message.requestId, child);
     pendingVoiceReviews.delete(message.requestId);
     let terminal = false;
@@ -299,6 +333,7 @@ async function startTenantVoiceReview(message: Extract<WebToSupervisorMessage, {
         });
       }
     });
+    await protectedWorker.ready;
     child.stdin!.end(`${JSON.stringify(message.request)}\n`);
   } catch (error) {
     pendingVoiceReviews.delete(message.requestId);
@@ -314,6 +349,9 @@ async function startTenantVoiceReview(message: Extract<WebToSupervisorMessage, {
 async function startTenantTitleAgent(message: Extract<WebToSupervisorMessage, { kind: "tenant_title_agent" }>): Promise<void> {
   if (titleAgentWorkers.has(message.requestId) || pendingTitleAgents.has(message.requestId)) {
     return sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: "Duplicate Codex title request" });
+  }
+  if (message.request.task === "personal_memory" && (workers.size || pendingWorkers.size || voiceReviewWorkers.size || pendingVoiceReviews.size || titleAgentWorkers.size || pendingTitleAgents.size)) {
+    return sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: "personal_memory_resources_busy" });
   }
   pendingTitleAgents.add(message.requestId);
   const identity = tenantIdentityForUser(message.request.userId);
@@ -332,11 +370,14 @@ async function startTenantTitleAgent(message: Extract<WebToSupervisorMessage, { 
         targetFile: path.join(tenantRoot, "codex-home", "auth.json"), targetUid: identity.uid, targetGid: identity.gid,
       });
     }
-    const child = spawn(process.execPath, [path.join(projectRoot, "dist-server", "server", "codex-conversation-title-worker.js")], {
+    if (stopping || cancelledTitleAgents.delete(message.requestId)) throw new Error("personal_memory_cancelled");
+    const protectedWorker = spawnTenantTask(process.execPath, [path.join(projectRoot, "dist-server", "server", "codex-conversation-title-worker.js")], {
       cwd: projectRoot,
       env: { ...process.env, HOME: tenantRoot, CODEX_HOME: path.join(tenantRoot, "codex-home"), CWW_TENANT_USER_ID: identity.userId, CWW_TENANT_UID: String(identity.uid), CWW_TENANT_GID: String(identity.gid) },
       uid: identity.uid, gid: identity.gid, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "inherit"],
-    });
+    }, identity.userId);
+    const child = protectedWorker.child;
+
     titleAgentWorkers.set(message.requestId, child);
     pendingTitleAgents.delete(message.requestId);
     let terminal = false;
@@ -356,9 +397,11 @@ async function startTenantTitleAgent(message: Extract<WebToSupervisorMessage, { 
       void releaseAuth().catch((error) => process.stderr.write(`Shared Codex auth commit failed for title agent: ${error instanceof Error ? error.message : String(error)}\n`));
       if (!terminal) sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: `Codex title worker exited before completion (${signal ?? code ?? "unknown"})` });
     });
+    await protectedWorker.ready;
     child.stdin!.end(`${JSON.stringify(message.request)}\n`);
   } catch (error) {
     pendingTitleAgents.delete(message.requestId);
+    cancelledTitleAgents.delete(message.requestId);
     await lease?.releaseWithoutCommit();
     sendToWeb({ kind: "tenant_title_agent_result", requestId: message.requestId, error: error instanceof Error ? error.message : "Codex title request could not start" });
   }

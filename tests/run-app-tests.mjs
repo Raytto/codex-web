@@ -11,9 +11,12 @@ assert.ok(files.includes(exclusive));
 // Keep storage migration/restore checks in a separate batch, before other
 // suites spawn different-UID permission-test helpers.
 // The remaining suites keep their normal parallelism; no tests are omitted.
-for (const group of [[exclusive], files.filter(name => name !== exclusive)]) {
+// New lifecycle tests also inspect /proc for unknown writers. Keep these away
+// from permission tests that intentionally create inaccessible UID processes.
+const storage = files.filter(name => name.startsWith('storage-') || name === 'host-storage-jobs.test.ts');
+for (const group of [[exclusive], storage, files.filter(name => name !== exclusive && !storage.includes(name))]) {
   const result = spawnSync(process.execPath, [
-    "--import", "tsx", "--test", ...process.argv.slice(2),
+    "--import", "tsx", "--test", ...(group===storage?["--test-concurrency=1"]:[]), ...process.argv.slice(2),
     ...group.map(name => fileURLToPath(new URL(name, directory))),
   ], { stdio: "inherit" });
   if (result.error) throw result.error;

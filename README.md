@@ -10,8 +10,13 @@
 
 [快速开始](#快速开始) · [可选能力](#可选能力) · [文档导航](#文档导航) · [云服务器部署手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
 
+[从零配置到完整功能](docs/SETUP_GUIDE.zh-CN.md) · [本轮升级检查](docs/UPGRADE_20261108.md)
+
 ## 主要能力
 
+- **持续通话**：在原会话连续说话、打断播报并委派任务；使用独立、可选的 Live API。
+- **长期总管**：PP Dot 跨项目派工、记录来源记忆并核对真实结果。
+- **存储恢复**：可选加密分块、冷文件按需恢复和独立恢复演练。
 - **语音输入**：说出需求，录音自动转写并交给 Agent。
 - **远程电脑**：从网页给自己的电脑派任务，使用那台电脑的文件和工具，取回结果。
 - **周期任务**：每天、每周或按间隔自动运行，定时巡检、整理资料、生成报告。
@@ -22,7 +27,7 @@
 - **多种引擎**：在同一个工作台中，按任务选择 Codex、Gemini 或 Antigravity。
 - **项目工作区**：按项目管理会话、文件和技能，在电脑与手机间继续工作。
 
-> **PP Dot · 长期总管（待公开同步）**：统筹长期目标、分派跨项目任务、跟进执行结果。当前公开仓库尚未包含此模块。
+> **PP Dot · 长期总管**：已包含固定总管会话、跨项目与节点委派、台账、来源记忆与结果复核。显式授权宿主账号后启用；持续语音另外配置。
 
 语音输入需配置转写服务；远程电脑需安装并授权 Remote Worker；机会卡片需在账号功能中启用；Gemini / Antigravity 需配置受支持的执行节点。详见[可选能力](#可选能力)。
 
@@ -134,7 +139,7 @@ ssh -L 37821:127.0.0.1:37821 user@your-server
 CODEX_WEB_BUILD_TARGET=documents ./scripts/build-image.sh
 ```
 
-构建脚本读取导出的 shell 环境变量，不能只修改 `.env` 就假定它会选择 `documents`。语音模板中的 `transcription-model`、记忆模板中的 `memory-model` 是占位值，启用时应替换为供应商实际支持的模型。完整配置与验收步骤见[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。
+构建脚本读取导出的 shell 环境变量，不能只修改 `.env` 就假定它会选择 `documents`。语音和记忆模型默认留空，启用时应填写本人账号实际支持的模型。完整配置与验收步骤见[分层部署与可选功能指南](docs/DEPLOYMENT_OPTIONS.md)。
 
 模型及思考深度以所选执行器的实际账号目录为准。Codex 的运行中引导要求与当前任务使用相同模型和思考深度；Gemini / Antigravity 的补充消息排队等待下一轮。切换引擎会传递有界的历史上下文，不等于迁移整个原生会话。
 
@@ -190,7 +195,7 @@ npm run dev
 | 项目与个人辅助功能 | [项目看板](docs/features/PERSONAL_KANBAN.md) · [机会卡片](docs/OPPORTUNITY_CARDS.md) · [判断簿](docs/JUDGMENT_BOOK.md) |
 | 文档阅读与分享 | [阅读器](docs/READER_PROGRESSIVE_LOADING.md) · [公开分享](docs/PUBLIC_FILE_SHARING.md) · [交互 HTML](docs/WEB_PRESENTATIONS.md) |
 | 其他执行器与模型 | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
-| 最近一轮公开功能升级 | [2026-11-04 升级说明](docs/UPGRADE_20261104.md) |
+| 最近一轮公开功能升级 | [本轮完整升级说明](docs/UPGRADE_20261108.md) |
 
 本页按当前公开 `main` 的实现维护；历史更新和迁移细节放在专题文档中。
 

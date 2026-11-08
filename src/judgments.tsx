@@ -19,7 +19,7 @@ export function JudgmentSidebar({selected,onOpen,query}:{selected:boolean;onOpen
   useEffect(()=>{let live=true;const load=()=>{void judgments.list().then(r=>{if(live){setCounts({all:r.items.length,feedback:r.items.filter(j=>j.status==='feedback').length});setFailed(false);}}).catch(()=>{if(live)setFailed(true);});};load();window.addEventListener('judgments-updated',load);const timer=window.setInterval(load,20000);return()=>{live=false;clearInterval(timer);window.removeEventListener('judgments-updated',load);};},[]);
   if(query.trim()&&!`判断簿 预测 想法 复盘`.includes(query.trim()))return null;
   return <ExtensionGroup id="judgments" label="判断簿" icon={<BookOpenCheck size={16}/>}>
-    <button className={`judgment-sidebar-link ${selected?'active':''}`} onClick={onOpen}><BookOpenCheck size={16}/><span>全部判断</span><small>{failed?'重试':counts.all}</small></button>
+    <button className={`judgment-sidebar-link ${selected?'active':''}`} onClick={onOpen}><span>全部判断</span><small>{failed?'重试':counts.all}</small></button>
     {counts.feedback>0&&<button className="judgment-sidebar-link" onClick={onOpen}><span>待我反馈</span><small>{counts.feedback}</small></button>}
   </ExtensionGroup>;
 }

@@ -1,4 +1,5 @@
 import type { GeminiAccountRequest, GeminiAccountResult } from "../remote-worker/src/gemini-account-types.js";
+import type { TaskMemoryErrorCode, TaskMemoryScopeResult, TenantMemoryTarget } from "./task-memory.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import type { AgentSelection, ExecutorRuntimeStatus } from "./model-options.js";
 import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
@@ -44,14 +45,23 @@ export type HostProjectFsResult = {
 export type HostRootClientMessage =
   | { type: "workflow_verify"; requestId: string; userId: string; evidence: unknown }
   | ({ type: "gemini_accounts"; requestId: string; userId: string } & GeminiAccountRequest)
+  | { type: "memory_scope_attach"; requestId: string; target: TenantMemoryTarget }
+  | { type: "memory_scope_finish"; requestId: string; userId: string; token: string }
   | { type: "project_skills"; requestId: string; userId: string; projectId: string; action: import("./project-skills.js").ProjectSkillAction; name?: string; content?: string; enabled?: boolean }
   | { type: "node_transfer"; requestId: string; userId: string; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
   | { type: "run"; request: HostRootRunRequest }
   | { type: "steer"; requestId: string; prompt: string; imageRelativePaths: string[] }
   | { type: "cancel" }
+  | { type: "delete_conversation_records"; requestId: string; userId: string; conversationId: string }
   | { type: "delete_thread"; requestId: string; userId: string; threadId: string }
   | { type: "thread_rollout_size"; requestId: string; userId: string; threadId: string }
-  | { type: "restore_cold_conversation"; requestId: string; userId: string; conversationId: string }
+  | { type: "restore_cold_conversation"; requestId: string; userId: string; conversationId: string; threadId?:string }
+  | { type: "restore_storage_file"; requestId: string; userId: string; fileId: string }
+  | { type: "restore_storage_native"; requestId: string; userId: string; unitId: string }
+  | { type: "restore_storage_item"; requestId: string; userId: string; itemId: string }
+  | { type: "read_storage_events"; requestId: string; userId: string; input: import('./storage-event-reader.js').EventReadRequest }
+  | { type: "restore_reader_version"; requestId: string; userId: string; versionId: string }
+  | { type: "remove_reader_resources"; requestId: string; userId: string; conversationId: string }
   | { type: "project_fs"; requestId: string; userId: string; action: "list" | "create" | "validate" | "initialize"; path: string; name?: string; content?: string }
   | { type: "runtime_status"; requestId: string; userId: string; checkLatest: boolean }
   | { type: "cleanup_runtimes"; requestId: string; userId: string; targets: HostJobRuntimeTarget[] }
@@ -69,12 +79,18 @@ export type HostRootClientMessage =
 export type HostRootServerMessage =
   | { type: "workflow_verify_result"; requestId: string; verified: true }
   | ({ type: "gemini_accounts_result"; requestId: string } & GeminiAccountResult)
+  | { type: "memory_scope_ready"; requestId: string }
+  | { type: "memory_scope_result"; requestId: string; result: TaskMemoryScopeResult }
   | { type: "project_skills_result"; requestId: string; result: import("./project-skills.js").ProjectSkillResult }
   | { type: "node_transfer_started"; requestId: string }
   | { type: "event"; jobId: string; event: TenantWorkerEvent }
   | { type: "delete_thread_result"; requestId: string; removed: number }
   | { type: "thread_rollout_size_result"; requestId: string; bytes: number | null }
   | { type: "restore_cold_conversation_result"; requestId: string; conversationId: string; restored: boolean }
+  | { type: "restore_storage_result"; requestId: string; restored: boolean }
+  | { type: "storage_events_result"; requestId: string; result: import('./storage-event-reader.js').EventHistoryPage & {retryAfterSeconds?:number} }
+  | { type: "restore_reader_version_result"; requestId: string; versionId: string; restored: boolean }
+  | { type: "remove_reader_resources_result"; requestId: string; conversationId: string; removed: boolean }
   | ({ type: "project_fs_result"; requestId: string } & HostProjectFsResult)
   | ({ type: "runtime_status_result"; requestId: string } & ExecutorRuntimeStatus)
   | ({ type: "cleanup_runtimes_result"; requestId: string } & HostRuntimeCleanupResult)
@@ -84,7 +100,7 @@ export type HostRootServerMessage =
   | { type: "codex_account_reset_result"; requestId: string; result: ResetConsumption }
   | { type: "codex_accounts_result"; requestId: string; accounts: CodexAccountView[]; activeAccountId: string }
   | { type: "codex_account_login_result"; requestId: string; login: CodexAccountLoginView }
-  | { type: "request_failed"; requestId?: string; message: string };
+  | { type: "request_failed"; requestId?: string; message: string; resourceCode?: TaskMemoryErrorCode };
 
 export type HostRootExecutionRequest = HostRootRunRequest & {
   workspace: string;

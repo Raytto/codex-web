@@ -1,5 +1,7 @@
 # Deployment
 
+Current capability/configuration walkthrough: [中文](SETUP_GUIDE.zh-CN.md) · [English](SETUP_GUIDE.en.md). New Dot/Live/memory/storage boundaries and migration checks: [full update](UPGRADE_20261108.md).
+
 ## Recommended rollout
 
 Use a layered rollout: complete the base Compose installation and its backup,

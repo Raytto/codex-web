@@ -6,6 +6,7 @@ import type { AppConfig } from "./config.js";
 import { AppDatabase, StorageQuotaExceededError, type FileRow, type ResumableUploadRow, type SessionRow } from "./db.js";
 import { newId, safeUploadName, tenantPaths } from "./paths.js";
 import { grantCompletedUploadAccess, openUploadDirectory, uploadBasename } from "./upload-permissions.js";
+import {largeStorageWriteBlocked} from './storage-metrics.js';
 
 const TUS_VERSION = "1.0.0";
 const ACTIVE_STATES = new Set(["uploading", "finalizing"]);
@@ -160,6 +161,7 @@ export class ResumableUploadService {
     const size = headerInteger(req.get("upload-length"));
     if (size === null) return res.status(400).json({ code: "UPLOAD_LENGTH_INVALID", error: "上传长度无效。" });
     if (size > this.config.maxUploadFileBytes) return res.status(413).json({ code: "UPLOAD_TOO_LARGE", error: "单个附件不能超过 2 GiB。" });
+    if(this.config.storageLifecycleEnabled && largeStorageWriteBlocked(this.db.sqlite,[this.config.dataRoot,this.config.tenantRoot],size))return res.status(507).json({code:'STORAGE_HIGH_WATERMARK',error:'存储正在整理，暂缓新增大文件；文字和小文件仍可使用，请稍后重试。'});
     let metadata: Map<string, string>;
     try { metadata = metadataValues(req.get("upload-metadata")); }
     catch { return res.status(400).json({ code: "UPLOAD_METADATA_INVALID", error: "上传元数据无效。" }); }

@@ -1,4 +1,6 @@
 import { instance, BrandIcon } from "./instance";
+import {ConversationVoiceProvider,ConversationVoiceWorkspace,ConversationCallControl,useConversationCallActive} from './conversation-voice';
+import { DotEntry, DotProvider, DotLedgerMenuItem } from "./dot";
 import { canRunPendingPromptImmediately, hasMultipleEngines, modelMenuOptions, modelReasoningOptions, pendingPromptActionMode, reasoningForModel } from "./agent-model-options";
 import { AntigravityUsagePanel } from "./antigravity-usage-panel";
 import { TransientNotice, useNoticeState } from "./transient-notice";
@@ -6,6 +8,7 @@ import { JudgmentWorkspace, JudgmentSidebar } from "./judgments";
 import { isTransientRestoreBlock } from "./conversation-restore-state";
 import { WebPresentation } from "./web-presentation";
 import { FileShareDialog } from "./file-share-dialog";
+import {FileRestoreStatus,ConversationRestoreStatus,RestoreDownloadButton} from "./storage-restore-progress";
 import { ExtensionsSidebar } from './extensions-sidebar';
 import { OpportunityWorkspace } from "./opportunities";
 import { OpportunitySidebar } from "./opportunity-sidebar";
@@ -89,8 +92,8 @@ const PROJECT_CONVERSATION_PAGE_SIZE = 5;
 const BODY_SEARCH_RESULT_LIMIT = 100;
 const MAINTENANCE_QUEUE_GUIDANCE = "系统正在维护，任务已保存到等待队列，维护完成后将自动开始。";
 const COMPOSER_DRAFT_SAVE_DELAY_MS = 1_500;
-const COMPOSER_LONG_PRESS_DELAY_MS = 650;
-const COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX = 12;
+const SEARCH_VOICE_LONG_PRESS_DELAY_MS = 650;
+const SEARCH_VOICE_LONG_PRESS_MOVE_TOLERANCE_PX = 12;
 const READER_POSITION_SAVE_DELAY_MS = 2_000;
 const READER_POSITION_SAVE_INTERVAL_MS = 5_000;
 const READER_POSITION_RESTORE_ATTEMPTS = 10;
@@ -368,7 +371,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
     <div className="file-reader-settings-popover" role="menu" aria-label="阅读器设置选项">
       {download && fileReaderKind(file) === "html" && <button className="file-reader-settings-item file-reader-web-action" type="button" role="menuitem" onClick={() => { if (menu.current) { menu.current.open = false; menu.current.querySelector("summary")?.focus(); } setPresentationOpen(true); }}><Play size={16} /><span>以交互网页打开</span></button>}
       {download && <ParaCollectButton fileId={file.id} menuItem onOpen={() => { if (menu.current) menu.current.open = false; }} />}
-      {download && <a className="file-reader-settings-item" role="menuitem" href={download} download={file.original_name} onClick={() => { if (menu.current) menu.current.open = false; }}><Download size={15} /><span>下载</span></a>}
+      {download && <RestoreDownloadButton file={file} className="file-reader-settings-item"><Download size={15}/><span>下载</span></RestoreDownloadButton>}
       {download && <div className="file-reader-settings-divider" />}
       <div className="file-reader-theme-label">颜色模式</div>
       <div className="file-reader-theme-options" role="group" aria-label="颜色模式">
@@ -718,8 +721,8 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
       </div>
     </header>
     <section ref={readerBodyRef} className="file-preview-body">
-      {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在安全读取原文件…</p></div>}
-      {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <a href={download} download={file.original_name}>下载原文件</a>}</div>}
+      {loading && <div className="file-preview-state"><FileRestoreStatus fileId={fileId}/></div>}
+      {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p>{file && <RestoreDownloadButton file={file}>下载原文件</RestoreDownloadButton>}</div>}
       {!loading && !error && readerAnnotationSyncError && <div className="reader-inline-error" role="alert">{readerAnnotationSyncError}</div>}
       {!loading && !error && readerManifest && file && (readerManifest.source.format === "pdf" || readerManifest.source.format === "epub") && <Suspense fallback={<div className="reader-document-loading"><LoaderCircle className="spin" size={24} />正在加载分页阅读器…</div>}><LazyReaderDocument manifest={readerManifest} onTitleChange={setReaderDocumentTitle} annotations={readerAnnotations} onDeleteAnnotation={deleteReaderAnnotation} onSelectAnnotation={focusReaderAnnotation} onAskAnnotation={askReaderAnnotation} /></Suspense>}
       {!loading && !error && content !== null && file && (readerKind === "markdown" || readerKind === "html") && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
@@ -785,7 +788,7 @@ function PublicFilePreviewPage({ fileId, resolvedTheme, themePreference, onTheme
       </div>
     </header>
     <section className="file-preview-body">
-      {loading && <div className="file-preview-state"><LoaderCircle className="spin" size={24} /><p>正在读取公开文件…</p></div>}
+      {loading && <div className="file-preview-state"><FileRestoreStatus fileId={fileId} publicView/></div>}
       {!loading && error && <div className="file-preview-state error"><FileText size={28} /><strong>暂时无法在线阅读</strong><p>{error}</p></div>}
       {!loading && !error && content !== null && file && <FileReaderLayout file={file} content={content} prepared={prepared} tocOpen={outline.open} activeAnchor={outline.activeAnchor} onSelect={outline.select} onActiveAnchorChange={outline.updateFromScroll} navigationToken={outline.navigationToken} />}
     </section>
@@ -953,13 +956,13 @@ function SearchVoiceInput({ query, projectId, disabled = false, onTranscript }: 
       const pointer = pressPointerRef.current;
       if (!pointer || pointer.pointerId !== event.pointerId) return;
       pointer.triggered = true; setLongPressArmed(false); void startRecording();
-    }, COMPOSER_LONG_PRESS_DELAY_MS);
+    }, SEARCH_VOICE_LONG_PRESS_DELAY_MS);
   }
 
   function movePress(event: ReactPointerEvent<HTMLButtonElement>) {
     const pointer = pressPointerRef.current;
     if (!pointer || pointer.pointerId !== event.pointerId || pointer.triggered) return;
-    if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX) clearPress(event.pointerId);
+    if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > SEARCH_VOICE_LONG_PRESS_MOVE_TOLERANCE_PX) clearPress(event.pointerId);
   }
 
   function endPress(event: ReactPointerEvent<HTMLButtonElement>) {
@@ -1143,6 +1146,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [maintenancePhase, setMaintenancePhase] = useState<MaintenancePhase>(() => normalizedMaintenancePhase(session.maintenancePhase, session.maintenance));
   const [maintenanceStatus, setMaintenanceStatus] = useState<SystemStatus | null>(null);
   const [voiceInputActive, setVoiceInputActive] = useState(false);
+  const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false);
   const [voiceTransfers, setVoiceTransfers] = useState<Record<string, boolean>>({});
   const [instanceReloadDeferred, setInstanceReloadDeferred] = useState(false);
   const [editingPending, setEditingPending] = useConversationState<PendingPrompt | null>(composerScope, null);
@@ -1187,6 +1191,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const unreadScrollTargetRef = useRef<{ conversationId: string; messageId: string } | null>(null);
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const conversationMenuRef = useRef<HTMLDetailsElement>(null);
+  const workspaceHeaderRef = useRef<HTMLElement>(null);
   const rolloutWarningRef = useRef<HTMLDetailsElement>(null);
   const accountAreaRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -1231,6 +1236,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const maintenancePhaseRef = useRef(maintenancePhase);
   const deploymentPhaseRef = useRef<DeploymentPhase>("idle");
   const voiceInputActiveRef = useRef(false);
+  const realtimeVoiceActiveRef = useRef(false);
+  const handleRealtimeVoiceActivity = useCallback((active: boolean) => { realtimeVoiceActiveRef.current = active; setRealtimeVoiceActive(active); }, []);
   const instanceReloadDeferredRef = useRef(false);
   const conversationSelectionReadyRef = useRef(conversationRoute.explicit);
   const creatingConversationProjectsRef = useRef(new Set<string>());
@@ -1266,7 +1273,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const applySystemStatus = (status: SystemStatus): boolean => {
       if (serverInstanceIdRef.current && status.instanceId && serverInstanceIdRef.current !== status.instanceId) {
         serverInstanceIdRef.current = status.instanceId;
-        if (voiceInputActiveRef.current || instanceReloadDeferredRef.current || [...setSubmitting.entries()].some(([, busy]) => busy) || [...setDraftUploads.entries()].some(([, uploads]) => uploads.length > 0)) {
+        if (voiceInputActiveRef.current || realtimeVoiceActiveRef.current || instanceReloadDeferredRef.current || [...setSubmitting.entries()].some(([, busy]) => busy) || [...setDraftUploads.entries()].some(([, uploads]) => uploads.length > 0)) {
           instanceReloadDeferredRef.current = true;
           setInstanceReloadDeferred(true);
         } else {
@@ -1376,7 +1383,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       page,
       retainedConversationRef.current,
       projectId,
-      { append: !suppressRetained },
+      { append: !suppressRetained, excludeDotCoordinator: !queryRef.current },
     );
     if (suppressRetained && result.conversations.some((conversation) => conversation.id === pending.id)) {
       retainedConversationNeedsNaturalPageRef.current = null;
@@ -1498,7 +1505,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (activate) {
       if (selectedIdRef.current === id) setConversationLoad({ id, state: "loading" });
       const activation = await api.activateConversation(id);
-      if (activation.state !== "local") {
+      if (activation.state !== "local" && activation.state !== "metadata") {
         if (selectedIdRef.current === id) setDetail(null);
         return { restoring: true as const, state: activation.state === "error" ? "error" as const : "restoring" as const, conversation: activation.conversation };
       }
@@ -1733,7 +1740,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         setCollapsedProjects(collapsedProjectsRef.current);
         // Include old conversations beyond the first sidebar page.
         const page = projectConversationPagesRef.current[projectId];
-        if (page) storeProjectConversationPage(projectId, retainSelectedConversation(page, conversation, projectId));
+        if (page) storeProjectConversationPage(projectId, retainProjectConversationPage(page, projectId));
         else void loadProjectPage(projectId);
       }
       selectedIdRef.current = conversation.id;
@@ -2042,7 +2049,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     if (!instanceReloadDeferred) return;
     const currentDraftSignature = composerDraftSignature(input, askAgentQuote);
     if (!canApplyDeferredInstanceReload({
-      voiceActive: voiceInputActive,
+      voiceActive: voiceInputActive || realtimeVoiceActive,
       submitting: [...setSubmitting.entries()].some(([, busy]) => busy),
       conversationId: selectedId,
       editingPending: Boolean(editingPending),
@@ -2057,7 +2064,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     instanceReloadDeferredRef.current = false;
     setInstanceReloadDeferred(false);
     window.location.reload();
-  }, [askAgentQuote, draftSaveState, draftUploads.length, editingPending, files.length, input, instanceReloadDeferred, selectedId, submitting, voiceInputActive]);
+  }, [askAgentQuote, draftSaveState, draftUploads.length, editingPending, files.length, input, instanceReloadDeferred, selectedId, submitting, voiceInputActive, realtimeVoiceActive]);
   useEffect(() => () => {
     if (draftSaveTimerRef.current !== null) window.clearTimeout(draftSaveTimerRef.current);
     const conversationId = selectedId;
@@ -2105,7 +2112,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         prependScrollRestoreRef.current = null;
         const messagesTop = messages.getBoundingClientRect().top;
         const targetTop = target.getBoundingClientRect().top;
-        messages.scrollTop = Math.max(0, messages.scrollTop + targetTop - messagesTop - 12);
+        const headerInset = Math.max(0, (workspaceHeaderRef.current?.getBoundingClientRect().bottom ?? messagesTop) - messagesTop);
+        messages.scrollTop = Math.max(0, messages.scrollTop + targetTop - messagesTop - headerInset - 12);
         lastScrollTopRef.current = messages.scrollTop;
         autoFollowRef.current = false;
         return;
@@ -2130,6 +2138,24 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     });
     return () => window.cancelAnimationFrame(frame);
   }, [detail?.messages.length, detail?.wakePlan?.id, activities, sending]);
+  useEffect(() => {
+    if (conversationMenuRef.current) conversationMenuRef.current.open = false;
+    setConversationMenuOpen(false);
+  }, [selectedId, activeProjectId]);
+  // The header can grow for larger browser text or an important system status.
+  // Keep the scroll inset in sync without adding a second block of empty space.
+  useLayoutEffect(() => {
+    const header = workspaceHeaderRef.current;
+    if (!header) return;
+    const update = () => {
+      const height = header.getBoundingClientRect().height;
+      if (height > 0) header.parentElement?.style.setProperty("--workspace-header-height", `${height}px`);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
   useEffect(() => {
     const menu = conversationMenuRef.current;
     if (!menu || !selectedId || !conversationMenuOpen) return;
@@ -2159,6 +2185,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const closeMenu = (event: PointerEvent) => {
       const menu = conversationMenuRef.current;
       if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) menu.open = false;
+      const deployment = workspaceHeaderRef.current?.querySelector<HTMLDetailsElement>(".deployment-status");
+      if (deployment?.open && event.target instanceof Node && !deployment.contains(event.target)) deployment.open = false;
       const rolloutWarning = rolloutWarningRef.current;
       if (rolloutWarning?.open && event.target instanceof Node && !rolloutWarning.contains(event.target)) rolloutWarning.open = false;
       if (projectMenu && event.target instanceof Element && !event.target.closest("[data-project-menu]")) setProjectMenu(null);
@@ -2167,8 +2195,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (accountSettingsOpen && event.target instanceof Node && !accountAreaRef.current?.contains(event.target)) setAccountSettingsOpen(false);
     };
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape" && conversationMenuRef.current?.open) conversationMenuRef.current.open = false;
-      if (event.key === "Escape" && rolloutWarningRef.current?.open) rolloutWarningRef.current.open = false;
+      if (event.key === "Escape" && conversationMenuRef.current?.open) {
+        conversationMenuRef.current.open = false;
+        conversationMenuRef.current.querySelector("summary")?.focus();
+      }
+      if (event.key === "Escape") workspaceHeaderRef.current?.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((panel) => { panel.open = false; panel.querySelector("summary")?.focus(); });
       if (event.key === "Escape") setProjectMenu(null);
       if (event.key === "Escape") setProjectSectionMenu(null);
       if (event.key === "Escape") setTaskMenu(null);
@@ -2462,7 +2493,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
     const page = projectConversationPagesRef.current[projectId];
     if (page && conversation) {
-      const retained = retainSelectedConversation(page, conversation, projectId);
+      const retained = retainProjectConversationPage(page, projectId);
       projectConversationPagesRef.current = { ...projectConversationPagesRef.current, [projectId]: retained };
       setProjectConversationPages((pages) => ({ ...pages, [projectId]: retained }));
       conversationsRef.current = retained.conversations;
@@ -2700,7 +2731,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       projectId,
       pinned: Boolean(conversation.pinned_at),
       title: conversation.title,
-      projectMoveBlocked: Boolean(conversation.project_move_blocked),
+      projectMoveBlocked: Boolean(conversation.project_move_blocked || conversation.is_dot_coordinator),
     });
   }
 
@@ -3924,7 +3955,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         projectId,
         pinned: Boolean(conversation.pinned_at),
         title: conversation.title,
-        projectMoveBlocked: Boolean(conversation.project_move_blocked),
+        projectMoveBlocked: Boolean(conversation.project_move_blocked || conversation.is_dot_coordinator),
       })}
       onPointerMove={moveTouchDrag}
       onPointerUp={endTouchDrag}
@@ -3994,7 +4025,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
-      <ExtensionsSidebar judgments={features.judgmentBook && <JudgmentSidebar selected={judgmentVisible} query={query} onOpen={()=>openJudgments()} />} key={session.accountId} accountId={session.accountId!} query={query} onSettings={() => setFeatureSelectionOpen(true)} opportunities={features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />} boards={features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />} />
+      <ExtensionsSidebar dot={Boolean(session.dotEligible) && features.ppDot !== false && <DotEntry onOpen={selectProjectConversation} onError={setError} />} judgments={features.judgmentBook && <JudgmentSidebar selected={judgmentVisible} query={query} onOpen={()=>openJudgments()} />} key={session.accountId} accountId={session.accountId!} query={query} onSettings={() => setFeatureSelectionOpen(true)} opportunities={features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />} boards={features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />} />
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
           <div className="section-label project-label"><span>文件夹工程</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
@@ -4093,7 +4124,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           </button>
         </div>
       </div>
-      {featureSelectionOpen && createPortal(<FeatureSelectionDialog onClose={closeFeatureSelection} />, document.body)}
+      {featureSelectionOpen && createPortal(<FeatureSelectionDialog dotEligible={Boolean(session.dotEligible)} onClose={closeFeatureSelection} />, document.body)}
       {displaySettingsDialogOpen && <DisplaySettingsDialog
         chatFontSize={chatFontSize}
         fontSizeSaving={fontSizeSaving}
@@ -4150,7 +4181,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <button type="button" role="menuitem" onClick={() => openRecurring(projectMenuProject.id, null)}><Clock size={16} /><span>管理定时任务</span></button>
       <button type="button" role="menuitem" disabled={projectMenuProject.executor_id.startsWith("remote:")} title={projectMenuProject.executor_id.startsWith("remote:") ? "远端项目暂不支持网页管理技能" : "管理项目技能"} onClick={() => { setProjectMenu(null); setProjectSkillsDialogProject(projectMenuProject); }}><Pencil size={16} /><span>管理项目技能{projectMenuProject.executor_id.startsWith("remote:") ? "（远端暂不支持）" : ""}</span></button>
       <button type="button" role="menuitem" onClick={() => { setProjectMenu(null); void renameProject(projectMenuProject); }}><Pencil size={16} /><span>改名</span></button>
-      <button type="button" role="menuitem" className="danger" onClick={() => void archiveProject(projectMenuProject)}><Archive size={16} /><span>归档项目</span></button>
+      <button type="button" role="menuitem" className="danger" disabled={projectMenuProject.has_dot_coordinator} title={projectMenuProject.has_dot_coordinator ? "项目包含固定 PP Dot 总管，不能归档" : undefined} onClick={() => void archiveProject(projectMenuProject)}><Archive size={16} /><span>归档项目</span></button>
     </div>, document.body)}
 
     {taskMenu && taskMenuConversation && createPortal(<div
@@ -4167,8 +4198,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       {taskMenuConversation.active_wake_count
         ? <button type="button" role="menuitem" className="wake-menu-item active" title="查看自动续跑详情" onClick={() => openWakeDetails(taskMenuConversation)}><Clock size={16} /><span className="menu-item-copy"><strong>已安排的任务</strong><small>{wakeMenuDescription(taskMenuConversation)}</small></span></button>
         : <button type="button" role="menuitem" disabled={Boolean(taskMenuConversation.archived_at)} onClick={() => { setTaskMenu(null); setWakeDialogConversation(taskMenuConversation); }}><Clock size={16} /><span>安排自动续跑</span></button>}
-      <button type="button" role="menuitem" onClick={() => void archiveConversation(taskMenuConversation)}><Archive size={16} /><span>归档</span></button>
-      <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>
+      {!taskMenuConversation.is_dot_coordinator && <button type="button" role="menuitem" onClick={() => void archiveConversation(taskMenuConversation)}><Archive size={16} /><span>归档</span></button>}
+      {!taskMenuConversation.is_dot_coordinator && <button type="button" role="menuitem" className="danger" onClick={() => { setTaskMenu(null); void deleteConversation(taskMenuConversation); }}><Trash2 size={16} /><span>删除</span></button>}
     </div>, document.body)}
 
     {features.paraBoard && createTypeOpen && <NewProjectChoice engines={projects} onClose={() => setCreateTypeOpen(false)} onFolder={() => { setCreateTypeOpen(false); setProjectDialogOpen(true); }} onBoard={(board) => { setCreateTypeOpen(false); openPara(board.id); }} />}
@@ -4209,22 +4240,40 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       onMenu={() => setSidebarOpen(true)}
       onOpenConversation={(id, engineId) => { setParaVisible(false); setOpportunityVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
     {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace onJudgment={features.judgmentBook ? id=>openJudgments(id):undefined} onOpportunity={features.opportunityCards ? id => openOpportunities(id) : undefined} loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
-    <main style={judgmentVisible || opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
-      <header className="workspace-header">
-        <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <BrandIcon size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
-        <div className="workspace-header-actions">
-          {currentDetail && !showingGeminiMetrics && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
-            <summary className="icon-button" aria-label={`rollout 容量提醒：${formatRolloutBytes(currentDetail.rolloutBytes!)}`} title="rollout 容量提醒"><HardDrive size={17} /><span /></summary>
-            <div className="rollout-warning-panel" role="status">
-              <strong>rollout 已达到 {formatRolloutBytes(currentDetail.rolloutBytes!)}</strong>
-              <p>超过 {formatRolloutBytes(ROLLOUT_WARNING_BYTES)} 提醒阈值。rollout 是 Codex 维护的本地会话记录；容量大表示会话历史和磁盘占用较重，并不代表每轮都会上传整个文件，也不能单独说明网络超时。</p>
-            </div>
-          </details>}
-          <button className="icon-button" onClick={() => void newConversation()} aria-label="新建会话" title="新建会话"><SquarePen size={20} /></button>
-          {selectedConversation ? <details className={`conversation-menu${showingGeminiMetrics ? " has-antigravity-usage" : ""}`} ref={conversationMenuRef} onToggle={(event) => setConversationMenuOpen(event.currentTarget.open)}>
-            <summary className="icon-button" aria-label="会话操作" title="会话操作"><MoreHorizontal size={21} /></summary>
-            <div className="conversation-menu-panel" role="menu">
-              <div className="conversation-menu-actions">
+    <ConversationVoiceProvider onActivityChange={handleRealtimeVoiceActivity} recordingBusy={voiceInputActive} conversationId={selectedId} enabled={Boolean(session.dotEligible)} workspaceVisible={!(judgmentVisible || opportunityVisible || recurringView || (features.paraBoard && paraVisible))} onOpen={id=>{setJudgmentVisible(false);setOpportunityVisible(false);setParaVisible(false);setRecurringView(null);setConversationRoute({...readConversationLocation(conversationLocation(window.location.href,id)),fromHistory:true});}}><DotProvider conversationId={selectedId} enabled={Boolean(session.dotEligible)}><main style={judgmentVisible || opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
+      <header className="workspace-header workspace-context-header" ref={workspaceHeaderRef}>
+        <div className="workspace-header-row">
+          <button className="icon-button context-round-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={19} /></button>
+          <details className={`conversation-menu context-capsule${showingGeminiMetrics ? " has-antigravity-usage" : ""}`} ref={conversationMenuRef} onToggle={(event) => {
+            const menu = event.currentTarget;
+            setConversationMenuOpen(menu.open);
+            if (menu.open) menu.closest("header")?.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((other) => { if (other !== menu) other.open = false; });
+            if (!menu.open && menu.contains(document.activeElement)) menu.querySelector("summary")?.focus();
+          }} onBlur={(event) => {
+            if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+          }}>
+            <summary className="context-capsule-trigger" aria-label={`会话上下文与操作：${workspaceTitle} · ${workspaceSubtitle}`} aria-haspopup="dialog" aria-expanded={conversationMenuOpen} aria-controls="conversation-context-panel" onKeyDown={(event) => {
+              if (event.key !== "ArrowDown") return;
+              event.preventDefault();
+              if (conversationMenuRef.current) conversationMenuRef.current.open = true;
+              requestAnimationFrame(() => conversationMenuRef.current?.querySelector<HTMLButtonElement>("[role=menuitem]:not(:disabled), .context-panel-close")?.focus());
+            }}>
+              <span className="workspace-context-copy"><strong>{workspaceTitle}</strong><small>{workspaceSubtitle}</small></span>
+              <ChevronDown size={16} aria-hidden="true" />
+            </summary>
+            <div id="conversation-context-panel" className="conversation-menu-panel ui-dialog" role="dialog" aria-label="会话上下文与操作">
+              <div className="context-panel-heading"><span>当前上下文</span><button className="icon-button context-panel-close" aria-label="关闭会话操作" onClick={() => { if (conversationMenuRef.current) { conversationMenuRef.current.open = false; conversationMenuRef.current.querySelector("summary")?.focus(); } }}><X size={18} /></button></div>
+              <div className="context-full-names"><strong>{workspaceTitle}</strong><span>{workspaceSubtitle}</span></div>
+              {selectedConversation && <>
+              <div className="conversation-menu-actions" role="menu" aria-label="会话操作" onKeyDown={(event) => {
+                if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+                const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=menuitem]:not(:disabled)"));
+                const index = items.indexOf(document.activeElement as HTMLButtonElement);
+                if (index < 0) return;
+                event.preventDefault();
+                items[event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+              }}>
+                <DotLedgerMenuItem onSelect={() => { if (conversationMenuRef.current) conversationMenuRef.current.open = false; }} />
                 <button role="menuitem" onClick={() => void copyConversationLink(selectedConversation.id)}><Copy size={17} /><span>复制会话链接</span></button>
                 {features.paraBoard && <button role="menuitem" onClick={() => openConversationProjects(selectedConversation)}><LayoutDashboard size={17} /><span>关联项目</span></button>}
                 {selectedConversation.archived_at
@@ -4237,7 +4286,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                   {latestHandoff
                     ? <button role="menuitem" disabled={submitting || sending} onClick={() => void createConversationFromHandoff()}><BookOpen size={17} /><span>用交接摘要新建会话</span></button>
                     : <button role="menuitem" disabled={submitting || sending || Boolean(selectedConversation.has_pending_work) || Boolean(selectedConversation.active_wake_count)} onClick={() => void requestContextHandoff()}><BookOpen size={17} /><span>生成交接摘要</span></button>}
-                  <button role="menuitem" onClick={() => void archiveConversation(selectedConversation)}><Archive size={17} /><span>归档</span></button>
+                  {!selectedConversation.is_dot_coordinator && <button role="menuitem" onClick={() => void archiveConversation(selectedConversation)}><Archive size={17} /><span>归档</span></button>}
                 </>}</div>
               <div className="conversation-menu-separator" role="separator" />
               <div className="conversation-menu-info" role="group" aria-label="会话容量信息">
@@ -4252,13 +4301,29 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
                 </div>}
                 {showingGeminiMetrics && conversationMenuOpen && currentProject?.executor_id && <AntigravityUsagePanel key={currentProject.executor_id} executorId={currentProject.executor_id} />}
               </div>
+              </>}
             </div>
-          </details> : <button className="icon-button" aria-label="会话操作" title="请先选择会话" disabled><MoreHorizontal size={21} /></button>}
+          </details>
+
+          <button className="icon-button context-round-button context-new" onClick={() => void newConversation()} aria-label="新建会话" title="新建会话"><SquarePen size={19} /></button>
         </div>
+        {(maintenancePhase !== "idle" || maintenanceStatus?.deployment || (currentDetail && !showingGeminiMetrics && shouldWarnAboutRollout(currentDetail.rolloutBytes))) && <div className="workspace-header-statuses">
+          {maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}><LoaderCircle className="spin" size={13} /><span>{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span></span>}
+          {maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}
+          {currentDetail && !showingGeminiMetrics && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
+            <summary className="icon-button" aria-label={`rollout 容量提醒：${formatRolloutBytes(currentDetail.rolloutBytes!)}`} title="rollout 容量提醒"><HardDrive size={17} /><span /></summary>
+            <div className="rollout-warning-panel" role="status">
+              <strong>rollout 已达到 {formatRolloutBytes(currentDetail.rolloutBytes!)}</strong>
+              <p>超过 {formatRolloutBytes(ROLLOUT_WARNING_BYTES)} 提醒阈值。rollout 是 Codex 维护的本地会话记录；容量大表示会话历史和磁盘占用较重，并不代表每轮都会上传整个文件，也不能单独说明网络超时。</p>
+            </div>
+          </details>}
+        </div>}
       </header>
+      <ConversationVoiceWorkspace>
+      {currentDetail?.conversation.cold_storage_state === "restoring" && <ConversationRestoreStatus key={currentDetail.conversation.id} conversationId={currentDetail.conversation.id} compact/>}
       {conversationLinkError ? <section className="conversation-loading" role="alert"><span>{conversationLinkError}</span><button type="button" onClick={() => { resolvingLinkRef.current = true; setConversationRoute({ ...readConversationLocation(window.location.href), fromHistory: true }); }}>重试打开会话</button></section>
         : currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
-        : loadingConversation ? <ConversationLoading restoring={restoringConversationSelection} state={conversationLoad?.id === selectedId ? conversationLoad.state : undefined} onRetry={() => { if (selectedId) { setError(""); void reconcile(selectedId, true); } }} />
+        : loadingConversation ? <ConversationLoading conversationId={selectedId??undefined} restoring={restoringConversationSelection} state={conversationLoad?.id === selectedId ? conversationLoad.state : undefined} onRetry={() => { if (selectedId) { setError(""); void reconcile(selectedId, true); } }} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {(error || composerError) && <TransientNotice className="toast" role="alert" message={error || composerError} revision={`${errorRevision}:${composerScope}:${composerErrorNotice.revision}`} onDismiss={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button aria-label="关闭错误提示" onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></TransientNotice>}
       {notice && <TransientNotice className="toast info" message={notice} revision={noticeRevision} onDismiss={() => setNotice("")}><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></TransientNotice>}
@@ -4280,12 +4345,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onVoiceSendRecording={sendVoiceRecording}
         onVoiceSendAfterTranscription={(conversationId, content, quoteExcerpt, voiceTranscriptionIds) => { void sendVoiceTranscription(conversationId, content, quoteExcerpt, voiceTranscriptionIds); }}
         onSend={(message, voiceTranscriptionIds) => void send(message, voiceTranscriptionIds)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
-    </main>
+    </ConversationVoiceWorkspace></main></DotProvider></ConversationVoiceProvider>
   </div>;
 }
 
-function ConversationLoading({ restoring = false, state, onRetry }: { restoring?: boolean; state?: "loading" | "restoring" | "waiting" | "error"; onRetry?: () => void }) {
+function ConversationLoading({ conversationId, restoring = false, state, onRetry }: { conversationId?:string; restoring?: boolean; state?: "loading" | "restoring" | "waiting" | "error"; onRetry?: () => void }) {
   const failed = state === "error";
+  if(conversationId && !failed && (state==="restoring" || state==="waiting"))return <section className="conversation-loading"><ConversationRestoreStatus conversationId={conversationId}/></section>;
   return <section className="conversation-loading" role={failed ? "alert" : "status"} aria-live="polite">
     {!failed && <LoaderCircle className="spin" size={23} />}
     <span>{failed ? "任务或历史加载失败，请重试。" : state === "waiting" ? "正在等待恢复历史" : state === "restoring" ? "正在恢复历史…" : restoring ? "正在恢复上次任务…" : "正在加载任务…"}</span>
@@ -5072,7 +5138,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
         const messagesRect = messages.getBoundingClientRect();
         const viewport = {
           left: Math.max(0, messagesRect.left),
-          top: Math.max(0, messagesRect.top),
+          top: Math.max(0, messagesRect.top, chatRef.current?.closest(".workspace")?.querySelector(".workspace-context-header")?.getBoundingClientRect().bottom ?? 0),
           right: Math.min(window.innerWidth, messagesRect.right),
           bottom: Math.min(window.innerHeight, messagesRect.bottom),
         };
@@ -5372,11 +5438,11 @@ function FileCard({ file }: { file: WorkFile }) {
     {opensReaderByDefault
       ? <a href={filePreviewUrl(file)} target={web ? "_blank" : undefined} rel={web ? "noreferrer" : undefined} onClick={web ? undefined : handleReaderLinkClick}>{body}</a>
       : reader === "markdown" || previewable ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
-      : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
+      : <RestoreDownloadButton file={file} className="file-card-body" title={`下载 ${file.original_name}`}>{body}</RestoreDownloadButton>}
     <div className="file-card-actions">
       {previewHref && <a className="preview-button" href={previewHref} target={web || !reader ? "_blank" : undefined} rel={web || !reader ? "noreferrer" : undefined} onClick={reader && !web ? handleReaderLinkClick : undefined} title={web ? "打开交互网页" : "预览"} aria-label={`${web ? "打开" : "预览"} ${file.original_name}`}><Eye size={16} /></a>}
       {shareable && <button className="share-button" type="button" title="分享" aria-label={`分享 ${file.original_name}`} onClick={() => setShareOpen(true)}><Share2 size={16} /></button>}
-      <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载" aria-label={`下载 ${file.original_name}`}><Download size={16} /></a>
+      <RestoreDownloadButton file={file} className="download-button" title={`下载 ${file.original_name}`}/>
       <ParaCollectButton fileId={file.id} />
     </div>
     {shareOpen && <FileShareDialog fileId={file.id} onClose={() => setShareOpen(false)} />}
@@ -5555,6 +5621,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   onVoiceSendAfterTranscription: (conversationId: string | null, content: string, quoteExcerpt: string, transcriptionIds: string[]) => void;
   onCancel?: () => void;
 }) {
+  const dotCallActive = useConversationCallActive();
   const fileInput = useRef<HTMLInputElement>(null);
   const pasteTimer = useRef<number | undefined>(undefined);
   const [pasteNotice, setPasteNotice] = useState("");
@@ -5563,22 +5630,13 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   const [settingMenuIntent, setSettingMenuIntent] = useState(false);
   const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const longPressTimerRef = useRef<number | null>(null);
-  const longPressPointerRef = useRef<{ pointerId: number; startX: number; startY: number; triggered: boolean } | null>(null);
-  const [longPressArmed, setLongPressArmed] = useState(false);
   const handledFocusRequestRef = useRef(focusRequest);
   const conversationIdRef = useRef(conversationId);
   const inputRef = useRef(input);
-  const filesRef = useRef(files);
-  const draftFilesRef = useRef(draftFiles);
-  const draftUploadsRef = useRef(draftUploads);
   const editingPendingRef = useRef(editingPending);
   const removedEditingFileIdsRef = useRef(removedEditingFileIds);
   const onSendRef = useRef(onSend);
   inputRef.current = input;
-  filesRef.current = files;
-  draftFilesRef.current = draftFiles;
-  draftUploadsRef.current = draftUploads;
   editingPendingRef.current = editingPending;
   removedEditingFileIdsRef.current = removedEditingFileIds;
   onSendRef.current = onSend;
@@ -5648,91 +5706,12 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     if (!active && voice.starting) voice.cancel();
   }, [active, voice.state, voice.starting, voice.finish, voice.cancel]);
 
-  function resetLongPress(pointerId?: number) {
-    if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
-    longPressTimerRef.current = null;
-    const pointer = longPressPointerRef.current;
-    const textarea = textareaRef.current;
-    if (pointer && (pointerId === undefined || pointer.pointerId === pointerId) && textarea?.hasPointerCapture(pointer.pointerId)) {
-      try { textarea.releasePointerCapture(pointer.pointerId); } catch {}
-    }
-    if (pointerId === undefined || pointer?.pointerId === pointerId) {
-      longPressPointerRef.current = null;
-      setLongPressArmed(false);
-    }
-  }
-
-  function canArmLongPress() {
-    return voice.state === "idle"
-      && !submitting
-      && !selectionSaving
-      && !voice.notice
-      && !voice.error
-      && !inputRef.current.trim()
-      && !askAgentQuote
-      && filesRef.current.length === 0
-      && draftFilesRef.current.length === 0
-      && draftUploadsRef.current.length === 0
-      && !editingPendingRef.current;
-  }
-
-  function beginLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
-    if (event.pointerType !== "touch" || !event.isPrimary || !canArmLongPress()) return;
-    resetLongPress();
-    event.preventDefault();
-    try { event.currentTarget.setPointerCapture(event.pointerId); } catch {}
-    longPressPointerRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, triggered: false };
-    setLongPressArmed(true);
-    longPressTimerRef.current = window.setTimeout(() => {
-      const pointer = longPressPointerRef.current;
-      if (!pointer || pointer.pointerId !== event.pointerId || !canArmLongPress()) {
-        resetLongPress(event.pointerId);
-        return;
-      }
-      pointer.triggered = true;
-      if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-      setLongPressArmed(false);
-      void voice.start();
-    }, COMPOSER_LONG_PRESS_DELAY_MS);
-  }
-
-  function moveLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
-    const pointer = longPressPointerRef.current;
-    if (!pointer || pointer.pointerId !== event.pointerId || pointer.triggered) return;
-    const moved = Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY);
-    if (moved > COMPOSER_LONG_PRESS_MOVE_TOLERANCE_PX) resetLongPress(event.pointerId);
-  }
-
-  function endLongPress(event: ReactPointerEvent<HTMLTextAreaElement>) {
-    const pointer = longPressPointerRef.current;
-    if (!pointer || pointer.pointerId !== event.pointerId) return;
-    const wasTriggered = pointer.triggered;
-    resetLongPress(event.pointerId);
-    if (!wasTriggered) {
-      event.preventDefault();
-      event.currentTarget.focus();
-      event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length);
-    }
-  }
-
   useEffect(() => {
     if (!input.trim() && voice.transcriptionConversationId === conversationId) voice.clearTranscriptionIds();
   }, [conversationId, input, voice.clearTranscriptionIds, voice.transcriptionConversationId]);
 
-  useEffect(() => {
-    const cancel = () => resetLongPress();
-    window.addEventListener("blur", cancel);
-    document.addEventListener("visibilitychange", cancel);
-    return () => {
-      window.removeEventListener("blur", cancel);
-      document.removeEventListener("visibilitychange", cancel);
-    };
-  }, []);
-
   useEffect(() => () => {
     window.clearTimeout(pasteTimer.current);
-    resetLongPress();
   }, []);
 
   useEffect(() => {
@@ -5747,7 +5726,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     return () => window.cancelAnimationFrame(frame);
   }, [focusRequest]);
 
-  function startRecording() { return voice.start(); }
+  function startRecording() { if (!dotCallActive) return voice.start(); }
   function finishRecording(sendAfter: boolean) { voice.finish(sendAfter); }
   function cancelRecording() { voice.cancel(); }
   function addFiles(list: FileList | File[] | null) {
@@ -5848,7 +5827,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     </span>)}</div>}
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
-    <textarea ref={textareaRef} className={longPressArmed ? "long-press-armed" : undefined} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} onPointerDown={beginLongPress} onPointerMove={moveLongPress} onPointerUp={endLongPress} onPointerCancel={(event) => resetLongPress(event.pointerId)} onBlur={() => resetLongPress()} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
+    <textarea ref={textareaRef} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
     <ConversationVoicePanel voice={voice} />
     <div className="composer-actions"><div className="composer-primary-actions"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button><input ref={fileInput} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.currentTarget.value = ""; }} />
       <SettingMenu className="model" label="模型" value={selectedModel} options={modelOptions} placeholder="加载中" unavailableValueLabel={agentOptions ? `${selectedModel}（当前不可用）` : undefined} title={selectedModelOption?.description || "选择任务使用的模型"} disabled={submitting || selectionSaving || !agentOptions} open={openSettingMenu === "model"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {
@@ -5859,14 +5838,14 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
       }} onChange={(value) => onReasoningChange(value as ReasoningEffort)} />
     </div>
       <div className="composer-submit-actions">
-        {voice.state === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving} title="录音输入" aria-label="录音输入"><Mic size={18} /></button>}
+        {voice.state === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving || dotCallActive} title={dotCallActive ? "请先挂断通话再录音" : "录音输入"} aria-label="录音输入"><Mic size={18} /></button>}
+        {active && <ConversationCallControl conversationId={conversationId} disabled={submitting || selectionSaving || voice.state !== "idle"} />}
         {primaryAction === "stop" && onCancel
           ? <button type="button" className="send-button stop" onClick={onCancel} title="停止当前显示的任务" aria-label="停止当前显示的任务"><Square size={15} fill="currentColor" /></button>
           : <button type="button" className="send-button" onClick={() => voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds())} disabled={submitting || selectionSaving || draftUploads.length > 0 || voice.state === "transcribing" || (voice.state !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voice.state === "recording" ? "发送语音" : "发送"} aria-label={voice.state === "recording" ? "发送语音" : "发送"}>{submitting || voice.state === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}
       </div>
     </div>
   </div>
-    {selectedModel.startsWith("antigravity:") && <p className="composer-note engine-capability-note">Antigravity 不支持运行中引导；补充消息将在当前任务完成后发送。图片仅作为文件提供，能否识别取决于模型及读图工具。</p>}
     {openSettingMenu === "model" && hasMultipleEngines(agentOptions) && <p className="composer-note engine-switch-note">可在同一会话切换 Codex 与 Antigravity。切换从下一条请求生效，交接最近 20 条消息（最多约 24,000 字符）并共用项目文件；更早历史请先生成交接摘要。</p>}
     {composerExpanded && <p className="composer-note"><span>{draftStatusLabel || pendingQueueGuidance}</span>{hasUnsentDraft && conversationId && <button type="button" onClick={onClearDraft} disabled={submitting || draftUploads.length > 0}>清空草稿</button>}</p>}</div>;
 }

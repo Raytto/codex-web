@@ -1,4 +1,9 @@
+import { personalMemoryConfigured } from "./personal-memory.js";
+import { availableHostMemory, memoryDispatchBlock, TASK_MEMORY_POLL_MS, MEMORY_WAIT_MESSAGE, MEMORY_GUARD_MESSAGE } from "./task-memory.js";
 import { publicInstanceConfig, renderInstanceHtml } from './instance-config.js';
+import { DotError, DotStore, DOT_INSTRUCTIONS } from "./dot-store.js";
+import { DotLiveGateway } from "./dot-live.js";
+import { mountDotRoutes, mountDotAutomation } from "./dot-routes.js";
 import { validateCompletionEvidence } from "./workflow-store.js";
 import { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "./conversation-title.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
@@ -6,6 +11,11 @@ import { liveSteeringUnavailableReason } from "../src/agent-steering-capability.
 import { AUTO_RESET_INTERVAL_MS, CodexResetAutoUse } from "./codex-reset-auto-use.js";
 import { OpportunityVoiceService } from './opportunity-voice.js';
 import { createColdRestoreScheduler } from "./cold-restore-scheduler.js";
+import {StorageCatalog} from './storage-catalog.js';
+import {StorageFileAccess,StorageObjectAccess} from './storage-file-access.js';
+import {mountStorageAutomation} from './storage-routes.js';
+import {storageRestoreProgress} from './storage-progress.js';
+import {largeStorageWriteBlocked} from './storage-metrics.js';
 import { isTransientRestoreBlock } from "../src/conversation-restore-state.js";
 import { OpportunityError } from './opportunity-store.js';
 import { PRESENTATION_SUFFIX, WEB_RUNTIME_CSP, validateWebDocument, verifiedWebBody } from "./web-presentation.js";
@@ -56,6 +66,7 @@ import { PublicShareAssetError, isPublicShareImage, publicShareDocumentKind, res
 import { TENANT_LOCAL_EXECUTOR_ID, assertTenantProjectRoot, ensureTenantProjectLayout } from "./tenant-projects.js";
 import { operateProjectSkill, type ProjectSkillAction } from "./project-skills.js";
 import { containsPersonalContext } from "./personal-context.js";
+import { PERSONAL_MEMORY_PROVIDER, personalMemoryModel, PERSONAL_MEMORY_EFFORT } from "./codex-personal-memory.js";
 import { PersonalMemoryService } from "./personal-memory.js";
 import { ensurePersonalMemoryLibrary, isPersonalMemoryEditableFileName, personalMemoryEnabled, readPersonalMemoryManagedFiles, writePersonalMemoryManagedFile } from "./personal-memory-files.js";
 import { formatVoiceLexiconTerms, VoiceLexiconService } from "./voice-lexicon.js";
@@ -150,6 +161,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const executor = executorView(project.executor_id);
     return {
       ...project,
+      has_dot_coordinator: db.projectHasDotCoordinator(project.id, project.user_id),
       machine_name: executor?.machineName ?? "未知机器",
       executor_status: executor?.status ?? "offline",
       executor_last_seen_at: executor?.lastSeenAt ?? null,
@@ -239,6 +251,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function saveAgentSelection(userId: string, rawModel: unknown, rawEffort: unknown, conversation?: ConversationRow, executorId?: string): AgentSelection {
     const selection = resolveAgentSelection(conversation ? optionsForConversation(conversation) : optionsForExecutor(userId, executorId), rawModel, rawEffort);
+    if(conversation && db.sqlite.prepare('SELECT 1 FROM dot_sessions WHERE conversation_id=?').get(conversation.id) && engineForModel(selection.model)!=='codex') throw new Error('PP Dot 总管使用 Codex；可在任务中委派 AGY。');
     db.setAgentSelectionPreference(selection, userId);
     if (conversation) db.updateConversation(conversation.id, { agentSelection: selection });
     return selection;
@@ -254,6 +267,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     // reasoning/progress echo of it into the visible Codex Web conversation.
     if (containsPersonalContext(payload)) return;
     const seq = db.appendEvent(jobId, eventType, payload);
+    // Mirror actual queue/Job transitions; models do not author lifecycle facts.
+    const dotTask=db.sqlite.prepare('SELECT user_id,id FROM dot_tasks WHERE conversation_id=(SELECT conversation_id FROM jobs WHERE id=?)').get(jobId) as {user_id:string;id:string}|undefined;
+    if (dotTask) dotStore.reconcile(dotTask.user_id);
+
     const livePayload = {
       ...(payload && typeof payload === "object" ? payload : { payload }),
       created_at: new Date().toISOString(),
@@ -268,6 +285,67 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   const runner = new CodexRunner(config, db, publish, remoteWorkers);
+  const dotProjectionRoot = path.join(config.dataRoot, "dot-projection");
+  fs.mkdirSync(dotProjectionRoot, {recursive:true, mode:0o700});
+  const dotStore = new DotStore(db, (user, executor) => {
+    const options = optionsForExecutor(user, executor);
+    const selected = newConversationAgentSelection(user, options);
+    if (engineForModel(selected.model) === 'codex') return selected;
+    const fallback = options.models.find(m => engineForModel(m.id) === 'codex');
+    if (!fallback) throw new Error('当前节点没有可用的 Codex 模型。');
+    return availableAgentSelection(options, fallback.id, selected.reasoningEffort);
+  }, dotProjectionRoot, (user,executor,model,effort)=>resolveAgentSelection(optionsForExecutor(user,executor),model,effort), config.hostKnowledgeRoot);
+  const dotChanged = (cid:string) => { const c=db.getConversation(cid); if(c) publishConversationChanged(c); if(config.queueAutoStart) scheduleQueuePump(); };
+  dotStore.onChange=dotChanged;
+  dotStore.executorInfo=(user,executor)=>({status:executorView(executor)?.status??'unknown',models:optionsForExecutor(user,executor).models.map(m=>({id:m.id,engine:engineForModel(m.id),reasoningEfforts:m.reasoningEfforts}))});
+  const dotLive = new DotLiveGateway(dotStore, config, dotChanged);
+  const dotHooks = {
+    changed: dotChanged,
+    cancel: (id: string) => runner.cancel(id),
+    async steer(pendingId: string) {
+      const prior = db.sqlite.prepare('SELECT state FROM dot_steers WHERE pending_id=?').get(pendingId) as {state:string}|undefined;
+      if (prior) return {mode:prior.state, message:prior.state==='delivered'?'本次引导已送达，没有重复投递。':'引导送达状态不确定，请查看目标任务；没有自动重复投递。'};
+      const pending = db.getPendingPrompt(pendingId);
+      const running = pending && db.listActiveJobsForConversation(pending.conversation_id).find(j=>j.status==='running');
+      if (!pending || !running || liveSteeringUnavailableReason(running,pending)) return {mode:'queued_next_turn',message:'补充保留在原目标会话的下一轮队列。AGY 不支持运行中引导。'};
+      // Consume the pending item durably before external delivery. An ambiguous
+      // delivery is never automatically replayed as a second turn after restart.
+      db.sqlite.exec('BEGIN IMMEDIATE');
+      try {
+        db.sqlite.prepare('INSERT INTO dot_steers(pending_id,job_id,state,created_at) VALUES(?,?,?,?)').run(pendingId,running.id,'sending',new Date().toISOString());
+        db.addMessage({id:newId(),conversation_id:pending.conversation_id,role:'user',content:pending.content,created_at:new Date().toISOString()});
+        db.deletePendingPrompt(pendingId);
+        db.sqlite.exec('COMMIT');
+      } catch(e) { db.sqlite.exec('ROLLBACK'); throw e; }
+      try {
+        const turnId = await runner.steer(running.id, agentPrompt(pending.content,pending.quote_excerpt),pending.files);
+        db.sqlite.prepare("UPDATE dot_steers SET state='delivered',turn_id=? WHERE pending_id=?").run(turnId,pendingId);
+        return {mode:'delivered',message:'补充已送达当前 Codex 回合。'};
+      } catch {
+        db.sqlite.prepare("UPDATE dot_steers SET state='delivery_uncertain' WHERE pending_id=?").run(pendingId);
+        return {mode:'delivery_uncertain',message:'引导未确认送达，已保留消息供核对；不会自动重发。请查看目标任务后再决定下一步。'};
+      }
+    },
+  };
+  dotLive.hooks = {
+    ...dotHooks,
+    coldMetadataAvailable: Boolean(config.storageLifecycleEnabled),
+    cancelPending(id) {const p=db.getPendingPrompt(id);if(p){removePendingPromptFiles(p,db.getConversation(p.conversation_id)!.user_id);db.deletePendingPrompt(id);}},
+    eligibility(c) {
+      if(deletingConversations.has(c.id))return '会话正在删除。';
+      const p=c.project_id&&db.getActiveProjectForUser(c.project_id,c.user_id);
+      if(!p)return '项目不可用。';
+      if(executorView(p.executor_id)?.status!=='online')return '执行节点离线，请连接后再通话。';
+      const options=optionsForConversation(c);
+      if(!c.agent_model||!c.reasoning_effort||!options.models.some(m=>m.id===c.agent_model&&m.reasoningEfforts.includes(c.reasoning_effort!)))return '原会话模型当前不可用，请在聊天中确认模型。';
+      return null;
+    },
+    selection(c) {
+      const selected=resolveAgentSelection(optionsForConversation(c),c.agent_model,c.reasoning_effort);
+      if(selected.model!==c.agent_model||selected.reasoningEffort!==c.reasoning_effort)throw new Error('原模型不可用，未自动更换。');
+      return selected;
+    },
+  };
   const autoResetEnabled = config.containerized && config.queueAutoStart;
   const autoReset = new CodexResetAutoUse(db.sqlite, {
     executors: () => remoteWorkers.listExecutors().filter(item => item.codexAccountManagementCapable).map(item => ({
@@ -291,8 +369,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     },
   });
   const scheduleColdRestore = coldRestoreScheduler.schedule;
-  function activateConversation(conversation: ConversationRow): { conversation: ConversationRow; state: "local" | "restoring" | "error" } {
+  function activateConversation(conversation: ConversationRow): { conversation: ConversationRow; state: "local" | "metadata" | "restoring" | "error" } {
     const storage = db.getConversationStorage(conversation.id);
+    if(config.storageLifecycleEnabled){
+      // Viewing local text and the file directory is not a read of every
+      // original or native thread. Execution preheats its own dependencies.
+      return {conversation,state:!storage || storage.state==='local'?'local':'metadata'};
+    }
     if (!storage || storage.state === "local") {
       db.touchConversationActivity(conversation.id);
       return { conversation: db.getConversation(conversation.id) ?? conversation, state: "local" };
@@ -331,7 +414,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const opportunityVoice = new OpportunityVoiceService(config, db, transcription);
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs, engineId) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs, engineId));
-  const personalMemory = new PersonalMemoryService(config, db);
+  const personalMemory = new PersonalMemoryService(config, db,
+    (userId, prompt, timeoutMs, signal) => runner.extractPersonalMemory(userId, prompt, timeoutMs, signal),
+    () => !shuttingDown && !codexUpdateMaintenanceActive() && db.listRunningJobSummaries().length === 0 && db.listQueuedJobs().length === 0,
+  );
   const personalMemoryManagementPayload = (userId: string) => {
     const tenant = ensureTenant(config.tenantRoot, userId);
     const enabled = personalMemoryEnabled(tenant.library);
@@ -341,7 +427,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }));
     return {
       enabled,
-      configured: Boolean(config.personalMemoryApiKey && config.personalMemoryBaseUrl),
+      configured: personalMemoryConfigured(config), provider: config.personalMemoryProvider, model: config.personalMemoryModel, reasoningEffort: config.personalMemoryProvider === "codex-cli" ? PERSONAL_MEMORY_EFFORT : undefined,
       ...db.getPersonalMemoryStatus(userId),
       entries,
       files: enabled ? readPersonalMemoryManagedFiles(tenant.library) : [],
@@ -427,6 +513,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   let lastPublishedSystemStatus = JSON.stringify(systemStatusPayload(HOST_ROOT_USER_ID));
   let queuePumpBusy = false;
   let maintenanceQueueWaiting = false;
+  let memoryQueueWakeTimer: NodeJS.Timeout | undefined;
   let capacityQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
   let maintenanceQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
   let workflowEventCursor = 0;
@@ -450,13 +537,47 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return resolveInside(storageRoot, file.relative_path);
   }
 
+  const storageAccess=config.storageLifecycleEnabled?new StorageFileAccess(new StorageCatalog(db.sqlite),{
+    dataRoot:config.dataRoot,tenantRoot:config.tenantRoot,hostRootCodexHome:config.hostRootCodexHome,hostUserId:HOST_ROOT_USER_ID,
+  },resolveExistingFilePath,(userId,fileId)=>runner.restoreStorage(userId,fileId)):undefined;
+  const storageObjects=config.storageLifecycleEnabled?new StorageObjectAccess(new StorageCatalog(db.sqlite),(userId,id)=>runner.restoreStorage(userId,id,'item')):undefined;
+  function storageRequestError(res:Response,error:unknown){
+    res.setHeader('Retry-After','5');
+    if(error instanceof Error && error.message==='storage_restore_pending')return res.status(202).json({code:'STORAGE_RESTORE_IN_PROGRESS',restoring:true,retryable:true});
+    return res.status(503).json({code:'STORAGE_RESTORE_RETRY',retryable:true,
+      error:error instanceof Error && error.message==='storage_restore_pending'?'文件正在恢复，请稍后重试。':'文件恢复暂未完成，请稍后重试。'});
+  }
+  function fileRestoreProgress(file:FileRow,userId:string){
+    if(fs.existsSync(resolveExistingFilePath(file,userId)))return {state:'complete' as const,stage:'ready',percent:100,estimated:false,updatedAt:Date.now(),error:null};
+    let progress=storageRestoreProgress(db.sqlite,userId,'file',file.id);
+    const link=db.sqlite.prepare("SELECT item_id FROM storage_item_links WHERE user_id=? AND kind='file' AND subject_id=? LIMIT 1").get(userId,file.id);
+    if(link){const other=storageRestoreProgress(db.sqlite,userId,'item',String(link.item_id));if(other.updatedAt>progress.updatedAt)progress=other;}
+    return progress.state==='complete'?{...progress,state:'idle' as const,stage:'cold',percent:null}:progress;
+  }
+
   const reader = new ReaderService({
     db, config, resolveFilePath, resolveExistingFilePath,
     ensureFileAvailable: (file, userId) => {
+      if(storageAccess)return storageAccess.ensure(file,userId);
       const conversation = db.getConversationForUser(file.conversation_id, userId);
       if (!conversation) return "missing";
-      return activateConversation(conversation).state;
+      const state=activateConversation(conversation).state;
+      return state==='metadata'?'local':state;
     },
+    onOriginalRead:(file,userId)=>{storageAccess?.ensure(file,userId);},
+    ensureResourceAvailable:storageObjects?async(version,relative,userId)=>{
+      if(version.user_id!==userId || version.normalized_root!==`reader-resources/${userId}/${version.id}`)throw new Error('storage_reader_owner');
+      const absolute=resolveInside(resolveInside(config.dataRoot,version.normalized_root),relative);
+      const item=storageObjects.catalog.enroll({userId,scope:`reader:${version.id}`,sourceKey:relative,kind:'reader',locator:{root:`reader:${version.id}`,path:relative},
+        name:path.basename(relative),trustedUsedAt:Date.parse(version.last_accessed_at)||undefined,timeBasis:'reader-business-time'});
+      storageObjects.catalog.link(userId,item.id,'reader',version.id);
+      await storageObjects.read(item,absolute);
+    }:undefined,
+    // Aliyun/age keys and the cold-storage lock directory are root-owned on
+    // the host. Keep those operations behind the existing host bridge instead
+    // of making the web container depend on host credentials or permissions.
+    restoreReaderVersion: config.containerized && config.hostRootSocketPath ? (versionId, userId) => runner.restoreReaderVersion(userId, versionId) : undefined,
+    removeReaderResources: config.containerized && config.hostRootSocketPath ? (conversationId, userId) => runner.removeReaderResources(userId, conversationId) : undefined,
   });
 
   const webTickets = new WebRuntimeTickets();
@@ -807,6 +928,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function scheduleCapacityQueueWake(): void {
+    if (memoryQueueWakeTimer) clearTimeout(memoryQueueWakeTimer);
     if (capacityQueueWakeTimer) clearTimeout(capacityQueueWakeTimer);
     capacityQueueWakeTimer = undefined;
     if (!config.queueAutoStart || shuttingDown) return;
@@ -817,6 +939,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       if (!shuttingDown) trackBackground("capacity_queue_pump", pumpQueue());
     }, Math.max(1, Math.min(2_147_483_647, Date.parse(due) - Date.now())));
     capacityQueueWakeTimer.unref();
+  }
+
+  function scheduleMemoryQueueWake(): void {
+    if (memoryQueueWakeTimer) clearTimeout(memoryQueueWakeTimer);
+    memoryQueueWakeTimer = undefined;
+    if (!config.taskMemoryGuard || !config.queueAutoStart || shuttingDown) return;
+    if (!db.listQueuedJobs().length && !db.listDispatchablePendingPrompts().length) return;
+    memoryQueueWakeTimer = setTimeout(() => {
+      memoryQueueWakeTimer = undefined;
+      if (!shuttingDown) trackBackground("memory_queue_pump", pumpQueue());
+    }, TASK_MEMORY_POLL_MS);
+    memoryQueueWakeTimer.unref();
   }
 
   function removePendingPromptFiles(prompt: PendingPromptWithFiles, userId: string): void {
@@ -1028,7 +1162,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (recordCancellation) for (const job of activeJobs) recordUserCancelledJob(job);
   }
 
-  type DispatchBlock = "workflow_limit" | "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
+  type DispatchBlock = "workflow_limit" | "memory_watermark" | "memory_unavailable" | "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
 
   let diskSpaceSample: { sampledAt: number; bytes: number } | null = null;
   function availableDiskBytes(forceRefresh = false): number {
@@ -1055,8 +1189,26 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const conversation = db.getConversation(conversationId);
     if (!conversation) return "executor_unavailable";
     if (db.workflows.block(conversationId)) return "workflow_limit";
-    if (conversation.cold_storage_state !== "local") return "cold_storage";
+    if(config.storageLifecycleEnabled){
+      const nativePending=Boolean(db.sqlite.prepare(`SELECT 1 FROM storage_native_units WHERE conversation_id=? AND state IN ('verified','isolating','isolated','evicting','cold','restoring')
+        AND EXISTS(SELECT 1 FROM json_each(manifest_json,'$.lineage.threads') t WHERE json_extract(t.value,'$.id')=?)`).get(conversationId,conversation.codex_thread_id));
+      if(nativePending || conversation.cold_storage_state!=='local'){
+        const storage=db.getConversationStorage(conversationId);
+        if(storage && ['local','cold','error'].includes(storage.state)){
+          db.transitionConversationStorage(conversationId,[storage.state],'restoring','execution_preheat',{last_error:null});
+          publishConversationChanged(db.getConversation(conversationId)!);
+        }
+        scheduleColdRestore(conversationId,conversation.user_id);
+        return 'cold_storage';
+      }
+    }
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return "cold_storage";
     const project = conversation.project_id ? db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
+    if (config.taskMemoryGuard && !workerIdFromExecutor(project?.executor_id ?? "")) {
+      const blocked = memoryDispatchBlock((config.readAvailableMemory ?? availableHostMemory)());
+      if (blocked) return blocked === "MEMORY_WAIT" ? "memory_watermark" : "memory_unavailable";
+    }
+
     // CODEX_WEB is the explicitly trusted host operator account. Its jobs do not
     // consume the shared-user concurrency budget and are not capped by the
     // server-side user/host-executor defaults. Remote Workers still enforce
@@ -1082,6 +1234,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function dispatchBlockLabel(reason: DispatchBlock): string {
     return ({
       workflow_limit: "等待完整修改任务完成验收和收尾（暂不启动设计或执行）",
+      memory_watermark: MEMORY_WAIT_MESSAGE,
+      memory_unavailable: MEMORY_GUARD_MESSAGE,
       global_limit: `等待全局并发槽位（上限 ${config.maxGlobalRunningJobs}）`,
       user_limit: `等待当前账号并发槽位（上限 ${config.maxRunningJobsPerUser}）`,
       executor_limit: `等待执行器并发槽位（安全上限 ${config.maxRunningJobsPerExecutor}）`,
@@ -1113,7 +1267,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           && !waitingForRemote && !blocked && jobsAhead === 0,
         label: maintenancePhase !== "idle"
           ? maintenanceQueueGuidance[maintenancePhase]
-          : retry?.nextAttemptAt && retry.nextAttemptAt > new Date().toISOString() ? `模型容量等待中，将于 ${new Date(retry.nextAttemptAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）自动继续`
+          : retry?.resourceWait && retry.nextAttemptAt && retry.nextAttemptAt > new Date().toISOString() ? (retry.resourceWait === "MEMORY_WAIT" ? MEMORY_WAIT_MESSAGE : MEMORY_GUARD_MESSAGE)
+          : retry?.nextAttemptAt && retryWaiting ? `${retry.retryKind === "routing" ? "上游路由连接暂时不可用" : "模型容量等待中"}，将于 ${new Date(retry.nextAttemptAt).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）自动继续`
           : waitingForRemote ? `等待 ${executor?.machineName ?? "远程电脑"} 上线`
           : blocked ? dispatchBlockLabel(blocked)
           : jobsAhead === 0 ? "任务即将开始" : `正在等待本会话前面的 ${jobsAhead} 个任务运行完毕`,
@@ -1132,7 +1287,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       }
       const selection = repairAgentSelection(optionsForConversation(conversation), job.agent_model, job.reasoning_effort);
       scheduleConversationTitle(conversation.id, message.id, message.content, job.id);
-      await runner.run(job.id, conversation.id, agentPrompt(message.content, message.quote_excerpt), db.listFilesForMessage(message.id), selection);
+      await runner.run(job.id, conversation.id, (isHostRootUser(conversation.user_id) && dotStore.isCoordinator(conversation.user_id, conversation.id) ? DOT_INSTRUCTIONS + "\n当前用户消息来源 ID：" + message.id + "\n有来源状态：" + dotStore.boundedContext(conversation.user_id).text + "\n\n" : "") + agentPrompt(message.content, message.quote_excerpt), db.listFilesForMessage(message.id), selection);
     } catch (error) {
       const message = error instanceof Error ? error.message : "任务执行失败";
       if (db.getJob(job.id)?.status === "running") {
@@ -1215,6 +1370,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       queuePumpBusy = false;
       publishQueuePositions();
       scheduleCapacityQueueWake();
+    scheduleMemoryQueueWake();
     }
   }
 
@@ -1303,6 +1459,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   const router = express.Router();
   const api = express.Router();
+  api.get("/instance", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(publicInstanceConfig(config.instance));
+  });
 
   api.get("/instance", (_req, res) => {
     res.setHeader("Cache-Control", "no-store");
@@ -1495,7 +1655,19 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.type("text/html; charset=utf-8").send(webRuntimeDocument(active.body, String(req.params.ticket)));
   });
 
-  api.get("/files/:id/web-session/public", publicShareLimiter, (req, res) => {
+  // A valid public content request may restore its exact original. Permission
+  // and expiry are checked before any cloud work, then again by the handler.
+  api.use('/files/:id',(req,res,next)=>{
+    if(req.method!=='GET' || !/^\/(?:web-session\/public|preview\/public)(?:\/|$)/.test(req.path))return next();
+    return publicShareLimiter(req,res,()=>{
+    if(!storageAccess)return next();
+    const active=db.getActivePublicFile(String(req.params.id));
+    if(!active || !publicShareDocumentKind(active.file) || active.file.size>PUBLIC_FILE_READER_MAX_BYTES)return next();
+    try{const state=storageAccess.ensure(active.file,active.share.user_id);if(state==='restoring')throw new Error('storage_restore_pending');if(state==='error')throw new Error('storage_restore_failed');return next();}
+    catch(error){return storageRequestError(res,error);}
+    });
+  });
+  api.get("/files/:id/web-session/public", (req, res) => {
     publicResponseHeaders(res);
     const active = activePublicDocument(String(req.params.id));
     if (!active || active.file.presentation_mode !== "web") return res.status(404).json({ error: "分享已到期、关闭或文件不存在。" });
@@ -1509,11 +1681,17 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.head("/files/:id/preview/public", publicShareLimiter, (req, res) => {
     publicResponseHeaders(res);
-    if (!activePublicDocument(String(req.params.id))) return res.status(404).end();
+    const active=db.getActivePublicFile(String(req.params.id));
+    if (!active || !isPersistedDeliverablePath(active.file.relative_path) || !publicShareDocumentKind(active.file) || active.file.size>PUBLIC_FILE_READER_MAX_BYTES) return res.status(404).end();
     return res.status(204).end();
   });
+  api.get('/files/:id/storage-progress/public',publicShareLimiter,(req,res)=>{
+    publicResponseHeaders(res);const active=db.getActivePublicFile(String(req.params.id));
+    if(!active)return res.status(404).json({error:'分享已到期或关闭。'});
+    return res.json(fileRestoreProgress(active.file,active.share.user_id));
+  });
 
-  api.get("/files/:id/preview/public", publicShareLimiter, async (req, res) => {
+  api.get("/files/:id/preview/public", async (req, res) => {
     publicResponseHeaders(res);
     const fileId = String(req.params.id);
     const active = activePublicDocument(fileId);
@@ -1580,7 +1758,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     } catch { return res.status(404).end(); }
   });
 
-  api.get("/files/:id/preview/public/assets/:assetId", publicShareLimiter, (req, res) => {
+  api.get("/files/:id/preview/public/assets/:assetId", publicShareLimiter, async (req, res) => {
     publicResponseHeaders(res);
     const active = activePublicDocument(String(req.params.id));
     if (!active || active.file.presentation_mode === "web") return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
@@ -1595,6 +1773,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     let absolute: string;
     try { absolute = resolveFilePath(asset, active.share.user_id); }
     catch { return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" }); }
+    try{await storageAccess?.read(asset,active.share.user_id);}catch(error){return storageRequestError(res,error);}
     let stat: fs.Stats;
     try { stat = fs.statSync(absolute); }
     catch { return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" }); }
@@ -1671,6 +1850,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   mountOpportunityAutomation(api, db, authenticatedAutomationJob, config.tenantRoot);
+  mountStorageAutomation(api,db,authenticatedAutomationJob,{enabled:Boolean(config.storageLifecycleEnabled),
+    roots:{dataRoot:config.dataRoot,tenantRoot:config.tenantRoot,hostRootCodexHome:config.hostRootCodexHome,hostUserId:HOST_ROOT_USER_ID},
+    hostRoots:{dataRoot:config.hostDataRoot??config.dataRoot,tenantRoot:config.hostTenantRoot,hostRootCodexHome:config.hostRootCodexHome,hostUserId:HOST_ROOT_USER_ID},
+    restore:(user,id,kind)=>runner.restoreStorage(user,id,kind),readEvents:(user,input)=>runner.readStorageEvents(user,input)});
+  mountDotAutomation(api, dotStore, authenticatedAutomationJob, dotHooks);
   mountJudgmentAutomation(api, db, authenticatedAutomationJob, (user,executor) => newConversationAgentSelection(user, optionsForExecutor(user,executor)));
 
   function wakeDeadline(value: unknown): string | null {
@@ -1847,14 +2031,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       expires: expiresAt,
     });
     const maintenancePhase = codexUpdateMaintenancePhase();
-    return res.json({ authenticated: true, accountId: user.id, username: user.username, displayName: user.display_name, csrfToken, chatFontSize: db.getChatFontSize(user.id), features: db.getFeatureSelection(user.id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
+    return res.json({ authenticated: true, accountId: user.id, username: user.username, displayName: user.display_name, csrfToken, chatFontSize: db.getChatFontSize(user.id), features: db.getFeatureSelection(user.id), projectMode: true, dotEligible: isHostRootUser(user.id), maintenance: maintenancePhase !== "idle", maintenancePhase });
   });
 
   api.get("/auth/session", (req, res) => {
     const session = readSession(req, db, config);
     if (!session) return res.json({ authenticated: false });
     const maintenancePhase = codexUpdateMaintenancePhase();
-    return res.json({ authenticated: true, accountId: session.user_id, username: session.username, displayName: session.display_name, csrfToken: session.csrf_token, chatFontSize: db.getChatFontSize(session.user_id), features: db.getFeatureSelection(session.user_id), projectMode: true, maintenance: maintenancePhase !== "idle", maintenancePhase });
+    return res.json({ authenticated: true, accountId: session.user_id, username: session.username, displayName: session.display_name, csrfToken: session.csrf_token, chatFontSize: db.getChatFontSize(session.user_id), features: db.getFeatureSelection(session.user_id), projectMode: true, dotEligible: isHostRootUser(session.user_id), maintenance: maintenancePhase !== "idle", maintenancePhase });
   });
 
   api.use((req, res, next) => {
@@ -1891,8 +2075,19 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
+  mountDotRoutes(api, dotStore, dotLive, dotHooks);
+  api.get('/conversations/:id/voice', (req,res)=>{
+    const session=res.locals.session as SessionRow;
+    if(!db.getConversationForUser(String(req.params.id),session.user_id))return res.status(404).json({error:'会话不存在。'});
+    return res.json(dotLive.availability(session,String(req.params.id)));
+  });
+  api.post('/conversations/:id/voice', (req,res)=>{
+    try {return res.json(dotLive.ticket(res.locals.session as SessionRow,req.body?.takeover===true,String(req.params.id)));}
+    catch(e){return res.status(e instanceof DotError?e.status:400).json({error:e instanceof Error?e.message:'无法开始通话。'});}
+  });
+
   mountJudgmentRoutes(api, db, (user,executor) => newConversationAgentSelection(user, optionsForExecutor(user,executor)), cid => { const c = db.getConversation(cid); if(c) publishConversationChanged(c); });
-  mountOpportunityRoutes(api, db, { tenantRoot: config.tenantRoot, activate: cid => { const c = db.getConversation(cid); return c ? activateConversation(c).state : 'unavailable'; }, selection: (user, executor) => newConversationAgentSelection(user, optionsForExecutor(user, executor)), changed: cid => { const c = db.getConversation(cid); if (c) publishConversationChanged(c); if (config.queueAutoStart) scheduleQueuePump(); } });
+  mountOpportunityRoutes(api, db, { tenantRoot: config.tenantRoot, activate: cid => { const c = db.getConversation(cid); return c ? (config.storageLifecycleEnabled?'local':activateConversation(c).state) : 'unavailable'; }, selection: (user, executor) => newConversationAgentSelection(user, optionsForExecutor(user, executor)), changed: cid => { const c = db.getConversation(cid); if (c) publishConversationChanged(c); if (config.queueAutoStart) scheduleQueuePump(); } });
 
   mountRecurringRoutes(api, db, (user, executor, model, effort) => resolveAgentSelection(optionsForExecutor(user, executor), model, effort));
 
@@ -2360,7 +2555,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     let enabled = false;
     try { enabled = fs.lstatSync(path.join(tenant.library, "personal", "ENABLED")).isFile(); }
     catch { enabled = false; }
-    return res.json({ enabled, configured: Boolean(config.personalMemoryApiKey && config.personalMemoryBaseUrl), ...db.getPersonalMemoryStatus(session.user_id) });
+    return res.json({ enabled, configured: personalMemoryConfigured(config), provider: config.personalMemoryProvider, model: config.personalMemoryModel, reasoningEffort: config.personalMemoryProvider === "codex-cli" ? PERSONAL_MEMORY_EFFORT : undefined, ...db.getPersonalMemoryStatus(session.user_id) });
   });
 
   api.get("/personal-memory", (_req, res) => {
@@ -2691,6 +2886,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const projectId = String(req.params.id);
     const current = db.getActiveProjectForUser(projectId, session.user_id);
+    if (db.projectHasDotCoordinator(projectId, session.user_id)) return res.status(409).json({ error: "项目包含固定 PP Dot 总管，不能归档；其他普通会话仍可独立管理。" });
     if (current?.is_default) return res.status(409).json({ error: "默认项目不能归档。" });
     if (new RecurringStore(db).list(session.user_id).some(task => task.project_id === projectId && task.state === "active")) return res.status(409).json({ error: "请先暂停项目内的周期任务，再归档项目。" });
     if (syncingProjects.has(projectId)) return res.status(409).json({ error: "项目正在同步，请稍后再归档。" });
@@ -2723,6 +2919,13 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!isHostRootUser(session.user_id)) return res.status(403).json({ error: "当前账号不能同步远程项目。" });
     const project = db.getActiveProjectForUser(String(req.params.id), session.user_id);
     if (!project) return res.status(404).json({ error: "项目不存在。" });
+    // A targeted replay uses the same Worker protocol, without importing or
+    // triggering naming for unrelated historical conversations.
+    const target = req.body?.conversationId === undefined ? undefined
+      : db.getConversationForUser(String(req.body.conversationId), session.user_id);
+    if (req.body?.conversationId !== undefined && (!target || target.project_id !== project.id || !target.codex_thread_id)) {
+      return res.status(400).json({ error: "同步目标必须是本项目已关联远端线程的会话。" });
+    }
     if (!workerIdFromExecutor(project.executor_id)) return res.status(400).json({ error: "服务器本地项目不需要同步。" });
     if (syncingProjects.has(project.id)) return res.status(409).json({ error: "这个项目正在同步，请稍候。" });
     syncingProjects.add(project.id);
@@ -2736,6 +2939,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       let importedActivities = 0;
       let running = 0;
       let pages = 0;
+      let syncedThread: { id: string; name: string; nameSource?: string } | undefined;
       const syncedThreads: Array<{ id: string; createdAt: number; updatedAt: number }> = [];
       do {
         // A single Codex rollout can be hundreds of MB. Give each thread its
@@ -2743,10 +2947,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         // calls compete for the same timeout window.
         const page = await remoteWorkers.projectThreadsPage(project.executor_id, project.root_path, cursor, 1);
         for (const thread of page.threads) {
+          scanned += 1;
+          if (target && thread.id !== target.codex_thread_id) continue;
           const result = db.importRemoteThread(session.user_id, project.id, project.executor_id, thread, selection);
           scheduleImportedConversationTitle(result.conversation.id);
           if (result.created) syncedThreads.push({ id: thread.id, createdAt: thread.createdAt, updatedAt: thread.updatedAt });
-          scanned += 1;
+          if (target) syncedThread = { id: thread.id, name: thread.name, nameSource: thread.nameSource };
           if (result.created) created += 1;
           else if (result.changed) updated += 1;
           importedMessages += result.importedMessages;
@@ -2755,10 +2961,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         }
         cursor = page.nextCursor;
         pages += 1;
-      } while (cursor && pages < 500);
+      } while (cursor && pages < 500 && !syncedThread);
+      if (target && !syncedThread) return res.status(404).json({ error: "远端未找到目标线程。" });
       db.applyRemoteThreadOrderForUser(session.user_id, project.id, syncedThreads);
       if (config.queueAutoStart) scheduleQueuePump();
-      return res.json({ ok: true, scanned, created, updated, importedMessages, importedActivities, running, truncated: Boolean(cursor), syncedAt: new Date().toISOString() });
+      return res.json({ ok: true, scanned, created, updated, importedMessages, importedActivities, running, truncated: !syncedThread && Boolean(cursor), syncedAt: new Date().toISOString(), ...(syncedThread ? { syncedThread } : {}) });
     } catch (error) {
       return res.status(409).json({ error: error instanceof Error ? error.message : "远程项目同步失败。" });
     } finally {
@@ -2882,7 +3089,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.put("/user-settings/features", (req, res) => {
     const session = res.locals.session as SessionRow;
     res.setHeader("Cache-Control", "private, no-store");
-    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "opportunityCards", "judgmentBook", "revision"].includes(key))) {
+    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "opportunityCards", "judgmentBook", "ppDot", "revision"].includes(key))) {
       return res.status(400).json({ error: "功能选择无效，请重新打开设置。" });
     }
     const features = db.setFeatureSelection(session.user_id, req.body);
@@ -2951,6 +3158,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (config.maxActiveWorkflows > 0 && workflow && workflow.user_id === session.user_id && !["completed","aborted"].includes(workflow.state)) return res.status(409).json({error:"修改尚未完整收尾，请先完成或安全取消；删除/归档不能释放名额"});
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
+    if (conversation.is_dot_coordinator) return res.status(409).json({ error: "PP Dot 是固定总管，不能归档；可在功能选择中隐藏入口。" });
     if (conversation.archived_at) return res.json({ conversation });
     const hasWork = conversation.status === "running"
       || conversation.external_status === "running"
@@ -2990,7 +3198,19 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
     const activated = activateConversation(conversation);
     if (activated.state === "error") return res.status(503).json({ code: "COLD_STORAGE_RESTORE_FAILED", state: activated.state, conversation: activated.conversation, error: activated.conversation.cold_storage_error || "历史恢复失败，请稍后重试。" });
-    return res.status(activated.state === "local" ? 200 : 202).json({ state: activated.state, restoring: activated.state === "restoring", conversation: activated.conversation });
+    return res.status(["local","metadata"].includes(activated.state) ? 200 : 202).json({ state: activated.state, restoring: activated.state === "restoring", conversation: activated.conversation });
+  });
+  api.get('/conversations/:id/storage-progress',(req,res)=>{
+    const user=(res.locals.session as SessionRow).user_id,conversation=db.getConversationForUser(String(req.params.id),user);
+    if(!conversation)return res.status(404).json({error:'会话不存在。'});
+    res.setHeader('Cache-Control','private, no-store');return res.json(storageRestoreProgress(db.sqlite,user,'conversation',conversation.id));
+  });
+  api.post('/conversations/:id/restore',(req,res)=>{
+    const user=(res.locals.session as SessionRow).user_id,conversation=db.getConversationForUser(String(req.params.id),user);
+    if(!conversation)return res.status(404).json({error:'会话不存在。'});
+    const storage=db.getConversationStorage(conversation.id);
+    if(storage && ['local','cold','error'].includes(storage.state))db.transitionConversationStorage(conversation.id,[storage.state],'restoring','explicit_native_restore',{last_error:null});
+    scheduleColdRestore(conversation.id,user);return res.status(202).json({restoring:true});
   });
 
   api.get("/conversations/:id/rollout-size", async (req, res) => {
@@ -3016,7 +3236,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     let conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") {
+    if (!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local") {
       return res.status(202).json({ restoring: true, state: conversation.cold_storage_state, conversation });
     }
     const rolloutBytes = await runner.conversationRolloutBytes(conversation.id).catch(() => conversation!.rollout_bytes);
@@ -3237,6 +3457,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
     const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 80) : "";
     if (!title) return res.status(400).json({ error: "标题不能为空。" });
+    if (req.body?.expectedTitleSource !== undefined && typeof req.body?.expectedTitle !== "string") {
+      return res.status(400).json({ error: "缺少预期标题。" });
+    }
+    // Optional compare-and-set for targeted repairs. There is no await between
+    // reading the row, checking the precondition, and updating it.
+    if (req.body?.expectedTitle !== undefined && (req.body.expectedTitle !== conversation.title
+      || req.body.expectedTitleSource !== conversation.title_source)) {
+      return res.status(409).json({ error: "标题已变化，请刷新后重试。" });
+    }
     db.updateConversation(conversation.id, { title, titleSource: "manual" });
     await runner.renameRemoteThread(conversation.id, title).catch(() => undefined);
     return res.json({ conversation: db.getConversationForUser(conversation.id, session.user_id) });
@@ -3263,6 +3492,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.put("/conversations/:id/project", (req, res) => {
     const session = res.locals.session as SessionRow;
     const conversationId = String(req.params.id);
+    if(db.sqlite.prepare("SELECT 1 FROM dot_sessions WHERE conversation_id=? AND user_id=? UNION SELECT 1 FROM dot_tasks WHERE conversation_id=? AND user_id=?").get(conversationId,session.user_id,conversationId,session.user_id)) return res.status(409).json({error:"PP Dot 关联会话固定在原目标项目。"});
     const targetProjectId = typeof req.body?.projectId === "string" ? req.body.projectId : "";
     if (!targetProjectId) return res.status(400).json({ error: "目标项目无效。" });
     if (deletingConversations.has(conversationId)) return res.status(409).json({ error: "会话正在删除，暂时不能移动。" });
@@ -3336,6 +3566,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.delete("/conversations/:id", async (req, res) => {
     const session = res.locals.session as SessionRow;
+    if(db.sqlite.prepare("SELECT 1 FROM dot_sessions WHERE conversation_id=? AND user_id=? UNION SELECT 1 FROM dot_tasks WHERE conversation_id=? AND user_id=?").get(String(req.params.id),session.user_id,String(req.params.id),session.user_id)) return res.status(409).json({error:"PP Dot 台账引用了此会话，请保留原记录。"});
     const workflow = db.workflows.forConversation(String(req.params.id));
     if (config.maxActiveWorkflows > 0 && workflow && workflow.user_id === session.user_id && !["completed","aborted"].includes(workflow.state)) return res.status(409).json({error:"修改尚未完整收尾，请先完成或安全取消；删除/归档不能释放名额"});
     const id = String(req.params.id);
@@ -3387,6 +3618,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function uploadCapacityError(userId: string, uploads: Express.Multer.File[]): { status: number; code: string; error: string } | null {
     if (uploads.length === 0) return null;
     const incoming = uploads.reduce((total, file) => total + file.size, 0);
+    if(config.storageLifecycleEnabled && largeStorageWriteBlocked(db.sqlite,[config.dataRoot,config.tenantRoot],incoming))return {status:507,code:'STORAGE_HIGH_WATERMARK',error:'存储正在整理，暂缓新增大文件；文字和小文件仍可使用，请稍后重试。'};
     if (!isHostRootUser(userId) && db.sumStoredFileBytesForUser(userId) + incoming > config.maxStoredBytesPerUser) {
       return { status: 413, code: "USER_STORAGE_LIMIT", error: "该账号的文件存储已达到安全上限，请先删除不再需要的文件。" };
     }
@@ -3422,7 +3654,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
     db.touchConversationActivity(conversation.id);
     if (conversation.archived_at) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话已归档，请恢复后再继续发送。" }); }
-    if (conversation.cold_storage_state !== "local") { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再发送。" }); }
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再发送。" }); }
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     if (uploaded.length === 0) return res.status(400).json({ error: "没有收到附件。" });
     const capacityRejection = rejectUploadsOutsideCapacity(res, session.user_id, uploaded);
@@ -3458,7 +3690,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑草稿。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑草稿。" });
     db.touchConversationActivity(conversation.id);
     await resumableUploads.cancelConversationUploads(conversation.id);
     const draft = db.getComposerDraft(conversation.id);
@@ -3516,7 +3748,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const session = res.locals.session as SessionRow;
       const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
       if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-      if (conversation.archived_at || conversation.cold_storage_state !== "local" || deletingConversations.has(conversation.id)) return res.status(409).json({ error: "请恢复会话后再发送。" });
+      if (conversation.archived_at || (!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local") || deletingConversations.has(conversation.id)) return res.status(409).json({ error: "请恢复会话后再发送。" });
       const recordingId = String(req.body?.clientRecordingId ?? "");
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recordingId)) return res.status(400).json({ error: "录音 ID 无效。" });
       const pendingPrompt = voiceSubmissions.accept({ conversation, recordingId, filePath: file.path, mimeType: file.mimetype.split(";", 1)[0]!,
@@ -3537,7 +3769,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!conversation || !pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "语音消息不存在。" });
-    if (conversation.archived_at || conversation.cold_storage_state !== "local") return res.status(409).json({ error: "请恢复会话后再重试。" });
+    if (conversation.archived_at || (!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ error: "请恢复会话后再重试。" });
     if (!voiceSubmissions.retry(session.user_id, pending.id)) return res.status(409).json({ error: "语音状态已变化，请刷新后重试。" });
     res.status(202).json({ accepted: true });
     scheduleBackground("voice_submission_retry", () => voiceSubmissions.pump());
@@ -3687,7 +3919,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
     if (conversation.archived_at) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话已归档，请恢复后再继续发送。" }); }
-    if (conversation.cold_storage_state !== "local") { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再发送。" }); }
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再发送。" }); }
     db.touchConversationActivity(conversation.id);
     if (deletingConversations.has(conversation.id)) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "会话正在删除。" }); }
     const capacityRejection = rejectUploadsOutsideCapacity(res, session.user_id, uploaded);
@@ -3830,7 +4062,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再调整待发送任务。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再调整待发送任务。" });
     db.touchConversationActivity(conversation.id);
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((id: unknown): id is string => typeof id === "string") : [];
     try { return res.json({ pendingPrompts: db.reorderPendingPrompts(conversation.id, ids) }); }
@@ -3841,7 +4073,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑待发送任务。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑待发送任务。" });
     db.touchConversationActivity(conversation.id);
     const prompt = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!prompt || prompt.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
@@ -3854,7 +4086,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再继续任务。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再继续任务。" });
     db.touchConversationActivity(conversation.id);
     const prompt = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!prompt || prompt.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
@@ -3870,7 +4102,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const uploaded = (req.files as Express.Multer.File[] | undefined) ?? [];
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "会话不存在。" }); }
-    if (conversation.cold_storage_state !== "local") { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑任务。" }); }
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) { removeUnregisteredUploads(uploaded); return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再编辑任务。" }); }
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "待发送任务不存在。" }); }
@@ -3927,7 +4159,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再删除待发送任务。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再删除待发送任务。" });
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
@@ -3941,7 +4173,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再引导任务。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再引导任务。" });
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
@@ -3965,6 +4197,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) {
       return res.status(409).json({ error: error instanceof Error ? error.message : "引导失败。" });
     }
+  });
+
+  api.get('/jobs/:id/history',async(req,res)=>{
+    const session=res.locals.session as SessionRow,job=db.getJobForUser(String(req.params.id),session.user_id);
+    if(!job)return res.status(404).json({error:'任务不存在。'});
+    if(!config.storageLifecycleEnabled)return res.status(409).json({error:'尚未启用历史分段读取。'});
+    try{
+      const result=await runner.readStorageEvents(session.user_id,{jobId:job.id,afterSeq:req.query.afterSeq===undefined?undefined:Number(req.query.afterSeq),
+        limit:req.query.limit===undefined?undefined:Number(req.query.limit),batchId:typeof req.query.batchId==='string'?req.query.batchId:undefined,
+        offsetBytes:req.query.offsetBytes===undefined?undefined:Number(req.query.offsetBytes)});
+      res.setHeader('Cache-Control','private, no-store');return res.status(result.state==='cold'?202:result.state==='expired'?410:200).json(result);
+    }catch(error){return res.status(409).json({error:error instanceof Error?error.message:'历史分段读取暂不可用。'});}
   });
 
   api.get("/jobs/:id/events", (req, res) => {
@@ -4043,7 +4287,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!isHostRootUser(session.user_id)) return res.status(403).json({ error: "当前账号不能获取远程机器文件。" });
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation || !conversation.project_id) return res.status(404).json({ error: "任务不存在。" });
-    if (conversation.cold_storage_state !== "local") return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再获取文件。" });
+    if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再获取文件。" });
     db.touchConversationActivity(conversation.id);
     const message = db.getMessage(String(req.params.messageId));
     if (!message || message.conversation_id !== conversation.id || message.role !== "assistant") {
@@ -4067,8 +4311,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function shareMetadata(file: FileRow, req: Request) {
     return { file: { id: file.id, original_name: file.original_name, mime_type: file.mime_type, size: file.size, kind: file.kind, presentation_mode: file.presentation_mode ?? "reader", previous_file_id: file.previous_file_id },
       share: publicShareState(req, file.id), conversationId: file.conversation_id,
-      storageState: db.getConversationStorage(file.conversation_id)?.state ?? "local" };
+      storageState: config.storageLifecycleEnabled?(fs.existsSync(resolveExistingFilePath(file,db.getConversation(file.conversation_id)!.user_id))?'local':'cold'):
+        db.getConversationStorage(file.conversation_id)?.state ?? "local" };
   }
+  api.get('/files/:id/storage-progress',(req,res)=>{
+    const user=(res.locals.session as SessionRow).user_id,file=db.getFileForUser(String(req.params.id),user);
+    if(!file)return res.status(404).json({error:'文件不存在。'});
+    res.setHeader('Cache-Control','private, no-store');return res.json(fileRestoreProgress(file,user));
+  });
   api.get("/files/:id/share", (req, res) => {
     const file = db.getFileForUser(String(req.params.id), (res.locals.session as SessionRow).user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
@@ -4080,7 +4330,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
     try {
-      const state = activateConversation(db.getConversationForUser(file.conversation_id, session.user_id)!).state;
+      const state = storageAccess?storageAccess.ensure(file,session.user_id):activateConversation(db.getConversationForUser(file.conversation_id, session.user_id)!).state;
+      if(state==='error')return storageRequestError(res,new Error('storage_restore_failed'));
       return res.status(state === "restoring" ? 202 : 200).json({ ...shareMetadata(file, req), restoring: state === "restoring" });
     } catch (error) { return readerRequestError(res, error); }
   });
@@ -4294,10 +4545,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   });
 
-  api.get("/files/:id", (req, res) => {
+  api.get("/files/:id", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
+    try{await storageAccess?.read(file,session.user_id);}catch(error){return storageRequestError(res,error);}
     db.touchConversationActivity(file.conversation_id);
     let absolute: string;
     try { absolute = resolveFilePath(file, session.user_id); }
@@ -4396,7 +4648,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
   if (config.queueAutoStart) resumableUploads.start();
   return {
-    app, db, runner, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, opportunityVoice, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
+    app, db, runner, dotLive, dotStore, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, opportunityVoice, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
       autoReset.stop();
@@ -4411,7 +4663,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       resumableUploads.stop();
       if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
       wakeSchedulerTimer = undefined;
-      if (capacityQueueWakeTimer) clearTimeout(capacityQueueWakeTimer);
+      if (memoryQueueWakeTimer) clearTimeout(memoryQueueWakeTimer);
+    if (capacityQueueWakeTimer) clearTimeout(capacityQueueWakeTimer);
       capacityQueueWakeTimer = undefined;
       if (maintenanceQueueWakeTimer) clearTimeout(maintenanceQueueWakeTimer);
       maintenanceQueueWakeTimer = undefined;

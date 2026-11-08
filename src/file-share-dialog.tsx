@@ -5,6 +5,7 @@ import { Copy, ExternalLink, RefreshCw, X } from "lucide-react";
 import { api, type FileShareMetadata } from "./api";
 import { filePreviewUrl, fileReaderKind } from "./file-links";
 import { isPublicShareActive, publicShareRemaining } from "./public-share";
+import {FileRestoreStatus} from "./storage-restore-progress";
 import { useShareClock } from "./use-share-clock";
 
 export function FileShareDialog({ fileId, onClose, onChange, intent = "share" }: { fileId: string; onClose: () => void; onChange?: () => void; intent?: "share" | "open-web" }) {
@@ -102,7 +103,7 @@ export function FileShareDialog({ fileId, onClose, onChange, intent = "share" }:
           : <section className="file-share-version" aria-label="交互网页展示"><h4 className="dialog-section-heading">需要运行网页交互？</h4><p>阅读模式不运行脚本。校验后生成新的私有版本，原文件和原分享保持原样。</p><button disabled={busy} onClick={() => void change("redeliver", true)}>{busy ? "正在校验…" : "以交互网页打开"}</button></section>)}
         </>}
       </> : !error && <p>正在读取分享状态…</p>}
-      {notice && <p role="status">{notice}</p>}{error && <p className="file-share-error" role="alert">{error}</p>}
+      {busy && cold ? <FileRestoreStatus fileId={metadata?.file.id||fileId} compact/> : notice && <p role="status">{notice}</p>}{error && <p className="file-share-error" role="alert">{error}</p>}
     </section>
   </div>, document.body);
 }

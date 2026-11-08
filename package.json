@@ -15,7 +15,8 @@
     "test:app": "npm run build && node tests/run-app-tests.mjs",
     "test:worker": "npm --prefix remote-worker test",
     "lint": "tsc --noEmit",
-    "verify": "npm run lint && npm run test:app && npm run test:worker"
+    "verify": "npm run lint && npm run test:app && npm run test:worker && npm run test:storage-tools",
+    "test:storage-tools": "python3 -m unittest discover -s tests -p 'test_storage_*.py'"
   },
   "dependencies": {
     "@zip.js/zip.js": "2.8.60",
@@ -34,7 +35,8 @@
     "sharp": "0.35.5",
     "werift": "0.25.0",
     "ws": "^8.21.1",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "https-proxy-agent": "^5.0.1"
   },
   "devDependencies": {
     "@openai/codex-sdk": "0.162.1",

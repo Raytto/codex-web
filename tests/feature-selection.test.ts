@@ -35,7 +35,7 @@ test("PARA defaults off for every account and upgrades saved choices only once w
   const upgraded = new AppDatabase(root, undefined, false);
   assert.deepEqual(upgraded.getFeatureSelection(LEGACY_USER_ID), { opportunityCards: false, paraBoard: false, revision: 9 });
   assert.deepEqual(upgraded.getFeatureSelection(offUser), { opportunityCards: false, paraBoard: false, revision: 4 });
-  assert.deepEqual(upgraded.getFeatureSelection(HOST_ROOT_USER_ID), { opportunityCards: false, paraBoard: false, revision: 1 });
+  assert.deepEqual(upgraded.getFeatureSelection(HOST_ROOT_USER_ID), { opportunityCards: false, paraBoard: false, ppDot: true, revision: 1 });
   assert.deepEqual(upgraded.getFeatureSelection(missingUser), { opportunityCards: false, paraBoard: false, revision: 0 });
   assert.equal(upgraded.getChatFontSize(LEGACY_USER_ID), 19);
   assert.deepEqual(new ParaStore(upgraded).board(LEGACY_USER_ID, board.id), originalBoard);
@@ -58,7 +58,7 @@ test("PARA defaults off for every account and upgrades saved choices only once w
 test("feature selection is persistent, account isolated, revision guarded and broadcast to that account's clients", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "feature-selection-"));
   const password = "Feature-selection-test-only-2026!";
-  const instance = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
+  const instance = createApp({ basePath: "", projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync(password, 4), queueAutoStart: false, sessionSecret: "feature-selection-test-secret-longer-than-32-characters" });
   const friendId = crypto.randomUUID(), now = new Date().toISOString();
   instance.db.createUser({ id: friendId, username: "friend", display_name: "Fixture", password_hash: bcrypt.hashSync(password, 4), role: "member", status: "active", created_at: now, updated_at: now });
@@ -101,11 +101,11 @@ test("feature selection is persistent, account isolated, revision guarded and br
   assert.deepEqual(await Promise.all(clients.map(next => next())), [initial, initial, initial]);
   await request(server).get("/api/user-settings/features").expect(401);
   await owner.put("/api/user-settings/features").send({ opportunityCards: false, paraBoard: false, revision: 0 }).expect(403);
-  for (const invalid of [{ opportunityCards: false, paraBoard: "false", revision: 0 }, { opportunityCards: false, paraBoard: false }, { opportunityCards: false, paraBoard: false, revision: -1 }, { opportunityCards: false, paraBoard: false, revision: 0, userId: friendId }]) {
+  for (const invalid of [{ opportunityCards: false, paraBoard: false, ppDot: "false", revision: 0 }, { opportunityCards: false, paraBoard: "false", revision: 0 }, { opportunityCards: false, paraBoard: false }, { opportunityCards: false, paraBoard: false, revision: -1 }, { opportunityCards: false, paraBoard: false, revision: 0, userId: friendId }]) {
     await owner.put("/api/user-settings/features").set("X-CSRF-Token", a.body.csrfToken).send(invalid).expect(400);
   }
-  const hidden = { opportunityCards: false, paraBoard: false, revision: 1 };
-  await owner.put("/api/user-settings/features").set("X-CSRF-Token", a.body.csrfToken).send({ ...initial, paraBoard: false }).expect(200, hidden);
+  const hidden = { opportunityCards: false, paraBoard: false, ppDot: false, revision: 1 };
+  await owner.put("/api/user-settings/features").set("X-CSRF-Token", a.body.csrfToken).send({ ...initial, paraBoard: false, ppDot: false }).expect(200, hidden);
   assert.deepEqual(await Promise.all(clients.slice(0, 2).map(next => next())), [hidden, hidden]);
   assert.deepEqual((await otherDevice.get("/api/auth/session").expect(200)).body.features, hidden);
   const read = await otherDevice.get("/api/user-settings/features").expect(200, hidden); assert.match(read.headers["cache-control"], /no-store/);
@@ -119,7 +119,44 @@ test("feature selection is persistent, account isolated, revision guarded and br
   const reopened = new AppDatabase(path.join(root, "data"), undefined, false);
   try { assert.deepEqual(reopened.getFeatureSelection(LEGACY_USER_ID), hidden); assert.deepEqual(reopened.getFeatureSelection(friendId), friendNext); }
   finally { reopened.close(); }
-  const shown = { opportunityCards: false, paraBoard: true, revision: 2 };
+  const shown = { opportunityCards: false, paraBoard: true, ppDot: false, revision: 2 };
   await otherDevice.put("/api/user-settings/features").set("X-CSRF-Token", b.body.csrfToken).send({ opportunityCards: false, paraBoard: true, revision: 1 }).expect(200, shown);
   assert.deepEqual(await clients[0](), shown);
+});
+
+test('Dot API protects the bound coordinator and parent project without restricting same-title ordinary tasks', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dot-protection-'));
+  const password = 'Dot-test-only-password!';
+  const instance = createApp({ basePath: "",projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),username:'pp',passwordHash:bcrypt.hashSync(password,4),queueAutoStart:false,sessionSecret:'dot-protection-test-secret-longer-than-32-characters',hostKnowledgeRoot:path.join(root,'host-default'),hostRootSocketPath:path.join(root,'no-host.sock'),minimumFreeDiskBytes:0});
+  t.after(async()=>{await instance.beginShutdown();await instance.waitForBackgroundTasks();instance.db.close();fs.rmSync(root,{recursive:true,force:true});});
+  const db=instance.db, user=HOST_ROOT_USER_ID, now=new Date().toISOString();
+  db.createUser({id:user,username:'test-host',display_name:'Fixture',password_hash:bcrypt.hashSync(password,4),role:'owner',status:'active',created_at:now,updated_at:now});
+  const project=db.ensureDefaultProject(crypto.randomUUID(),user,'coordinator-project',instance.config.hostKnowledgeRoot,'local-host');
+  const other=db.createProject(crypto.randomUUID(),user,'Other',path.join(root,'other'),'local-host');
+  const dot=instance.dotStore.init(user), ordinary=db.createConversation(crypto.randomUUID(),'PP Dot',undefined,user,project.id);
+  const owner=request.agent(instance.app),friend=request.agent(instance.app);
+  const login=await owner.post('/api/auth/login').send({username:'test-host',password}).expect(200);
+  const friendLogin=await friend.post('/api/auth/login').send({username:'pp',password}).expect(200);
+  assert.equal(login.body.features.ppDot,true);
+  const csrf=login.body.csrfToken, original=db.getConversation(dot.id), binding=instance.dotStore.session(user);
+  const hidden=await owner.put('/api/user-settings/features').set('X-CSRF-Token',csrf).send({...login.body.features,ppDot:false}).expect(200);
+  await owner.put('/api/user-settings/features').set('X-CSRF-Token',csrf).send({paraBoard:false,revision:hidden.body.revision}).expect(200);
+  assert.equal((await owner.get('/api/auth/session').expect(200)).body.features.ppDot,false);
+  await owner.post(`/api/conversations/${dot.id}/archive`).set('X-CSRF-Token',csrf).expect(409);
+  await owner.delete(`/api/conversations/${dot.id}`).set('X-CSRF-Token',csrf).expect(409);
+  await owner.put(`/api/conversations/${dot.id}/project`).set('X-CSRF-Token',csrf).send({projectId:other.id}).expect(409);
+  await owner.post(`/api/projects/${project.id}/archive`).set('X-CSRF-Token',csrf).expect(409);
+  await friend.post(`/api/conversations/${dot.id}/archive`).set('X-CSRF-Token',friendLogin.body.csrfToken).expect(404);
+  await friend.post(`/api/projects/${project.id}/archive`).set('X-CSRF-Token',friendLogin.body.csrfToken).expect(404);
+  assert.deepEqual(db.getConversation(dot.id),original);assert.deepEqual(instance.dotStore.session(user),binding);
+  assert.equal(db.getProject(project.id)?.archived_at,null);
+  const projects=await owner.get('/api/projects').expect(200);
+  assert.equal(projects.body.projects.find((p:{id:string})=>p.id===project.id).has_dot_coordinator,true);
+  assert.equal(projects.body.projects.find((p:{id:string})=>p.id===other.id).has_dot_coordinator,false);
+  await owner.post(`/api/conversations/${ordinary.id}/archive`).set('X-CSRF-Token',csrf).expect(200);
+  await owner.post(`/api/conversations/${ordinary.id}/restore`).set('X-CSRF-Token',csrf).expect(200);
+  await owner.put(`/api/conversations/${ordinary.id}/project`).set('X-CSRF-Token',csrf).send({projectId:other.id}).expect(200);
+  await owner.delete(`/api/conversations/${ordinary.id}`).set('X-CSRF-Token',csrf).expect(204);
+  await owner.post(`/api/projects/${other.id}/archive`).set('X-CSRF-Token',csrf).expect(200);
+  assert.equal(db.sqlite.prepare('SELECT count(*) n FROM dot_calls').get()!.n,0);
 });

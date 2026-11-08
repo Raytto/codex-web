@@ -21,7 +21,7 @@ export type DeploymentStatus = {
   runningJobCount?: number;
   blockers?: import("../server/deployment-progress").DeploymentBlocker[];
 };
-export type Session = { authenticated: boolean; accountId?: string; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; features?: FeatureSelection; projectMode?: boolean; maintenance?: boolean; maintenancePhase?: MaintenancePhase };
+export type Session = { authenticated: boolean; accountId?: string; username?: string; displayName?: string; csrfToken?: string; chatFontSize?: number; features?: FeatureSelection; projectMode?: boolean; dotEligible?: boolean; maintenance?: boolean; maintenancePhase?: MaintenancePhase };
 export type SystemStatus = {
   instanceId: string;
   maintenance: boolean;
@@ -77,6 +77,7 @@ export type GeminiAccountLogin = {
   expiresAt: string;
 };
 export type Conversation = {
+  is_dot_coordinator?: number;
   id: string; project_id: string | null; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; external_status: "idle" | "running"; sync_origin: "codex_web" | "codex_app"; remote_updated_at: number; pinned_at: string | null; sidebar_order: number; has_unread_result: number; unread_anchor_message_id: string | null; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; project_move_blocked: number; rollout_bytes: number | null; last_active_at: string; cold_storage_state: "local" | "uploading" | "remote_verified" | "evicting" | "cold" | "restoring" | "error"; cold_storage_generation: number; cold_storage_revision: number; cold_storage_manifest_sha256: string | null; cold_storage_archive_sha256: string | null; cold_storage_archive_bytes: number | null; cold_storage_remote_path: string | null; cold_storage_error: string | null; archived_at: string | null; created_at: string; updated_at: string;
 };
 export type Executor = {
@@ -134,6 +135,7 @@ export type RemoteWorkerBootstrap = {
   platforms: Array<{ platform: "win32-x64" | "darwin-universal"; label: string; url: string; expiresAt: string }>;
 };
 export type Project = {
+  has_dot_coordinator?: boolean;
   id: string;
   name: string;
   root_path: string;
@@ -422,7 +424,7 @@ export type ConversationDetail = {
   remoteActivities: JobEvent[];
 };
 export type ConversationRestorePending = { restoring: true; state: Conversation["cold_storage_state"]; conversation: Conversation };
-export type ConversationActivation = { state: "local" | "restoring" | "error"; restoring: boolean; conversation: Conversation };
+export type ConversationActivation = { state: "local" | "metadata" | "restoring" | "error"; restoring: boolean; conversation: Conversation };
 export type ConversationActivity = {
   conversationStatus: Conversation["status"];
   externalStatus: Conversation["external_status"];
@@ -883,13 +885,16 @@ export const api = {
   ),
   deleteReaderAnnotation: (id: string) => request<void>(`/reader/annotations/${encodeURIComponent(id)}`, { method: "DELETE" }),
   fileShare: (id: string) => request<FileShareMetadata>(`/files/${encodeURIComponent(id)}/share`),
-  restoreSharedFile: (id: string) => request<FileShareMetadata & { restoring: boolean }>(`/files/${encodeURIComponent(id)}/restore`, { method: "POST" }, { allowStatuses: [202] }),
+  restoreSharedFile: (id: string, signal?:AbortSignal) => request<FileShareMetadata & { restoring: boolean }>(`/files/${encodeURIComponent(id)}/restore`, { method: "POST", signal }, { allowStatuses: [202] }),
+  fileStorageProgress: (id:string,publicView=false,signal?:AbortSignal)=>request<RestoreProgress>(`/files/${encodeURIComponent(id)}/storage-progress${publicView?'/public':''}`,{signal}),
+  conversationStorageProgress:(id:string,signal?:AbortSignal)=>request<RestoreProgress>(`/conversations/${encodeURIComponent(id)}/storage-progress`,{signal}),
+  restoreConversationStorage:(id:string)=>request<{restoring:boolean}>(`/conversations/${encodeURIComponent(id)}/restore`,{method:'POST'},{allowStatuses:[202]}),
   redeliverPresentation: (id: string, presentation_mode: "reader" | "web") => request<FileShareMetadata>(`/files/${encodeURIComponent(id)}/presentation-version`, { method: "POST", body: JSON.stringify({ presentation_mode }) }),
   webSession: async (id: string, publicView: boolean, signal?: AbortSignal): Promise<{ title: string; ticket: string; src: string }> => {
     for (let attempt = 0; attempt < 180; attempt++) {
       const result = await request<{ title?: string; ticket?: string; src?: string; restoring?: boolean }>(`/files/${encodeURIComponent(id)}/web-session${publicView ? "/public" : ""}`, { signal }, { allowStatuses: [202] });
       if (result.ticket && result.src) return { title: result.title || "交互网页", ticket: result.ticket, src: result.src };
-      if (!result.restoring || publicView) throw new Error("网页版本不可用。");
+      if (!result.restoring) throw new Error("网页版本不可用。");
       await waitForReaderRetry(signal, 1000);
     }
     throw new Error("仍在从阿里云盘恢复，请稍后重新打开。");
@@ -901,9 +906,15 @@ export const api = {
     `/files/${encodeURIComponent(id)}/share`, { method: "DELETE" },
   ),
   publicShares: () => request<{ shares: ManagedPublicShare[] }>("/public-shares"),
-  publicFilePreview: (id: string, viewId: string, signal?: AbortSignal) => request<PublicFilePreview>(
-    `/files/${encodeURIComponent(id)}/preview/public`, { signal, headers: { "X-Codex-View-ID": viewId } },
-  ),
+  publicFilePreview: async (id: string, viewId: string, signal?: AbortSignal):Promise<PublicFilePreview> => {
+    for(let attempt=0;attempt<180;attempt++){
+      const body=await request<PublicFilePreview|{restoring:boolean}>(`/files/${encodeURIComponent(id)}/preview/public`,{signal,headers:{'X-Codex-View-ID':viewId}},{allowStatuses:[202]});
+      if('file' in body)return body;
+      if(!body.restoring)break;
+      await waitForReaderRetry(signal,1000);
+    }
+    throw new Error('文件仍在恢复，请稍后重新打开。');
+  },
   verifyPublicFileShare: async (id: string, signal?: AbortSignal) => {
     const response = await fetch(`${BASE_PATH}/api/files/${encodeURIComponent(id)}/preview/public`, {
       method: "HEAD", credentials: "same-origin", cache: "no-store", signal,
@@ -922,6 +933,8 @@ export const api = {
     throw new Error("原文件仍在恢复，请稍后重试。");
   },
 };
+
+export type RestoreProgress = {state:'idle'|'queued'|'restoring'|'complete'|'error';stage:string;percent:number|null;estimated:boolean;updatedAt:number;error:string|null};
 
 export function fileUrl(file: WorkFile, download = false): string {
   return `${BASE_PATH}/api/files/${file.id}${download ? "?download=1" : ""}`;

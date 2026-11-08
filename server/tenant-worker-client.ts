@@ -1,4 +1,5 @@
 import { ExecutionUncertainError } from "./execution-ownership.js";
+import { taskMemoryError } from "./task-memory.js";
 import crypto from "node:crypto";
 import type { SupervisorToWebMessage, TenantWorkerEvent, TenantWorkerRunRequest, WebToSupervisorMessage } from "./tenant-worker-protocol.js";
 import type { JobRuntimeCleanupTarget } from "./python-runtime.js";
@@ -62,6 +63,28 @@ export class TenantWorkerClient {
         clearTimeout(timer); this.titleAgents.delete(requestId); reject(error);
       });
     });
+  }
+
+  async extractPersonalMemory(userId: string, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+    if (!process.send || !process.connected) throw new Error("personal_memory_executor_offline");
+    if (signal.aborted) throw new Error("personal_memory_cancelled");
+    const requestId = crypto.randomUUID();
+    let abort = () => {};
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        const cancel = () => {
+          if (process.connected) process.send?.({ kind: "tenant_title_cancel", requestId } satisfies WebToSupervisorMessage, () => {});
+          clearTimeout(timer); this.titleAgents.delete(requestId);
+          reject(new Error("personal_memory_cancelled"));
+        };
+        const timer = setTimeout(cancel, timeoutMs + 15_000);
+        abort = cancel;
+        signal.addEventListener("abort", abort, { once: true });
+        this.titleAgents.set(requestId, { resolve, reject, timer });
+        process.send!({ kind: "tenant_title_agent", requestId, request: { userId, prompt, timeoutMs, task: "personal_memory" } } satisfies WebToSupervisorMessage,
+          error => { if (error) { clearTimeout(timer); this.titleAgents.delete(requestId); reject(error); } });
+      });
+    } finally { signal.removeEventListener("abort", abort); }
   }
 
   reviewVoiceLexicon(userId: string, prompt: string, timeoutMs: number): Promise<string> {

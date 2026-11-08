@@ -1,5 +1,6 @@
 import { loadInstancePaths, loadPublicInstanceConfig, instanceBasePath, instancePort, instanceBoolean, type PublicInstanceConfig } from './instance-config.js';
 import { publicInstanceEnvironment } from './instance-environment.js';
+import { personalMemoryModel } from "./codex-personal-memory.js";
 import { workflowCapacity } from "./workflow-store.js";
 import path from "node:path";
 import os from "node:os";
@@ -38,6 +39,7 @@ export type AppConfig = {
   pythonVersion: string;
   codexWindowsSandbox: "elevated" | "unelevated";
   containerized: boolean;
+  storageLifecycleEnabled?: boolean;
   codexHome: string;
   codexModel?: string;
   queueAutoStart: boolean;
@@ -53,11 +55,14 @@ export type AppConfig = {
   readerRangeMaxBytes: number;
   readerRetentionDays: number;
   minimumFreeDiskBytes: number;
+  taskMemoryGuard: boolean;
+  readAvailableMemory?: () => number | null;
   resumableUploadChunkBytes: number;
   resumableUploadExpiryHours: number;
   tenantWorkerIsolation: boolean;
   hostRootSocketPath: string;
   hostTenantRoot: string;
+  hostDataRoot?: string;
   hostKnowledgeRoot: string;
   hostRootCodexHome: string;
   remoteWorkerEnrollmentToken: string;
@@ -68,6 +73,7 @@ export type AppConfig = {
   dashscopeModel: string;
   personalMemoryApiKey: string;
   personalMemoryBaseUrl: string;
+  personalMemoryProvider: string;
   personalMemoryModel: string;
   personalMemoryTimeoutMs: number;
   personalMemoryPollMs: number;
@@ -120,6 +126,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     pythonVersion: overrides.pythonVersion ?? (process.env.PYTHON_VERSION || "3.12"),
     codexWindowsSandbox: overrides.codexWindowsSandbox ?? (process.env.CODEX_WINDOWS_SANDBOX === "unelevated" ? "unelevated" : "elevated"),
     containerized: overrides.containerized ?? process.env.CONTAINERIZED === "true",
+    storageLifecycleEnabled: overrides.storageLifecycleEnabled ?? instanceBoolean(process.env.STORAGE_LIFECYCLE_ENABLED === "1" ? "true" : process.env.STORAGE_LIFECYCLE_ENABLED === "0" ? "false" : process.env.STORAGE_LIFECYCLE_ENABLED, false, "STORAGE_LIFECYCLE_ENABLED"),
     codexHome: overrides.codexHome ?? (process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
     codexModel: overrides.codexModel ?? (process.env.CODEX_MODEL || undefined),
     queueAutoStart: overrides.queueAutoStart ?? instanceBoolean(process.env.QUEUE_AUTO_START, true, "QUEUE_AUTO_START"),
@@ -134,23 +141,27 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     readerRangeMaxBytes: boundedInteger(overrides.readerRangeMaxBytes ?? process.env.READER_RANGE_MAX_BYTES, READER_V1_MAX_RANGE_BYTES, 64 * 1024, READER_V1_MAX_RANGE_BYTES),
     readerRetentionDays: boundedInteger(overrides.readerRetentionDays ?? process.env.READER_RETENTION_DAYS, READER_V1_RETENTION_DAYS, 1, READER_V1_RETENTION_DAYS),
     minimumFreeDiskBytes: boundedInteger(overrides.minimumFreeDiskBytes ?? process.env.MINIMUM_FREE_DISK_BYTES, 2 * 1024 * 1024 * 1024, 1, Number.MAX_SAFE_INTEGER),
+    taskMemoryGuard: overrides.taskMemoryGuard ?? instanceBoolean(process.env.TASK_MEMORY_GUARD, false, "TASK_MEMORY_GUARD"),
+    readAvailableMemory: overrides.readAvailableMemory,
     resumableUploadChunkBytes: boundedInteger(overrides.resumableUploadChunkBytes ?? process.env.RESUMABLE_UPLOAD_CHUNK_BYTES, 8 * 1024 * 1024, 1 * 1024 * 1024, 32 * 1024 * 1024),
     resumableUploadExpiryHours: boundedInteger(overrides.resumableUploadExpiryHours ?? process.env.RESUMABLE_UPLOAD_EXPIRY_HOURS, 72, 1, 24 * 30),
     tenantWorkerIsolation: overrides.tenantWorkerIsolation ?? instanceBoolean(process.env.TENANT_WORKER_ISOLATION, false, "TENANT_WORKER_ISOLATION"),
     hostRootSocketPath: overrides.hostRootSocketPath ?? roots.hostRootSocketPath,
     hostTenantRoot: overrides.hostTenantRoot ?? roots.hostTenantRoot,
+    hostDataRoot: overrides.hostDataRoot ?? process.env.STORAGE_HOST_DATA_ROOT,
     hostKnowledgeRoot: overrides.hostKnowledgeRoot ?? roots.hostKnowledgeRoot,
     hostRootCodexHome: overrides.hostRootCodexHome ?? roots.hostRootCodexHome,
     remoteWorkerEnrollmentToken: overrides.remoteWorkerEnrollmentToken ?? (process.env.REMOTE_WORKER_ENROLLMENT_TOKEN || ""),
     remoteWorkerReleaseRoot: overrides.remoteWorkerReleaseRoot ?? (process.env.REMOTE_WORKER_RELEASE_ROOT || path.join(projectRoot, "worker-release")),
     publicBaseUrl: overrides.publicBaseUrl ?? (process.env.PUBLIC_BASE_URL || ""),
     dashscopeApiKey: overrides.dashscopeApiKey ?? (process.env.DASHSCOPE_API_KEY || ""),
-    dashscopeBaseUrl: (overrides.dashscopeBaseUrl ?? process.env.DASHSCOPE_BASE_URL ?? "").replace(/\/$/, ""),
-    dashscopeModel: overrides.dashscopeModel ?? (process.env.DASHSCOPE_ASR_MODEL || "qwen3.5-omni-plus"),
-    personalMemoryApiKey: overrides.personalMemoryApiKey ?? (process.env.PERSONAL_MEMORY_API_KEY || ""),
+    dashscopeBaseUrl: (overrides.dashscopeBaseUrl ?? process.env.DASHSCOPE_BASE_URL ?? "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, ""),
+    dashscopeModel: overrides.dashscopeModel ?? (process.env.DASHSCOPE_ASR_MODEL || "qwen3.8-omni-flash"),
+    personalMemoryApiKey: overrides.personalMemoryApiKey ?? process.env.PERSONAL_MEMORY_API_KEY ?? "",
     personalMemoryBaseUrl: (overrides.personalMemoryBaseUrl ?? process.env.PERSONAL_MEMORY_BASE_URL ?? "").replace(/\/$/, ""),
-    personalMemoryModel: overrides.personalMemoryModel ?? (process.env.PERSONAL_MEMORY_MODEL || "memory-model"),
-    personalMemoryTimeoutMs: boundedInteger(overrides.personalMemoryTimeoutMs ?? process.env.PERSONAL_MEMORY_TIMEOUT_MS, 30_000, 5_000, 120_000),
+    personalMemoryProvider: overrides.personalMemoryProvider ?? process.env.PERSONAL_MEMORY_PROVIDER ?? "api",
+    personalMemoryModel: overrides.personalMemoryModel ?? personalMemoryModel(),
+    personalMemoryTimeoutMs: boundedInteger(overrides.personalMemoryTimeoutMs ?? process.env.PERSONAL_MEMORY_TIMEOUT_MS, 180_000, 30_000, 300_000),
     personalMemoryPollMs: boundedInteger(overrides.personalMemoryPollMs ?? process.env.PERSONAL_MEMORY_POLL_MS, 60_000, 5_000, 60 * 60_000),
     personalMemoryDelayMs: boundedInteger(overrides.personalMemoryDelayMs ?? process.env.PERSONAL_MEMORY_DELAY_MS, 120_000, 0, 24 * 60 * 60_000),
     personalMemoryBatchSize: boundedInteger(overrides.personalMemoryBatchSize ?? process.env.PERSONAL_MEMORY_BATCH_SIZE, 12, 1, 50),

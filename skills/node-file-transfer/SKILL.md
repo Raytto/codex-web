@@ -42,4 +42,4 @@ description: "通过 Codex Web 服务端在已登记节点之间复制文件，�
 node scripts/transfer.mjs --request-file request.json
 ```
 
-请求 JSON 与动态工具参数相同。脚本从当前回合的 `PPAGENT_AUTOMATION_*` 环境读取短期凭据，只访问本任务所属 Codex Web；不打印、不复制 token。脚本路径相对当前 SKILL.md 所在目录解析。不要从其他账号或另一实例借凭据。环境缺失时报告入口不可用，不自行签发管理员会话。
+请求 JSON 与动态工具参数相同。脚本从当前回合的 `CODEX_WEB_AUTOMATION_*` 环境读取短期凭据，只访问本任务所属 Codex Web；不打印、不复制 token。脚本路径相对当前 SKILL.md 所在目录解析。不要从其他账号或另一实例借凭据。环境缺失时报告入口不可用，不自行签发管理员会话。

@@ -1,4 +1,5 @@
 import { runAntigravityConversationTitle, type AntigravityTitleRuntime } from "../remote-worker/src/antigravity-title.js";
+import { runCodexPersonalMemory } from "./codex-personal-memory.js";
 import readline from "node:readline";
 import { runCodexConversationTitle, validateConversationTitleRequest, type ConversationTitleAgentRequest, type ConversationTitleWorkerEvent } from "./conversation-title.js";
 
@@ -16,7 +17,9 @@ input.on("line", (line) => {
       const expectedUid = Number(process.env.CWW_TENANT_UID ?? "NaN");
       const expectedGid = Number(process.env.CWW_TENANT_GID ?? "NaN");
       if (process.platform !== "win32" && (process.getuid?.() !== expectedUid || process.getgid?.() !== expectedGid)) throw new Error("Codex title worker Unix identity mismatch");
-      const output = request.engineId === "antigravity"
+      const output = request.task === "personal_memory"
+        ? await runCodexPersonalMemory(request, { signal: controller.signal, onAuthReady: () => send({ type: "auth_ready" }) })
+        : request.engineId === "antigravity"
         ? await runAntigravityConversationTitle(request.prompt, request.timeoutMs, request.antigravity!, controller.signal)
         : await runCodexConversationTitle(request, { signal: controller.signal, onAuthReady: () => send({ type: "auth_ready" }) });
       send({ type: "completed", output });

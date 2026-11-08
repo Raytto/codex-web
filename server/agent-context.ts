@@ -50,6 +50,7 @@ const SKILL_LOCATOR_RULES = [
 ].join("\n");
 
 type TurnPromptOptions = {
+  storageLifecycleEnabled?: boolean;
   managedWebDelivery?: boolean;
   userPrompt: string;
   attachments: AgentAttachmentContext[];
@@ -84,6 +85,7 @@ export function buildAgentTurnPrompt(options: TurnPromptOptions): string {
   if (/判断簿|预测簿|judgment/i.test(instruction)) parts.push('判断簿使用 codex_web_judgments 工具，先 context / list / detail。旧会话未发现时将相同 JSON 写入过程文件，再运行 node "$CODEX_WEB_JUDGMENT_CLI" 请求文件；使用环境凭据，不读取、打印或复制。本人概率须来自本人，语义候选必须由本人在页面确认；缺少证据不能判否。');
   if (/机会|opportunit/i.test(instruction)) parts.push('机会主题在服务器项目的正常会话中管理：使用 codex_web_opportunities（先 topics / context）。旧会话未发现该工具时，可将同样的 JSON 请求写入过程文件，再运行 node "$CODEX_WEB_OPPORTUNITY_CLI" 请求文件；凭据由运行环境提供，不读取、打印或复制。远程项目不可操作机会主题。');
   if (options.managedWebDelivery) parts.push(WEB_DELIVERY_RULES);
+  if (options.storageLifecycleEnabled) parts.push('<pp_agent_storage_context>\n长期未使用的文件可能已冷存储，目录中的 .pp-storage-index.json 仅是目录，不是原文。遇到已登记文件路径不存在时，先用 pp_agent_storage context / lookup / restore，只恢复要读的文件；返回 restoring 时按提示重试。旧线程没有此工具时将 JSON 请求写入过程文件，再运行 node "$CODEX_WEB_STORAGE_CLI" 请求文件；不要打印环境凭据，也不要创建空文件替代原件。\n</pp_agent_storage_context>');
   parts.push(instruction);
   return parts.join("\n\n");
 }

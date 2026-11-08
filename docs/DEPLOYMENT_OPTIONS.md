@@ -1,5 +1,7 @@
 # Deployment profiles and optional features
 
+Current capability/configuration walkthrough: [中文](SETUP_GUIDE.zh-CN.md) · [English](SETUP_GUIDE.en.md). New Dot/Live/memory/storage boundaries and migration checks: [full update](UPGRADE_20261108.md).
+
 This guide is the decision point for a new installation. Deploy the safe base
 profile first, then enable extensions one at a time. An extension is enabled
 only after the operator answers **yes**, supplies its own configuration, and

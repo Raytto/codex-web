@@ -1,5 +1,7 @@
 # Building, capacity and safe cleanup
 
+Current capability/configuration walkthrough: [中文](SETUP_GUIDE.zh-CN.md) · [English](SETUP_GUIDE.en.md). New Dot/Live/memory/storage boundaries and migration checks: [full update](UPGRADE_20261108.md).
+
 Compose first runs the network-disabled `init-state` service against only the application data/tenant/cold-state mounts. It fixes ownership and ACLs, then exits. The regular supervisor retains only SETUID/SETGID/KILL capabilities; file ownership/DAC initialization capabilities do not remain in that process. Both services share the same image.
 
 The default `runtime` target is the base application. It contains Node, the web/API service, an independent low-privilege tenant worker, one pinned Codex CLI, Git, bubblewrap, FFmpeg and a managed Python interpreter with its standard library and uv. Browser dependencies and Codex SDK **types** are build dependencies: the browser bundle is served from `dist`, and the server starts the separate CLI. The runtime does not need a second SDK-installed CLI. Its script directory contains only the six Linux startup, permission initialization, password hashing and Python setup/task entrypoints. Browser acceptance scripts stay in the source/test stages. The HTML report skill has one account-resource seed, and Python uses one profile-based runtime definition; legacy duplicate skill and spreadsheet-runtime trees are not shipped.

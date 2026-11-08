@@ -1,3 +1,4 @@
+import { renderInstanceHtml, loadPublicInstanceConfig } from "../server/instance-config.js";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -614,7 +615,7 @@ test("voice transcription retries are idempotent for the same client recording",
   const originalTranscribe = TranscriptionService.prototype.transcribe;
   let calls = 0;
   TranscriptionService.prototype.transcribe = async function () { calls += 1; return "电梯断网后仍可重试"; };
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -654,7 +655,7 @@ test("voice upload accepts a ten-minute PCM-sized payload and rejects above 30 M
   const originalTranscribe = TranscriptionService.prototype.transcribe;
   let calls = 0;
   TranscriptionService.prototype.transcribe = async function () { calls += 1; return "十分钟录音"; };
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo", passwordHash: bcrypt.hashSync("Voice-Upload-Limit-2026!", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -858,9 +859,9 @@ test("appearance setting supports light, dark, and live system preference", () =
 test("workspace uses one compact top bar with new-conversation and pin actions", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /className="workspace-header"/);
+  assert.match(appSource, /className="workspace-header workspace-context-header"/);
   assert.match(appSource, /className="maintenance-state"[\s\S]*maintenanceStatusLabel\(maintenancePhase, maintenanceStatus\)[\s\S]*LoaderCircle/);
-  assert.match(appSource, /serverInstanceIdRef\.current !== status\.instanceId[\s\S]*voiceInputActiveRef\.current \|\| instanceReloadDeferredRef\.current[\s\S]*setInstanceReloadDeferred\(true\)[\s\S]*source\.close\(\)[\s\S]*window\.location\.reload\(\)/);
+  assert.match(appSource, /serverInstanceIdRef\.current !== status\.instanceId[\s\S]*voiceInputActiveRef\.current \|\| realtimeVoiceActiveRef\.current \|\| instanceReloadDeferredRef\.current[\s\S]*setInstanceReloadDeferred\(true\)[\s\S]*source\.close\(\)[\s\S]*window\.location\.reload\(\)/);
   assert.match(appSource, /canApplyDeferredInstanceReload\([\s\S]*syncedDraftSignature[\s\S]*window\.location\.reload\(\)/);
   assert.match(appSource, /onVoiceActivityChange=\{\(active\) => \{ voiceInputActiveRef\.current = active; setVoiceInputActive\(active\); \}\}/);
   assert.match(appSource, /new EventSource\(`\$\{BASE_PATH\}\/api\/system\/events`\)/);
@@ -915,17 +916,19 @@ test("task search renders the voice input with project context and long-press be
   assert.match(appSource, /purpose: "search"/);
 });
 
-test("empty composer supports a touch long-press voice shortcut without replacing the mic button", () => {
+test("composer leaves native text gestures intact and keeps explicit recording", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
+  const composer = appSource.slice(appSource.indexOf("function Composer("), appSource.indexOf("function clipboardTimestamp("));
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /COMPOSER_LONG_PRESS_DELAY_MS = 650/);
-  assert.match(appSource, /event\.pointerType !== "touch"[\s\S]*canArmLongPress\(\)/);
-  assert.match(appSource, /!inputRef\.current\.trim\(\)[\s\S]*!askAgentQuote[\s\S]*!editingPendingRef\.current/);
-  assert.match(appSource, /onPointerDown=\{beginLongPress\}[\s\S]*onPointerMove=\{moveLongPress\}[\s\S]*onPointerUp=\{endLongPress\}[\s\S]*onPointerCancel=/);
-  assert.match(appSource, /onClick=\{\(\) => void startRecording\(\)\}/);
-  assert.match(appSource, /window\.addEventListener\("blur", cancel\)[\s\S]*document\.addEventListener\("visibilitychange", cancel\)/);
-  assert.match(styles, /\.composer\.compact textarea \{ touch-action: manipulation; -webkit-touch-callout: none; \}/);
-  assert.match(styles, /\.composer textarea\.long-press-armed \{ background: var\(--indigo-pale\)/);
+  const textarea = composer.match(/<textarea[^\n]*\/>/)?.[0];
+  assert.ok(textarea);
+  assert.doesNotMatch(textarea, /onPointer|onTouch|onContextMenu/);
+  assert.doesNotMatch(composer, /longPress|LongPress|setPointerCapture/);
+  assert.doesNotMatch(styles, /\.composer[^{}]*textarea[^{}]*\{[^}]*-webkit-touch-callout:\s*none/);
+  assert.doesNotMatch(styles, /\.composer textarea\.long-press-armed/);
+  assert.match(composer, /function startRecording\(\) \{ if \(!dotCallActive\) return voice\.start\(\); \}/);
+  assert.match(composer, /onClick=\{\(\) => void startRecording\(\)\}/);
+  assert.match(composer, /onKeyDown=\{keyDown\} onPaste=\{pasted\}/);
 });
 
 test("workspace header identifies the selected task and its project", () => {
@@ -933,8 +936,7 @@ test("workspace header identifies the selected task and its project", () => {
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /const workspaceTitle = selectedConversation\?\.title \|\| instance\.productName/);
   assert.match(appSource, /const workspaceSubtitle = selectedProject\?\.display_name \|\| selectedProject\?\.name \|\| instance\.tagline/);
-  assert.match(appSource, /className="wordmark workspace-context"[\s\S]*selectedProject\?\.executor_id\.startsWith\("remote:"\) \? <Monitor size=\{15\} \/> : selectedProject \? <Folder size=\{15\} \/> : <BrandIcon size=\{14\} \/>/);
-  assert.match(appSource, /className="brand-copy workspace-context-copy"><strong>\{workspaceTitle\}/);
+  assert.match(appSource, /className="workspace-context-copy"><strong>\{workspaceTitle\}/);
   assert.match(appSource, /<small>\{workspaceSubtitle\}<\/small>/);
   assert.match(appSource, /deploymentStatusTone\(maintenanceStatus\.deployment\)/);
   assert.match(appSource, /发布 \{deploymentStageNumber\(maintenanceStatus\.deployment\.phase\)\}\/\{DEPLOYMENT_STAGES\.length\}/);
@@ -1091,7 +1093,7 @@ test("completed tasks show a green unread marker until their detail is viewed", 
   assert.match(appSource, /result\.conversation\.has_unread_result[\s\S]*?api\.markConversationSeen\(id\)/);
   assert.match(appSource, /unread_anchor_message_id[\s\S]*?resolveUnreadScrollTarget[\s\S]*?api\.conversationMessages\(id, result\.messagePage\.nextCursor\)/);
   assert.match(messageSource, /data-message-id=\{message\.id\}/);
-  assert.match(appSource, /messages\.scrollTop = Math\.max\(0, messages\.scrollTop \+ targetTop - messagesTop - 12\)/);
+  assert.match(appSource, /messages\.scrollTop = Math\.max\(0, messages\.scrollTop \+ targetTop - messagesTop - headerInset - 12\)/);
   assert.match(appSource, /window\.setInterval\([\s\S]*?refreshList\(false, project\.id\)[\s\S]*?10_000/);
   assert.match(apiSource, /markConversationSeen:[\s\S]*?\/conversations\/\$\{id\}\/seen[\s\S]*?method: "POST"/);
   assert.match(styles, /\.conversation-row\.unread \.conversation-select::after \{[^}]*background: #38c976;[^}]*content: "";/);
@@ -1124,7 +1126,7 @@ test("switching conversations hides stale detail until the selected task loads",
   assert.match(appSource, /currentDetail = detail\?\.conversation\.id === selectedId \? detail : null/);
   assert.match(appSource, /restoringConversationSelection = !conversationSelectionReady/);
   assert.match(appSource, /loadingConversation = restoringConversationSelection \|\| Boolean\(selectedId && !currentDetail\)/);
-  assert.match(appSource, /loadingConversation \? <ConversationLoading restoring=\{restoringConversationSelection\} state=/);
+  assert.match(appSource, /loadingConversation \? <ConversationLoading conversationId=\{selectedId\?\?undefined\} restoring=\{restoringConversationSelection\} state=/);
   assert.match(appSource, /conversationSelectionReady && !conversationLinkError && \(!selectedId \|\| !selectedConversation\?\.archived_at\) && <Composer/);
   assert.match(appSource, /restoring \? "正在恢复上次任务…" : "正在加载任务…"/);
   assert.match(appSource, /role=\{failed \? "alert" : "status"\} aria-live="polite"/);
@@ -1530,7 +1532,7 @@ test("running work journal retains every important direction and compacts repeat
   assert.doesNotMatch(appSource, /stageFeedback|process-journal-pinned/);
   assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*overflow-x: hidden;[^}]*border-top:/);
   assert.doesNotMatch(styles, /\.process-journal \{[^}]*max-height:|\.process-journal \{[^}]*overflow-y: auto|\.process-journal \{[^}]*overscroll-behavior-y:/);
-  assert.doesNotMatch(styles, /\.process-journal-pinned|position: sticky;/);
+  assert.doesNotMatch(styles, /\.process-journal-pinned|\.process-journal[^}]*position: sticky;/);
   assert.match(appSource, /\{\(sending \|\| workflow\) && <article className="message assistant running">/);
   assert.match(appSource, /<ProcessPanel key=\{`\$\{detail\.conversation\.id\}:\$\{detail\.remoteTurnId \?\? "job"\}`\} activities=\{activities\} loading=\{activitiesLoading\}/);
   assert.match(appSource, /<div className="process-journal">\{journal\.length/);
@@ -2273,7 +2275,7 @@ test("personal memory extraction rejects local skill/project/task rules and keep
 test("personal memory management API reviews entries and bumps manual file revisions", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-personal-memory-management-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -2326,7 +2328,7 @@ test("personal memory management API reviews entries and bumps manual file revis
 
 test("voice lexicon management API exposes the ranked top one hundred and every candidate only to its owner", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-lexicon-management-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -2926,7 +2928,7 @@ test("selected conversations keep their sidebar position while search matches me
 
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const selectionFlow = appSource.match(/function selectProjectConversation[\s\S]*?function selectConversation[\s\S]*?\n  }/)?.[0] ?? "";
-  assert.match(selectionFlow, /retainSelectedConversation\(page, conversation, projectId\)/);
+  assert.match(selectionFlow, /retainProjectConversationPage\(page, projectId\)/);
   assert.match(selectionFlow, /selectedIdRef\.current = conversationId/);
   assert.doesNotMatch(selectionFlow, /setQuery\(|selectProject\(projectId\)/);
   assert.doesNotMatch(selectionFlow, /\[conversation,[\s\S]*?filter/);
@@ -2999,7 +3001,7 @@ test("executor runtime catalogs and update state persist across database restart
 
 test("queued jobs keep their own executor-specific model and reasoning selections at dispatch", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-executor-selection-dispatch-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -3874,13 +3876,19 @@ test("finished outputs are copied to immutable app storage and legacy rows migra
   const anotherId = crypto.randomUUID();
   const copiedPath = await persistDeliverable(dataRoot, workspace, legacyPath, anotherId);
   assert.equal(fs.readFileSync(resolveInside(dataRoot, copiedPath), "utf8"), "result");
+  fs.writeFileSync(resolveInside(workspace, "outputs/.gitignore"), "node_modules/\n");
+  const hiddenPath = await persistDeliverable(dataRoot, workspace, "outputs/.gitignore", crypto.randomUUID());
+  assert.equal(isPersistedDeliverablePath(hiddenPath), true);
+  assert.equal(fs.readFileSync(resolveInside(dataRoot, hiddenPath), "utf8"), "node_modules/\n");
+  for (const suffix of [".", "..", "", "../private", ".git/config"])
+    assert.equal(isPersistedDeliverablePath(`deliverables/${fileId}/${suffix}`), false);
 });
 
 test("authenticated image thumbnails transfer a real 56 by 32 WebP instead of the original", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-image-thumbnail-test-"));
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -3981,7 +3989,7 @@ test("public share image manifests resolve only safe same-delivery images and re
 test("fixed public file sharing is private by default, owner-controlled, image-aware, and audited only in SQLite", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-public-file-share-"));
   const dataRoot = path.join(root, "data");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -4331,7 +4339,7 @@ test("risky uploads and execution requests use offline isolation", () => {
 test("new conversation requests atomically reuse only a completely empty task in the same project", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-empty-conversation-reuse-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -4398,7 +4406,7 @@ test("new-task UI refreshes the promoted row before retaining and selecting the 
 test("conversation archive API keeps history readable, blocks new turns, and restores the sidebar row", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-archive-api-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot,
@@ -4461,7 +4469,7 @@ test("conversation archive API keeps history readable, blocks new turns, and res
 test("single-user login and CSRF protection", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(),
     dataRoot: path.join(root, "data"),
     tenantRoot,
@@ -4646,7 +4654,7 @@ test("single-user login and CSRF protection", async (context) => {
 
 test("owner preserves project expansion and project-local task order alongside remote executors", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-host-sidebar-order-api-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -4728,7 +4736,7 @@ test("owner preserves project expansion and project-local task order alongside r
 test("owner can fetch any readable remote file into the normal deliverable download flow", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-file-fetch-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -4826,7 +4834,7 @@ test("owner can fetch any readable remote file into the normal deliverable downl
 test("remote Worker output uploads keep large JSON files on the raw streaming transfer path", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-json-output-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -4946,7 +4954,7 @@ test("remote Worker output uploads keep large JSON files on the raw streaming tr
 test("remote Worker behavior updates import automatically without duplicating messages or activities", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-live-sync-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5214,7 +5222,7 @@ test("remote Worker behavior updates import automatically without duplicating me
 test("remote Worker capacity can be changed to unlimited through the managed protocol", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-capacity-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5278,7 +5286,7 @@ test("remote Worker update waits for an idle heartbeat and succeeds only after v
   assert.equal(REMOTE_WORKER_UPDATE_TIMEOUT_MS, 15 * 60_000);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-worker-update-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5395,7 +5403,7 @@ test("production automatically queues an outdated capable Worker after deploymen
     ref: REMOTE_WORKER_TARGET_REF, commit, platform: "win32-x64",
     archive: { fileName, sha256, size: archive.length },
   }));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5464,7 +5472,7 @@ test("versioned Remote Worker release downloads require the enrollment credentia
       "darwin-universal": { fileName: macFileName, sha256: macSha256, size: macArchive.length, format: "tar.gz" },
     },
   }));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5515,7 +5523,7 @@ test("versioned Remote Worker release downloads require the enrollment credentia
 test("remote worker heartbeats preserve terminal errors while replacement connections reconcile lost jobs", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-remote-reconcile-test-"));
   const enrollmentToken = "test-remote-worker-enrollment-token";
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters", queueAutoStart: false,
@@ -5617,7 +5625,7 @@ test("remote worker heartbeats preserve terminal errors while replacement connec
 
 test("first-message Codex naming is audited independently and never overwrites a manual title", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-codex-title-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -5666,7 +5674,7 @@ test("first-message Codex naming is audited independently and never overwrites a
 
 test("quoted selections stay outside the visible message body and survive the pending queue", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-message-quote-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -5716,7 +5724,7 @@ test("conversation stop cancels every active job and tombstone deletion removes 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-soft-delete-test-"));
   const dataRoot = path.join(root, "data");
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -5779,7 +5787,7 @@ test("conversation stop cancels every active job and tombstone deletion removes 
   instance.db.updateConversation(conversationId, { codexThreadId: threadId });
   const sessionFile = path.join(ensureTenant(tenantRoot, LEGACY_USER_ID).codexHome, "sessions", "2026", "07", "19", `rollout-${threadId}.jsonl`);
   fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-  fs.writeFileSync(sessionFile, "thread state", "utf8");
+  fs.writeFileSync(sessionFile, JSON.stringify({ type: "session_meta", payload: { id: threadId, source: "exec" } }) + "\n", "utf8");
 
   const originalDeletePending = instance.db.deletePendingPromptsForConversation.bind(instance.db);
   let observedDrainBeforeFileGc = false;
@@ -5812,7 +5820,7 @@ test("conversation stop cancels every active job and tombstone deletion removes 
 
 test("failed conversation GC remains tombstoned and can be retried idempotently", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-delete-saga-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -5839,7 +5847,7 @@ test("failed conversation GC remains tombstoned and can be retried idempotently"
 test("web users have isolated conversations, files, jobs, settings, and tenant directories", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-multi-user-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -5931,7 +5939,7 @@ test("web users have isolated conversations, files, jobs, settings, and tenant d
 test("composer drafts and attachments survive browser sessions and are consumed atomically", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-composer-draft-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6047,7 +6055,7 @@ test("composer drafts and attachments survive browser sessions and are consumed 
 test("file-only submissions persist on the server and wait for a real instruction", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-awaiting-instruction-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6127,7 +6135,7 @@ test("file-only submissions persist on the server and wait for a real instructio
 
 test("later submissions stay out of chat as drafts and materialize one at a time", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-queue-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6190,7 +6198,7 @@ test("later submissions stay out of chat as drafts and materialize one at a time
 test("pending drafts support reorder, steer, edit with attachments, and delete", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-pending-actions-test-"));
   const tenantRoot = path.join(root, "tenants");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6281,7 +6289,7 @@ test("maintenance status is pushed to every connected client and clears automati
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-maintenance-status-test-"));
   const dataRoot = path.join(root, "data");
   const marker = path.join(dataRoot, ".codex-update-maintenance");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6367,7 +6375,7 @@ test("maintenance status is pushed to every connected client and clears automati
 test("maintenance preparation exposes safe wait progress and flags stale activity", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-maintenance-wait-test-"));
   const dataRoot = path.join(root, "data");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6428,7 +6436,7 @@ test("system status keeps the latest deployment phase after maintenance ends", a
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-deployment-status-test-"));
   const dataRoot = path.join(root, "data");
   const deployStatusFile = path.join(root, "deploy-status.json");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), deployStatusFile, queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6471,7 +6479,7 @@ test("system status keeps the latest deployment phase after maintenance ends", a
 test("maintenance gate pauses dispatch while submissions, edits, and steering remain available", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-update-gate-test-"));
   const dataRoot = path.join(root, "data");
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6645,7 +6653,7 @@ test("maintenance queue wakes automatically after the gate is removed", async (c
   fs.writeFileSync(path.join(dataRoot, ".codex-update-maintenance"), "preparing\n");
   const oldMarkerTime = new Date(Date.now() - 2 * 60 * 60 * 1000);
   fs.utimesSync(path.join(dataRoot, ".codex-update-maintenance"), oldMarkerTime, oldMarkerTime);
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot, tenantRoot: path.join(root, "tenants"), queueAutoStart: true,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6776,7 +6784,7 @@ test("manual wake scheduling exposes conversation placement and an explicit cont
 
 test("different conversations start concurrently within configured safety limits", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-parallel-conversations-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6868,7 +6876,7 @@ test("database restart preserves a leased remote Worker job for exact-turn recov
 
 test("shutdown gate retains queued jobs without dispatching them", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-shutdown-gate-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6943,7 +6951,7 @@ test("private file citations become safe readable references", () => {
 
 test("conversation API sanitizes historical file citations without rewriting the database", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-citation-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -6987,7 +6995,7 @@ test("conversation API sanitizes historical file citations without rewriting the
 
 test("AI-titled conversations hide repeated title envelopes without rewriting audit rows", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-title-envelope-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -7085,7 +7093,7 @@ test("job progress events refresh the job activity timestamp", (context) => {
 
 test("conversation history is returned newest-first by page and can load older messages", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-message-pages-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -7122,7 +7130,7 @@ test("conversation history is returned newest-first by page and can load older m
 
 test("conversation detail restores running progress and terminal SSE replay", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-recovery-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",
@@ -7172,7 +7180,7 @@ test("conversation detail restores running progress and terminal SSE replay", as
 
 test("conversation activity snapshots retain five stage updates before the rolling window", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-activity-retention-test-"));
-  const instance = createApp({
+  const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "demo-owner", passwordHash: bcrypt.hashSync("fixture", 8),
     sessionSecret: "test-session-secret-that-is-longer-than-thirty-two-characters",

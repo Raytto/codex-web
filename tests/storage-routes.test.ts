@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import bcrypt from 'bcryptjs';
+import request from 'supertest';
+import {createApp} from '../server/app.js';
+import {LEGACY_USER_ID} from '../server/db.js';
+import {StorageRestoreProgress} from '../server/storage-progress.js';
+import {StorageCatalog} from '../server/storage-catalog.js';
+import {enrollRegisteredFiles,itemForFile} from '../server/storage-inventory.js';
+
+test('cold metadata and progress never restore or heat files; content restores one file and valid public shares only',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'pp-storage-routes-')),dataRoot=path.join(root,'data'),tenantRoot=path.join(root,'tenants');
+ const instance=createApp({ basePath: "",projectRoot:process.cwd(),dataRoot,tenantRoot,username:'tester',passwordHash:bcrypt.hashSync('Test-password-2026!',4),sessionSecret:'test-secret-at-least-thirty-two-characters',queueAutoStart:false,publicBaseUrl:'https://agent.test',storageLifecycleEnabled:true});
+ t.after(async()=>{finish();await new Promise(resolve=>setImmediate(resolve));await instance.waitForBackgroundTasks();instance.db.close();fs.rmSync(root,{recursive:true,force:true});});
+ const db=instance.db,cid=crypto.randomUUID(),fileId=crypto.randomUUID(),otherId=crypto.randomUUID(),old='2026-08-01T00:00:00.000Z',content='# old planning document\n';
+ db.createConversation(cid,'test cold metadata');db.sqlite.prepare('UPDATE conversations SET last_active_at=? WHERE id=?').run(old,cid);
+ const relative=`deliverables/${fileId}/plan.md`,absolute=path.join(dataRoot,relative);fs.mkdirSync(path.dirname(absolute),{recursive:true});
+ for(const id of [fileId,otherId])db.addFile({id,conversation_id:cid,message_id:null,original_name:'plan.md',relative_path:`deliverables/${id}/plan.md`,mime_type:'text/markdown',size:Buffer.byteLength(content),kind:'output',created_at:old});
+ const catalog=new StorageCatalog(db.sqlite);enrollRegisteredFiles(catalog,{dataRoot,tenantRoot,hostRootCodexHome:path.join(root,'host'),hostUserId:crypto.randomUUID()});
+ const before=itemForFile(catalog,LEGACY_USER_ID,fileId)!;
+ let calls=0,finish:()=>void=()=>undefined,progress:StorageRestoreProgress|undefined;
+ instance.runner.restoreStorage=async(user,id)=>{
+  assert.equal(user,LEGACY_USER_ID);assert.equal(id,fileId);calls++;
+  progress=new StorageRestoreProgress(db.sqlite,user,'file',id);progress.update({stage:'downloading',completed:45,total:100,estimated:true});
+  await new Promise<void>(resolve=>{finish=resolve;});fs.writeFileSync(absolute,content);progress.finish();
+ };
+ const owner=request.agent(instance.app),guest=request(instance.app),login=await owner.post('/api/auth/login').send({username:'tester',password:'Test-password-2026!'}).expect(200);
+ for(const endpoint of ['share','storage-progress'])await owner.get(`/api/files/${fileId}/${endpoint}`).expect(200);
+ await owner.post(`/api/conversations/${cid}/activate`).set('X-CSRF-Token',login.body.csrfToken).expect(200);
+ await owner.get(`/api/conversations/${cid}`).expect(200);
+ assert.equal(calls,0);assert.equal(catalog.item(LEGACY_USER_ID,before.id).last_used_at,before.last_used_at);
+ await guest.get(`/api/files/${fileId}/storage-progress/public`).expect(404);
+ await guest.get(`/api/files/${fileId}/preview/public`).expect(404);assert.equal(calls,0);
+ // Grant share at the metadata layer without asking the UI to restore first.
+ db.enablePublicFileShare({id:crypto.randomUUID(),file:db.getFileForUser(fileId,LEGACY_USER_ID)!,userId:LEGACY_USER_ID,assets:[]});
+ await guest.head(`/api/files/${fileId}/preview/public`).expect(204);assert.equal(calls,0);
+ await guest.get(`/api/files/${fileId}/preview/public`).expect(202);assert.equal(calls,1);
+ const state=(await guest.get(`/api/files/${fileId}/storage-progress/public`).expect(200)).body;
+ assert.equal(state.percent,45);assert.equal(state.estimated,true);assert.equal(state.stage,'downloading');
+ await owner.post(`/api/files/${fileId}/restore`).set('X-CSRF-Token',login.body.csrfToken).expect(202);assert.equal(calls,1);
+ const outsider=crypto.randomUUID();db.createUser({id:outsider,username:'other',display_name:'Other',password_hash:bcrypt.hashSync('Another-password-2026!',4),role:'member',status:'active',created_at:old,updated_at:old});
+ const other=request.agent(instance.app);await other.post('/api/auth/login').send({username:'other',password:'Another-password-2026!'}).expect(200);
+ await other.get(`/api/files/${fileId}/storage-progress`).expect(404);await other.get(`/api/conversations/${cid}/storage-progress`).expect(404);
+ finish();await new Promise(resolve=>setImmediate(resolve));
+ assert.equal((await owner.get(`/api/files/${fileId}/storage-progress`).expect(200)).body.percent,100);
+ const download=await owner.get(`/api/files/${fileId}?download=1`).expect(200);assert.match(download.text,/old planning/);
+ assert.equal(fs.existsSync(path.join(dataRoot,`deliverables/${otherId}/plan.md`)),false);assert.ok(catalog.item(LEGACY_USER_ID,before.id).last_used_at>before.last_used_at);
+});

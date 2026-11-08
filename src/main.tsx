@@ -7,6 +7,7 @@ import { installMobileViewportRecovery } from "./mobile-viewport";
 import { applyThemePreference, readStoredThemePreference } from "./theme";
 import "./styles.css";
 
+document.documentElement.dataset.brandTheme = instance.theme;
 applyThemePreference(readStoredThemePreference());
 installMobileViewportRecovery();
 

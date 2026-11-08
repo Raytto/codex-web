@@ -8,7 +8,12 @@ import { HOST_ROOT_USER_ID } from "./host-root-user.js";
 import type { ConversationStorageState } from "./db.js";
 import { retryColdOperation } from "./cold-storage-maintenance.js";
 
-export const COLD_STORAGE_FORMAT = "conversation-cold-storage-v2";
+import { collectConversationLineage, conversationThreadReferences, readLineageInventory, mutateThreadIndex, validateRestoredLineage, type ThreadLineage, type LineageInventory } from "./conversation-lineage.js";
+import { acquireCodexLifecycleLock, assertNoUnmanagedCodexRuntime, codexHomeRuntimeBusy } from "./codex-lifecycle-lock.js";
+import { isTransientRestoreBlock } from "../src/conversation-restore-state.js";
+
+export const COLD_STORAGE_FORMAT = "conversation-cold-storage-v3";
+const V2_COLD_STORAGE_FORMAT = "conversation-cold-storage-v2";
 const LEGACY_COLD_STORAGE_FORMAT = "conversation-cold-storage-v1";
 export const COLD_STORAGE_DRIVE_ID = "";
 export const COLD_STORAGE_AGE_RECIPIENT = "";
@@ -64,10 +69,13 @@ export type ColdManifestEntry = {
   relativePath: string;
   size: number;
   sha256: string;
+  mode?: number;
+  uid?: number;
+  gid?: number;
 };
 
 export type ColdManifest = {
-  format: typeof COLD_STORAGE_FORMAT | typeof LEGACY_COLD_STORAGE_FORMAT;
+  format: typeof COLD_STORAGE_FORMAT | typeof V2_COLD_STORAGE_FORMAT | typeof LEGACY_COLD_STORAGE_FORMAT;
   conversationId: string;
   userId: string;
   threadId: string;
@@ -75,6 +83,7 @@ export type ColdManifest = {
   createdAt: string;
   plaintextBytes: number;
   entries: ColdManifestEntry[];
+  lineage?: ThreadLineage;
 };
 
 export type ColdStorageRoots = {
@@ -105,6 +114,10 @@ export type ColdCandidate = {
   eligible: boolean;
   reasons: string[];
   rolloutBytes: number;
+  rootRolloutBytes: number;
+  childRolloutBytes: number;
+  childRollouts: number;
+  lineageThreads: number;
   deliverableBytes: number;
   sharedFiles: number;
   entries: number;
@@ -150,13 +163,23 @@ export function safeRelative(value: string): string {
   return normalized;
 }
 
+function safeRootMember(root: string, relativePath: string): string {
+  const parts = safeRelative(relativePath).split("/");
+  let current = path.resolve(root);
+  if (fs.existsSync(current) && fs.realpathSync(current) !== current) throw new Error("cold_storage_root_symlink");
+  for (const part of parts) {
+    current = path.join(current, part);
+    try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error("cold_storage_member_symlink"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  return current;
+}
+
 export function openColdStorageDb(databasePath: string): DatabaseSync {
   const sqlite = new DatabaseSync(databasePath);
   sqlite.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;");
   return sqlite;
 }
-
-const openDb = openColdStorageDb;
 
 function rowForConversation(sqlite: DatabaseSync, conversationId: string, userId?: string): StorageDbRow | undefined {
   const row = sqlite.prepare(`
@@ -193,7 +216,7 @@ function storedManifest(row: StorageDbRow): ColdManifest | undefined {
   if (!row.manifest_json || !row.remote_path || !row.archive_sha256) return undefined;
   const manifest = JSON.parse(row.manifest_json) as ColdManifest;
   if (crypto.createHash("sha256").update(row.manifest_json).digest("hex") !== row.manifest_sha256
-    || ![COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format)
+    || ![COLD_STORAGE_FORMAT, V2_COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format)
     || manifest.conversationId !== row.conversation_id || manifest.userId !== row.user_id
     || manifest.threadId !== row.codex_thread_id || manifest.generation !== row.generation) {
     throw new Error("已有冷存储清单不一致");
@@ -212,29 +235,17 @@ function conversationWorkspaceFor(roots: ColdStorageRoots, userId: string, conve
   return path.join(roots.tenantRoot, userId, "conversations", conversationId);
 }
 
-function walkThreadRollouts(codexHome: string, threadId: string): string[] {
-  assertUuid(threadId, "thread id");
-  const result: string[] = [];
-  for (const directoryName of ["sessions", "archived_sessions"]) {
-    const root = path.resolve(codexHome, directoryName);
-    if (!fs.existsSync(root)) continue;
-    const visit = (directory: string): void => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const absolute = path.resolve(directory, entry.name);
-        if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new Error("rollout path escapes Codex Home");
-        if (entry.isDirectory()) visit(absolute);
-        else if (entry.isFile() && entry.name.includes(threadId)) result.push(absolute);
-      }
-    };
-    visit(root);
-  }
-  return result.sort();
+function lineageFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: StorageDbRow, archivedEntries: ColdManifestEntry[] = [], inventory?: LineageInventory, references?: Map<string, Set<string>>) {
+  return collectConversationLineage(sqlite, {
+    conversationId: row.conversation_id, userId: row.user_id, executorId: row.executor_id!, codexHome: codexHomeFor(roots, row.user_id),
+  }, archivedEntries.filter((entry) => entry.root === "codexHome").map((entry) => entry.relativePath), inventory, references);
 }
 
 function addEntry(entries: ColdManifestEntry[], kind: ColdManifestEntry["kind"], root: ColdManifestEntry["root"], rootPath: string, absolute: string): void {
+  safeRootMember(rootPath, path.relative(rootPath, absolute));
   const stat = fs.lstatSync(absolute);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`冷存储目标不是普通文件: ${absolute}`);
-  entries.push({ kind, root, relativePath: safeRelative(path.relative(rootPath, absolute)), size: stat.size, sha256: fileSha256(absolute) });
+  entries.push({ kind, root, relativePath: safeRelative(path.relative(rootPath, absolute)), size: stat.size, sha256: fileSha256(absolute), mode: stat.mode & 0o777, uid: stat.uid, gid: stat.gid });
 }
 
 type ColdFileSource = {
@@ -350,13 +361,14 @@ function coldFileSources(
   return sources;
 }
 
-function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: StorageDbRow, cutoff: number): ColdCandidate {
+function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: StorageDbRow, cutoff: number, inventory?: LineageInventory, references?: Map<string, Set<string>>): ColdCandidate {
   const reasons: string[] = [];
   const now = Date.now();
   const lastActive = row.last_active_at ? Date.parse(row.last_active_at) : 0;
   const ageHours = lastActive > 0 ? Math.max(0, (now - lastActive) / (60 * 60 * 1_000)) : Number.POSITIVE_INFINITY;
   if (!row.codex_thread_id) reasons.push("no_codex_thread");
   if (!row.executor_id || row.executor_id.startsWith("remote:")) reasons.push("remote_executor_unsupported");
+  else if (row.executor_id !== (row.user_id === HOST_ROOT_USER_ID ? "local-host" : "tenant-local")) reasons.push("local_executor_scope_mismatch");
   if (row.status !== "idle" || row.external_status !== "idle") reasons.push("conversation_busy");
   if (row.deleted_at || row.deletion_state !== "active") reasons.push("deleting_or_deleted");
   const archived = Boolean(row.archived_at);
@@ -374,8 +386,6 @@ function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: Storag
   if (wakes) reasons.push("armed_wake");
   const uploads = Number((sqlite.prepare("SELECT count(*) AS n FROM resumable_uploads WHERE conversation_id=? AND state IN ('uploading','finalizing')").get(row.conversation_id) as { n: number }).n);
   if (uploads) reasons.push("shared_file_transfer");
-  const usedByAnother = row.codex_thread_id && Number((sqlite.prepare("SELECT count(*) AS n FROM conversations WHERE codex_thread_id=? AND id<>? AND deleted_at IS NULL AND deletion_state='active'").get(row.codex_thread_id, row.conversation_id) as { n: number }).n);
-  if (usedByAnother) reasons.push("shared_codex_thread");
 
   const shared = sharedFileIds(sqlite, row.conversation_id);
   const files = fileRows(sqlite, row.conversation_id);
@@ -392,20 +402,27 @@ function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: Storag
   const coldFiles = coldFileSources(sqlite, roots, row, shared, reasons, archivedEntries);
   let rolloutBytes = 0;
   let rolloutEntries = 0;
-  if (row.codex_thread_id) {
+  let rootRolloutBytes = 0;
+  let childRolloutBytes = 0;
+  let childRollouts = 0;
+  let lineageThreads = 0;
+  if (row.codex_thread_id && row.executor_id && !row.executor_id.startsWith("remote:")) {
     try {
-      for (const file of walkThreadRollouts(codexHomeFor(roots, row.user_id), row.codex_thread_id)) {
-        rolloutBytes += fs.statSync(file).size;
-        rolloutEntries += 1;
-      }
-    } catch { reasons.push("rollout_scan_failed"); }
+      if (codexHomeRuntimeBusy(codexHomeFor(roots, row.user_id))) reasons.push("codex_runtime_active");
+      const found = lineageFor(sqlite, roots, row, archivedEntries, inventory, references);
+      reasons.push(...found.reasons);
+      rolloutBytes = found.rollouts.reduce((sum, file) => sum + file.size, 0);
+      rolloutEntries = found.rollouts.length;
+      ({ rootRolloutBytes, childRolloutBytes, childRollouts } = found);
+      lineageThreads = found.lineage.threads.length;
+    } catch (error) { reasons.push(`lineage_scan_failed:${error instanceof Error ? error.message : "unknown"}`); }
   }
   const deliverableBytes = coldFiles.reduce((sum, source) => sum + source.file.size, 0);
   if (rolloutEntries === 0 && coldFiles.length === 0) reasons.push("no_local_cold_files");
   return {
     conversationId: row.conversation_id, userId: row.user_id, title: row.title, lastActiveAt: row.last_active_at,
     ageHours, state: row.storage_state, drawing, archived, eligible: reasons.length === 0, reasons,
-    rolloutBytes, deliverableBytes, sharedFiles: shared.size, entries: rolloutEntries + coldFiles.length,
+    rolloutBytes, rootRolloutBytes, childRolloutBytes, childRollouts, lineageThreads, deliverableBytes, sharedFiles: shared.size, entries: rolloutEntries + coldFiles.length,
   };
 }
 
@@ -430,11 +447,23 @@ export function defaultColdStorageRoots(overrides: Partial<ColdStorageRoots> = {
 }
 
 export function listColdCandidates(roots: ColdStorageRoots, inactiveDays = 15): ColdCandidate[] {
-  const sqlite = openDb(roots.databasePath);
+  const sqlite = new DatabaseSync(roots.databasePath, { readOnly: true });
   try {
     const cutoff = Date.now() - inactiveDays * DAY_MS;
     const rows = sqlite.prepare("SELECT c.id AS conversation_id,c.user_id,c.project_id,c.codex_thread_id,c.title,c.status,c.external_status,c.deleted_at,c.deletion_state,c.archived_at,c.last_active_at,p.executor_id,COALESCE(s.state,'local') AS storage_state,COALESCE(s.generation,0) AS generation,COALESCE(s.revision,0) AS revision,s.manifest_json,s.manifest_sha256,s.archive_sha256,s.archive_bytes,s.plaintext_bytes,s.remote_drive_id,s.remote_path,s.local_isolated_path,COALESCE(s.retry_count,0) AS retry_count,s.last_error FROM conversations c LEFT JOIN projects p ON p.id=c.project_id LEFT JOIN conversation_storage s ON s.conversation_id=c.id WHERE c.deleted_at IS NULL").all() as StorageDbRow[];
-    return rows.map((row) => candidateFor(sqlite, roots, row, cutoff)).sort((left, right) => {
+    const inventories = new Map<string, LineageInventory>();
+    const referenceSets = new Map<string, Map<string, Set<string>>>();
+    return rows.map((row) => {
+      const home = codexHomeFor(roots, row.user_id);
+      if (row.executor_id && !row.executor_id.startsWith("remote:") && !inventories.has(home)) {
+        try { inventories.set(home, readLineageInventory(home)); } catch { /* candidate reports failure */ }
+      }
+      const key = `${row.user_id}:${row.executor_id}`;
+      if (row.executor_id && !row.executor_id.startsWith("remote:") && !referenceSets.has(key)) {
+        try { referenceSets.set(key, conversationThreadReferences(sqlite, row.user_id, row.executor_id)); } catch { /* candidate reports corrupt reference evidence */ }
+      }
+      return candidateFor(sqlite, roots, row, cutoff, inventories.get(home), referenceSets.get(key));
+    }).sort((left, right) => {
       // Explicitly archived conversations take precedence within each snapshot.
       const archivedOrder = Number(right.archived) - Number(left.archived);
       if (archivedOrder) return archivedOrder;
@@ -462,22 +491,40 @@ function transition(sqlite: DatabaseSync, row: StorageDbRow, expected: Conversat
   return next;
 }
 
+const coldLockDescriptors = new Map<string, number>();
+
 export function acquireColdStorageLock(roots: ColdStorageRoots, conversationId: string): string {
   const lockRoot = path.join(path.dirname(roots.isolationRoot), "locks");
   fs.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
   const lock = path.join(lockRoot, conversationId);
-  try { fs.mkdirSync(lock, { mode: 0o700 }); }
-  catch { throw new Error("该会话已有归档或恢复操作正在执行"); }
-  fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${new Date().toISOString()}\n`, { mode: 0o600 });
-  return lock;
+  const fd = fs.openSync(`${lock}.flock`, fs.constants.O_CREAT | fs.constants.O_RDWR | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    execFileSync("flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "ignore", "pipe", fd] });
+    try { fs.mkdirSync(lock, { mode: 0o700 }); }
+    catch {
+      // Reclaim only a recorded, dead owner. A missing/malformed owner is not
+      // proof of death (it can be the mkdir/write window of a live acquirer).
+      const owner = Number(fs.readFileSync(path.join(lock, "owner"), "utf8").split("\n")[0]);
+      if (!Number.isSafeInteger(owner) || owner < 1) throw new Error("冷存储锁 owner 无效");
+      try { process.kill(owner, 0); throw new Error("该会话已有归档或恢复操作正在执行"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      const stale = `${lock}.stale-${crypto.randomUUID()}`;
+      fs.renameSync(lock, stale);
+      try { fs.mkdirSync(lock, { mode: 0o700 }); } finally { fs.rmSync(stale, { recursive: true }); }
+    }
+    fs.writeFileSync(path.join(lock, "owner"), `${process.pid}\n${new Date().toISOString()}\n`, { mode: 0o600 });
+    coldLockDescriptors.set(lock, fd);
+    return lock;
+  } catch (error) { fs.closeSync(fd); throw error; }
 }
 
 export function removeColdStorageLock(lock: string): void {
   try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
+  const fd = coldLockDescriptors.get(lock);
+  if (fd !== undefined) { coldLockDescriptors.delete(lock); fs.closeSync(fd); }
 }
-
-const acquireOperationLock = acquireColdStorageLock;
-const removeOperationLock = removeColdStorageLock;
 
 export function runAliyun(roots: ColdStorageRoots, args: string[], timeout = 6 * 60 * 60_000): string {
   return execFileSync(roots.aliyunpan, args, { encoding: "utf8", timeout, maxBuffer: 8 * 1024 * 1024 });
@@ -499,10 +546,16 @@ function remoteTree(roots: ColdStorageRoots, remotePath: string): string {
 }
 
 function ensureRemoteDirectory(roots: ColdStorageRoots, remotePath: string): void {
+  const verify = () => {
+    // tree recursively enumerates every conversation below the archive root. Directory
+    // creation needs only the bounded direct listing and its exact root header.
+    const listing = runAliyun(roots, ["ls", "--driveId", roots.driveId, remotePath], 120_000);
+    if (!listing.split(/\r?\n/).some((line) => line.trim() === `当前目录: ${remotePath}`)) throw new Error(`云端目录读取失败: ${remotePath}`);
+  };
   retryColdOperation(() => {
-    try { remoteTree(roots, remotePath); return; } catch { /* create below */ }
+    try { retryColdOperation(verify); return; } catch { /* create below */ }
     runAliyun(roots, ["mkdir", "--driveId", roots.driveId, remotePath], 120_000);
-    remoteTree(roots, remotePath);
+    verify();
   });
 }
 
@@ -590,8 +643,7 @@ export function verifyAgeArchive(roots: ColdStorageRoots, archivePath: string): 
 
 function copyOrLink(source: string, destination: string): void {
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  try { fs.linkSync(source, destination); }
-  catch { fs.copyFileSync(source, destination); }
+  fs.copyFileSync(source, destination, fs.constants.COPYFILE_FICLONE);
 }
 
 function moveToIsolation(roots: ColdStorageRoots, manifest: ColdManifest, conversationId: string): string {
@@ -605,8 +657,10 @@ function moveToIsolation(roots: ColdStorageRoots, manifest: ColdManifest, conver
         : entry.root === "conversation"
           ? conversationWorkspaceFor(roots, manifest.userId, manifest.conversationId)
           : roots.dataRoot;
-      const source = path.resolve(sourceRoot, ...safeRelative(entry.relativePath).split("/"));
+      const source = safeRootMember(sourceRoot, entry.relativePath);
       if (!fs.existsSync(source)) throw new Error(`归档前文件消失: ${entry.relativePath}`);
+      const stat = fs.lstatSync(source);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== entry.size || fileSha256(source) !== entry.sha256) throw new Error(`归档前文件已变化: ${entry.relativePath}`);
       const target = path.join(isolated, entry.kind, entry.relativePath);
       fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
       fs.renameSync(source, target);
@@ -622,30 +676,49 @@ function moveToIsolation(roots: ColdStorageRoots, manifest: ColdManifest, conver
 export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conversationId: string): ColdArchiveResult {
   const roots = defaultColdStorageRoots(rootsInput);
   assertUuid(conversationId, "conversation id");
-  const lock = acquireOperationLock(roots, conversationId);
-  const sqlite = openDb(roots.databasePath);
+  const lock = acquireColdStorageLock(roots, conversationId);
+  const sqlite = openColdStorageDb(roots.databasePath);
   let work = "";
+  let releaseHome: (() => void) | undefined;
   try {
     let row = rowForConversation(sqlite, conversationId);
     if (!row) throw new Error("会话不存在");
+    if (!row.executor_id || row.executor_id.startsWith("remote:")) throw new Error("remote_executor_unsupported");
+    if (row.storage_state === "uploading") row = transition(sqlite, row, ["uploading"], "local", "interrupted_upload_retained");
+    if (["remote_verified", "evicting", "restoring"].includes(row.storage_state)) {
+      row = transition(sqlite, row, [row.storage_state], "error", "interrupted_operation_recovered");
+      if (row.remote_path) restoreColdConversationLocked(roots, sqlite, conversationId, row.user_id);
+      else row = transition(sqlite, row, ["error"], "local", "interrupted_upload_retained");
+      row = rowForConversation(sqlite, conversationId)!;
+    }
     const candidate = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
     if (!candidate.eligible) throw new Error(`会话不满足冷存储条件: ${candidate.reasons.join(",")}`);
     assertColdStorageConfigured(roots);
-    const previousIsolation = row.local_isolated_path;
     if (["cold", "error"].includes(row.storage_state) && row.remote_path) {
       restoreColdConversationLocked(roots, sqlite, conversationId, row.user_id);
       row = rowForConversation(sqlite, conversationId)!;
       const refreshed = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
       if (!refreshed.eligible) throw new Error(`恢复后会话不满足冷存储条件: ${refreshed.reasons.join(",")}`);
     }
+    releaseHome = acquireCodexLifecycleLock(codexHomeFor(roots, row.user_id));
     const generation = row.generation + 1;
     // Keep the old generation usable if upload/verification fails. Advance it
     // atomically with its new verified manifest, never before that point.
-    row = transition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { retry_count: 0, last_error: null });
+    sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      row = rowForConversation(sqlite, conversationId)!;
+      const gate = candidateFor(sqlite, roots, row, Date.now() - 15 * DAY_MS);
+      if (!gate.eligible) throw new Error(`归档门禁已变化: ${gate.reasons.join(",")}`);
+      row = transition(sqlite, row, ["local", "error"], "uploading", "archive_begin", { retry_count: 0, last_error: null });
+      sqlite.exec("COMMIT");
+    } catch (error) { sqlite.exec("ROLLBACK"); throw error; }
     work = fs.mkdtempSync(path.join(path.dirname(roots.isolationRoot), `.package-${conversationId}-`));
     const codexHome = codexHomeFor(roots, row.user_id);
     const entries: ColdManifestEntry[] = [];
-    for (const file of walkThreadRollouts(codexHome, row.codex_thread_id!)) addEntry(entries, "rollout", "codexHome", codexHome, file);
+    const found = lineageFor(sqlite, roots, row);
+    if (found.reasons.length) throw new Error(`lineage: ${found.reasons.join(",")}`);
+    assertNoUnmanagedCodexRuntime(codexHome, found.rollouts.map((file) => path.join(codexHome, file.relativePath)));
+    for (const file of found.rollouts) addEntry(entries, "rollout", "codexHome", codexHome, path.join(codexHome, file.relativePath));
     const shared = sharedFileIds(sqlite, conversationId);
     const fileReasons: string[] = [];
     const coldFiles = coldFileSources(sqlite, roots, row, shared, fileReasons);
@@ -654,6 +727,7 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     if (!entries.length) throw new Error("没有可归档的 rollout 或会话文件");
     const manifest: ColdManifest = {
       format: COLD_STORAGE_FORMAT, conversationId, userId: row.user_id, threadId: row.codex_thread_id!, generation,
+      lineage: found.lineage,
       createdAt: new Date().toISOString(), plaintextBytes: entries.reduce((sum, entry) => sum + entry.size, 0), entries,
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
@@ -667,11 +741,18 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
           : roots.dataRoot;
       copyOrLink(path.resolve(root, ...entry.relativePath.split("/")), path.join(work, entry.kind, entry.relativePath));
     }
+    for (const entry of entries) {
+      const staged = path.join(work, entry.kind, entry.relativePath);
+      if (fs.statSync(staged).size !== entry.size || fileSha256(staged) !== entry.sha256) throw new Error("snapshot_copy_changed");
+    }
     const archiveLocal = path.join(work, `generation-${generation}.tar.age`);
     packageArchive(roots, work, archiveLocal);
     verifyAgeArchive(roots, archiveLocal);
     const archiveSha256 = sha256File(archiveLocal);
     const archiveBytes = fs.statSync(archiveLocal).size;
+    // The upload uses an immutable independent snapshot. Let unrelated Home
+    // jobs run during network I/O; reacquire and revalidate before eviction.
+    releaseHome(); releaseHome = undefined;
     const remoteDirectory = `${roots.remoteRoot}/${row.user_id}/${conversationId}`;
     const remotePath = `${remoteDirectory}/generation-${generation}-${archiveSha256}.tar.age`;
     const remoteArchiveLocal = path.join(work, path.basename(remotePath));
@@ -689,7 +770,19 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
       const downloaded = findDownloadedFile(downloadWork, path.basename(remotePath), [path.dirname(roots.downloadDir)]);
       if (sha256File(downloaded) !== archiveSha256 || fs.statSync(downloaded).size !== archiveBytes) throw new Error("云端回下载 SHA-256/字节数不一致");
     } finally { try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} }
+    audit(sqlite, conversationId, generation, row.revision, "uploading", "uploading", "candidate_remote_verified", { remotePath, archiveSha256, archiveBytes, manifestSha256 });
+    releaseHome = acquireCodexLifecycleLock(codexHome);
     row = rowForConversation(sqlite, conversationId)!;
+    const finalGate = candidateFor(sqlite, roots, { ...row, storage_state: "local" }, Date.now() - 15 * DAY_MS);
+    if (!finalGate.eligible) throw new Error(`归档门禁已变化: ${finalGate.reasons.join(",")}`);
+    const latest = lineageFor(sqlite, roots, row);
+    if (latest.reasons.length || JSON.stringify(latest.lineage) !== JSON.stringify(found.lineage)) throw new Error("lineage_snapshot_changed");
+    assertNoUnmanagedCodexRuntime(codexHome, latest.rollouts.map((file) => path.join(codexHome, file.relativePath)));
+    for (const entry of entries) {
+      const sourceRoot = entry.root === "codexHome" ? codexHome : entry.root === "conversation" ? conversationWorkspaceFor(roots, row.user_id, conversationId) : roots.dataRoot;
+      const source = path.join(sourceRoot, entry.relativePath);
+      if (fs.statSync(source).size !== entry.size || fileSha256(source) !== entry.sha256) throw new Error("snapshot_source_changed");
+    }
     row = transition(sqlite, row, ["uploading"], "remote_verified", "remote_verify", {
       generation,
       manifest_json: manifestText, manifest_sha256: manifestSha256, archive_sha256: archiveSha256, archive_bytes: archiveBytes,
@@ -698,20 +791,17 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
     });
     row = transition(sqlite, row, ["remote_verified"], "evicting", "local_evict_begin");
     const isolatedPath = moveToIsolation(roots, manifest, conversationId);
+    mutateThreadIndex(codexHome, found.lineage.index, "remove");
     row = rowForConversation(sqlite, conversationId)!;
     transition(sqlite, row, ["evicting"], "cold", "local_evict_complete", { local_isolated_path: isolatedPath, last_error: null });
-    // Restored bytes now have a newly verified cloud copy and a fresh 7-day
-    // isolation copy. Only discard the redundant prior generation directory.
-    if (previousIsolation && previousIsolation !== isolatedPath
-      && path.resolve(previousIsolation) === path.join(roots.isolationRoot, conversationId, String(generation - 1))) {
-      try { fs.rmSync(previousIsolation, { recursive: true, force: true }); } catch { /* redundant copy can be retained */ }
-    }
+    // Every generation keeps its own isolation clock and verification record.
+    // A later archive or restore never authorizes early deletion of this one.
     return { conversationId, generation, archiveBytes, plaintextBytes: manifest.plaintextBytes, archiveSha256, manifestSha256, remotePath, isolatedPath };
   } catch (error) {
     const row = rowForConversation(sqlite, conversationId);
     if (row && ["uploading", "remote_verified", "evicting"].includes(row.storage_state)) {
       try {
-        const next = transition(sqlite, row, [row.storage_state], "error", "archive_error", { last_error: error instanceof Error ? error.message.slice(0, 2_000) : "archive_failed" });
+        const next = transition(sqlite, row, [row.storage_state], row.storage_state === "uploading" ? "local" : "error", "archive_error", { last_error: error instanceof Error ? error.message.slice(0, 2_000) : "archive_failed" });
         sqlite.prepare("UPDATE conversation_storage SET retry_count=retry_count+1 WHERE conversation_id=? AND revision=?").run(conversationId, next.revision);
       } catch { /* preserve original failure */ }
     }
@@ -719,7 +809,8 @@ export function archiveConversation(rootsInput: Partial<ColdStorageRoots>, conve
   } finally {
     sqlite.close();
     if (work) try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
-    removeOperationLock(lock);
+    releaseHome?.();
+    removeColdStorageLock(lock);
   }
 }
 
@@ -727,13 +818,13 @@ function restoreFilesFromExtract(roots: ColdStorageRoots, manifest: ColdManifest
   const installed: Array<{ source: string; target: string }> = [];
   try {
     for (const entry of manifest.entries) {
-      const source = path.resolve(extractRoot, entry.kind, ...safeRelative(entry.relativePath).split("/"));
+      const source = safeRootMember(extractRoot, `${entry.kind}/${entry.relativePath}`);
       const targetRoot = entry.root === "codexHome"
         ? codexHomeFor(roots, manifest.userId)
         : entry.root === "conversation"
           ? conversationWorkspaceFor(roots, manifest.userId, manifest.conversationId)
           : roots.dataRoot;
-      const target = path.resolve(targetRoot, ...safeRelative(entry.relativePath).split("/"));
+      const target = safeRootMember(targetRoot, entry.relativePath);
       const stat = fs.lstatSync(source);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== entry.size || fileSha256(source) !== entry.sha256) throw new Error(`冷存储成员校验失败: ${entry.relativePath}`);
       if (fs.existsSync(target)) {
@@ -742,9 +833,14 @@ function restoreFilesFromExtract(roots: ColdStorageRoots, manifest: ColdManifest
         continue;
       }
       const temporary = `${target}.cold-restore-${process.pid}-${crypto.randomUUID()}`;
+      const created: string[] = [];
+      for (let dir = path.dirname(target); !fs.existsSync(dir); dir = path.dirname(dir)) created.push(dir);
       fs.mkdirSync(path.dirname(target), { recursive: true });
+      const owner = fs.statSync(targetRoot);
+      if (process.getuid?.() === 0) for (const dir of created) fs.chownSync(dir, owner.uid, owner.gid);
       fs.copyFileSync(source, temporary);
-      fs.chmodSync(temporary, stat.mode & 0o777);
+      fs.chmodSync(temporary, entry.mode ?? (stat.mode & 0o777));
+      if (process.getuid?.() === 0) fs.chownSync(temporary, entry.uid ?? owner.uid, entry.gid ?? owner.gid);
       fs.renameSync(temporary, target);
       installed.push({ source, target });
     }
@@ -759,7 +855,13 @@ export function restoreColdConversation(rootsInput: Partial<ColdStorageRoots>, c
   assertUuid(conversationId, "conversation id"); assertUuid(userId, "user id");
   const lock = acquireColdStorageLock(roots, conversationId);
   const sqlite = openColdStorageDb(roots.databasePath);
-  try { restoreColdConversationLocked(roots, sqlite, conversationId, userId); }
+  try {
+    const row = rowForConversation(sqlite, conversationId, userId);
+    if (!row || !row.executor_id || row.executor_id.startsWith("remote:")) throw new Error("local_conversation_required");
+    if (row.storage_state === "uploading") { transition(sqlite, row, ["uploading"], "local", "interrupted_upload_retained"); return; }
+    if (["remote_verified", "evicting"].includes(row.storage_state)) transition(sqlite, row, [row.storage_state], "error", "interrupted_operation_recovered");
+    restoreColdConversationLocked(roots, sqlite, conversationId, userId);
+  }
   finally { sqlite.close(); removeColdStorageLock(lock); }
 }
 
@@ -768,17 +870,22 @@ export function restoreColdConversation(rootsInput: Partial<ColdStorageRoots>, c
 function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: DatabaseSync, conversationId: string, userId: string): void {
   let downloadWork = "";
   let extractWork = "";
+  let releaseHome: (() => void) | undefined;
   try {
     let row = rowForConversation(sqlite, conversationId, userId);
     if (!row) throw new Error("会话不存在或账号不匹配");
     if (row.storage_state === "local") return;
-    assertColdStorageConfigured(roots);
     if (!row.remote_path || !row.archive_sha256 || !row.manifest_sha256 || !row.manifest_json) throw new Error("冷存储清单不完整");
     const remotePath = row.remote_path;
     const manifestSha256 = row.manifest_sha256;
     const manifestJson = row.manifest_json;
     if (!["cold", "restoring", "error"].includes(row.storage_state)) throw new Error(`当前状态不能恢复: ${row.storage_state}`);
     if (row.storage_state !== "restoring") row = transition(sqlite, row, ["cold", "error"], "restoring", "restore_begin");
+    // Avoid repeatedly downloading the archive while another runtime owns this
+    // Home. Recheck under the exclusive lease before installing any files.
+    releaseHome = acquireCodexLifecycleLock(codexHomeFor(roots, userId));
+    assertNoUnmanagedCodexRuntime(codexHomeFor(roots, userId), []);
+    releaseHome(); releaseHome = undefined;
     prepareDownloadDirectory(roots.downloadDir);
     downloadWork = fs.mkdtempSync(path.join(roots.downloadDir, `${conversationId}-`));
     prepareDownloadDirectory(downloadWork);
@@ -800,8 +907,11 @@ function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: Database
     const manifestText = fs.readFileSync(path.join(extractWork, "manifest.json"), "utf8");
     if (crypto.createHash("sha256").update(manifestText).digest("hex") !== manifestSha256) throw new Error("恢复 manifest SHA-256 不一致");
     const manifest = JSON.parse(manifestText) as ColdManifest;
-    if (![COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format) || manifest.conversationId !== conversationId || manifest.userId !== userId || manifest.threadId !== row.codex_thread_id || manifest.generation !== row.generation) throw new Error("恢复 manifest 身份或代次不一致");
+    if (![COLD_STORAGE_FORMAT, V2_COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format) || manifest.conversationId !== conversationId || manifest.userId !== userId || manifest.threadId !== row.codex_thread_id || manifest.generation !== row.generation) throw new Error("恢复 manifest 身份或代次不一致");
     if (JSON.stringify(manifest) !== JSON.stringify(JSON.parse(manifestJson))) throw new Error("恢复 manifest 内容与数据库不一致");
+    if (manifest.format === COLD_STORAGE_FORMAT && (!manifest.lineage || manifest.lineage.userId !== userId || manifest.lineage.executorId !== row.executor_id || manifest.lineage.codexHome !== codexHomeFor(roots, userId))) throw new Error("lineage_scope_mismatch");
+    releaseHome = acquireCodexLifecycleLock(codexHomeFor(roots, userId));
+    assertNoUnmanagedCodexRuntime(codexHomeFor(roots, userId), manifest.entries.filter((entry) => entry.root === "codexHome").map((entry) => path.join(codexHomeFor(roots, userId), entry.relativePath)));
     restoreFilesFromExtract(roots, manifest, extractWork);
     for (const file of fileRows(sqlite, conversationId)) {
       if (file.presentation_mode !== "web") continue;
@@ -809,18 +919,29 @@ function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: Database
       if (!source) throw new Error("web_version_path_invalid");
       verifiedWebBody(file, source.absolute);
     }
+    if (manifest.lineage) {
+      validateRestoredLineage(codexHomeFor(roots, userId), manifest.lineage);
+      mutateThreadIndex(codexHomeFor(roots, userId), manifest.lineage.index, "restore");
+    }
     row = rowForConversation(sqlite, conversationId, userId)!;
     transition(sqlite, row, ["restoring"], "local", "restore_complete", { restored_at: new Date().toISOString(), last_error: null });
   } catch (error) {
     const row = rowForConversation(sqlite, conversationId, userId);
     if (row && ["restoring", "cold"].includes(row.storage_state)) {
       try {
-        const next = transition(sqlite, row, [row.storage_state], "error", "restore_error", { last_error: error instanceof Error ? error.message.slice(0, 2_000) : "restore_failed" });
-        sqlite.prepare("UPDATE conversation_storage SET retry_count=retry_count+1 WHERE conversation_id=? AND revision=?").run(conversationId, next.revision);
+        const message = error instanceof Error ? error.message.slice(0, 2_000) : "restore_failed";
+        const waiting = isTransientRestoreBlock(message);
+        // Occupancy is temporary. Persist the restore intent for the Web
+        // scheduler (including after restart), without counting it as failure.
+        if (!waiting || row.last_error !== message) {
+          const next = transition(sqlite, row, [row.storage_state], waiting ? "restoring" : "error", waiting ? "restore_waiting_for_runtime" : "restore_error", { last_error: message });
+          if (!waiting) sqlite.prepare("UPDATE conversation_storage SET retry_count=retry_count+1 WHERE conversation_id=? AND revision=?").run(conversationId, next.revision);
+        }
       } catch { /* preserve original failure */ }
     }
     throw error;
   } finally {
+    releaseHome?.();
     if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {}
     if (extractWork) try { fs.rmSync(extractWork, { recursive: true, force: true }); } catch {}
     if (extractWork) try { fs.rmSync(`${extractWork}.plain.tar`, { force: true }); } catch {}
@@ -829,11 +950,109 @@ function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: Database
 
 export function coldStorageSummary(rootsInput: Partial<ColdStorageRoots> = {}) {
   const roots = defaultColdStorageRoots(rootsInput);
-  const sqlite = openDb(roots.databasePath);
+  const sqlite = new DatabaseSync(roots.databasePath, { readOnly: true });
   try {
     const rows = sqlite.prepare("SELECT state,count(*) AS conversations,COALESCE(sum(archive_bytes),0) AS archive_bytes,COALESCE(sum(plaintext_bytes),0) AS plaintext_bytes FROM conversation_storage GROUP BY state ORDER BY state").all();
     return { rows, candidates: listColdCandidates(roots) };
   } finally { sqlite.close(); }
+}
+
+/** Read-only capacity inventory. Unattributed records are reported, never
+ * treated as a deletion list. Public legacy Homes and Remote Workers are out
+ * of scope. Bytes here are logical sizes, separately from allocated blocks. */
+export function auditConversationLineage(rootsInput: Partial<ColdStorageRoots> = {}) {
+  const roots = defaultColdStorageRoots(rootsInput);
+  const sqlite = new DatabaseSync(roots.databasePath, { readOnly: true });
+  try {
+    const scopes = sqlite.prepare("SELECT DISTINCT c.user_id,p.executor_id FROM conversations c JOIN projects p ON p.id=c.project_id WHERE p.executor_id NOT LIKE 'remote:%'").all() as Array<{ user_id: string; executor_id: string }>;
+    return scopes.map((scope) => {
+      const home = codexHomeFor(roots, scope.user_id);
+      const inventory = readLineageInventory(home);
+      const references = conversationThreadReferences(sqlite, scope.user_id, scope.executor_id);
+      const conversationIds = new Set([...references.values()].flatMap((ids) => [...ids]));
+      const attributed = new Map<string, Set<string>>();
+      const skipped: Array<{ conversationId: string; reasons: string[] }> = [];
+      for (const id of conversationIds) {
+        const row = rowForConversation(sqlite, id)!;
+        const manifest = storedManifest(row);
+        const found = lineageFor(sqlite, roots, row, manifest?.entries, inventory, references);
+        if (found.reasons.length) skipped.push({ conversationId: id, reasons: found.reasons });
+        for (const file of found.rollouts) {
+          if (!attributed.has(file.relativePath)) attributed.set(file.relativePath, new Set());
+          attributed.get(file.relativePath)!.add(id);
+        }
+      }
+      const counts = { root: { files: 0, bytes: 0, allocatedBytes: 0 }, descendant: { files: 0, bytes: 0, allocatedBytes: 0 }, unresolved: { files: 0, bytes: 0, allocatedBytes: 0 } };
+      const unresolved: Array<{ threadId: string | null; reason: string; bytes: number }> = [];
+      for (const file of inventory.rollouts) {
+        const owners = attributed.get(file.relativePath);
+        const kind = owners?.size === 1 ? (file.parentId ? "descendant" : "root") : "unresolved";
+        counts[kind].files += 1; counts[kind].bytes += file.size; counts[kind].allocatedBytes += file.allocated;
+        if (kind === "unresolved") unresolved.push({ threadId: file.id, bytes: file.size, reason: owners?.size ? "multiple_conversation_references" : "no_trusted_conversation_lineage" });
+      }
+      for (const file of inventory.unclassified) {
+        counts.unresolved.files += 1; counts.unresolved.bytes += file.size;
+        unresolved.push({ threadId: null, bytes: file.size, reason: file.reason });
+      }
+      return { userId: scope.user_id, executorId: scope.executor_id, counts, unresolved, skipped };
+    });
+  } finally { sqlite.close(); }
+}
+
+/** Called only after the Web tombstone and runtime drain. Remote ciphertext
+ * follows the existing retained-backup policy; keep its recovery receipt even
+ * after the conversation's cascading DB rows are removed. */
+export function garbageCollectConversationRecords(rootsInput: Partial<ColdStorageRoots>, conversationId: string, userId: string): number {
+  const roots = defaultColdStorageRoots(rootsInput);
+  assertUuid(conversationId, "conversation id"); assertUuid(userId, "user id");
+  const lock = acquireColdStorageLock(roots, conversationId);
+  const sqlite = openColdStorageDb(roots.databasePath);
+  let releaseHome: (() => void) | undefined;
+  try {
+    const row = rowForConversation(sqlite, conversationId, userId);
+    if (!row) return 0;
+    if (!row.deleted_at || !["deleting", "cleanup_failed"].includes(row.deletion_state)) throw new Error("conversation_tombstone_required");
+    if (!row.executor_id || row.executor_id.startsWith("remote:")) throw new Error("local_conversation_required");
+    const active = sqlite.prepare("SELECT 1 FROM jobs WHERE conversation_id=? AND status IN ('queued','running') LIMIT 1").get(conversationId);
+    if (active) throw new Error("conversation_jobs_not_drained");
+    const home = codexHomeFor(roots, userId);
+    releaseHome = acquireCodexLifecycleLock(home);
+    const previous = storedManifest(row);
+    const directory = path.join(path.dirname(roots.isolationRoot), "gc-receipts");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const receiptPath = path.join(directory, `${conversationId}.json`);
+    const inventory = readLineageInventory(home);
+    if (fs.existsSync(receiptPath)) {
+      const prior = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as { conversationId: string; userId: string; executorId: string; threads: ThreadLineage["threads"] };
+      if (prior.conversationId !== conversationId || prior.userId !== userId || prior.executorId !== row.executor_id) throw new Error("gc_receipt_scope_mismatch");
+      // A previous attempt may have removed the root before a child. Retain
+      // traversal evidence until the whole tombstone saga has completed.
+      for (const thread of prior.threads) if (thread.parentId) inventory.edges.push({ parent_thread_id: thread.parentId, child_thread_id: thread.id, status: "gc_receipt" });
+    }
+    const found = lineageFor(sqlite, roots, row, previous?.entries, inventory);
+    const errors = found.reasons.filter((reason) => !["shared_codex_thread", "lineage_rollout_missing", "lineage_thread_missing"].includes(reason));
+    if (errors.length) throw new Error(`lineage_gc_unsafe:${errors.join(",")}`);
+    assertNoUnmanagedCodexRuntime(home, found.rollouts.map((file) => path.join(home, file.relativePath)));
+    const shared = found.reasons.includes("shared_codex_thread");
+    const receipt = {
+      conversationId, userId, executorId: row.executor_id, at: new Date().toISOString(),
+      retainedReason: shared ? "shared_codex_thread" : null,
+      remotePolicy: "retain_encrypted_backup", remotePath: row.remote_path,
+      manifestSha256: row.manifest_sha256, archiveSha256: row.archive_sha256,
+      generation: row.generation, threads: found.lineage.threads,
+    };
+    if (!fs.existsSync(receiptPath)) fs.writeFileSync(receiptPath, `${JSON.stringify(receipt)}\n`, { mode: 0o600, flag: "wx" });
+    if (shared) return 0;
+    mutateThreadIndex(home, found.lineage.index, "remove");
+    for (const file of found.rollouts) fs.unlinkSync(path.join(home, file.relativePath));
+    // Only this conversation's controlled isolation tree, never a whole Home.
+    const isolated = path.join(roots.isolationRoot, conversationId);
+    if (fs.existsSync(isolated)) {
+      if (fs.lstatSync(isolated).isSymbolicLink()) throw new Error("gc_isolation_symlink");
+      fs.rmSync(isolated, { recursive: true });
+    }
+    return found.rollouts.length;
+  } finally { releaseHome?.(); sqlite.close(); removeColdStorageLock(lock); }
 }
 
 export type ColdPurgeResult = { conversationId: string; isolatedPath: string; deleted: boolean; reason?: string };
@@ -843,14 +1062,14 @@ export type ColdPurgeResult = { conversationId: string; isolatedPath: string; de
 export function purgeColdIsolated(rootsInput: Partial<ColdStorageRoots> = {}, graceDays = 7): ColdPurgeResult[] {
   const roots = defaultColdStorageRoots(rootsInput);
   if (!Number.isFinite(graceDays) || graceDays < 1) throw new Error("graceDays must be at least 1");
-  const sqlite = openDb(roots.databasePath);
+  const sqlite = openColdStorageDb(roots.databasePath);
   const results: ColdPurgeResult[] = [];
   try {
     const cutoff = Date.now() - graceDays * DAY_MS;
     const rows = sqlite.prepare("SELECT conversation_id,generation,revision,state,local_isolated_path,updated_at FROM conversation_storage WHERE state='cold' AND local_isolated_path IS NOT NULL").all() as Array<{ conversation_id: string; generation: number; revision: number; state: string; local_isolated_path: string; updated_at: string }>;
     for (const row of rows) {
       if (Date.parse(row.updated_at) > cutoff) continue;
-      const lock = acquireOperationLock(roots, row.conversation_id);
+      const lock = acquireColdStorageLock(roots, row.conversation_id);
       try {
         const source = path.resolve(row.local_isolated_path);
         const isolationRoot = path.resolve(roots.isolationRoot);
@@ -869,7 +1088,7 @@ export function purgeColdIsolated(rootsInput: Partial<ColdStorageRoots> = {}, gr
         try { fs.rmSync(trash, { recursive: true, force: true }); } catch (error) { results.push({ conversationId: row.conversation_id, isolatedPath: source, deleted: false, reason: `已从工作路径移出，等待删除: ${error instanceof Error ? error.message : "unknown"}` }); continue; }
         results.push({ conversationId: row.conversation_id, isolatedPath: source, deleted: true });
       } catch (error) { results.push({ conversationId: row.conversation_id, isolatedPath: row.local_isolated_path, deleted: false, reason: error instanceof Error ? error.message : "purge_failed" }); }
-      finally { removeOperationLock(lock); }
+      finally { removeColdStorageLock(lock); }
     }
     return results;
   } finally { sqlite.close(); }
@@ -981,7 +1200,7 @@ function verifyVoicePlaintext(roots: ColdStorageRoots, encrypted: string, row: V
 
 export function listVoiceRecordingCandidates(rootsInput: Partial<ColdStorageRoots> = {}, inactiveDays = 15): VoiceRecordingCandidate[] {
   const roots = defaultColdStorageRoots(rootsInput);
-  const sqlite = openDb(roots.databasePath);
+  const sqlite = openColdStorageDb(roots.databasePath);
   try {
     const cutoff = Date.now() - inactiveDays * DAY_MS;
     const rows = sqlite.prepare("SELECT id,user_id,conversation_id,created_at,status,audio_relative_path,audio_bytes,audio_storage_state FROM voice_transcriptions WHERE audio_relative_path IS NOT NULL AND audio_storage_state IN ('local','error') ORDER BY created_at").all() as Array<Pick<VoiceStorageRow, "id" | "user_id" | "conversation_id" | "created_at" | "status" | "audio_relative_path" | "audio_bytes" | "audio_storage_state">>;
@@ -1000,7 +1219,7 @@ export function listVoiceRecordingCandidates(rootsInput: Partial<ColdStorageRoot
 
 export function archiveVoiceRecording(rootsInput: Partial<ColdStorageRoots>, transcriptionId: string): VoiceRecordingArchiveResult {
   const roots = defaultColdStorageRoots(rootsInput); assertUuid(transcriptionId, "transcription id");
-  const lock = acquireOperationLock(roots, `voice-${transcriptionId}`); const sqlite = openDb(roots.databasePath); let work = ""; let downloadWork = "";
+  const lock = acquireColdStorageLock(roots, `voice-${transcriptionId}`); const sqlite = openColdStorageDb(roots.databasePath); let work = ""; let downloadWork = "";
   try {
     let row = voiceRow(sqlite, transcriptionId); if (!row) throw new Error("语音转写记录不存在");
     if (!row.audio_relative_path || !row.audio_sha256 || !row.audio_bytes) throw new Error("语音文件清单不完整");
@@ -1029,15 +1248,14 @@ export function archiveVoiceRecording(rootsInput: Partial<ColdStorageRoots>, tra
   } catch (error) {
     const row = voiceRow(sqlite, transcriptionId); if (row && ["uploading", "remote_verified", "evicting"].includes(row.audio_storage_state)) { try { voiceTransition(sqlite, row, [row.audio_storage_state], "error", "archive_error", { audio_last_error: error instanceof Error ? error.message.slice(0, 2_000) : "archive_failed" }); } catch {} }
     throw error;
-  } finally { sqlite.close(); if (work) try { fs.rmSync(work, { recursive: true, force: true }); } catch {} if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} removeOperationLock(lock); }
+  } finally { sqlite.close(); if (work) try { fs.rmSync(work, { recursive: true, force: true }); } catch {} if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} removeColdStorageLock(lock); }
 }
 
 export function restoreVoiceRecording(rootsInput: Partial<ColdStorageRoots>, transcriptionId: string, userId: string): void {
   const roots = defaultColdStorageRoots(rootsInput); assertUuid(transcriptionId, "transcription id"); assertUuid(userId, "user id");
-  const lock = acquireOperationLock(roots, `voice-${transcriptionId}`); const sqlite = openDb(roots.databasePath); let downloadWork = ""; let work = "";
+  const lock = acquireColdStorageLock(roots, `voice-${transcriptionId}`); const sqlite = openColdStorageDb(roots.databasePath); let downloadWork = ""; let work = "";
   try {
     let row = voiceRow(sqlite, transcriptionId, userId); if (!row) throw new Error("语音记录不存在或账号不匹配"); if (row.audio_storage_state === "local") return;
-    assertColdStorageConfigured(roots);
     if (!row.audio_remote_path || !row.audio_archive_sha256 || !row.audio_archive_bytes || !row.audio_relative_path) throw new Error("语音远端清单不完整");
     if (!["cold", "restoring", "error"].includes(row.audio_storage_state)) throw new Error(`当前语音状态不能恢复: ${row.audio_storage_state}`);
     if (row.audio_storage_state !== "restoring") row = voiceTransition(sqlite, row, ["cold", "error"], "restoring", "restore_begin");
@@ -1053,20 +1271,20 @@ export function restoreVoiceRecording(rootsInput: Partial<ColdStorageRoots>, tra
   } catch (error) {
     const row = voiceRow(sqlite, transcriptionId, userId); if (row && ["restoring", "cold"].includes(row.audio_storage_state)) { try { voiceTransition(sqlite, row, [row.audio_storage_state], "error", "restore_error", { audio_last_error: error instanceof Error ? error.message.slice(0, 2_000) : "restore_failed" }); } catch {} }
     throw error;
-  } finally { sqlite.close(); if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} if (work) try { fs.rmSync(work, { recursive: true, force: true }); } catch {} removeOperationLock(lock); }
+  } finally { sqlite.close(); if (downloadWork) try { fs.rmSync(downloadWork, { recursive: true, force: true }); } catch {} if (work) try { fs.rmSync(work, { recursive: true, force: true }); } catch {} removeColdStorageLock(lock); }
 }
 
 export type VoicePurgeResult = { transcriptionId: string; isolatedPath: string; deleted: boolean; reason?: string };
 
 export function purgeVoiceRecordingIsolation(rootsInput: Partial<ColdStorageRoots> = {}, graceDays = 7): VoicePurgeResult[] {
   const roots = defaultColdStorageRoots(rootsInput); if (!Number.isFinite(graceDays) || graceDays < 1) throw new Error("graceDays must be at least 1");
-  const sqlite = openDb(roots.databasePath); const results: VoicePurgeResult[] = [];
+  const sqlite = openColdStorageDb(roots.databasePath); const results: VoicePurgeResult[] = [];
   try {
     const cutoff = Date.now() - graceDays * DAY_MS;
     const rows = sqlite.prepare("SELECT id,audio_generation,audio_revision,audio_local_isolated_path,audio_updated_at FROM voice_transcriptions WHERE audio_storage_state='cold' AND audio_local_isolated_path IS NOT NULL").all() as Array<Pick<VoiceStorageRow, "id" | "audio_generation" | "audio_revision" | "audio_local_isolated_path" | "audio_updated_at">>;
     for (const row of rows) {
       if (!row.audio_updated_at || Date.parse(row.audio_updated_at) > cutoff) continue;
-      const lock = acquireOperationLock(roots, `voice-${row.id}`);
+      const lock = acquireColdStorageLock(roots, `voice-${row.id}`);
       try {
         const source = path.resolve(row.audio_local_isolated_path!); const isolationRoot = path.resolve(roots.voiceIsolationRoot); if (!source.startsWith(`${isolationRoot}${path.sep}`)) throw new Error("语音隔离路径越界");
         if (!fs.existsSync(source)) { sqlite.prepare("UPDATE voice_transcriptions SET audio_local_isolated_path=NULL,audio_revision=audio_revision+1,audio_updated_at=? WHERE id=? AND audio_revision=? AND audio_storage_state='cold'").run(new Date().toISOString(), row.id, row.audio_revision); results.push({ transcriptionId: row.id, isolatedPath: source, deleted: true }); continue; }
@@ -1077,7 +1295,7 @@ export function purgeVoiceRecordingIsolation(rootsInput: Partial<ColdStorageRoot
         try { fs.rmSync(trash, { force: true }); } catch (error) { results.push({ transcriptionId: row.id, isolatedPath: source, deleted: false, reason: `已移出工作路径，等待删除: ${error instanceof Error ? error.message : "unknown"}` }); continue; }
         results.push({ transcriptionId: row.id, isolatedPath: source, deleted: true });
       } catch (error) { results.push({ transcriptionId: row.id, isolatedPath: row.audio_local_isolated_path!, deleted: false, reason: error instanceof Error ? error.message : "purge_failed" }); }
-      finally { removeOperationLock(lock); }
+      finally { removeColdStorageLock(lock); }
     }
     return results;
   } finally { sqlite.close(); }

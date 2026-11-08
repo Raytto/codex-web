@@ -33,3 +33,7 @@ test("cached and missing catalogs default to Astra/high without inventing live c
   assert.deepEqual(limited.defaults, { model: "remote-only", reasoningEffort: "medium" });
   assert.equal(limited.models.length, 1);
 });
+
+test("personal memory uses explicit model configuration", () => {
+  assert.equal(loadConfig({personalMemoryModel: "test-memory"}).personalMemoryModel, "test-memory");
+});

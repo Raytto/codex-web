@@ -49,6 +49,8 @@ export type ReaderServiceOptions = {
   /** Lets the reader reuse the conversation cold-storage state machine when
    * the original PDF/EPUB has been evicted with its conversation. */
   ensureFileAvailable?: (file: FileRow, userId: string) => ReaderFileAvailability;
+  onOriginalRead?: (file:FileRow,userId:string)=>void;
+  ensureResourceAvailable?: (version:ReadingSourceVersionRow,relative:string,userId:string)=>Promise<void>;
   /** Optional boundary for operations that require elevated storage credentials.
    * The local fallback is retained for isolated tests and non-container use. */
   restoreReaderVersion?: (versionId: string, userId: string) => Promise<void>;
@@ -103,6 +105,7 @@ export class ReaderService {
     }
     const derivedKind = format === "epub" ? "normalized" : "original";
     let version = this.options.db.getReadingVersionForSource(source.id, userId, derivedKind);
+    if(format==='epub' && version && this.granularVersionReady(version,userId))return this.manifestFor(source,version,format,userId);
     if (version?.storage_state === "evicting") {
       this.options.db.touchReadingVersion(version.id, userId);
       throw new ReaderUnavailableError("阅读资源正在转入冷存储，请稍后重试。");
@@ -150,6 +153,7 @@ export class ReaderService {
     }
     if (stat?.isSymbolicLink()) throw new ReaderIngestError("文件不是普通文件。");
     if (stat && stat.size !== file.size) throw new ReaderIngestError("文件不存在或大小已变化。");
+    if(stat)this.options.onOriginalRead?.(file,userId);
 
     // File hashes are normally persisted by upload/finalization.  Legacy
     // rows may not have one; calculate it once so a same-size replacement can
@@ -226,8 +230,13 @@ export class ReaderService {
    * an existing target and turn a recoverable local copy into a failed read).
    */
   private readerVersionNeedsRestore(version: ReadingSourceVersionRow): boolean {
+    if(this.granularVersionReady(version,version.user_id))return false;
     return shouldRestoreReaderVersion(version)
       && !(version.normalized_root && this.normalizedResourceExists(version));
+  }
+  private granularVersionReady(version:ReadingSourceVersionRow,userId:string):boolean{
+    return Boolean(this.options.ensureResourceAvailable && version.normalized_root && version.status!=='processing'
+      && this.options.db.listReadingUnits(version.id,userId).length);
   }
 
   private coldRoots() {
@@ -310,13 +319,14 @@ export class ReaderService {
   }
 
   manifestFor(source: Awaited<ReturnType<AppDatabase["getReadingSourceForFile"]>> & {}, version: ReadingSourceVersionRow, format: ReaderFormat, userId: string): ReaderManifest {
-    const units = version.status === "ready" ? this.options.db.listReadingUnits(version.id, userId) : [];
+    const granular=this.granularVersionReady(version,userId),status=granular?'ready':version.status;
+    const units = status === "ready" ? this.options.db.listReadingUnits(version.id, userId) : [];
     let extra: { spineCount?: number; opfPath?: string; navPath?: string | null } = {};
     try { extra = version.manifest_json ? JSON.parse(version.manifest_json) as typeof extra : {}; } catch { /* corrupted optional metadata is ignored */ }
     return {
       source: { id: source.id, fileId: source.file_id, title: source.title, author: source.author, format },
       version: {
-        id: version.id, versionNo: version.version_no, derivedKind: version.derived_kind, status: version.status,
+        id: version.id, versionNo: version.version_no, derivedKind: version.derived_kind, status,
         parserVersion: version.parser_version, sourceBytes: version.source_bytes, lastAccessedAt: version.last_accessed_at, error: version.last_error,
       },
       capabilities: readerCapabilities(format),
@@ -334,6 +344,7 @@ export class ReaderService {
     const source = this.options.db.getReadingSource(sourceId(version), userId);
     if (!source) return null;
     if (source.file_id !== version.file_id || !this.options.db.getFileForUser(version.file_id, userId)) return null;
+    if(this.granularVersionReady(version,userId))return this.manifestFor(source,version,source.format,userId);
     this.options.db.touchReadingVersion(version.id, userId);
     if (version.storage_state === "evicting") throw new ReaderUnavailableError("阅读资源正在转入冷存储，请稍后重试。");
     if (this.readerVersionNeedsRestore(version)) {
@@ -412,8 +423,8 @@ export class ReaderService {
       if (version.normalized_root) this.startRestore(version, userId);
       throw new ReaderUnavailableError();
     }
-    if (version.status === "processing" || version.status === "restoring") throw new ReaderUnavailableError("EPUB 正在解析或恢复，请稍后重试。");
-    if (version.status !== "ready") {
+    if (!this.granularVersionReady(version,userId) && (version.status === "processing" || version.status === "restoring")) throw new ReaderUnavailableError("EPUB 正在解析或恢复，请稍后重试。");
+    if (version.status !== "ready" && !this.granularVersionReady(version,userId)) {
       if (version.status === "failed") throw new ReaderIngestError(version.last_error || "EPUB 解析失败。");
       return null;
     }
@@ -424,6 +435,7 @@ export class ReaderService {
     let absolute: string;
     try { absolute = resolveInside(root, unit.content_path); } catch { return null; }
     try { assertNoSymlinkPath(absolute); } catch { return null; }
+    await this.options.ensureResourceAvailable?.(version,unit.content_path,userId);
     this.options.db.touchReadingVersion(versionId, userId);
     const stat = await fsp.lstat(absolute).catch(() => null);
     if (!stat || stat.isSymbolicLink() || !stat.isFile() || !Number.isSafeInteger(unit.byte_size) || stat.size !== unit.byte_size || stat.size > MAX_ASSET_RESPONSE_BYTES) {
@@ -446,8 +458,8 @@ export class ReaderService {
       if (version.normalized_root) this.startRestore(version, userId);
       throw new ReaderUnavailableError();
     }
-    if (version.status === "processing" || version.status === "restoring") throw new ReaderUnavailableError("EPUB 正在解析或恢复，请稍后重试。");
-    if (version.status !== "ready") {
+    if (!this.granularVersionReady(version,userId) && (version.status === "processing" || version.status === "restoring")) throw new ReaderUnavailableError("EPUB 正在解析或恢复，请稍后重试。");
+    if (version.status !== "ready" && !this.granularVersionReady(version,userId)) {
       if (version.status === "failed") throw new ReaderIngestError(version.last_error || "EPUB 解析失败。");
       return null;
     }
@@ -463,6 +475,7 @@ export class ReaderService {
     let absolute: string;
     try { absolute = resolveInside(root, relative); } catch { return null; }
     try { assertNoSymlinkPath(absolute); } catch { return null; }
+    await this.options.ensureResourceAvailable?.(version,relative,userId);
     const stat = await fsp.lstat(absolute).catch(() => null);
     if (!stat || stat.isSymbolicLink() || !stat.isFile()) {
       const latest = this.options.db.getReadingVersion(versionId, userId);
@@ -501,6 +514,7 @@ export class ReaderService {
         if (!absolute || !probe()) return null;
       } else return null;
     }
+    this.options.onOriginalRead?.(file,userId);
     return { version, file, absolute };
   }
 }
