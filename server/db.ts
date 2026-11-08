@@ -1,3 +1,4 @@
+import { WorkflowStore } from "./workflow-store.js";
 import { migrateAutoReset } from "./codex-reset-auto-use.js";
 import { migrateJudgments } from "./judgment-schema.js";
 import { migrateOpportunities } from "./opportunity-schema.js";
@@ -768,6 +769,7 @@ const conversationSelect = `
 
 export class AppDatabase {
   readonly sqlite: DatabaseSync;
+  readonly workflows: WorkflowStore;
 
   constructor(dataRoot: string, legacyUser: LegacyUserSeed = { username: "owner", passwordHash: "", displayName: "Owner" }, recoverJobs = true) {
     fs.mkdirSync(dataRoot, { recursive: true });
@@ -879,6 +881,14 @@ export class AppDatabase {
           job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
           session_id TEXT NOT NULL REFERENCES agent_engine_sessions(id) ON DELETE CASCADE);`);
     });
+    WorkflowStore.normalizeLegacyMigration(this.sqlite);
+    this.applyMigration(2026110802, "durable-complete-workflows", () => WorkflowStore.migrate(this.sqlite));
+    this.applyMigration(2026110803, "workflow-execution-ack", () => {
+      this.sqlite.exec("DROP TRIGGER IF EXISTS workflow_claim");
+      WorkflowStore.migrate(this.sqlite);
+    });
+    this.workflows = new WorkflowStore(this.sqlite);
+    this.workflows.adoptLegacy();
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
       // Worker turns are different: the Worker process and its Codex turn can remain
@@ -5373,6 +5383,9 @@ export class AppDatabase {
         planConversation = this.getConversation(planConversation.id)!;
         this.sqlite.prepare("UPDATE conversations SET pinned_at=NULL WHERE id=?").run(sourceConversation.id);
       }
+      this.sqlite.prepare(`INSERT OR IGNORE INTO workflow_conversations(conversation_id,workflow_id)
+        SELECT ?,c.workflow_id FROM workflow_conversations c JOIN workflows w ON w.id=c.workflow_id
+        WHERE c.conversation_id=? AND w.state NOT IN ('completed','aborted')`).run(planConversation.id,sourceConversation.id);
       this.sqlite.prepare(`
         INSERT INTO wake_plans(
           id,conversation_id,created_by_job_id,mode,state,label,run_id,deadline_at,

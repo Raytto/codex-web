@@ -1,3 +1,5 @@
+import { publicInstanceConfig, renderInstanceHtml } from './instance-config.js';
+import { validateCompletionEvidence } from "./workflow-store.js";
 import { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "./conversation-title.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { liveSteeringUnavailableReason } from "../src/agent-steering-capability.js";
@@ -108,6 +110,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   fs.mkdirSync(config.dataRoot, { recursive: true });
   fs.mkdirSync(config.tenantRoot, { recursive: true });
   const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: "Codex" });
+  db.workflows.configure(config.maxActiveWorkflows);
   db.recoverVoiceTranscriptionReceipts();
   const remoteWorkers = new RemoteWorkerGateway(config, db);
   const remoteFileDelivery = new RemoteFileDelivery(db, config.dataRoot, remoteWorkers);
@@ -164,7 +167,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return db.ensureDefaultProject(
       newId(),
       user.id,
-      hostRoot ? "host-project" : "默认项目",
+      hostRoot ? config.hostProjectName : "默认项目",
       rootPath,
       hostRoot ? HOST_EXECUTOR_ID : TENANT_LOCAL_EXECUTOR_ID,
     );
@@ -426,6 +429,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   let maintenanceQueueWaiting = false;
   let capacityQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
   let maintenanceQueueWakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let workflowEventCursor = 0;
   let wakeSchedulerBusy = false;
   let wakeSchedulerTimer: ReturnType<typeof setInterval> | undefined;
   const backgroundTasks = new Set<Promise<void>>();
@@ -720,6 +724,17 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (wakeSchedulerBusy || shuttingDown) return;
     wakeSchedulerBusy = true;
     try {
+      // A local deployment supervisor can close the same ledger while Web is idle.
+      // Reconcile database events, not model polling or an expiring business lease.
+      if (config.maxActiveWorkflows > 0) {
+        const latest=(db.sqlite.prepare("SELECT COALESCE(MAX(seq),0) AS n FROM workflow_events").get() as {n:number}).n;
+        if(latest !== workflowEventCursor){
+          const changed=db.sqlite.prepare("SELECT DISTINCT c.conversation_id FROM workflow_conversations c JOIN workflow_events e ON e.workflow_id=c.workflow_id WHERE e.seq>? LIMIT 100").all(workflowEventCursor) as Array<{conversation_id:string}>;
+          workflowEventCursor=latest;
+          for(const item of changed){const conversation=db.getConversation(item.conversation_id);if(conversation)publishConversationChanged(conversation);}
+          if(config.queueAutoStart)scheduleQueuePump();
+        }
+      }
       const recurring = new RecurringStore(db);
       for (const task of recurring.due(Date.now())) {
         try {
@@ -958,6 +973,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function scheduleConversationTitle(conversationId: string, messageId: string, content: string, jobId?: string): void {
+    if (config.maxActiveWorkflows > 0 && jobId && db.getJob(jobId)?.status !== "running") return;
     const message = db.getMessage(messageId);
     if (!message || message.conversation_id !== conversationId || message.role !== "user" || message.is_internal) return;
     const firstMessage = db.getFirstUserMessage(conversationId);
@@ -1012,7 +1028,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (recordCancellation) for (const job of activeJobs) recordUserCancelledJob(job);
   }
 
-  type DispatchBlock = "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
+  type DispatchBlock = "workflow_limit" | "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
 
   let diskSpaceSample: { sampledAt: number; bytes: number } | null = null;
   function availableDiskBytes(forceRefresh = false): number {
@@ -1038,6 +1054,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function dispatchBlock(conversationId: string): DispatchBlock | null {
     const conversation = db.getConversation(conversationId);
     if (!conversation) return "executor_unavailable";
+    if (db.workflows.block(conversationId)) return "workflow_limit";
     if (conversation.cold_storage_state !== "local") return "cold_storage";
     const project = conversation.project_id ? db.getProjectForUser(conversation.project_id, conversation.user_id) : undefined;
     // CODEX_WEB is the explicitly trusted host operator account. Its jobs do not
@@ -1064,6 +1081,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function dispatchBlockLabel(reason: DispatchBlock): string {
     return ({
+      workflow_limit: "等待完整修改任务完成验收和收尾（暂不启动设计或执行）",
       global_limit: `等待全局并发槽位（上限 ${config.maxGlobalRunningJobs}）`,
       user_limit: `等待当前账号并发槽位（上限 ${config.maxRunningJobsPerUser}）`,
       executor_limit: `等待执行器并发槽位（安全上限 ${config.maxRunningJobsPerExecutor}）`,
@@ -1122,6 +1140,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         publish(job.id, "failed", { status: "failed", message });
       }
     } finally {
+      db.workflows.settled(job.id);
+      const completedConversation = db.getConversation(job.conversation_id);
+      if (completedConversation) publishConversationChanged(completedConversation);
       publishQueuePositions();
       await pumpQueue();
     }
@@ -1140,6 +1161,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     maintenanceQueueWaiting = false;
     queuePumpBusy = true;
     try {
+      db.workflows.reconcileUnstarted();
       for (;;) {
         if (shuttingDown) break;
         if (codexUpdateMaintenanceActive()) {
@@ -1168,12 +1190,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         // Reserve the conversation synchronously before launching the async
         // runner. This lets other conversations start immediately while keeping
         // every turn in this conversation strictly serial.
-        db.updateJob(job.id, "running");
+        try { db.updateJob(job.id, "running"); }
+        catch (error) { if (error instanceof Error && /WORKFLOW_/.test(error.message)) break; throw error; }
         // The publisher can close its gate between the last marker read and
         // this database write. Recheck after reserving so an idle observation
         // can never race into launching a task during the production switch.
         if (codexUpdateMaintenanceActive()) {
           db.updateJob(job.id, "queued");
+          db.workflows.settled(job.id);
           maintenanceQueueWaiting = true;
           publishQueuePositions();
           wakeQueueAfterMaintenance();
@@ -1279,6 +1303,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   const router = express.Router();
   const api = express.Router();
+
+  api.get("/instance", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(publicInstanceConfig(config.instance));
+  });
 
   api.get("/health", (_req, res) => res.json({ ok: true, service: "codex-web", time: new Date().toISOString() }));
 
@@ -1589,8 +1618,36 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!claims || claims.jobId !== jobId) return null;
     const job = db.getJob(jobId);
     if (!job || job.status !== "running" || job.conversation_id !== claims.conversationId) return null;
+    try {
+      const workflow=db.workflows.assertJob(job.id);
+      if (claims.workflowEpoch !== undefined ? claims.workflowEpoch !== workflow.epoch : workflow.epoch !== 0) return null;
+    } catch { return null; }
     return job;
   }
+
+  api.post("/automation/jobs/:jobId/workflow", automationLimiter, async (req, res) => {
+    const job=authenticatedAutomationJob(req);
+    if(!job)return res.status(401).json({error:"执行身份已结束或失效"});
+    try {
+      let workflow=db.workflows.assertJob(job.id);
+      const action=req.body?.action;
+      if(action==="phase" || action==="block")workflow=db.workflows.phase(job.id,String(req.body?.phase||""),action==="block");
+      else if(action==="track_release") {
+        db.workflows.trackRelease(job.id,String(req.body?.instance||""),Number(req.body?.requestId),String(req.body?.sha||""));
+        workflow=db.workflows.assertJob(job.id);
+      }
+      else if(action==="complete") {
+        validateCompletionEvidence(req.body?.evidence);
+        if(req.body.evidence.kind==="deployment") {
+          const owner=db.getConversation(job.conversation_id)!.user_id;
+          if(!isHostRootUser(owner))throw new Error("部署回执只允许宿主管理账号核验");
+          await transferHost.verifyWorkflow(owner,req.body.evidence);
+        }
+        workflow=db.workflows.requestClose(job.id,Number(req.body?.revision),req.body?.evidence);
+      } else if(action!=="status")throw new Error("action 必须是 status、phase、block 或 complete");
+      return res.json({workflow,capacity:config.maxActiveWorkflows,completionSchema:{revision:"先 status 获取当前 revision",evidence:{kind:"design | artifact | deployment",summary:"目标与实际结果",functionalVerified:true,cleanupVerified:true,backgroundWorkFinished:true,checks:[{name:"实际验证项目",passed:true}],releases:"deployment 必填 [{instance: 注册实例名, requestId: 发布编号, sha: 完整SHA}]；必须已有 accepted/cleaned 回执"}},releaseRule:"complete 只申请完成；关联执行退出且无等待/排队指令后，服务端才释放名额"});
+    }catch(error){return res.status(409).json({error:error instanceof Error?error.message:"工作流操作失败"});}
+  });
 
   api.all("/automation/jobs/:jobId/transfers{/:transferId}{/:action}", automationLimiter, (req, res) => {
     const job = authenticatedAutomationJob(req);
@@ -2890,6 +2947,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.post("/conversations/:id/archive", (req, res) => {
     const session = res.locals.session as SessionRow;
+    const workflow = db.workflows.forConversation(String(req.params.id));
+    if (config.maxActiveWorkflows > 0 && workflow && workflow.user_id === session.user_id && !["completed","aborted"].includes(workflow.state)) return res.status(409).json({error:"修改尚未完整收尾，请先完成或安全取消；删除/归档不能释放名额"});
     const conversation = db.getConversationForUser(String(req.params.id), session.user_id);
     if (!conversation) return res.status(404).json({ error: "会话不存在。" });
     if (conversation.archived_at) return res.json({ conversation });
@@ -2943,6 +3002,16 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ rolloutBytes });
   });
 
+  api.get("/workflows", (req,res) => {
+    const session=res.locals.session as SessionRow;
+    return res.json({capacity:config.maxActiveWorkflows,workflows:db.workflows.list(session.user_id)});
+  });
+  api.post("/workflows/:id/cancel", (req,res) => {
+    const session=res.locals.session as SessionRow;
+    try { db.workflows.cancelQueued(String(req.params.id),session.user_id); scheduleQueuePump(); return res.json({ok:true}); }
+    catch(error){return res.status(409).json({error:error instanceof Error?error.message:"无法取消"});}
+  });
+
   api.get("/conversations/:id", async (req, res) => {
     const session = res.locals.session as SessionRow;
     let conversation = db.getConversationForUser(String(req.params.id), session.user_id);
@@ -2972,6 +3041,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       editingPrompt,
       composerDraft,
       wakePlan: publicWakePlan(wakePlan),
+      workflow: db.workflows.forConversation(conversation.id) ?? null,
+      workflowCapacity: config.maxActiveWorkflows,
       wakeEvents: wakePlan ? db.listWakeEvents(wakePlan.id) : [],
       ...activity,
       rolloutBytes,
@@ -3265,6 +3336,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.delete("/conversations/:id", async (req, res) => {
     const session = res.locals.session as SessionRow;
+    const workflow = db.workflows.forConversation(String(req.params.id));
+    if (config.maxActiveWorkflows > 0 && workflow && workflow.user_id === session.user_id && !["completed","aborted"].includes(workflow.state)) return res.status(409).json({error:"修改尚未完整收尾，请先完成或安全取消；删除/归档不能释放名额"});
     const id = String(req.params.id);
     const existing = db.getConversationForUser(id, session.user_id) ?? db.getConversationCleanupForUser(id, session.user_id);
     if (!existing) return res.status(404).json({ error: "会话不存在。" });
@@ -4240,7 +4313,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   router.use("/api", api);
   const distPath = path.join(config.projectRoot, "dist");
+  const sendIndex: express.RequestHandler = (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.type("html").send(renderInstanceHtml(fs.readFileSync(path.join(distPath, "index.html"), "utf8"), config.instance));
+  };
   if (fs.existsSync(distPath)) {
+    router.get(["/", "/index.html"], sendIndex);
     router.use(express.static(distPath, {
       index: false,
       maxAge: "1h",
@@ -4253,7 +4331,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
   router.use((req, res, next) => {
     if (req.method !== "GET" || !req.accepts("html") || !fs.existsSync(path.join(distPath, "index.html"))) return next();
-    return res.sendFile("index.html", { root: distPath });
+    return sendIndex(req, res, next);
   });
   if (config.basePath) app.get(config.basePath, (_req, res) => res.redirect(308, `${config.basePath}/`));
   app.use(config.basePath || "/", router);

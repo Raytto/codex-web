@@ -2297,3 +2297,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .codex-auto-reset-history li { padding:12px 0; }
 .codex-auto-reset-history li + li { border-top:1px solid var(--line); }
 .codex-auto-reset-history p { margin:8px 0; }
+
+.activity-compact .activity-title { margin-bottom: 0; }
+
+/* Optional palette; the default retains the established appearance. */
+:root[data-brand-theme="jade"] .brand-mark { background:#9cdac8; color:#174e40; box-shadow:none; }
+:root[data-brand-theme="jade"] .boot { background:var(--canvas); }
+:root[data-brand-theme="jade"] .login-page { background:#e6f3ec; }
+:root[data-brand-theme="jade"] .login-page::before { border-color:#c6dfd4; }
+:root[data-brand-theme="jade"] .sidebar { background:#285c50; }
+:root[data-brand-theme="jade"][data-theme="dark"] { --indigo:#8dd5c1; --indigo-bright:#ace6d6; --indigo-pale:#253f37; --amber:#8dd5c1; --amber-pale:#253f37; }
+:root[data-brand-theme="jade"][data-theme="dark"] .sidebar { background:#1d3d35; }
+:root[data-brand-theme="jade"][data-theme="dark"] .login-page { background:#172e27; }
+:root[data-brand-theme="jade"] .primary-button { background:#287c69; box-shadow:0 8px 20px rgba(25,75,58,.12); }
+:root[data-brand-theme="jade"] .primary-button:hover:not(:disabled) { background:#236c5c; box-shadow:0 10px 24px rgba(25,75,58,.16); }
+:root[data-brand-theme="jade"]:not([data-theme="dark"]) { --ink:#163d36; --navy:#163d36; --navy-soft:#23554a; --indigo:#257b69; --indigo-bright:#2d8b78; --indigo-pale:#e9f5f0; --amber:#93d5c3; --amber-pale:#e7f6ef; --canvas:#f3faf7; --surface:#edf6f1; --line:#d8e7df; }
+.startup-status { padding:24px; text-align:center; }
+.startup-status h1 { margin:0; font-size:22px; color:var(--ink); }
+.startup-status p { margin:0; color:var(--ink-soft); }
+.startup-status a { color:var(--indigo); text-underline-offset:4px; }
+.startup-status a:focus-visible { outline:2px solid currentColor; outline-offset:6px; }

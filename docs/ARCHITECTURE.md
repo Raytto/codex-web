@@ -75,3 +75,7 @@ Composer writes use a 45-second ordinary-write budget and a 10-minute new-file f
 The [build and capacity guide](BUILD_AND_STORAGE.md) defines the base/document profiles, isolated build cleanup, direct bundled Codex runtime and upgrade migration. Default Compose retains read-only application layers, separate web/tenant UIDs, no Docker socket and empty optional host/Worker/model configuration. `documents` only adds office tools; it grants no host capability. Runtime state is created after installation under the configured state root and is excluded from build context.
 
 [Voice submissions](VOICE_SEND.md) add durable accepted/processing/failed states and restart recovery; [opportunity cards](OPPORTUNITY_CARDS.md) start empty and disabled, enforce account/project ownership, CSRF on browser writes and scoped live-Job authorization on automation writes. These changes do not introduce phone/SMS login or production provider defaults. Migrations `2026101401` and `2026101402` require the usual pre-upgrade state backup. Worker 1.20.2 permits 256 automatic results per batch without raising byte/time limits.
+
+## Complete workflows
+
+The queue also tracks durable complete-task ownership, independent of individual Jobs. Epoch-bound claims survive waits and transport uncertainty; verified completion releases a slot after execution exits. Instance policy defaults to unlimited complete workflows (`MAX_ACTIVE_WORKFLOWS=-1`) while the existing resource guards remain active. See [complete task ownership](COMPLETE_WORKFLOWS.md).

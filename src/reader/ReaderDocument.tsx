@@ -17,7 +17,10 @@ type ReaderDocumentProps = {
   onAskAnnotation?: (annotation: ReaderAnnotation) => void;
 };
 
-function endpoint(path: string): string { return path.startsWith("http") ? path : `${BASE_PATH}${path}`; }
+function endpoint(path: string): string {
+  if (path.startsWith("http") || (BASE_PATH && path.startsWith(`${BASE_PATH}/`))) return path;
+  return `${BASE_PATH}${path}`;
+}
 
 function ReaderPageIndicator({ label, ariaLabel }: { label: string; ariaLabel?: string }) {
   return <div className="reader-page-indicator" aria-live="polite" aria-label={ariaLabel ?? label}>{label}</div>;

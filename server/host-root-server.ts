@@ -1,3 +1,8 @@
+import { loadInstancePaths } from './instance-config.js';
+import { publicInstanceEnvironment } from './instance-environment.js';
+import { DatabaseSync } from "node:sqlite";
+import { WorkflowStore } from "./workflow-store.js";
+import { verifyWorkflowEvidence } from "./workflow-evidence.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { resolveAntigravityModel, type AntigravityAgentOptions } from "../remote-worker/src/antigravity-runtime.js";
 import { operateHostProjectSkill } from "./host-project-skills.js";
@@ -28,10 +33,14 @@ import { defaultColdStorageRoots, restoreColdConversation } from "./conversation
 import { countRunningJobsForExecutorInDatabase, countRunningGeminiJobsForExecutorInDatabase } from "./executor-job-status.js";
 import { HOST_EXECUTOR_ID } from "./remote-worker-protocol.js";
 
-const socketPath = process.env.CODEX_WEB_HOST_SOCKET_PATH?.trim() || "";
-const hostTenantRoot = path.resolve(process.env.CODEX_WEB_HOST_TENANT_ROOT?.trim() || "");
-const knowledgeRoot = path.resolve(process.env.CODEX_WEB_KNOWLEDGE_ROOT?.trim() || "");
-const codexHome = path.resolve(process.env.CODEX_WEB_CODEX_HOME?.trim() || "");
+const hostPaths = loadInstancePaths(publicInstanceEnvironment(process.env, process.cwd()), process.cwd());
+for (const key of ['CODEX_WEB_HOST_SOCKET_PATH', 'CODEX_WEB_HOST_TENANT_ROOT', 'CODEX_WEB_KNOWLEDGE_ROOT', 'CODEX_WEB_CODEX_HOME', 'CWW_DATABASE_PATH', 'CODEX_WEB_HOST_HOME']) {
+  if (!process.env[key]) throw new Error(`Host bridge requires explicit ${key}`);
+}
+const socketPath = hostPaths.hostRootSocketPath;
+const hostTenantRoot = hostPaths.hostTenantRoot;
+const knowledgeRoot = hostPaths.hostKnowledgeRoot;
+const codexHome = hostPaths.hostRootCodexHome;
 const webUid = Number(process.env.CODEX_WEB_WEB_UID || "10001");
 const webGid = Number(process.env.CODEX_WEB_WEB_GID || "10001");
 const workers = new Map<string, { model: string; child: ChildProcess; socket: Socket; workspace: string; runtimeRoot: string; terminal: boolean; timers: NodeJS.Timeout[] }>();
@@ -39,7 +48,8 @@ const voiceReviewWorkers = new Map<string, ChildProcess>();
 const titleAgentWorkers = new Map<string, ChildProcess>();
 const geminiTitleRequests = new Set<string>();
 let stopping = false;
-const hostDatabasePath = process.env.CWW_DATABASE_PATH || path.join(process.cwd(), ".state", "data", "codex-web.sqlite");
+const hostDatabasePath = hostPaths.hostDatabasePath;
+if (![webUid, webGid].every(n => Number.isSafeInteger(n) && n > 0)) throw new Error("Invalid bridge web UID/GID");
 
 if (!socketPath || !process.env.CODEX_WEB_HOST_TENANT_ROOT || !process.env.CODEX_WEB_KNOWLEDGE_ROOT || !process.env.CODEX_WEB_CODEX_HOME) {
   throw new Error("Host bridge is disabled until CODEX_WEB_HOST_SOCKET_PATH, CODEX_WEB_HOST_TENANT_ROOT, CODEX_WEB_KNOWLEDGE_ROOT, and CODEX_WEB_CODEX_HOME are configured");
@@ -144,6 +154,13 @@ function handleConnection(socket: Socket): void {
         );
         return;
       }
+      if (message.type === "workflow_verify") {
+        if (activeJobId) throw new Error("Use an independent verification connection");
+        validateHostUser(message.userId);
+        verifyWorkflowEvidence(message.evidence);
+        send(socket, { type:"workflow_verify_result",requestId:message.requestId,verified:true });
+        socket.end(); return;
+      }
       if (message.type === "project_skills") {
         if (activeJobId) throw new Error("Cannot manage skills through an active job connection");
         validateHostUser(message.userId);
@@ -212,6 +229,11 @@ function handleConnection(socket: Socket): void {
         return;
       }
       if (message.type === "codex_upgrade") {
+        const workflowDb = new DatabaseSync(hostDatabasePath, { readOnly: true });
+        try {
+          const setting = workflowDb.prepare("SELECT capacity FROM workflow_settings WHERE id=1").get() as {capacity:number}|undefined;
+          if (setting && setting.capacity > 0) throw new Error("Use a complete maintenance workflow for runtime upgrades when admission is limited");
+        } finally { workflowDb.close(); }
         if (activeJobId || workers.size > 0 || voiceReviewWorkers.size > 0 || titleAgentWorkers.size > 0) throw new Error("CODEX_WEB 仍有任务执行，暂不能升级 Codex");
         validateHostUser(message.userId);
         if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(message.version)) throw new Error("目标 Codex 版本无效");
@@ -331,7 +353,7 @@ async function startVoiceReview(socket: Socket, requestId: string, request: impo
       cwd: process.cwd(),
       env: {
         ...process.env,
-        HOME: "/root",
+        HOME: hostPaths.hostHome,
         CODEX_HOME: codexHome,
         CWW_TENANT_USER_ID: HOST_ROOT_USER_ID,
         CWW_TENANT_UID: String(process.getuid?.() ?? 0),
@@ -409,7 +431,7 @@ async function startTitleAgent(socket: Socket, requestId: string, request: impor
     if (sharedAuthPolicy) lease = await acquireSharedCodexAuth({ sourceFile: sharedAuthPolicy.sourceFile, lockFile: sharedAuthPolicy.lockFile, targetFile: path.join(codexHome, "auth.json") });
     const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "codex-conversation-title-worker.js")], {
       cwd: process.cwd(),
-      env: { ...process.env, HOME: "/root", CODEX_HOME: codexHome, CWW_TENANT_USER_ID: HOST_ROOT_USER_ID, CWW_TENANT_UID: String(process.getuid?.() ?? 0), CWW_TENANT_GID: String(process.getgid?.() ?? 0) },
+      env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome, CWW_TENANT_USER_ID: HOST_ROOT_USER_ID, CWW_TENANT_UID: String(process.getuid?.() ?? 0), CWW_TENANT_GID: String(process.getgid?.() ?? 0) },
       detached: process.platform !== "win32", stdio: ["pipe", "pipe", "inherit"],
     });
     titleAgentWorkers.set(requestId, child);
@@ -488,7 +510,7 @@ async function readHostAgentOptions(executable: string): Promise<AgentOptions> {
   }) : null;
   try {
     return await new Promise((resolve, reject) => {
-    const child = spawn(executable, ["app-server", "--listen", "stdio://"], { env: { ...process.env, HOME: "/root", CODEX_HOME: codexHome }, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(executable, ["app-server", "--listen", "stdio://"], { env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome }, stdio: ["pipe", "pipe", "pipe"] });
     const output = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
     let nextId = 1;
     let stderr = "";
@@ -528,6 +550,11 @@ async function readHostAgentOptions(executable: string): Promise<AgentOptions> {
 
 async function startWorker(socket: Socket, request: HostRootRunRequest): Promise<string> {
   validateRunRequest(request);
+  const ownershipDb = new DatabaseSync(hostDatabasePath, { readOnly: true });
+  try {
+    const workflow = new WorkflowStore(ownershipDb).assertJob(request.jobId);
+    if (workflow.epoch !== request.workflowEpoch) throw new Error("Expired complete-workflow execution generation");
+  } finally { ownershipDb.close(); }
   const isGemini = engineForModel(request.selection.model) === "antigravity";
   const geminiRuntime = isGemini ? await geminiAccountManager.getActiveRuntime() : null;
   if (isGemini && (!geminiRuntime || geminiRuntime.accountId !== request.agentAccountId)) throw new Error("当前节点的 Gemini 登录账号已变化或失效，请刷新账号后重试。");
@@ -557,7 +584,7 @@ async function startWorker(socket: Socket, request: HostRootRunRequest): Promise
   };
   const child = spawn(process.execPath, [path.join(process.cwd(), "dist-server", "server", "host-root-job.js")], {
     cwd: process.cwd(),
-    env: { ...process.env, HOME: "/root", CODEX_HOME: codexHome },
+    env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: codexHome },
     detached: process.platform !== "win32",
     stdio: ["pipe", "pipe", "inherit"],
   });

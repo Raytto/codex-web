@@ -1,3 +1,4 @@
+import { ExecutionUncertainError } from "./execution-ownership.js";
 import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
@@ -35,11 +36,11 @@ export class HostRootWorkerClient {
       const lines = this.readLines(socket);
       lines.on("line", (line) => this.handleLine(request.jobId, line));
       socket.once("connect", () => this.send(socket, { type: "run", request }));
-      socket.once("error", (error) => this.failJob(request.jobId, error));
+      socket.once("error", (error) => this.failJob(request.jobId, new ExecutionUncertainError(error.message)));
       socket.once("close", () => {
         lines.close();
         const active = this.jobs.get(request.jobId);
-        if (active && !active.terminal) this.failJob(request.jobId, new Error("CODEX_WEB 宿主执行服务已断开"));
+        if (active && !active.terminal) this.failJob(request.jobId, new ExecutionUncertainError("宿主执行服务已断开，执行退出尚未确认"));
       });
     });
   }
@@ -96,7 +97,7 @@ export class HostRootWorkerClient {
       });
       socket.once("connect", () => this.send(socket, { type: "delete_thread", requestId, userId, threadId }));
       socket.once("error", (error) => finish(error));
-      socket.once("close", () => finish(new Error("CODEX_WEB 宿主执行服务已断开")));
+      socket.once("close", () => finish(new ExecutionUncertainError("宿主执行服务已断开，执行退出尚未确认")));
     });
   }
 
@@ -276,6 +277,11 @@ export class HostRootWorkerClient {
     );
   }
 
+  verifyWorkflow(userId: string, evidence: unknown): Promise<boolean> {
+    const requestId = crypto.randomUUID();
+    return this.singleRequest({type:"workflow_verify",requestId,userId,evidence}, response => response.type==="workflow_verify_result" && response.requestId===requestId ? response.verified : undefined);
+  }
+
   private singleRequest<T>(message: HostRootClientMessage, pick: (message: HostRootServerMessage) => T | undefined, matches?: (message: HostRootServerMessage) => boolean, timeoutMs = 60_000): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
@@ -297,7 +303,7 @@ export class HostRootWorkerClient {
       });
       socket.once("connect", () => this.send(socket, message));
       socket.once("error", (error) => finish(error));
-      socket.once("close", () => finish(new Error("CODEX_WEB 宿主执行服务已断开")));
+      socket.once("close", () => finish(new ExecutionUncertainError("宿主执行服务已断开，执行退出尚未确认")));
     });
   }
 
@@ -350,7 +356,7 @@ export class HostRootWorkerClient {
       });
       socket.once("connect", () => this.send(socket, { type: "project_fs", requestId, userId, action, path: directory, name, content }));
       socket.once("error", (error) => finish(error));
-      socket.once("close", () => finish(new Error("CODEX_WEB 宿主执行服务已断开")));
+      socket.once("close", () => finish(new ExecutionUncertainError("宿主执行服务已断开，执行退出尚未确认")));
     });
   }
 

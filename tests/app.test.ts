@@ -931,9 +931,9 @@ test("empty composer supports a touch long-press voice shortcut without replacin
 test("workspace header identifies the selected task and its project", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
-  assert.match(appSource, /const workspaceTitle = selectedConversation\?\.title \|\| "Codex Web"/);
-  assert.match(appSource, /const workspaceSubtitle = selectedProject\?\.display_name \|\| selectedProject\?\.name \|\| "PERSONAL AI WORKSTATION"/);
-  assert.match(appSource, /className="wordmark workspace-context"[\s\S]*selectedProject\?\.executor_id\.startsWith\("remote:"\) \? <Monitor size=\{15\} \/> : selectedProject \? <Folder size=\{15\} \/> : <Zap size=\{14\} \/>/);
+  assert.match(appSource, /const workspaceTitle = selectedConversation\?\.title \|\| instance\.productName/);
+  assert.match(appSource, /const workspaceSubtitle = selectedProject\?\.display_name \|\| selectedProject\?\.name \|\| instance\.tagline/);
+  assert.match(appSource, /className="wordmark workspace-context"[\s\S]*selectedProject\?\.executor_id\.startsWith\("remote:"\) \? <Monitor size=\{15\} \/> : selectedProject \? <Folder size=\{15\} \/> : <BrandIcon size=\{14\} \/>/);
   assert.match(appSource, /className="brand-copy workspace-context-copy"><strong>\{workspaceTitle\}/);
   assert.match(appSource, /<small>\{workspaceSubtitle\}<\/small>/);
   assert.match(appSource, /deploymentStatusTone\(maintenanceStatus\.deployment\)/);
@@ -955,7 +955,7 @@ test("scheduled prompts use an amber clock identity instead of impersonating the
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /const scheduledMessage = message\.role === "user" && Boolean\(message\.is_scheduled\)/);
   assert.match(appSource, /scheduledMessage \? <Clock size=\{15\} \/>/);
-  assert.match(appSource, /scheduledMessage \? "定时任务" : message\.role === "assistant" \? "Codex Web" : "你"/);
+  assert.match(appSource, /scheduledMessage \? "定时任务" : message\.role === "assistant" \? instance\.productName : "你"/);
   assert.match(styles, /\.message\.user \.message-avatar\.scheduled \{[^}]*color: var\(--navy\);[^}]*background: linear-gradient\(145deg, #f8bb55, var\(--amber\)\);/);
   assert.match(styles, /:root\[data-theme="dark"\] \.message\.user \.message-avatar\.scheduled \{[^}]*background: linear-gradient\(145deg, #f8bb55, var\(--amber\)\);/);
 });
@@ -1114,7 +1114,7 @@ test("unread replies open at the preceding user prompt for context", () => {
 
 test("completed remote turns hide live progress and leave the final reply as the last result", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
-  assert.match(appSource, /\{sending && <article className="message assistant running">/);
+  assert.match(appSource, /\{\(sending \|\| workflow\) && <article className="message assistant running">/);
   assert.doesNotMatch(appSource, /completedRemoteWorkRecord|本轮工作记录|本轮处理已完成|阶段反馈和本机步骤已保留/);
 });
 
@@ -1531,7 +1531,7 @@ test("running work journal retains every important direction and compacts repeat
   assert.match(styles, /\.process-journal \{[^}]*position: relative;[^}]*overflow-x: hidden;[^}]*border-top:/);
   assert.doesNotMatch(styles, /\.process-journal \{[^}]*max-height:|\.process-journal \{[^}]*overflow-y: auto|\.process-journal \{[^}]*overscroll-behavior-y:/);
   assert.doesNotMatch(styles, /\.process-journal-pinned|position: sticky;/);
-  assert.match(appSource, /\{sending && <article className="message assistant running">/);
+  assert.match(appSource, /\{\(sending \|\| workflow\) && <article className="message assistant running">/);
   assert.match(appSource, /<ProcessPanel key=\{`\$\{detail\.conversation\.id\}:\$\{detail\.remoteTurnId \?\? "job"\}`\} activities=\{activities\} loading=\{activitiesLoading\}/);
   assert.match(appSource, /<div className="process-journal">\{journal\.length/);
   assert.doesNotMatch(appSource, /journalElement|journalFollowingRef|handleJournalScroll/);
@@ -5750,6 +5750,7 @@ test("conversation stop cancels every active job and tombstone deletion removes 
   assert.doesNotMatch(stoppedSummary.content, /private command/);
   assert.equal(latestUserCancellationContext(instance.db.listMessages(conversationId)), stoppedSummary.content);
 
+  instance.db.workflows.settled(runningJobId); // Mock execution has exited.
   const deletionJobId = crypto.randomUUID();
   instance.db.createJob(deletionJobId, conversationId, messageId);
   instance.db.updateJob(deletionJobId, "running");

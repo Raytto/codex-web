@@ -1,3 +1,5 @@
+import { instance } from "./instance";
+document.documentElement.dataset.brandTheme = instance.theme;
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";

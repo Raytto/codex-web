@@ -1,3 +1,4 @@
+import { WORKFLOW_TOOL_SPEC, callWorkflowTool } from "./workflow-tool.js";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,7 @@ export function platformAutomationConfig(env: NodeJS.ProcessEnv = process.env): 
 
 export function workerPlatformTools(config: PlatformAutomationConfig | null): PlatformMcpTool[] {
   return config ? [
+    { ...WORKFLOW_TOOL_SPEC, call: (args) => callWorkflowTool(config, args) },
     { ...WAIT_DYNAMIC_TOOL_SPEC, call: (args) => callWaitDynamicTool(config, args) },
     { ...NODE_TRANSFER_TOOL_SPEC, call: (args) => callNodeTransferTool(config, args) },
   ] : [];

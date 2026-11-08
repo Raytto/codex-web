@@ -1,3 +1,4 @@
+import { WORKFLOW_TOOL_NAME, WORKFLOW_TOOL_SPEC, callWorkflowTool } from "./workflow-tool.js";
 import { NODE_TRANSFER_TOOL_NAME, NODE_TRANSFER_TOOL_SPEC, callNodeTransferTool } from "./node-transfer-tool.js";
 import { normalizeResetCredits } from "./codex-reset-credits.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -37,6 +38,7 @@ export function waitAutomationEnvironment(automation?: { baseUrl: string; token:
     CODEX_WEB_AUTOMATION_TOKEN: automation.token,
     CODEX_WEB_AUTOMATION_JOB_ID: automation.jobId,
     CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+    PPAGENT_WORKFLOW_CLI: fileURLToPath(new URL("./workflow-job-cli.js", import.meta.url)),
   } : {};
 }
 
@@ -133,7 +135,7 @@ export class CodexExecution {
         ? await this.startupRequest("thread/resume", { threadId: this.options.threadId, ...common, excludeTurns: true }, "正在恢复远端会话")
         : await this.startupRequest("thread/start", {
             ...common,
-            ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC, NODE_TRANSFER_TOOL_SPEC] } : {}),
+            ...(this.options.automation?.dynamicTool ? { dynamicTools: [WAIT_DYNAMIC_TOOL_SPEC, NODE_TRANSFER_TOOL_SPEC, WORKFLOW_TOOL_SPEC] } : {}),
           }, "正在创建远端会话");
       if (this.terminal || this.cancellationRequested) return;
       const thread = (response as { thread?: { id?: string } }).thread;
@@ -178,12 +180,12 @@ export class CodexExecution {
 
   private async handleServerRequest(id: number, method: string, params: JsonObject): Promise<void> {
     const reply = (result: unknown) => this.child.stdin.write(`${JSON.stringify({ id, result })}\n`);
-    if (method !== "item/tool/call" || !this.options.automation?.dynamicTool || ![WAIT_DYNAMIC_TOOL_NAME, NODE_TRANSFER_TOOL_NAME].includes(String(params.tool))) {
+    if (method !== "item/tool/call" || !this.options.automation?.dynamicTool || ![WAIT_DYNAMIC_TOOL_NAME, NODE_TRANSFER_TOOL_NAME, WORKFLOW_TOOL_NAME].includes(String(params.tool))) {
       reply({ contentItems: [{ type: "inputText", text: "Unsupported dynamic tool request" }], success: false });
       return;
     }
     try {
-      const result = await (params.tool === NODE_TRANSFER_TOOL_NAME ? callNodeTransferTool(this.options.automation as WaitToolConfig, params.arguments) : callWaitDynamicTool(this.options.automation as WaitToolConfig, params.arguments));
+      const result = await (params.tool === WORKFLOW_TOOL_NAME ? callWorkflowTool(this.options.automation as WaitToolConfig, params.arguments) : params.tool === NODE_TRANSFER_TOOL_NAME ? callNodeTransferTool(this.options.automation as WaitToolConfig, params.arguments) : callWaitDynamicTool(this.options.automation as WaitToolConfig, params.arguments));
       reply({ contentItems: [{ type: "inputText", text: result }], success: true });
     } catch (error) {
       reply({ contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });

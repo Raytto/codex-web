@@ -1,3 +1,4 @@
+import { instance } from "./instance";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Copy, ExternalLink, RefreshCw, X } from "lucide-react";
@@ -85,7 +86,7 @@ export function FileShareDialog({ fileId, onClose, onChange, intent = "share" }:
       {metadata ? <><h3 className="dialog-section-heading file-share-filename">{metadata.file.original_name}</h3><p>{web ? "交互网页 · 打开后为无顶栏网页" : "阅读文档"}{cold ? " · 已冷存储或正在恢复" : ""}</p>
         {openingWeb ? <>
           <p>阅读模式不运行网页脚本。如果这是需要点击、切换或绘图的交互作品，可校验后打开完整网页。</p>
-          <p>将创建新的私有版本，原文件、原分享开关和链接保持原样。新版本的分享由 Codex Web 控制。</p>
+          <p>将创建新的私有版本，原文件、原分享开关和链接保持原样。新版本的分享由 {instance.productName} 控制。</p>
           <p>支持 5 MiB 以内的自包含 HTML；不支持外部资源或需要联网的功能。</p>
           <div className="file-share-actions">{web ? <a href={filePreviewUrl(metadata.file)}>打开交互网页</a> : <button disabled={busy} onClick={() => void change("redeliver")}>{busy ? "正在校验…" : "校验并打开交互网页"}</button>}</div>
         </> : <>

@@ -1,3 +1,4 @@
+import { ExecutionUncertainError } from "./execution-ownership.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { bindEngineSession, recordEngineNativeId, engineHandoffContext } from "./agent-engine-sessions.js";
 import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
@@ -450,6 +451,7 @@ export class CodexRunner {
     const executor = this.remoteWorkers.executor(project.executor_id);
     if (!workerIdFromExecutor(project.executor_id)) return true;
     return Boolean(executor?.status === "online"
+      && this.remoteWorkers.supportsCompleteWorkflows(project.executor_id)
       && this.remoteWorkers.canRun(project.executor_id)
       && remoteWorkerHasCapacity(this.db.countRunningJobsForExecutor(project.executor_id), executor.capacity));
   }
@@ -503,9 +505,14 @@ export class CodexRunner {
   }
 
   async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection, options: { resumeRemote?: boolean } = {}): Promise<void> {
+    // Direct/recovery callers must use the same atomic admission as pumpQueue.
+    if (this.db.getJob(jobId)?.status === "queued") this.db.updateJob(jobId, "running");
+    this.db.workflows.assertJob(jobId);
     const engine = engineForModel(selection.model);
     const controller = new AbortController();
+    let executionExitUncertain = false;
     const eventQueue = new SqliteJobEventQueue(this.db.sqlite, { onFailure: (error) => {
+      executionExitUncertain = true;
       const cause = error.cause as { code?: unknown; errcode?: unknown } | undefined;
       console.error("Job callback persistence failed", { jobId, name: error.name, code: cause?.code, errcode: cause?.errcode });
       // Stop only this execution. Do not mark this as a user cancellation or
@@ -530,6 +537,7 @@ export class CodexRunner {
     let capacityContinuationRequired = attemptState?.continuation ?? false;
     this.abortControllers.set(jobId, controller);
     try {
+      this.db.workflows.assertJob(jobId);
       const conversation = this.db.getConversation(conversationId);
       if (!conversation) throw new Error("会话不存在");
       const tenant = ensureTenant(this.config.tenantRoot, conversation.user_id);
@@ -568,7 +576,7 @@ export class CodexRunner {
       const waitAutomationSupported = !remoteWorkerId || Boolean(project && this.remoteWorkers.supportsWaitAutomation(project.executor_id));
       const automation = waitAutomationSupported ? {
         baseUrl: this.config.publicBaseUrl.replace(/\/$/, "") || `http://127.0.0.1:${this.config.port}${this.config.basePath}`,
-        token: createJobAutomationToken(this.config.sessionSecret, jobId, conversationId),
+        token: createJobAutomationToken(this.config.sessionSecret, jobId, conversationId, Date.now(), 24 * 60 * 60_000, this.db.workflows.assertJob(jobId).epoch),
         receiptDirectory: path.join(agentWorkspace, ".automation", "wake-receipts"),
       } : undefined;
       const before = attemptState ? new Map(attemptState.outputs) : await snapshotDeliverables(workspace);
@@ -580,7 +588,7 @@ export class CodexRunner {
       const pythonRuntime = resolvePythonRuntime(this.config);
       const taskPolicy = assessTaskPolicy(prompt, uploads);
       const recoveryCheckpoint = this.db.getTaskRecoveryForTurn(conversationId, jobId);
-      const recoveredPrompt = handoff + withTaskRecoveryPrompt(prompt, recoveryCheckpoint);
+      const recoveredPrompt = handoff + withTaskRecoveryPrompt(prompt, recoveryCheckpoint) + this.db.workflows.instructions(jobId);
       const storedCapabilities = this.db.getConversationOptionalCapabilities(conversationId);
       const optionalCapabilities = storedCapabilities
         ? updateOptionalAgentCapabilities(storedCapabilities, [prompt])
@@ -617,7 +625,7 @@ export class CodexRunner {
       const effectivePrompt = appendWaitAutomationInstructions(baseEffectivePrompt, legacyWaitInstructions);
       const continuationEffectivePrompt = buildAgentTurnPrompt({
         managedWebDelivery: Boolean(remoteWorkerId),
-        userPrompt: withTaskRecoveryPrompt(capacityRetryPrompt(prompt, true, attemptState.retryKind), recoveryCheckpoint, true),
+        userPrompt: withTaskRecoveryPrompt(capacityRetryPrompt(prompt, true, attemptState.retryKind), recoveryCheckpoint, true) + this.db.workflows.instructions(jobId),
         attachments: [],
         personalContext,
         runtimeWarning: !hostRoot && !pythonRuntime.ready
@@ -655,6 +663,7 @@ export class CodexRunner {
       };
       const hostRequest: HostRootRunRequest = {
         jobId,
+        workflowEpoch: this.db.workflows.assertJob(jobId).epoch,
         userId: conversation.user_id,
         conversationId,
         projectRoot: conversation.project_id
@@ -759,7 +768,7 @@ export class CodexRunner {
         const continuationAttempt = capacityContinuationRequired;
         const attemptUserPrompt = withTaskRecoveryPrompt(capacityRetryPrompt(prompt, continuationAttempt, attemptState?.retryKind), recoveryCheckpoint, continuationAttempt);
         const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
-        const attemptRemotePrompt = appendPersonalContextToUserPrompt((continuationAttempt ? "" : handoff) + attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)), personalContext);
+        const attemptRemotePrompt = appendPersonalContextToUserPrompt((continuationAttempt ? "" : handoff) + attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)) + this.db.workflows.instructions(jobId), personalContext);
         const attemptUploads = continuationAttempt ? [] : uploads;
         request.effectivePrompt = attemptEffectivePrompt;
         request.imagePaths = continuationAttempt ? [] : selectedImagePaths
@@ -809,7 +818,7 @@ export class CodexRunner {
         signal: controller.signal,
         // Capacity waits are persisted and release the worker. Only pre-execution
         // transport failures may retry inside this invocation.
-        canRetry: (error) => engine === "codex" && !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error),
+        canRetry: (error) => engine === "codex" && !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error) && !(error instanceof ExecutionUncertainError),
         onRetry: ({ attempt, maxAttempts, delayMs }) => {
           this.publish(jobId, "status", { status: "retrying", label: "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt, retryMaxAttempts: maxAttempts, retryDelaySeconds: delayMs / 1000,
@@ -919,6 +928,7 @@ export class CodexRunner {
         console.warn("Finalization staging cleanup failed", error instanceof Error ? error.message : error);
       });
     } catch (error) {
+      if(error instanceof ExecutionUncertainError)this.db.workflows.executionUncertain(jobId,error.message);
       const errorMessage = error instanceof Error ? error.message : "Agent 任务失败";
       const committed = this.db.getJob(jobId);
       if (committed?.status === "completed" && ["db_committed", "published"].includes(committed.finalization_state)) {
@@ -987,6 +997,8 @@ export class CodexRunner {
       if (runtimeRoot && this.db.getJob(jobId)?.status !== "queued") cleanupJobRuntime(runtimeRoot);
       try { cleanupOwnedStagingDirectory(this.config.dataRoot, "remote-worker-staging", jobId); }
       catch { /* Staging cleanup must not mask the job result. */ }
+      if(executionExitUncertain)await retrySqliteWrite(this.db.sqlite, () => this.db.workflows.executionUncertain(jobId,"执行事件持久化失败，需核验实际执行退出"));
+      await retrySqliteWrite(this.db.sqlite, () => this.db.workflows.settled(jobId));
     }
   }
 

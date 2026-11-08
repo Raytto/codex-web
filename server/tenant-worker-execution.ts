@@ -47,6 +47,7 @@ export function startTenantTurn(request: TenantWorkerRunRequest, callbacks: Exec
     CODEX_WEB_AUTOMATION_TOKEN: request.automation.token,
     CODEX_WEB_AUTOMATION_JOB_ID: request.jobId,
     CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+    PPAGENT_WORKFLOW_CLI: fileURLToPath(new URL("./workflow-job-cli.js", import.meta.url)),
           CODEX_WEB_JUDGMENT_CLI: fileURLToPath(new URL("./judgment-cli.js", import.meta.url)),
           CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
   });

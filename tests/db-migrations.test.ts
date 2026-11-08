@@ -90,6 +90,8 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026102302, name: "codex-auto-reset-uses" },
     { version: 2026102801, name: "opportunity-backlog" },
     { version: 2026102901, name: "opportunity-upload-base-revision" },
+    { version: 2026110802, name: "durable-complete-workflows" },
+    { version: 2026110803, name: "workflow-execution-ack" },
   ]);
   first.close();
   const reopened = new AppDatabase(root, undefined, false);

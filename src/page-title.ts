@@ -1,6 +1,7 @@
+import { instance } from "./instance";
 import { useEffect } from "react";
 
-const APP_TITLE = "Codex Web";
+const APP_TITLE = instance.productName;
 
 /** The mounted page owns the tab title; leaving it clears any private context. */
 export function usePageTitle(title?: string | null): void {

@@ -3,18 +3,29 @@ set -Eeuo pipefail
 
 data_root="${DATA_ROOT:-/app/data}"
 tenant_root="${TENANT_ROOT:-/app/tenants}"
+# Match ReaderService: its local locks/isolation sit beside the data root.
+cold_root="$(dirname -- "$data_root")/cold-storage"
 owner_id="00000000-0000-4000-8000-000000000001"
 web_uid=10001
 tenant_uid=11001
 tenant_gid=11001
 
-for root in "$data_root" "$tenant_root"; do
+for root in "$data_root" "$tenant_root" "$cold_root"; do
   if [[ -z "$root" || "$root" == "/" || "$root" == "/app" ]]; then
     echo "Refusing unsafe state root: $root" >&2
     exit 1
   fi
 done
 command -v setfacl >/dev/null 2>&1 || { echo "setfacl is required" >&2; exit 1; }
+
+# Do not recursively change existing archive/isolation ownership.
+if [[ -L "$cold_root" || -L "$cold_root/locks" ]]; then
+  echo "Refusing symlinked cold-storage state or locks" >&2
+  exit 1
+fi
+mkdir -p "$cold_root/locks"
+chown "$web_uid:$web_uid" "$cold_root" "$cold_root/locks"
+chmod 0700 "$cold_root" "$cold_root/locks"
 
 mkdir -p "$data_root" "$tenant_root"
 chown -R "$web_uid:$web_uid" "$data_root"

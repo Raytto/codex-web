@@ -12,6 +12,6 @@ export const UPSTREAM_ROUTING_CONTINUATION_PROMPT = [
 
 export function isModelCapacityContinuationPrompt(value: string): boolean {
   // Keep the historical entry point for observer imports and old transcripts.
-  const prompt = stripTaskRecoveryPrompt(value).trim();
+  const prompt = stripTaskRecoveryPrompt(value.replace(/<pp_agent_complete_workflow>[\s\S]*?<\/pp_agent_complete_workflow>/g, "")).trim();
   return prompt === MODEL_CAPACITY_CONTINUATION_PROMPT || prompt === UPSTREAM_ROUTING_CONTINUATION_PROMPT;
 }

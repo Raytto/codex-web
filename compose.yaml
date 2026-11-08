@@ -10,6 +10,7 @@ services:
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: ["no-new-privileges:true"]
     volumes:
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/cold-storage:/app/cold-storage
       - ${CODEX_WEB_STATE_ROOT:-./.state}/data:/app/data
       - ${CODEX_WEB_STATE_ROOT:-./.state}/tenants:/app/tenants
 
@@ -30,7 +31,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 37821
-      BASE_PATH: /codex-web
+      BASE_PATH: ${BASE_PATH:-/codex-web}
       CONTAINERIZED: "true"
       DATA_ROOT: /app/data
       TENANT_ROOT: /app/tenants
@@ -54,6 +55,7 @@ services:
       - "127.0.0.1:${CWW_BIND_PORT:-37821}:37821"
     volumes:
       - ${CODEX_WEB_ENV_FILE:-./.env}:/app/.env:ro
+      - ${CODEX_WEB_STATE_ROOT:-./.state}/cold-storage:/app/cold-storage
       - ${CODEX_WEB_STATE_ROOT:-./.state}/data:/app/data
       - ${CODEX_WEB_STATE_ROOT:-./.state}/tenants:/app/tenants
       - ${CODEX_WEB_SHARED_AUTH_ROOT:-${CODEX_WEB_STATE_ROOT:-./.state}/shared-codex-auth}:/app/shared-codex-auth
@@ -83,7 +85,7 @@ services:
     # Give SIGTERM shutdown enough time to drain in-flight local and remote jobs.
     stop_grace_period: 30m
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:37821/codex-web/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "const b=process.env.BASE_PATH||'';fetch('http://127.0.0.1:37821'+(b.endsWith('/')?b.slice(0,-1):b)+'/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 20s
       timeout: 5s
       retries: 5

@@ -459,7 +459,7 @@ test("job-scoped automation API redacts event secrets and accepts idempotent com
   instance.db.addMessage({ id: messageId, conversation_id: conversationId, role: "user", content: "等待 OCR", created_at: new Date().toISOString() });
   instance.db.createJob(jobId, conversationId, messageId, selection);
   instance.db.updateJob(jobId, "running");
-  const token = createJobAutomationToken(secret, jobId, conversationId);
+  const token = createJobAutomationToken(secret,jobId,conversationId,Date.now(),86400000,instance.db.workflows.assertJob(jobId).epoch);
   assert.equal(verifyJobAutomationToken(secret, token)?.jobId, jobId);
   assert.equal(verifyJobAutomationToken(`${secret}-wrong`, token), null);
   const armed = await request(instance.app)

@@ -1,3 +1,5 @@
+import { loadInstancePaths } from './instance-config.js';
+import { publicInstanceEnvironment } from './instance-environment.js';
 import { ensureAntigravityMcpConfig } from "../remote-worker/src/antigravity-runtime.js";
 import { startAntigravityTurn } from "../remote-worker/src/antigravity-client.js";
 import fs from "node:fs";
@@ -68,15 +70,16 @@ input.on("line", (line) => {
           targetFile: path.join(message.request.codexHome, "auth.json"),
         });
       }
+      const hostPaths = loadInstancePaths(publicInstanceEnvironment(process.env, process.cwd()), process.cwd());
       const shellEnvironment = {
-        HOME: "/root",
+        HOME: hostPaths.hostHome,
         CODEX_HOME: message.request.codexHome,
         TMPDIR: path.join(message.request.runtimeRoot, "tmp"),
         TMP: path.join(message.request.runtimeRoot, "tmp"),
         TEMP: path.join(message.request.runtimeRoot, "tmp"),
         XDG_CACHE_HOME: path.join(message.request.runtimeRoot, "xdg-cache"),
         XDG_CONFIG_HOME: path.join(message.request.runtimeRoot, "xdg-config"),
-        CWW_SHARED_PYTHON: process.env.CODEX_WEB_SPREADSHEET_PYTHON || "python3",
+        CWW_SHARED_PYTHON: process.env.CODEX_WEB_SPREADSHEET_PYTHON ? hostPaths.spreadsheetPython : "python3",
         CWW_WORKSPACE_ROOT: message.request.workspace,
         CWW_UPLOADS_DIR: path.join(message.request.workspace, "uploads"),
         CWW_OUTPUTS_DIR: path.join(message.request.workspace, "outputs"),
@@ -87,6 +90,7 @@ input.on("line", (line) => {
           CODEX_WEB_AUTOMATION_TOKEN: message.request.automation.token,
           CODEX_WEB_AUTOMATION_JOB_ID: message.request.jobId,
           CODEX_WEB_WAIT_CLI: fileURLToPath(new URL("./wait-cli.js", import.meta.url)),
+    PPAGENT_WORKFLOW_CLI: fileURLToPath(new URL("./workflow-job-cli.js", import.meta.url)),
           CODEX_WEB_JUDGMENT_CLI: fileURLToPath(new URL("./judgment-cli.js", import.meta.url)),
           CODEX_WEB_OPPORTUNITY_CLI: fileURLToPath(new URL("./opportunity-cli.js", import.meta.url)),
         } : {}),
@@ -115,7 +119,7 @@ input.on("line", (line) => {
       }, callbacks) : startAppServerTurn({
         executablePath: process.env.CODEX_RUNTIME_PATH || "/usr/bin/codex",
         cwd: message.request.knowledgeRoot,
-        env: { ...process.env, HOME: "/root", CODEX_HOME: message.request.codexHome },
+        env: { ...process.env, HOME: hostPaths.hostHome, CODEX_HOME: message.request.codexHome },
         threadId: message.request.codexThreadId,
         threadInstructions: message.request.threadInstructions,
         prompt: message.request.effectivePrompt,

@@ -5,6 +5,7 @@ export type JobAutomationClaims = {
   conversationId: string;
   expiresAt: number;
   nonce: string;
+  workflowEpoch?: number;
 };
 
 const TOKEN_VERSION = "v1";
@@ -15,12 +16,14 @@ export function createJobAutomationToken(
   conversationId: string,
   now = Date.now(),
   ttlMs = 24 * 60 * 60_000,
+  workflowEpoch?: number,
 ): string {
   const payload = Buffer.from(JSON.stringify({
     jobId,
     conversationId,
     expiresAt: now + ttlMs,
     nonce: crypto.randomBytes(16).toString("base64url"),
+    ...(workflowEpoch === undefined ? {} : { workflowEpoch }),
   } satisfies JobAutomationClaims), "utf8").toString("base64url");
   return `${TOKEN_VERSION}.${payload}.${signature(secret, `${TOKEN_VERSION}.${payload}`)}`;
 }

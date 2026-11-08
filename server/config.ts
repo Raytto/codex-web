@@ -1,3 +1,6 @@
+import { loadInstancePaths, loadPublicInstanceConfig, instanceBasePath, instancePort, instanceBoolean, type PublicInstanceConfig } from './instance-config.js';
+import { publicInstanceEnvironment } from './instance-environment.js';
+import { workflowCapacity } from "./workflow-store.js";
 import path from "node:path";
 import os from "node:os";
 import dotenv from "dotenv";
@@ -18,6 +21,8 @@ export {
 dotenv.config({ path: path.join(process.cwd(), ".env") });
 
 export type AppConfig = {
+  instance: PublicInstanceConfig;
+  hostProjectName: string;
   host: string;
   port: number;
   basePath: string;
@@ -36,6 +41,7 @@ export type AppConfig = {
   codexHome: string;
   codexModel?: string;
   queueAutoStart: boolean;
+  maxActiveWorkflows: number;
   maxGlobalRunningJobs: number;
   maxRunningJobsPerUser: number;
   maxRunningJobsPerExecutor: number;
@@ -81,11 +87,6 @@ export type AppConfig = {
   voiceLexiconTokenBudget: number;
 };
 
-function normalizeBasePath(value: string): string {
-  const normalized = `/${value}`.replace(/\/+/g, "/").replace(/\/$/, "");
-  return normalized === "/" ? "" : normalized;
-}
-
 function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.round(parsed))) : fallback;
@@ -93,25 +94,36 @@ function boundedInteger(value: unknown, fallback: number, minimum: number, maxim
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const projectRoot = overrides.projectRoot ?? process.cwd();
+  const environment = publicInstanceEnvironment(process.env, projectRoot);
+  const pathKeys = { DATA_ROOT: 'dataRoot', TENANT_ROOT: 'tenantRoot', PYTHON_RUNTIME_ROOT: 'pythonRuntimeRoot',
+    PPHK_HOST_SOCKET_PATH: 'hostRootSocketPath', PPHK_HOST_TENANT_ROOT: 'hostTenantRoot',
+    PPHK_KNOWLEDGE_ROOT: 'hostKnowledgeRoot', PPHK_CODEX_HOME: 'hostRootCodexHome' } as const;
+  for (const [key, field] of Object.entries(pathKeys)) if (overrides[field] !== undefined) environment[key] = overrides[field];
+  const roots = loadInstancePaths(environment, projectRoot);
+  const basePath = instanceBasePath(overrides.basePath ?? process.env.BASE_PATH);
+
   return {
+    instance: overrides.instance ?? loadPublicInstanceConfig(process.env, basePath),
+    hostProjectName: overrides.hostProjectName ?? process.env.CODEX_WEB_PROJECT_NAME ?? "host-project",
     host: overrides.host ?? process.env.HOST ?? "127.0.0.1",
-    port: overrides.port ?? Number(process.env.PORT ?? 37821),
-    basePath: overrides.basePath ?? normalizeBasePath(process.env.BASE_PATH ?? ""),
+    port: instancePort(overrides.port ?? process.env.PORT ?? 37821),
+    basePath: basePath,
     username: overrides.username ?? process.env.APP_USERNAME ?? "owner",
     passwordHash: overrides.passwordHash ?? process.env.APP_PASSWORD_HASH ?? "",
     deployStatusFile: overrides.deployStatusFile ?? (process.env.CODEX_WEB_DEPLOY_STATUS_FILE || path.join(projectRoot, "deploy-status", "status.json")),
     sessionSecret: overrides.sessionSecret ?? process.env.SESSION_SECRET ?? "",
     sessionTtlHours: overrides.sessionTtlHours ?? Number(process.env.SESSION_TTL_HOURS ?? 336),
     projectRoot,
-    dataRoot: overrides.dataRoot ?? (process.env.DATA_ROOT || path.join(projectRoot, "data")),
-    tenantRoot: overrides.tenantRoot ?? (process.env.TENANT_ROOT || path.join(projectRoot, "tenants")),
-    pythonRuntimeRoot: overrides.pythonRuntimeRoot ?? (process.env.PYTHON_RUNTIME_ROOT || path.join(projectRoot, "data", "python")),
+    dataRoot: overrides.dataRoot ?? roots.dataRoot,
+    tenantRoot: overrides.tenantRoot ?? roots.tenantRoot,
+    pythonRuntimeRoot: overrides.pythonRuntimeRoot ?? roots.pythonRuntimeRoot,
     pythonVersion: overrides.pythonVersion ?? (process.env.PYTHON_VERSION || "3.12"),
     codexWindowsSandbox: overrides.codexWindowsSandbox ?? (process.env.CODEX_WINDOWS_SANDBOX === "unelevated" ? "unelevated" : "elevated"),
     containerized: overrides.containerized ?? process.env.CONTAINERIZED === "true",
     codexHome: overrides.codexHome ?? (process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
     codexModel: overrides.codexModel ?? (process.env.CODEX_MODEL || undefined),
-    queueAutoStart: overrides.queueAutoStart ?? process.env.QUEUE_AUTO_START !== "false",
+    queueAutoStart: overrides.queueAutoStart ?? instanceBoolean(process.env.QUEUE_AUTO_START, true, "QUEUE_AUTO_START"),
+    maxActiveWorkflows: workflowCapacity(overrides.maxActiveWorkflows ?? process.env.MAX_ACTIVE_WORKFLOWS),
     maxGlobalRunningJobs: boundedInteger(overrides.maxGlobalRunningJobs ?? process.env.MAX_GLOBAL_RUNNING_JOBS, 8, 1, 64),
     maxRunningJobsPerUser: boundedInteger(overrides.maxRunningJobsPerUser ?? process.env.MAX_RUNNING_JOBS_PER_USER, 3, 1, 32),
     maxRunningJobsPerExecutor: boundedInteger(overrides.maxRunningJobsPerExecutor ?? process.env.MAX_RUNNING_JOBS_PER_EXECUTOR, 4, 1, 32),
@@ -124,11 +136,11 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     minimumFreeDiskBytes: boundedInteger(overrides.minimumFreeDiskBytes ?? process.env.MINIMUM_FREE_DISK_BYTES, 2 * 1024 * 1024 * 1024, 1, Number.MAX_SAFE_INTEGER),
     resumableUploadChunkBytes: boundedInteger(overrides.resumableUploadChunkBytes ?? process.env.RESUMABLE_UPLOAD_CHUNK_BYTES, 8 * 1024 * 1024, 1 * 1024 * 1024, 32 * 1024 * 1024),
     resumableUploadExpiryHours: boundedInteger(overrides.resumableUploadExpiryHours ?? process.env.RESUMABLE_UPLOAD_EXPIRY_HOURS, 72, 1, 24 * 30),
-    tenantWorkerIsolation: overrides.tenantWorkerIsolation ?? process.env.TENANT_WORKER_ISOLATION === "true",
-    hostRootSocketPath: overrides.hostRootSocketPath ?? (process.env.CODEX_WEB_HOST_SOCKET_PATH || ""),
-    hostTenantRoot: overrides.hostTenantRoot ?? (process.env.CODEX_WEB_HOST_TENANT_ROOT || path.join(projectRoot, "host", "tenants")),
-    hostKnowledgeRoot: overrides.hostKnowledgeRoot ?? (process.env.CODEX_WEB_KNOWLEDGE_ROOT || path.join(projectRoot, "host", "knowledge")),
-    hostRootCodexHome: overrides.hostRootCodexHome ?? (process.env.CODEX_WEB_CODEX_HOME || path.join(projectRoot, "host", "codex-home")),
+    tenantWorkerIsolation: overrides.tenantWorkerIsolation ?? instanceBoolean(process.env.TENANT_WORKER_ISOLATION, false, "TENANT_WORKER_ISOLATION"),
+    hostRootSocketPath: overrides.hostRootSocketPath ?? roots.hostRootSocketPath,
+    hostTenantRoot: overrides.hostTenantRoot ?? roots.hostTenantRoot,
+    hostKnowledgeRoot: overrides.hostKnowledgeRoot ?? roots.hostKnowledgeRoot,
+    hostRootCodexHome: overrides.hostRootCodexHome ?? roots.hostRootCodexHome,
     remoteWorkerEnrollmentToken: overrides.remoteWorkerEnrollmentToken ?? (process.env.REMOTE_WORKER_ENROLLMENT_TOKEN || ""),
     remoteWorkerReleaseRoot: overrides.remoteWorkerReleaseRoot ?? (process.env.REMOTE_WORKER_RELEASE_ROOT || path.join(projectRoot, "worker-release")),
     publicBaseUrl: overrides.publicBaseUrl ?? (process.env.PUBLIC_BASE_URL || ""),

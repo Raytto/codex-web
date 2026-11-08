@@ -1,3 +1,4 @@
+import { instance } from "./instance";
 import { CodexAutoResetHistory } from "./codex-auto-reset-history";
 import { CodexResetCreditDetails } from "./codex-reset-credits";
 import { GeminiAccountList, GeminiLoginFlow, useGeminiAccounts } from "./gemini-account-panel";
@@ -205,7 +206,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     setNotice("");
     try {
       setState(await api.deleteCodexAccount(executorId, account.id));
-      setNotice(`${account.label} 已从 Codex Web 移除。`);
+      setNotice(`${account.label} 已从 ${instance.productName} 移除。`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "账号删除失败");
     } finally {
@@ -256,7 +257,7 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
         </label>
         {selectedExecutor && <div className="codex-account-machine">
           <span>{remote ? <Monitor size={20} /> : <Server size={20} />}</span>
-          <div><strong>{selectedExecutor.machineName}</strong><small>{remote ? `Windows Remote Worker · ${selectedExecutor.status === "online" ? "在线" : "离线"}` : "Codex Web 服务器 · 在线"}</small></div>
+          <div><strong>{selectedExecutor.machineName}</strong><small>{remote ? `Windows Remote Worker · ${selectedExecutor.status === "online" ? "在线" : "离线"}` : `${instance.productName} 服务器 · 在线`}</small></div>
           <em>{selectedExecutor.codexAccountManagementCapable ? "账号保存在本机" : "需要升级 Worker"}</em>
         </div>}
         <div className="codex-account-summary">

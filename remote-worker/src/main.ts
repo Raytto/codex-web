@@ -106,7 +106,7 @@ function connect(): void {
     type: "hello", protocolVersion: PROTOCOL_VERSION, workerId: config.workerId, machineName: config.machineName,
     enrollmentToken: config.enrollmentToken, platform: `${process.platform}-${process.arch}`,
     workerVersion: WORKER_VERSION, workerRelease: workerRelease().ref, workerCommit: workerRelease().commit,
-    capabilities: { nodeTransfers: true, deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, geminiTitleAgent: true, codexAccounts: true, geminiAccounts: true, geminiUsage: true, threadLifecycle: true, threadRolloutSize: true },
+    capabilities: { completeWorkflows: true, nodeTransfers: true, deviceCredentials: true, workerUpdate: Boolean(config.workerUpdateTaskName), waitAutomation: true, capacityConfig: true, dynamicWaitTool: true, agentTurnContext: true, accountSkills: true, titleAgent: true, geminiTitleAgent: true, codexAccounts: true, geminiAccounts: true, geminiUsage: true, threadLifecycle: true, threadRolloutSize: true },
     codexVersion: runtimeManager.snapshot().installedVersion, capacity: config.capacity,
   }));
   socket.on("message", (data, isBinary) => {
@@ -389,6 +389,7 @@ async function startRun(request: RunRequest): Promise<void> {
   const isGemini = engineForModel(request.selection.model) === "antigravity";
   const previousAttempt = readRunAttempt(stateRoot, request.jobId);
   const run: ActiveRun = { request, controller, changedFiles: new Set(previousAttempt?.changedFiles) };
+  let completedEvent: Extract<WorkerEvent, { type: "completed" }> | undefined;
   let deferredFailure: Extract<WorkerEvent, { type: "failed" }> | undefined;
   activeRuns.set(request.jobId, run);
   send({ type: "heartbeat", activeJobs: [...activeRuns.keys()], retainedJobs: retainedRunIds(stateRoot) });
@@ -469,7 +470,7 @@ async function startRun(request: RunRequest): Promise<void> {
       )
       : { uploaded: 0, omitted: [] };
     const omittedArtifacts = [...changed.omitted, ...generated.omitted].slice(0, 100);
-    sendEvent(request.jobId, { type: "completed", finalResponse, omittedArtifacts });
+    completedEvent = { type: "completed", finalResponse, omittedArtifacts };
   } catch (error) {
     const cancelled = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
     deferredFailure = { type: "failed", message: cancelled ? "任务已停止" : error instanceof Error ? error.message : "远程任务失败", cancelled };
@@ -481,6 +482,7 @@ async function startRun(request: RunRequest): Promise<void> {
     // Report failure only after the same Job ID can be accepted again. The
     // server may intentionally redispatch capacity failures after a delay.
     if (deferredFailure) sendEvent(request.jobId, deferredFailure);
+    else if (completedEvent) sendEvent(request.jobId, completedEvent);
   }
 }
 

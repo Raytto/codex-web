@@ -1,7 +1,8 @@
+import { instance, BrandIcon } from "./instance";
 import { reasoningForModel } from "./agent-model-options";
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { ArrowLeft, Bot, Clock, Highlighter, LoaderCircle, Minus, StickyNote, X, Zap } from "lucide-react";
+import { ArrowLeft, Bot, Clock, Highlighter, LoaderCircle, Minus, StickyNote, X } from "lucide-react";
 import { api, BASE_PATH, type AgentOptions, type AgentSelection, type ConversationActivity, type ConversationDetail, type ConversationMessagesPage, type Job } from "./api";
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds, type SelectionRect } from "./ask-agent-selection";
 import { ConversationMessageList } from "./conversation/ConversationMessageList";
@@ -805,12 +806,12 @@ export function ReaderAskBubble({ conversationId, conversationTitle, quoteExcerp
     <div className="reader-ask-resize-handle reader-ask-resize-handle-bottom-right" data-direction="bottom-right" role="separator" aria-label="从右下角调整窗口大小" onPointerDown={beginPanelResize} onPointerMove={movePanelResize} onPointerUp={endPanelResize} onPointerCancel={endPanelResize} />
     <header className="reader-ask-header" onPointerDown={beginPanelDrag} onPointerMove={movePanelDrag} onPointerUp={endPanelDrag} onPointerCancel={endPanelDrag}><div className="reader-ask-heading"><Bot size={17} /><div><strong>在当前会话中咨询</strong><small>{conversationTitle}</small></div></div><button type="button" onClick={requestClose} aria-label="返回阅读" title="收起到机器人入口"><ArrowLeft className="reader-ask-mobile-back" size={18} /><Minus className="reader-ask-desktop-close" size={18} /></button></header>
     <div ref={historyRef} className="reader-ask-history" onScroll={(event) => { if (event.currentTarget.scrollTop < 42) void loadOlder(); }}>
-      <ConversationMessageList messages={visibleMessages} variant="reader" loading={loading} loadingLabel="正在加载会话上下文…" emptyLabel={<div className="reader-ask-empty">这是当前会话的第一次咨询。<br />你可以直接问这段内容。</div>} userAvatar={userInitials} assistantAvatar={<Zap size={15} />} messageProps={(message) => {
+      <ConversationMessageList messages={visibleMessages} variant="reader" loading={loading} loadingLabel="正在加载会话上下文…" emptyLabel={<div className="reader-ask-empty">这是当前会话的第一次咨询。<br />你可以直接问这段内容。</div>} userAvatar={userInitials} assistantAvatar={<BrandIcon size={15} />} messageProps={(message) => {
         const scheduled = message.role === "user" && Boolean(message.is_scheduled);
         return {
-          avatar: scheduled ? <Clock size={15} /> : message.role === "assistant" ? <Zap size={15} /> : userInitials,
+          avatar: scheduled ? <Clock size={15} /> : message.role === "assistant" ? <BrandIcon size={15} /> : userInitials,
           avatarClassName: scheduled ? "scheduled" : undefined,
-          name: scheduled ? "定时任务" : message.role === "assistant" ? "Codex Web" : "你",
+          name: scheduled ? "定时任务" : message.role === "assistant" ? instance.productName : "你",
           timeLabel: formatConversationMessageDateTime(message.created_at),
           timeTitle: formatConversationFullDateTime(message.created_at),
         };

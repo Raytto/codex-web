@@ -1,6 +1,7 @@
+import { instance } from "./instance";
 import type { RecurringInput, RecurringTask, RecurringRun, Recurrence, RecurrencePreview } from "./recurring-types";
 import type { FeatureSelection } from "./feature-selection";
-export const BASE_PATH = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
+export const BASE_PATH = instance.basePath;
 
 export type MaintenancePhase = "idle" | "preparing" | "active";
 export type DeploymentPhase = "idle" | "queued" | "building" | "candidate_ready" | "waiting_for_jobs" | "promoting" | "health_check" | "deployed" | "superseded" | "conflict" | "deferred" | "failed";
@@ -410,6 +411,8 @@ export type ConversationDetail = {
   pendingPrompts: PendingPrompt[];
   editingPrompt: PendingPrompt | null;
   composerDraft: ComposerDraft | null;
+  workflow?: {id:string; state:string; phase:string; reason:string; seq:number; title:string} | null;
+  workflowCapacity?: number;
   wakePlan: WakePlan | null;
   wakeEvents: WakeEvent[];
   activeJob: Job | null;

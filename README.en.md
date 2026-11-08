@@ -197,3 +197,9 @@ This page follows the implementation on public `main`. Historical updates and mi
 ## License
 
 [MIT](LICENSE)
+
+## Complete tasks and instance configuration
+
+Complete tasks retain ownership across Jobs, durable waits and repairs. `MAX_ACTIVE_WORKFLOWS=-1` defaults to unlimited complete tasks; an explicit positive integer imposes a cap. Single-conversation serialization and Job, executor, memory and disk guards remain active. See [complete task ownership](docs/COMPLETE_WORKFLOWS.md).
+
+Brand, icon, theme and base path now use shared runtime configuration instead of scattered frontend strings. The browser receives only a public allowlist. Recreate the app after changing runtime settings; no asset rebuild is needed for branding. See [configuration ownership and precedence](docs/INSTANCE_CONFIGURATION.md).

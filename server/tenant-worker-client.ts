@@ -1,3 +1,4 @@
+import { ExecutionUncertainError } from "./execution-ownership.js";
 import crypto from "node:crypto";
 import type { SupervisorToWebMessage, TenantWorkerEvent, TenantWorkerRunRequest, WebToSupervisorMessage } from "./tenant-worker-protocol.js";
 import type { JobRuntimeCleanupTarget } from "./python-runtime.js";
@@ -34,7 +35,7 @@ export class TenantWorkerClient {
   constructor() {
     process.on("message", (message: SupervisorToWebMessage) => this.handleMessage(message));
     process.on("disconnect", () => {
-      for (const job of this.jobs.values()) job.reject(new Error("Tenant worker supervisor disconnected"));
+      for (const job of this.jobs.values()) job.reject(new ExecutionUncertainError("Tenant worker supervisor disconnected"));
       this.jobs.clear();
       for (const steer of this.steers.values()) { clearTimeout(steer.timer); steer.reject(new Error("Tenant worker supervisor disconnected")); }
       this.steers.clear();

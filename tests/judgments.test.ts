@@ -131,7 +131,7 @@ test('real routes enforce authentication, CSRF, tenant and project ownership, jo
   const created=await agent.post('/api/judgments').set('X-CSRF-Token',csrf).send(input).expect(201),j=created.body as JudgmentDetail;
   await agent.post(`/api/recurring-tasks/${j.checks[0].taskId}/state`).set('X-CSRF-Token',csrf).send({revision:1,state:'paused'}).expect(409);
   const p2=app.db.createProject(id(),user,'Different project',path.join(root,'other'),'tenant-local'),c=app.db.createConversation(id(),'Agent fixture',selection,user,p2.id),job=app.db.createJob(id(),c.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(job.id);
-  const token=createJobAutomationToken(secret,job.id,c.id),endpoint=`/api/automation/jobs/${job.id}/judgments`,call=(body:unknown)=>request(app.app).post(endpoint).set('Authorization','Bearer '+token).send(body);
+  const token=createJobAutomationToken(secret,job.id,c.id,Date.now(),86400000,app.db.workflows.assertJob(job.id).epoch),endpoint=`/api/automation/jobs/${job.id}/judgments`,call=(body:unknown)=>request(app.app).post(endpoint).set('Authorization','Bearer '+token).send(body);
   await call({action:'context'}).expect(200);await call({action:'detail',id:j.judgment.id}).expect(200);await call({action:'revise',id:j.judgment.id,data:{revision:1,requestKey:id(),probability:.8,reason:'Wrong project'}}).expect(403);
   await call({action:'create',data:{...input,requestKey:id()}}).expect(403);
   const foreign=id(),now=stamp();app.db.createUser({id:foreign,username:'other',password_hash:'',display_name:'Other',role:'member',status:'active',created_at:now,updated_at:now});const fp=app.db.createProject(id(),foreign,'Private',path.join(root,'foreign'),'tenant-local');

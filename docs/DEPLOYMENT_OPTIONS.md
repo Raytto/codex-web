@@ -122,7 +122,7 @@ automatically deleted.
 ## 4. Host/root bridge (high-risk, explicit consent)
 
 This is not a convenience switch. The bridge is a separate host-side Node.js
-process that must run as **root**. It can launch Codex with `HOME=/root`, browse
+process that must run as **root**. It can launch Codex with an explicitly configured `CODEX_WEB_HOST_HOME`, browse
 the configured knowledge/project roots, and perform host-side maintenance. Do
 not enable it unless the operator understands that a prompt executed through
 the host executor has host-root authority and has explicitly approved the
@@ -147,6 +147,7 @@ carefully ACLed directories for:
 - `CODEX_WEB_HOST_TENANT_ROOT` (host tenant state),
 - `CODEX_WEB_KNOWLEDGE_ROOT` (host project root),
 - `CODEX_WEB_CODEX_HOME` (host Codex Home and login state), and
+- `CODEX_WEB_HOST_HOME` (explicit host process HOME), and
 - the Unix socket directory shared with the app container.
 
 The app sees the socket at `/run/codex-web-host/host.sock` (the Compose mount
@@ -202,7 +203,7 @@ both processes when the paths differ across the container boundary.
    ```
 
    The root-only environment file must contain the host-side socket path, the
-   three absolute host roots, `CWW_DATABASE_PATH` pointing to the Compose data
+   absolute host roots and `CODEX_WEB_HOST_HOME`, `CWW_DATABASE_PATH` pointing to the Compose data
    volume's SQLite file, `CODEX_RUNTIME_PATH`, `CODEX_WEB_WEB_GID=10001`, and
    the reviewed shared-auth source/lock/policy paths. Protect the file with
    `chmod 600`; do not put its values in Git. Start it only after

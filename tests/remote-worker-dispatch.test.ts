@@ -4,7 +4,7 @@ import { CodexRunner, isAlreadyAbsentRemoteThread, remoteArtifactDeliveryName } 
 import { HOST_ROOT_USER_ID } from "../server/host-root-user.js";
 import { remoteThreadSyncTimeoutMs } from "../server/remote-worker-gateway.js";
 
-function dispatchResult(capacity: number, runningJobs: number): boolean {
+function dispatchResult(capacity: number, runningJobs: number, completeWorkflows = true): boolean {
   const executorId = "remote:00000000-0000-4000-8000-000000000099";
   const runner = Object.create(CodexRunner.prototype) as CodexRunner;
   Reflect.set(runner, "db", {
@@ -15,6 +15,7 @@ function dispatchResult(capacity: number, runningJobs: number): boolean {
   Reflect.set(runner, "remoteWorkers", {
     executor: () => ({ status: "online", capacity }),
     canRun: () => true,
+    supportsCompleteWorkflows: () => completeWorkflows,
   });
   return runner.canDispatchConversation("conversation");
 }
@@ -24,6 +25,7 @@ test("remote dispatch treats capacity zero as unlimited in the database race gua
   assert.equal(dispatchResult(0, 8), true);
   assert.equal(dispatchResult(2, 1), true);
   assert.equal(dispatchResult(2, 2), false);
+  assert.equal(dispatchResult(0, 0, false), false, "old Worker remains queued until workflow capability is available");
 });
 
 test("remote thread sync gives every page a bounded five-minute budget", () => {

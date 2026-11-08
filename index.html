@@ -2,6 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <!--instance-config-->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#fafbff" />
     <meta name="robots" content="noindex,nofollow,noarchive" />
@@ -11,7 +12,15 @@
     <title>Codex Web</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main class="boot startup-status" aria-labelledby="startup-title">
+        <img src="%BASE_URL%favicon.png" width="48" height="48" alt="" />
+        <h1 id="startup-title">Codex Web</h1>
+        <p role="status">正在加载页面…</p>
+        <a href="">长时间没有响应？重新加载</a>
+        <noscript>请启用 JavaScript 后重新加载页面。</noscript>
+      </main>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

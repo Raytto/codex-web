@@ -99,7 +99,7 @@ test('real routes enforce CSRF, ownership, server executor, live job credential 
  await friend.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',fl.body.csrfToken).send({name:'New',revision:1}).expect(404);
  await a.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',csrf).send({name:'New',revision:1}).expect(200);
  await a.patch('/api/opportunities/topics/'+tid+'/name').set('X-CSRF-Token',csrf).send({name:'Stale',revision:1}).expect(409);
- const c=app.db.createConversation(id(),'Agent',selection,u,p.id),j=app.db.createJob(id(),c.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(j.id);const token=createJobAutomationToken(secret,j.id,c.id);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(200);
+ const c=app.db.createConversation(id(),'Agent',selection,u,p.id),j=app.db.createJob(id(),c.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(j.id);const token=createJobAutomationToken(secret,j.id,c.id,Date.now(),86400000,app.db.workflows.assertJob(j.id).epoch);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(200);
  const store=new OpportunityStore(app.db),batch=store.begin(u,tid,c.id,j.id),idea=store.ingest(u,batch.id,c.id,[{key:'route',content:content(9)}])[0].idea;
  const corrected=await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'evidence',topicId:tid,data:{ideaId:idea.id,requestKey:id(),revision:idea.revision,reason:'实际受控接口更正',patch:{facts:'有来源支持的更正事实'}}}).expect(200);assert.equal(corrected.body.idea.content.facts,'有来源支持的更正事实');
  const imageDir=path.join(root,'tenants',u,'conversations',c.id,'outputs');fs.mkdirSync(imageDir,{recursive:true});
@@ -532,7 +532,7 @@ test('cross-project research API permits only linked reads/results, never discov
  assert.equal(result.body.projectId,target.id);
  assert.equal(app.db.sqlite.prepare('SELECT count(*) n FROM jobs WHERE conversation_id=?').get(cid)?.n,0);
  const job=app.db.createJob(id(),cid,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(job.id);
- const token=createJobAutomationToken(secret,job.id,cid);
+ const token=createJobAutomationToken(secret,job.id,cid,Date.now(),86400000,app.db.workflows.assertJob(job.id).epoch);
  const call=(action:string,data:Record<string,unknown>={})=>request(app.app).post(`/api/automation/jobs/${job.id}/opportunities`).set('Authorization','Bearer '+token).send({action,topicId:topic.id,data});
  await call('topics').expect(200);
  const context=await call('context').expect(200);assert.equal(context.body.linkedIdeaId,ideas[0].id);assert.equal(context.body.sourceProject.id,p.id);
@@ -542,6 +542,6 @@ test('cross-project research API permits only linked reads/results, never discov
  await call('research_result',{ideaId:ideas[1].id,status:'validated',result:'wrong card'}).expect(403);
  for(const action of ['begin','ingest','review','publish','feedback','feedback_inbox','learn_feedback','evidence','images','return_to_reserve','backlog_limit','preferences','recent','history','inventory','fail'])await call(action,{ideaId:ideas[0].id}).expect(403);
  const unrelated=app.db.createConversation(id(),'Unlinked',selection,u,target.id),unlinked=app.db.createJob(id(),unrelated.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(unlinked.id);
- await request(app.app).post(`/api/automation/jobs/${unlinked.id}/opportunities`).set('Authorization','Bearer '+createJobAutomationToken(secret,unlinked.id,unrelated.id)).send({action:'context',topicId:topic.id}).expect(403);
+ await request(app.app).post(`/api/automation/jobs/${unlinked.id}/opportunities`).set('Authorization','Bearer '+createJobAutomationToken(secret,unlinked.id,unrelated.id,Date.now(),86400000,app.db.workflows.assertJob(unlinked.id).epoch)).send({action:'context',topicId:topic.id}).expect(403);
  app.db.sqlite.prepare("UPDATE jobs SET status='completed' WHERE id=?").run(job.id);await call('context').expect(401);
 });

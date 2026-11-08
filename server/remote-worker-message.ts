@@ -133,6 +133,7 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
     workerRelease: text(100, 1).nullable().optional(),
     workerCommit: text(64, 1).nullable().optional(),
     capabilities: z.object({
+      completeWorkflows: z.boolean().optional(),
       workerUpdate: z.boolean().optional(),
       nodeTransfers: z.boolean().optional(),
       deviceCredentials: z.boolean().optional(),

@@ -1,3 +1,4 @@
+import { instance, BrandIcon } from "./instance";
 import { canRunPendingPromptImmediately, hasMultipleEngines, modelMenuOptions, modelReasoningOptions, pendingPromptActionMode, reasoningForModel } from "./agent-model-options";
 import { AntigravityUsagePanel } from "./antigravity-usage-panel";
 import { TransientNotice, useNoticeState } from "./transient-notice";
@@ -23,7 +24,7 @@ import remarkGfm from "remark-gfm";
 import {
   Archive, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleAlert, CircleDashed, Clock, Download, Eye, File as FileIcon, FileImage, FileText, Folder, FolderArchive, FolderOpen, Gauge, HardDrive,
   Copy, CornerUpLeft, GripVertical, KeyRound, LayoutDashboard, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, MonitorUp, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RefreshCw, RotateCcw, Search, Settings2, Share2, Square, SquarePen, Sun,
-  Trash2, X, Zap,
+  Trash2, X,
 } from "lucide-react";
 import { api, BASE_PATH, fileThumbnailUrl, fileUrl, isApiErrorStatus, resumableUploadEndpoint, resumableUploadHeaders, setCsrf, type AgentOptions, type ComposerDraft, type Conversation, type ConversationActivity, type ConversationDetail, type ConversationPage, type DeploymentPhase, type DeploymentStatus, type Executor, type FileShareState, type Job, type JobEvent, type MaintenancePhase, type PendingPrompt, type Project, type ProjectDirectoryPage, type ReaderAnnotation, type ReasoningEffort, type RemoteWorkerBootstrap, type Session, type SystemStatus, type WakePlan, type WorkFile } from "./api";
 import { filePreviewIdFromPath, filePreviewUrl, fileReaderKind, isBrowserPreviewable, isLocalMarkdownUrl, publicFilePreviewIdFromPath, remoteMessageFileReferences, resolveMessageFileLink } from "./file-links";
@@ -282,9 +283,9 @@ export default function App() {
   }, [publicPreviewFileId]);
 
   if (publicPreviewFileId) return <PublicFilePreviewPage key={publicPreviewFileId} fileId={publicPreviewFileId} resolvedTheme={resolvedTheme} themePreference={guestReaderThemePreference} onThemePreferenceChange={setGuestReaderThemePreference} />;
-  if (loading) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
+  if (loading) return <div className="boot"><div className="brand-mark"><BrandIcon size={20} /></div><LoaderCircle className="spin" /><span>正在恢复登录状态…</span></div>;
   if (!session?.authenticated) return <Login onLogin={(value) => { setCsrf(value.csrfToken); setSession(value); }} />;
-  if (!session.accountId) return <div className="boot"><div className="brand-mark"><Zap size={20} /></div><span>账号信息不完整，请刷新后重新登录。</span></div>;
+  if (!session.accountId) return <div className="boot"><div className="brand-mark"><BrandIcon size={20} /></div><span>账号信息不完整，请刷新后重新登录。</span></div>;
   if (previewFileId) return <FeatureSelectionProvider key={session.accountId} initial={session.features}><FilePreviewPage key={previewFileId} fileId={previewFileId} userInitials={resolveAccountIdentity(session).initials} onSessionExpired={expireSession} resolvedTheme={resolvedTheme} themePreference={themePreference} onThemePreferenceChange={setThemePreference} /></FeatureSelectionProvider>;
   return <FeatureSelectionProvider key={session.accountId} initial={session.features}><Workspace key={session.accountId} session={session} onLogout={() => { setCsrf(); setSession({ authenticated: false }); }} themePreference={themePreference} onThemePreferenceChange={setThemePreference} /></FeatureSelectionProvider>;
 }
@@ -304,15 +305,15 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 
   return <main className="login-page">
     <section className="login-card">
-      <div className="brand-mark large"><Zap size={25} /></div>
-      <div className="login-heading"><h1>Codex Web</h1><p>登录你的私人 Agent 工作站</p></div>
+      <div className="brand-mark large"><BrandIcon size={25} /></div>
+      <div className="login-heading"><h1>{instance.productName}</h1><p>{instance.loginHint}</p></div>
       <form onSubmit={submit}>
         <label>用户名<input autoComplete="username" autoFocus value={username} onChange={(e) => setUsername(e.target.value)} /></label>
         <label>密码<input autoComplete="current-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
         {error && <div className="form-error">{error}</div>}
         <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" size={18} /> : "登录"}</button>
       </form>
-      <p className="privacy-note">任务与文件仅在你的本机处理</p>
+      <p className="privacy-note">{instance.privacyNote}</p>
     </section>
   </main>;
 }
@@ -3891,9 +3892,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const selectedProject = selectedConversation?.project_id
     ? projects.find((project) => project.id === selectedConversation.project_id)
     : undefined;
-  const workspaceTitle = selectedConversation?.title || "Codex Web";
+  const workspaceTitle = selectedConversation?.title || instance.productName;
   usePageTitle(judgmentVisible ? "判断簿" : opportunityVisible ? "机会卡片" : recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
-  const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || "PERSONAL AI WORKSTATION";
+  const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || instance.tagline;
   const projectMenuProject = projectMenu ? projects.find((project) => project.id === projectMenu.projectId) : undefined;
   const taskMenuConversation = taskMenu
     ? [...conversations, ...projectConversations, ...(currentDetail ? [currentDetail.conversation] : [])]
@@ -3988,7 +3989,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
       <div className="sidebar-top">
-        <div className="wordmark"><span className="brand-mark small"><Zap size={15} /></span><span className="brand-copy"><strong>Codex Web</strong><small>PERSONAL AI WORKSTATION</small></span></div>
+        <div className="wordmark"><span className="brand-mark small"><BrandIcon size={15} /></span><span className="brand-copy"><strong>{instance.productName}</strong><small>{instance.tagline}</small></span></div>
         <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="关闭"><X size={19} /></button>
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
@@ -4210,7 +4211,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace onJudgment={features.judgmentBook ? id=>openJudgments(id):undefined} onOpportunity={features.opportunityCards ? id => openOpportunities(id) : undefined} loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
     <main style={judgmentVisible || opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="workspace-header">
-        <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
+        <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <BrandIcon size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
           {currentDetail && !showingGeminiMetrics && shouldWarnAboutRollout(currentDetail.rolloutBytes) && <details className="rollout-warning" key={currentDetail.conversation.id} ref={rolloutWarningRef}>
             <summary className="icon-button" aria-label={`rollout 容量提醒：${formatRolloutBytes(currentDetail.rolloutBytes!)}`} title="rollout 容量提醒"><HardDrive size={17} /><span /></summary>
@@ -4837,7 +4838,7 @@ function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
 
   if (workerBootstrap) return <div className="project-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="project-dialog worker-onboarding-dialog" role="dialog" aria-modal="true" aria-labelledby="worker-onboarding-title">
-      <header><div><h2 id="worker-onboarding-title">新建远程 Worker</h2><p>下载对应系统的安装器，把这台电脑接入 Codex Web。</p></div><button type="button" onClick={onClose} aria-label="关闭 Worker 安装向导"><X size={18} /></button></header>
+      <header><div><h2 id="worker-onboarding-title">新建远程 Worker</h2><p>下载对应系统的安装器，把这台电脑接入 {instance.productName}。</p></div><button type="button" onClick={onClose} aria-label="关闭 Worker 安装向导"><X size={18} /></button></header>
       <div className="project-dialog-body worker-onboarding-body">
         <div className="worker-onboarding-intro"><Monitor size={22} /><div><strong>安装后会自动完成连接配置</strong><span>安装器会准备 Node.js、安装或更新 Codex，并设置登录后自动启动。运行时只需输入这台电脑的显示名称。</span></div></div>
         <div className="worker-download-list">
@@ -4847,7 +4848,7 @@ function ProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
         </div>
         <ol className="worker-onboarding-steps"><li>下载与你电脑匹配的安装器</li><li>运行安装器并输入机器名称</li><li>等待 Codex 和 Worker 配置完成，回到这里刷新节点</li></ol>
         {workerBootstrap.version && <small className="worker-onboarding-version">Worker 目标版本 {workerBootstrap.version}</small>}
-        <div className="worker-onboarding-note">安装链接约 30 分钟有效，只能使用一次；不要转发给其他人。Worker 只发起到 Codex Web 的出站连接，不开放本机端口。</div>
+        <div className="worker-onboarding-note">安装链接约 30 分钟有效，只能使用一次；不要转发给其他人。Worker 只发起到 {instance.productName} 的出站连接，不开放本机端口。</div>
       </div>
       <footer><button type="button" onClick={() => setWorkerBootstrap(null)}>返回机器选择</button><div><button type="button" onClick={onClose}>关闭</button></div></footer>
     </section>
@@ -4919,7 +4920,7 @@ function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
     [<FileImage key="c" />, "分析图片", "识别截图并给出处理结果"],
     [<Bot key="d" />, "执行临时任务", "在独立工作区完成复杂操作"],
   ];
-  return <section className="welcome"><div className="welcome-logo"><Zap size={27} /></div><h1>今天想完成什么？</h1><p>文字、图片和文件都会交给本机 Agent 处理</p><div className="suggestions">
+  return <section className="welcome"><div className="welcome-logo"><BrandIcon size={27} /></div><h1>今天想完成什么？</h1><p>文字、图片和文件都会交给本机 Agent 处理</p><div className="suggestions">
     {suggestions.map(([icon, title, description]) => <button key={String(title)} onClick={() => onSuggestion(`${title}：`)}>{icon}<strong>{title}</strong><span>{description}</span></button>)}
   </div></section>;
 }
@@ -5043,6 +5044,8 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
       || message.content.includes(latestJobError)
       || latestJobError.includes(message.content);
   }));
+  const workflow = detail.workflow && (detail.workflowCapacity ?? -1) > 0 && !["completed", "aborted"].includes(detail.workflow.state)
+    ? detail.workflow : undefined;
   const chatRef = useRef<HTMLElement>(null);
   const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
 
@@ -5119,8 +5122,8 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
         return {
           className: errorNotice ? "error" : undefined,
           avatarClassName: scheduledMessage ? "scheduled" : undefined,
-          avatar: errorNotice ? <CircleAlert size={16} /> : scheduledMessage ? <Clock size={15} /> : message.role === "assistant" ? <Zap size={15} /> : userInitials,
-          name: errorNotice ? "任务错误" : scheduledMessage ? "定时任务" : message.role === "assistant" ? "Codex Web" : "你",
+          avatar: errorNotice ? <CircleAlert size={16} /> : scheduledMessage ? <Clock size={15} /> : message.role === "assistant" ? <BrandIcon size={15} /> : userInitials,
+          name: errorNotice ? "任务错误" : scheduledMessage ? "定时任务" : message.role === "assistant" ? instance.productName : "你",
           timeLabel: formatMessageDateTime(message.created_at),
           timeTitle: formatFullDateTime(message.created_at),
           hideQuote: errorNotice,
@@ -5138,7 +5141,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
           <div className="message-avatar"><CircleAlert size={16} /></div>
           <div className="message-body"><div className="message-meta"><span className="message-name">任务错误</span>{detail.latestJob?.updated_at && <time dateTime={detail.latestJob.updated_at} title={formatFullDateTime(detail.latestJob.updated_at)}>{formatMessageDateTime(detail.latestJob.updated_at)}</time>}</div><ErrorBubble content={latestJobError} /></div>
         </article>}
-        {sending && <article className="message assistant running"><div className="message-avatar"><Zap size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">Codex Web</span><span className="live-label">实时进度</span></div><ProcessPanel key={`${detail.conversation.id}:${detail.remoteTurnId ?? "job"}`} activities={activities} loading={activitiesLoading} runningModel={detail.activeJob?.agent_model} /></div></article>}
+        {(sending || workflow) && <article className="message assistant running"><div className="message-avatar"><BrandIcon size={15} /></div><div className="message-body"><div className="message-meta"><span className="message-name">{instance.productName}</span><span className="live-label">{sending ? "实时进度" : "任务状态"}</span></div><ProcessPanel key={`${detail.conversation.id}:${detail.remoteTurnId ?? "job"}`} activities={activities} loading={activitiesLoading} runningModel={detail.activeJob?.agent_model} workflow={workflow} activeAttempt={sending} /></div></article>}
         {detail.wakePlan && <WakePlanCard plan={detail.wakePlan} onCancel={onCancelWake} onPostpone={onPostponeWake} onTrigger={onTriggerWake} onEdit={onEditWake} />}
         <div />
       </>}
@@ -5177,8 +5180,8 @@ function WakePlanCard({ plan, onCancel, onPostpone, onTrigger, onEdit }: { plan:
   </article>;
 }
 
-function ProcessPanel({ activities, loading, runningModel }: { activities: JobEvent[]; loading: boolean; runningModel?: string }) {
-  if (loading) return <div className="activity-card activity-loading" role="status" aria-live="polite" aria-busy="true">
+function ProcessPanel({ activities, loading, runningModel, workflow, activeAttempt }: { activities: JobEvent[]; loading: boolean; runningModel?: string; workflow?: ConversationDetail["workflow"]; activeAttempt: boolean }) {
+  if (loading && activeAttempt && !workflow) return <div className="activity-card activity-loading" role="status" aria-live="polite" aria-busy="true">
     <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>正在加载运行记录</strong><span>正在恢复完整上下文，加载完成后显示实时进度</span></div>
   </div>;
   const { latestStatus, queueStatus, queued, retrying, starting } = resolveProcessStatus(activities);
@@ -5186,14 +5189,19 @@ function ProcessPanel({ activities, loading, runningModel }: { activities: JobEv
   const journal = buildProcessJournal(activities);
   const subagents = buildSubagentActivity(activities);
   const completedPlanItems = plan?.items?.filter((item) => item.completed).length ?? 0;
+  const waitingForWorkflow = workflow?.state === "queued";
+  const idleWorkflow = Boolean(workflow && !activeAttempt);
+  const compact = idleWorkflow || ((queued || waitingForWorkflow) && !journal.length && !plan?.items?.length && !subagents.agents.length);
+  const workflowTitle = waitingForWorkflow ? "正在排队" : workflow?.state === "closing" ? "正在收尾" : workflow?.state === "blocked" ? "等待处理" : idleWorkflow ? "等待续跑或验收" : undefined;
+  const workflowHint = waitingForWorkflow ? (queueStatus?.label?.includes("完整修改任务") ? "前项验收收尾后自动开始" : queueStatus?.label || "排队中，获准后自动开始") : workflow?.state === "closing" ? "确认执行结束后继续下一项" : workflow?.state === "blocked" ? "本项尚未收尾，后续任务继续排队" : idleWorkflow ? "本项完成前，后续任务继续排队" : workflow && workflow.phase !== "执行中" ? workflow.phase : undefined;
 
-  return <div className="activity-card" role="status" aria-live="polite">
-    <div className="activity-title"><LoaderCircle className="spin" size={17} /><strong>{queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理"}</strong><span>{queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : (runningModel?.startsWith("antigravity:") ? "Antigravity 不支持运行中引导，补充消息将在完成后发送" : runningModel ? "完成前持续保留，可随时引导" : "完成前持续保留，补充消息可加入队列")}</span></div>
-    {plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
+  return <div className={`activity-card${compact ? " activity-compact" : ""}`} role="status" aria-live="polite">
+    <div className="activity-title">{waitingForWorkflow || idleWorkflow ? <Clock size={17} /> : <LoaderCircle className="spin" size={17} />}<strong>{workflowTitle ?? (queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理")}</strong><span title={workflow?.reason || undefined}>{workflowHint ?? (queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : (runningModel?.startsWith("antigravity:") ? "Antigravity 不支持运行中引导，补充消息将在完成后发送" : runningModel ? "完成前持续保留，可随时引导" : "完成前持续保留，补充消息可加入队列"))}</span></div>
+    {!idleWorkflow && plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
-    {subagents.agents.length > 0 && <SubagentPanel summary={subagents} />}
-    <div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
+    {!idleWorkflow && subagents.agents.length > 0 && <SubagentPanel summary={subagents} />}
+    {!compact && <><div className="process-section-title"><strong>工作记录</strong><span>{journal.length ? `${journal.length} 条 · 阶段反馈保留上限 5 条` : "实时更新"}</span></div>
     <div className="process-journal">{journal.length ? journal.map((activity, index) => isNarrativeActivity(activity)
       ? <ProcessJournalNote activity={activity} key={activity.seq ?? `${activity.kind}-${index}`} />
       : <div className="activity-line" key={activity.seq ?? `${activity.label}-${index}`}>
@@ -5203,7 +5211,7 @@ function ProcessPanel({ activities, loading, runningModel }: { activities: JobEv
             {["search", "tool", "error", "retry"].includes(activity.kind ?? "") && activity.detail ? <small>{activity.detail}</small> : null}
             {activity.kind === "command" && activity.detail ? <details className="technical-detail"><summary>{activity.actionCount && activity.actionCount > 1 ? `查看 ${activity.actionCount} 个技术步骤` : "查看技术细节"}</summary><code>{activity.groupedDetails?.join("\n\n") || activity.detail}</code></details> : null}
           </div>
-        </div>) : <p className="process-journal-empty">{starting ? "正在准备执行…" : "正在建立执行方向…"}</p>}</div>
+        </div>) : <p className="process-journal-empty">{idleWorkflow ? "等待本项继续。" : starting ? "正在准备执行…" : "正在建立执行方向…"}</p>}</div></>}
   </div>;
 }
 

@@ -45,6 +45,7 @@ test("recovery survives cancellation/restart and keeps uncertain work, current i
   const thread = crypto.randomUUID(); db.updateConversation(c.id, { codexThreadId: thread });
   const job = addJob(db, c.id); db.updateJob(job.id, "running"); progress(db, job.id);
   db.deferJobForCapacity(job.id, capacity());
+  db.workflows.settled(job.id); // The mocked capacity attempt has actually exited.
   db.sqlite.prepare("DELETE FROM job_recovery_checkpoints WHERE job_id=?").run(job.id);
   assert.equal(db.getTaskRecoveryForTurn(c.id, job.id)?.reason, "capacity", "waiting Jobs from before deployment are upgraded lazily");
   assert.equal(db.cancelQueuedJob(job.id), true);

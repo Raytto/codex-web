@@ -1,3 +1,4 @@
+import { ExecutionUncertainError } from "./execution-ownership.js";
 import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import crypto from "node:crypto";
@@ -47,7 +48,7 @@ export function remoteThreadSyncTimeoutMs(): number {
   return REMOTE_THREAD_SYNC_TIMEOUT_MAX_MS;
 }
 
-type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; geminiTitleAgent: boolean; codexAccounts: boolean; geminiAccounts: boolean; geminiUsage: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
+type Connection = { socket: WebSocket; workerId: string; capacity: number; lastHeartbeat: number; activeJobs: Set<string>; heartbeatSeen: boolean; waitAutomation: boolean; completeWorkflows: boolean; capacityConfig: boolean; dynamicWaitTool: boolean; agentTurnContext: boolean; accountSkills: boolean; titleAgent: boolean; geminiTitleAgent: boolean; codexAccounts: boolean; geminiAccounts: boolean; geminiUsage: boolean; threadRolloutSize: boolean; threadLifecycle: boolean; deviceCredentials: boolean; migrationOnly: boolean; accountSwitching: boolean; nodeTransfers: boolean };
 type BootstrapGrant = { platform: RemoteWorkerBootstrapPlatform; expiresAt: number };
 type PendingFs = { workerId: string; resolve(value: RemoteProjectFsResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 type PendingRename = { workerId: string; resolve(): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
@@ -361,6 +362,11 @@ export class RemoteWorkerGateway extends EventEmitter {
     if (!workerId) return true;
     const connection = this.connections.get(workerId);
     return Boolean(connection?.titleAgent && (engineId !== "antigravity" || connection.geminiTitleAgent) && connection.socket.readyState === WebSocket.OPEN);
+  }
+
+  supportsCompleteWorkflows(executorId: string): boolean {
+    const workerId=workerIdFromExecutor(executorId);
+    return !workerId || Boolean(this.connections.get(workerId)?.completeWorkflows);
   }
 
   supportsDynamicWaitTool(executorId: string): boolean {
@@ -679,7 +685,7 @@ export class RemoteWorkerGateway extends EventEmitter {
         uploadedBytes: state.uploadedBytes,
       };
       this.pendingJobs.set(jobId, pending);
-      pending.disconnectTimer = setTimeout(() => this.failJob(jobId, new Error("远程电脑未在 90 秒内恢复该任务")), 90_000);
+      pending.disconnectTimer = setTimeout(() => this.failJob(jobId, new ExecutionUncertainError("远端执行退出尚未确认：远程电脑未在 90 秒内恢复该任务")), 90_000);
       this.updatePresence(workerId);
       if (state.terminalEvent) queueMicrotask(() => this.handleJobEvent(jobId, pending, state.terminalEvent!));
     });
@@ -1062,6 +1068,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       activeJobs: new Set(),
       heartbeatSeen: false,
       waitAutomation: Boolean(hello.capabilities?.waitAutomation),
+      completeWorkflows: Boolean(hello.capabilities?.completeWorkflows),
       capacityConfig: Boolean(hello.capabilities?.capacityConfig),
       dynamicWaitTool: Boolean(hello.capabilities?.dynamicWaitTool),
       agentTurnContext: Boolean(hello.capabilities?.agentTurnContext),
@@ -1336,7 +1343,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     for (const key of this.rolloutSizes.keys()) if (key.startsWith(`${workerId}:`)) this.rolloutSizes.delete(key);
     for (const [jobId, pending] of this.pendingJobs) {
       if (pending.workerId !== workerId || pending.disconnectTimer) continue;
-      pending.disconnectTimer = setTimeout(() => this.failJob(jobId, new Error("远程电脑断线超过 90 秒")), 90_000);
+      pending.disconnectTimer = setTimeout(() => this.failJob(jobId, new ExecutionUncertainError("远端执行退出尚未确认：远程电脑断线超过 90 秒")), 90_000);
     }
   }
 
@@ -1351,7 +1358,7 @@ export class RemoteWorkerGateway extends EventEmitter {
         continue;
       }
       if (!pending.observedActive && !pending.disconnectTimer) continue;
-      this.failJob(jobId, new Error("远程电脑重连后未恢复该任务，请重新发送"));
+      this.failJob(jobId, new ExecutionUncertainError("远端执行退出尚未确认：远程电脑重连后未恢复该任务"));
     }
   }
 

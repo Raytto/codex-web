@@ -11,6 +11,7 @@ import type { CodexAccountLoginView, CodexAccountView } from "./codex-account-ma
 
 export type HostRootRunRequest = {
   jobId: string;
+  workflowEpoch?: number;
   userId: string;
   conversationId: string;
   projectRoot: string;
@@ -41,6 +42,7 @@ export type HostProjectFsResult = {
 };
 
 export type HostRootClientMessage =
+  | { type: "workflow_verify"; requestId: string; userId: string; evidence: unknown }
   | ({ type: "gemini_accounts"; requestId: string; userId: string } & GeminiAccountRequest)
   | { type: "project_skills"; requestId: string; userId: string; projectId: string; action: import("./project-skills.js").ProjectSkillAction; name?: string; content?: string; enabled?: boolean }
   | { type: "node_transfer"; requestId: string; userId: string; spec: import("../remote-worker/src/node-transfer-types.js").TransferSpec }
@@ -65,6 +67,7 @@ export type HostRootClientMessage =
   | { type: "codex_account_delete"; requestId: string; userId: string; accountId: string };
 
 export type HostRootServerMessage =
+  | { type: "workflow_verify_result"; requestId: string; verified: true }
   | ({ type: "gemini_accounts_result"; requestId: string } & GeminiAccountResult)
   | { type: "project_skills_result"; requestId: string; result: import("./project-skills.js").ProjectSkillResult }
   | { type: "node_transfer_started"; requestId: string }

@@ -229,7 +229,7 @@ test("PDF/EPUB browser code, styles, runtime, and worker stay out of the initial
   const distRoot = path.join(process.cwd(), "dist");
   const assetsRoot = path.join(distRoot, "assets");
   const builtIndex = fs.readFileSync(path.join(distRoot, "index.html"), "utf8");
-  const entryName = builtIndex.match(/<script[^>]+src="\/codex-web\/assets\/([^"]+\.js)"/)?.[1];
+  const entryName = builtIndex.match(/<script[^>]+src="(?:\.\/|\/)assets\/([^"]+\.js)"/)?.[1];
   assert.ok(entryName, "the production build should expose its JavaScript entry");
   const assetNames = fs.readdirSync(assetsRoot);
   const sources = new Map(assetNames.filter((name) => /\.(?:js|mjs|css)$/.test(name)).map((name) => [name, fs.readFileSync(path.join(assetsRoot, name), "utf8")]));
