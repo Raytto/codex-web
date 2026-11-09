@@ -172,9 +172,14 @@ both processes when the paths differ across the container boundary.
    username no longer occupies `owner`:
 
    ```bash
-   sudo docker compose exec app \
+   sudo docker compose exec --user 10001:10001 app \
      node dist-server/server/manage-user.js create-host-root owner "Host owner"
    ```
+
+   Run user-management commands as Web UID/GID `10001:10001`, which can read
+   the private `.env` and database. The hardened app container drops root's
+   filesystem-bypass capabilities; its default UID 0 cannot read those files.
+   This CLI identity does not grant ordinary tenant jobs host permissions.
 
    Capture the generated password in a secure terminal, deliver it once to the
    operator, and remove it from shell/log history. Change it after first login.
