@@ -1,5 +1,6 @@
 import { personalMemoryConfigured } from "./personal-memory.js";
 import { availableHostMemory, memoryDispatchBlock, TASK_MEMORY_POLL_MS, MEMORY_WAIT_MESSAGE, MEMORY_GUARD_MESSAGE } from "./task-memory.js";
+import { routeDotTask } from './dot-task-routing.js';
 import { publicInstanceConfig, renderInstanceHtml } from './instance-config.js';
 import { DotError, DotStore, DOT_INSTRUCTIONS } from "./dot-store.js";
 import { DotLiveGateway } from "./dot-live.js";
@@ -47,7 +48,7 @@ import { AppDatabase, PublicShareStorageBusyError, StorageQuotaExceededError, ty
 import { isPublicShareActive } from "../src/public-share.js";
 import { availableAgentSelection, loadAgentOptions, mergeEngineOptions, repairAgentSelection, resolveAgentSelection, withPreferredAgentDefaults, type AgentOptions, type AgentSelection } from "./model-options.js";
 import { ensureTenant, ensureTenantWorkspace, isPersistedDeliverablePath, newId, persistDeliverableSync, removeCodexThreadFiles, removePersistedDeliverable, removeWorkspace, resolveInside, safeUploadName } from "./paths.js";
-import { AUDIO_MIME_EXTENSIONS, TRANSCRIPTION_PROMPT_VERSION, TranscriptionError, TranscriptionService } from "./transcription.js";
+import { AUDIO_MIME_EXTENSIONS, transcriptionIdentity, TranscriptionError, TranscriptionService } from "./transcription.js";
 import { CONVERSATION_TITLE_CODEX_MODEL, CONVERSATION_TITLE_PROMPT_VERSION, CONVERSATION_TITLE_REASONING_EFFORT, ConversationTitleService, extractTitleRequestText } from "./conversation-title.js";
 import { HOST_ROOT_USER_ID, isHostRootUser } from "./host-root-user.js";
 import { DEFAULT_PROJECT_AGENTS_TEMPLATE, PROJECT_AGENTS_TEMPLATE_SETTING } from "./project-instructions.js";
@@ -298,6 +299,25 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const dotChanged = (cid:string) => { const c=db.getConversation(cid); if(c) publishConversationChanged(c); if(config.queueAutoStart) scheduleQueuePump(); };
   dotStore.onChange=dotChanged;
   dotStore.executorInfo=(user,executor)=>({status:executorView(executor)?.status??'unknown',models:optionsForExecutor(user,executor).models.map(m=>({id:m.id,engine:engineForModel(m.id),reasoningEfforts:m.reasoningEfforts}))});
+  const dotCatalogIssues = new Map<string, string>();
+  dotStore.refreshTaskCatalog = async (user, executor) => {
+    if (executorView(executor)?.status !== 'online') throw new DotError(409, '目标节点不在线；未更换执行位置。');
+    // Dot must not depend on a browser opening the model menu first.
+    try {
+      const result = await runner.geminiAccounts(user, { action: 'catalog' }, executor);
+      geminiCatalogs.set(executor, result.catalog ?? null);
+      dotCatalogIssues.set(executor, '目标节点未返回可用的 Gemini 模型目录');
+    } catch {
+      geminiCatalogs.delete(executor);
+      dotCatalogIssues.set(executor, '目标节点 Gemini 目录查询失败，账号或权限状态无法确认');
+    }
+  };
+  dotStore.routeTask = (user, executor, intent) => {
+    // Do not route from fallback/static Codex models when the node has no catalog.
+    const codex = db.getExecutorRuntime(executor)?.agentOptions;
+    const models = codex ? mergeEngineOptions(codex, geminiCatalogs.get(executor)).models : geminiCatalogs.get(executor)?.models ?? [];
+    return routeDotTask(intent, { status: executorView(executor)?.status ?? 'unknown', models, defaultSelection: newConversationAgentSelection(user, optionsForExecutor(user, executor)), geminiUnavailableReason: dotCatalogIssues.get(executor) });
+  };
   const dotLive = new DotLiveGateway(dotStore, config, dotChanged);
   const dotHooks = {
     changed: dotChanged,
@@ -349,11 +369,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const autoResetEnabled = config.containerized && config.queueAutoStart;
   const autoReset = new CodexResetAutoUse(db.sqlite, {
     executors: () => remoteWorkers.listExecutors().filter(item => item.codexAccountManagementCapable).map(item => ({
-      id: item.id, machineName: item.machineName, online: item.status === "online", supported: remoteWorkers.supportsAutoResetCredit(item.id),
+      id: item.id, machineName: item.machineName, online: item.status === "online", supported: remoteWorkers.supportsAutoResetCredit(item.id), lowQuotaSupported: remoteWorkers.supportsLowQuotaResetCredit(item.id),
     })),
     accounts: executorId => runner.listCodexAccounts(HOST_ROOT_USER_ID, executorId, true),
-    consume: (executorId, accountId, attemptId, expiresAt) => runner.consumeResetCredit(HOST_ROOT_USER_ID, accountId, attemptId, executorId, expiresAt),
+    consume: (executorId, accountId, attemptId, expiresAt, quotaKey) => runner.consumeResetCredit(HOST_ROOT_USER_ID, accountId, attemptId, executorId, expiresAt, quotaKey),
   });
+  let lastAutoResetNotice = 0;
   let autoResetTimer: ReturnType<typeof setInterval> | undefined;
   const coldRestoreScheduler = createColdRestoreScheduler({
     restore: (id, userId) => runner.restoreColdConversation(userId, id),
@@ -410,7 +431,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const voiceSubmissions = new VoiceSubmissionService(config, db, transcription, (id) => {
     const conversation = db.getConversation(id);
     if (conversation && !conversation.deleted_at) publishConversationChanged(conversation);
-  }, () => { if (config.queueAutoStart) scheduleQueuePump(); });
+  }, () => { if (config.queueAutoStart) scheduleQueuePump(); }, deliverPendingPrompt);
   const opportunityVoice = new OpportunityVoiceService(config, db, transcription);
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs, engineId) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs, engineId));
@@ -891,6 +912,10 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   });
 
   remoteWorkers.on("quota_usage", (notice: { executorId: string }) => {
+    if (autoResetEnabled && Date.now() - lastAutoResetNotice >= 10_000) {
+      lastAutoResetNotice = Date.now();
+      scheduleBackground("codex_auto_reset_usage", () => autoReset.tick());
+    }
     systemStatusSequence += 1;
     for (const [response, userId] of systemSubscribers) {
       if (isHostRootUser(userId)) writeSse(response, systemStatusSequence, "executor_quota", { executorId: notice.executorId });
@@ -1027,9 +1052,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function submittedVoiceTranscriptionIds(value: unknown): string[] {
-    if (typeof value !== "string" || !value) return [];
     try {
-      const parsed = JSON.parse(value) as unknown;
+      const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
       if (!Array.isArray(parsed)) return [];
       return [...new Set(parsed.filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 20);
     } catch { return []; }
@@ -2428,6 +2452,20 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json({ records: autoReset.history(executorId), enabled: autoResetEnabled, supported: remoteWorkers.supportsAutoResetCredit(executorId) });
   });
 
+  api.patch("/codex-accounts/:accountId/auto-reset", async (req, res) => {
+    const session = codexAccountAdminSession(res); if (!session) return;
+    const executorId = codexAccountExecutor(req, res); if (!executorId) return;
+    if (typeof req.body?.enabled !== "boolean") return res.status(400).json({ error: "自动用卡设置必须为勾选或取消勾选。" });
+    try {
+      const state = await runner.listCodexAccounts(session.user_id, executorId);
+      const accountId = String(req.params.accountId);
+      const account = state.accounts.find(account => account.id === accountId);
+      if (!account) return res.status(404).json({ error: "账号不存在。" });
+      autoReset.setEnabled(executorId, accountId, req.body.enabled, account.resetAccountKey);
+      return res.json({ enabled: autoReset.enabled(executorId, accountId, account.resetAccountKey) });
+    } catch { return res.status(400).json({ error: "自动用卡设置保存失败，请重试。" }); }
+  });
+
   api.post("/codex-accounts/refresh-usage", async (req, res) => {
     const session = codexAccountAdminSession(res);
     if (!session) return;
@@ -3644,7 +3682,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (typeof req.body?.content !== "string") return res.status(400).json({ error: "草稿正文无效。" });
     const content = req.body.content.slice(0, 100_000);
     const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
-    return res.json({ composerDraft: db.saveComposerDraft(conversation.id, content, quoteExcerpt) ?? null });
+    const voiceIds = submittedVoiceTranscriptionIds(req.body?.voiceTranscriptionIds);
+    if (!db.validateVoiceTranscriptions(voiceIds, session.user_id, conversation.id)) {
+      return res.status(400).json({ error: "语音转写记录无效、已发送或不属于此会话。" });
+    }
+    return res.json({ composerDraft: db.saveComposerDraft(conversation.id, content, quoteExcerpt, voiceIds) ?? null });
   });
 
   api.post("/conversations/:id/draft/files", upload.array("files", 12), (req, res) => {
@@ -3851,6 +3893,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       })() : [];
       const runTranscription = async (): Promise<{ text: string; transcriptionId: string }> => {
         try {
+          let usageSeconds: number | undefined;
           const text = await transcription.transcribe(file.filename, {
             purpose: req.body?.purpose === "search" ? "search" : "composer",
             draftText: typeof req.body?.draftText === "string" ? req.body.draftText : "",
@@ -3858,7 +3901,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
             attachments,
             recentMessages,
             personalizedTerms: ["Codex Web", ...selectedLexicon.lines],
-          });
+          }, { onUsage: seconds => { usageSeconds = seconds; } });
           const transcriptionId = newId();
           persistedAudio = persistVoiceRecording({
             dataRoot: config.dataRoot,
@@ -3869,8 +3912,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
           });
           db.createVoiceTranscription({
             id: transcriptionId, userId: session.user_id, clientRecordingId: clientRecordingId || null,
-            conversationId: conversation?.id ?? null, projectId: conversation?.project_id ?? null, rawText: text, model: config.dashscopeModel,
-            promptVersion: TRANSCRIPTION_PROMPT_VERSION, selectedTermIds: selectedLexicon.ids, audio: persistedAudio,
+            conversationId: conversation?.id ?? null, projectId: conversation?.project_id ?? null, rawText: text,
+            ...transcriptionIdentity(config), usageSeconds, selectedTermIds: selectedLexicon.ids, audio: persistedAudio,
           });
           if (clientRecordingId) db.updateVoiceTranscriptionReceipt({ userId: session.user_id, clientRecordingId, state: "succeeded", transcriptionId });
           return { text, transcriptionId };
@@ -3926,12 +3969,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (capacityRejection) return capacityRejection;
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
     const quoteExcerpt = submittedQuoteExcerpt(req.body?.quoteExcerpt);
-    const voiceTranscriptionIds = submittedVoiceTranscriptionIds(req.body?.voiceTranscriptionIds);
+    const useComposerDraft = req.body?.useComposerDraft === "true";
+    const voiceTranscriptionIds = [...new Set([
+      ...(useComposerDraft ? db.getComposerDraftVoiceTranscriptionIds(conversation.id) : []),
+      ...submittedVoiceTranscriptionIds(req.body?.voiceTranscriptionIds),
+    ])].slice(-20);
     if (voiceTranscriptionIds.length > 0 && !db.validateVoiceTranscriptions(voiceTranscriptionIds, session.user_id)) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "语音转写记录无效或已经发送。" });
     }
-    const useComposerDraft = req.body?.useComposerDraft === "true";
     if (useComposerDraft && uploaded.length > 0) {
       removeUnregisteredUploads(uploaded);
       return res.status(400).json({ error: "服务器草稿附件无需重复上传。" });
@@ -4163,11 +4209,30 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
+    if (pending.voiceSubmission?.steer_state === "sending") return res.status(409).json({ error: "正在自动发送，请等待结果后再操作。" });
     removePendingPromptFiles(pending, session.user_id);
     db.deletePendingPrompt(pending.id);
     if (config.queueAutoStart) await pumpQueue();
     return res.status(204).end();
   });
+
+  async function deliverPendingPrompt(pending: PendingPromptWithFiles) {
+    const running = db.listActiveJobsForConversation(pending.conversation_id).find(job => job.status === "running");
+    if (!running) {
+      const job = db.materializePendingPrompt(pending.id, newId(), newId());
+      if (!job) throw new Error("待发送队列已经变化，请刷新后重试。");
+      publishQueuePositions();
+      if (config.queueAutoStart) await pumpQueue();
+      return { ok: true, mode: "insert", job: db.getJob(job.id) ?? job };
+    }
+    const unavailable = liveSteeringUnavailableReason(running, pending);
+    if (unavailable) throw new Error(unavailable);
+    const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
+    const message = db.materializeSteeredPrompt(pending.id, newId());
+    if (!message) throw new Error("引导已送达，但本地记录队列发生变化，请刷新确认。");
+    publishQueuePositions();
+    return { ok: true, mode: "steer", turnId, message };
+  }
 
   api.post("/conversations/:id/pending-prompts/:promptId/steer", async (req, res) => {
     const session = res.locals.session as SessionRow;
@@ -4177,26 +4242,27 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     db.touchConversationActivity(conversation.id);
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
-    if (!db.pendingVoiceReady(pending.id)) return res.status(409).json({ error: "请等待语音识别完成。" });
+    if (pending.voiceSubmission && (pending.voiceSubmission.state !== "completed" || pending.voiceSubmission.steer_state)) {
+      const running = db.listActiveJobsForConversation(conversation.id).find(job => job.status === "running");
+      // A repeated click only reads the durable acknowledgement, even if the
+      // active turn changed while recognition was in progress.
+      if (!db.pendingVoiceActionBusy(pending.id)) {
+        const unavailable = running && liveSteeringUnavailableReason(running, pending);
+        if (unavailable) return res.status(409).json({ code: "LIVE_STEERING_UNAVAILABLE", error: unavailable });
+      }
+      try {
+        const pendingPrompt = voiceSubmissions.requestSteer(session.user_id, pending.id, running ? "steer" : "insert");
+        res.status(202).json({ ok: true, mode: "deferred", pendingPrompt });
+        scheduleBackground("voice_deferred_steer", () => voiceSubmissions.pump());
+        return;
+      } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "预约引导失败。" }); }
+    }
     if (pending.status !== "queued") return res.status(409).json({ error: "请先完成编辑。" });
-    const running = db.listActiveJobsForConversation(conversation.id).find((job) => job.status === "running");
-    if (!running) {
-      const job = db.materializePendingPrompt(pending.id, newId(), newId());
-      if (!job) return res.status(409).json({ error: "待发送队列已经变化，请刷新后重试。" });
-      publishQueuePositions();
-      if (config.queueAutoStart) await pumpQueue();
-      return res.json({ ok: true, mode: "insert", job: db.getJob(job.id) ?? job });
-    }
-    const steeringUnavailable = liveSteeringUnavailableReason(running, pending);
-    if (steeringUnavailable) return res.status(409).json({ code: "LIVE_STEERING_UNAVAILABLE", error: steeringUnavailable });
-    try {
-      const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
-      const message = db.materializeSteeredPrompt(pending.id, newId());
-      if (!message) throw new Error("引导已送达，但本地记录队列发生变化，请刷新确认。 ");
-      return res.json({ ok: true, mode: "steer", turnId, message });
-    } catch (error) {
-      return res.status(409).json({ error: error instanceof Error ? error.message : "引导失败。" });
-    }
+    const running = db.listActiveJobsForConversation(conversation.id).find(job => job.status === "running");
+    const unavailable = running && liveSteeringUnavailableReason(running, pending);
+    if (unavailable) return res.status(409).json({ code: "LIVE_STEERING_UNAVAILABLE", error: unavailable });
+    try { return res.json(await deliverPendingPrompt(pending)); }
+    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "引导失败。" }); }
   });
 
   api.get('/jobs/:id/history',async(req,res)=>{

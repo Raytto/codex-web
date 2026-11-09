@@ -97,6 +97,10 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026110801, name: "personal-memory-codex-audit" },
     { version: 2026110802, name: "durable-complete-workflows" },
     { version: 2026110803, name: "workflow-execution-ack" },
+    { version: 2026110804, name: "transcription-provider" },
+    { version: 2026110901, name: "composer-draft-voice-links" },
+    { version: 2026110902, name: "codex-auto-reset-preferences" },
+    { version: 2026110903, name: "voice-deferred-steering" },
   ]);
   assert.deepEqual((first.sqlite.prepare("PRAGMA table_info(personal_memory_runs)").all() as Array<{name:string}>).filter(column => ["provider", "reasoning_effort", "runtime_verified"].includes(column.name)).map(column => column.name), ["provider", "reasoning_effort", "runtime_verified"]);
   first.close();

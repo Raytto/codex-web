@@ -473,7 +473,7 @@ test("mobile wake plan cards give copy and actions their own responsive rows", (
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /pendingActionMode=\{pendingPromptActionMode\(job, selectedModel, reasoningEffort\)\}/);
-  assert.match(appSource, /canRunPendingPromptImmediately\(actionMode, prompt\.agent_model, runningModel, prompt\.reasoning_effort, runningEffort\) && <button[^\n]+className="steer-action"/);
+  assert.match(appSource, /canRunPendingPromptImmediately\(actionMode, prompt\.agent_model, runningModel, prompt\.reasoning_effort, runningEffort\)\) && <button[^\n]+className="steer-action"/);
   assert.match(appSource, /const actionLabel = actionMode === "steer" \? "引导" : "插入"/);
   assert.match(appSource, /会话正在等待时间或事件，待发送任务会保持排队；可选择“插入”立即发送。/);
   assert.match(appSource, /WakePlanCard[\s\S]*onEditWake/);
@@ -4982,8 +4982,8 @@ test("remote Worker behavior updates import automatically without duplicating me
   const remoteAccountState = () => ({
     activeAccountId: currentRemoteAccount,
     accounts: [
-      { id: remoteAccountA, label: "home A", email: "a@example.com", accountHint: "••••••ount-a", active: currentRemoteAccount === remoteAccountA, createdAt: now, lastUsedAt: now },
-      { id: remoteAccountB, label: "home B", email: "b@example.com", accountHint: "••••••ount-b", active: currentRemoteAccount === remoteAccountB, createdAt: now, lastUsedAt: null },
+      { id: remoteAccountA, resetAccountKey: "a".repeat(64), label: "home A", email: "a@example.com", accountHint: "••••••ount-a", active: currentRemoteAccount === remoteAccountA, createdAt: now, lastUsedAt: now },
+      { id: remoteAccountB, resetAccountKey: "b".repeat(64), label: "home B", email: "b@example.com", accountHint: "••••••ount-b", active: currentRemoteAccount === remoteAccountB, createdAt: now, lastUsedAt: null },
     ],
   });
   const ppThreadId = crypto.randomUUID();
@@ -5004,7 +5004,7 @@ test("remote Worker behavior updates import automatically without duplicating me
     socket.once("error", reject);
     socket.once("open", () => socket.send(JSON.stringify({
       type: "hello", protocolVersion: REMOTE_WORKER_PROTOCOL_VERSION, workerId, machineName: "LIVE-PC",
-      enrollmentToken, platform: "win32-x64", workerVersion: "1.19.6", codexVersion: "test", capacity: 1,
+      enrollmentToken, platform: "win32-x64", workerVersion: "1.22.1", codexVersion: "test", capacity: 1,
       capabilities: { codexAccounts: true, threadLifecycle: true, threadRolloutSize: true },
     })));
     socket.on("message", (raw) => {
@@ -5015,6 +5015,7 @@ test("remote Worker behavior updates import automatically without duplicating me
         accountId?: string;
         refreshUsage?: boolean;
         attemptId?: string;
+        autoLowQuota?: string;
         projects?: Array<{ id: string; rootPath: string }>;
       };
       if (message.type === "codex_accounts" && message.requestId) {
@@ -5024,7 +5025,7 @@ test("remote Worker behavior updates import automatically without duplicating me
           assert.equal(message.accountId, remoteAccountB);
           assert.equal(typeof message.attemptId, "string");
           socket.send(JSON.stringify({ type: "codex_accounts_result", requestId: message.requestId, ok: true, resetResult: {
-            attemptId: message.attemptId, outcome: "reset", refreshed: true,
+            attemptId: message.attemptId, outcome: message.autoLowQuota ? "notDue" : "reset", refreshed: true,
             quota: { remainingPercent: 100, resetAt: "2026-10-01T00:00:00.000Z" },
             resetCredits: { availableCount: 2, earliestExpiresAt: "2026-10-05T00:00:00.000Z", expiryStatus: "complete", state: "ok", updatedAt: now, checkedAt: now },
           } }));
@@ -5033,7 +5034,7 @@ test("remote Worker behavior updates import automatically without duplicating me
         if (message.action === "activate" && message.accountId) currentRemoteAccount = message.accountId;
         if (message.refreshUsage) resetRefreshRequested = true;
         const state = remoteAccountState();
-        const accounts = state.accounts.map((account) => ({ ...account, ...(message.refreshUsage ? { resetCredits: {
+        const accounts = state.accounts.map((account) => ({ ...account, ...(message.refreshUsage ? { quotaRemainingPercent: 0.5, quotaResetAt: "2030-01-01T00:00:00.000Z", quotaUpdatedAt: new Date().toISOString(), resetCredits: {
           availableCount: account.id === remoteAccountA ? 3 : 0, earliestExpiresAt: account.id === remoteAccountA ? "2026-10-04T00:41:43.000Z" : null,
           expiryStatus: "complete", state: "ok", updatedAt: now, checkedAt: now,
         } } : {}) }));
@@ -5162,10 +5163,18 @@ test("remote Worker behavior updates import automatically without duplicating me
 
   const accounts = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
   assert.equal(accounts.body.activeAccountId, remoteAccountA);
+  assert.equal(accounts.body.accounts[0].resetAccountKey, "a".repeat(64));
+  const preferencePath = `/api/codex-accounts/${remoteAccountA}/auto-reset`;
+  await agent.patch(preferencePath).set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}`, enabled: false }).expect(200);
+  const disabled = await agent.get(`/api/codex-accounts?executorId=${encodeURIComponent(`remote:${workerId}`)}`).expect(200);
+  assert.equal(disabled.body.accounts[0].autoResetEnabled, false);
+  await agent.patch(preferencePath).set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}`, enabled: true }).expect(200);
   await agent.post("/api/codex-accounts/refresh-usage").send({ executorId: `remote:${workerId}` }).expect(403);
   const resetResponse = await agent.post("/api/codex-accounts/refresh-usage")
     .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(200);
   assert.equal(resetRefreshRequested, true);
+  assert.equal(resetResponse.body.accounts[0].quotaRemainingPercent, 0.5);
+  assert.ok(Date.parse(resetResponse.body.accounts[0].quotaUpdatedAt) >= Date.parse(now));
   assert.equal(resetResponse.body.accounts[0].resetCredits.availableCount, 3);
   assert.equal(resetResponse.body.accounts[0].resetCredits.earliestExpiresAt, "2026-10-04T00:41:43.000Z");
   assert.equal(resetResponse.body.accounts[1].resetCredits.availableCount, 0);
@@ -5186,6 +5195,9 @@ test("remote Worker behavior updates import automatically without duplicating me
   assert.equal(resetAccount.quotaRemainingPercent, 100);
   assert.equal(resetAccount.resetCredits.availableCount, 2);
   assert.equal(afterReset.body.activeAccountId, remoteAccountA);
+  const skipped = await instance.runner.consumeResetCredit(HOST_ROOT_USER_ID, remoteAccountB, crypto.randomUUID(), `remote:${workerId}`, undefined,
+    JSON.stringify(["2030-01-01T00:00:00.000Z", 2, null]));
+  assert.equal(skipped.outcome, "notDue");
 
   instance.db.sqlite.prepare("DELETE FROM codex_quota_snapshots WHERE scope_id=?").run(`executor:remote:${workerId}:account:${remoteAccountB}`);
   instance.db.sqlite.prepare("UPDATE conversations SET external_status='running' WHERE id=?").run(imported.id);
@@ -5209,7 +5221,7 @@ test("remote Worker behavior updates import automatically without duplicating me
   await agent.post(`/api/codex-accounts/${remoteAccountA}/activate`)
     .set("X-CSRF-Token", login.body.csrfToken).send({ executorId: `remote:${workerId}` }).expect(200);
   const switchedBack = await agent.get(`/api/conversations/${ppConversation.id}`).expect(200);
-  assert.equal(switchedBack.body.packageQuota.remainingPercent, 63);
+  assert.equal(switchedBack.body.packageQuota.remainingPercent, 0.5, "switching back preserves the fresh account read over its older observer snapshot");
   const disconnected = new Promise<void>((resolve) => socket.once("close", () => resolve()));
   socket.close();
   await disconnected;
@@ -6689,17 +6701,17 @@ test("maintenance queue wakes automatically after the gate is removed", async (c
   assert.match(appSource, /latestQueueStatus\?\.label !== MAINTENANCE_QUEUE_GUIDANCE/);
 });
 
-test("sidebar distinguishes running work from queued work with animated and static indicators", () => {
+test("sidebar distinguishes execution from grey animated waiting and preserves wake controls", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /conversation\.pinned_at && <Pin className="conversation-pin-icon"[^>]*aria-label="已置顶"/);
   assert.match(styles, /\.conversation-select > svg\.conversation-pin-icon \{ color: #b9bdcc; \}/);
   assert.match(styles, /\.conversation-row\.active \.conversation-select > svg \{ color: var\(--amber\); \}/);
-  assert.match(appSource, /conversation\.status === "running" \|\| conversation\.external_status === "running"[\s\S]*LoaderCircle[\s\S]*Boolean\(conversation\.has_pending_work\) && !conversation\.active_wake_count[\s\S]*CircleDashed/);
+  assert.match(appSource, /conversation\.status === "running" \|\| conversation\.external_status === "running"[\s\S]*LoaderCircle[\s\S]*waitingLabel[\s\S]*CircleDashed[^>]*className="conversation-waiting spin"/);
   assert.match(appSource, /Boolean\(conversation\.active_wake_count\) && conversation\.status !== "running" && conversation\.external_status !== "running" && <button[\s\S]*className="conversation-wake-trigger"/);
   assert.doesNotMatch(appSource, /conversation\.external_status !== "running" && !conversation\.has_pending_work && <button/);
-  assert.match(appSource, /maintenancePhase === "idle" \? "等待发送" : "等待维护结束后发送"/);
-  assert.match(styles, /\.conversation-select > svg\.conversation-waiting \{ color: #9399ad; \}/);
+  assert.match(appSource, /conversationWaitingLabel\(conversation, maintenancePhase\)/);
+  assert.match(styles, /\.conversation-row\.active \.conversation-select > svg\.conversation-waiting \{ color: #9399ad; \}/);
   assert.match(styles, /\.conversation-wake-trigger \{[^}]*color: #9399ad;/);
   assert.match(styles, /\.conversation-row\.active \.conversation-wake-trigger \{ color: var\(--amber\); \}/);
 });

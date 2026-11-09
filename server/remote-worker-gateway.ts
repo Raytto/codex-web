@@ -404,14 +404,21 @@ export class RemoteWorkerGateway extends EventEmitter {
     return major > 1 || (major === 1 && (minor > 21 || (minor === 21 && patch >= 5)));
   }
 
-  consumeResetCredit(executorId: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
+  supportsLowQuotaResetCredit(executorId: string): boolean {
+    if (executorId === HOST_EXECUTOR_ID) return true;
+    const [major, minor, patch] = (this.executor(executorId)?.worker?.installedVersion ?? "").split(".").map(Number);
+    return major > 1 || (major === 1 && (minor > 22 || (minor === 22 && patch >= 1)));
+  }
+
+  consumeResetCredit(executorId: string, accountId: string, attemptId: string, autoExpiresAt?: string, autoLowQuota?: string): Promise<ResetConsumption> {
     const version = this.executor(executorId)?.worker?.installedVersion ?? "";
     const parts = version.split(".").map(Number);
     if (!(parts[0] > 1 || (parts[0] === 1 && (parts[1] > 19 || (parts[1] === 19 && parts[2] >= 6))))) {
       return Promise.reject(new Error("请先升级此机器的 Worker，才能使用重置卡。"));
     }
+    if (autoLowQuota && !this.supportsLowQuotaResetCredit(executorId)) return Promise.reject(new Error("请先升级此机器的 Worker，才能在额度不足时自动使用重置卡。"));
     if (autoExpiresAt && !this.supportsAutoResetCredit(executorId)) return Promise.reject(new Error("请先升级此机器的 Worker，才能自动使用重置卡。"));
-    return this.codexAccountsRequest(executorId, "reset_credit", { accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}) }).then((result) => {
+    return this.codexAccountsRequest(executorId, "reset_credit", { accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}), ...(autoLowQuota ? { autoLowQuota } : {}) }).then((result) => {
       if (!result.resetResult) throw new Error("远程 Worker 未返回重置结果，请重试核对同一次操作。");
       return result.resetResult;
     });
@@ -506,7 +513,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     });
   }
 
-  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string }): Promise<{ resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
+  private codexAccountsRequest(executorId: string, action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit", fields: { label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string, autoLowQuota?: string }): Promise<{ resetResult?: ResetConsumption; state?: RemoteCodexAccountsState; login?: CodexAccountLoginView; restart?: boolean; threadStates?: Array<{ threadId: string; status: "idle" | "running" }> }> {
     const workerId = workerIdFromExecutor(executorId);
     if (!workerId) return Promise.reject(new Error("远程执行机器无效"));
     const connection = this.connection(workerId);

@@ -21,7 +21,7 @@ Complete one real text task, a small upload/result download and a container rest
 | Website | Self-generated bcrypt hash and random secret; required | Private `.env`: `APP_USERNAME`, `APP_PASSWORD_HASH`, `SESSION_SECRET` | Login/logout; disable the account or stop the site |
 | Codex | Your authorized Codex account; account limits apply | Tenant/host/Worker Codex Home, according to the chosen executor | Real task and `codex login status`; log out on that executor |
 | Gemini / Antigravity | Google OAuth; vendor access and limits | Settings → Account management → node → add Gemini account | Real task using the node catalog; remove/log out the node account |
-| Recorded speech | Audio-capable compatible Chat Completions service; API billing | `DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, `DASHSCOPE_ASR_MODEL` | Short recording and offline retry; clear key and recreate app |
+| Recorded speech | DashScope audio input or an independent OpenAI API project; API billing | [Choose a provider and its own configuration](VOICE_TRANSCRIPTION_PROVIDERS.md) | Short recording and offline retry; clear the selected key and recreate app |
 | Continuous voice | Explicit host account/project, HTTPS/microphone, OpenAI API access to GPT-Live | `CODEX_WEB_LIVE_*`; private server key file | Call, interrupt, delegate, verify original task, hang up; set enabled=false |
 | API memory extraction | Compatible text model supporting JSON output; separate API billing | `PERSONAL_MEMORY_PROVIDER=api`, API_KEY, BASE_URL and MODEL | Inspect candidate sources and run audit; disable personal memory or clear config |
 | Managed Codex memory | Existing executor Codex authorization and selected supported model | `PERSONAL_MEMORY_PROVIDER=codex-cli`, MODEL and EFFORT | Inspect actual provider/model audit; disable or switch provider |
@@ -31,7 +31,7 @@ Unset optional credentials leave those integrations inactive. There is no single
 
 ## Recorded speech
 
-This release uses an audio-capable **Chat Completions** contract with `input_audio`. It does not implement OpenAI's `/audio/transcriptions` contract; changing only the endpoint cannot convert protocols. A separate in-progress transcription adapter is outside this release.
+Recorded speech supports the existing DashScope-compatible Chat Completions provider and an explicit OpenAI file-transcription adapter. See [recording providers](VOICE_TRANSCRIPTION_PROVIDERS.md); the instructions below describe DashScope.
 
 Obtain a regional/workspace key from [Model Studio](https://help.aliyun.com/en/model-studio/get-api-key), then select an audio-input model and matching base URL from the [Qwen-Omni documentation](https://help.aliyun.com/en/model-studio/qwen-omni). Put the three values in private `.env`, without appending `/chat/completions` to the base URL. Recreate app, permit the microphone and test the explicit recording button. Check transcription, submission and retry after a network interruption. The context budget can include draft text, recent messages, filenames and bounded images; use `TRANSCRIPTION_CONTEXT_*` to control it. Clearing the key stops new cloud transcription without deleting historical records.
 
@@ -84,4 +84,9 @@ Use [storage lifecycle setup](STORAGE_LIFECYCLE.md) for age keys, drive authoriz
 
 For every upgrade: preserve edits → back up state and `.env` → record old commit/image → pull main → build → initialize/start → login/text task/file checks → validate retained state → test enabled integrations → restore drill. Never open a migrated database with an incompatible old image; restore the matching state snapshot with the old image. See [build/rollback](BUILD_AND_STORAGE.md) and [this release's migration boundaries](UPGRADE_20261108.md). Synthetic protocol tests do not prove real paid API calls, physical-device audio or Worker upgrades.
 
-Known voice limitation at this source baseline: after network congestion, late older audio may re-enter playback and transcript aggregation may not reflect playback order. Fresh-turn playback suppression/recovery is a separate unfinished change, not included here. Use the explicit stop-playback/hang-up controls and verify real-device behavior; this release does not promise latest-turn-only playback under degraded networks.
+
+For explicit host setup, verification and shutdown, see [per-task memory protection](TASK_MEMORY_GUARD.md).
+
+Current continuous voice includes stale-playback suppression, physical connection retirement and timed transcript fragments after interruption. Missing network audio may still require repeating a sentence. Validate real microphones, iOS and paid cloud access independently.
+
+PP Dot now includes read-only task preview and fresh node-catalog checks. Public defaults follow the target node selection; [optional routing policy](DOT_ROUTING.md) can map task types/difficulty to explicit model/effort pairs. No personal model preference ships.

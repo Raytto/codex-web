@@ -146,7 +146,7 @@ export type ServerToRemoteWorker =
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
   | { type: "worker_update_result_ack"; requestId: string }
   | { type: "worker_config"; requestId: string; capacity: number }
-  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string }
+  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string; autoLowQuota?: string }
   | { type: "heartbeat_ack"; at: string };
 
 export type RemoteWorkerToServer =

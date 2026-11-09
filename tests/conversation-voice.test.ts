@@ -152,3 +152,19 @@ test('lifecycle metadata can continue voice while native work stays queued for i
  assert.throws(()=>f.scope.validate(),/恢复/);
  assert.equal(f.db.listPendingPrompts(f.dot.id).length,0);
 });
+
+test('late timed voice is preserved as context but cannot redispatch an older intent',async t=>{
+ const f=fixture(t),base={callId:'one',startMs:2000,endMs:2200,timed:true,withheld:false};
+ f.scope.record('user','latest green',id(),'2026-11-09T00:00:02.000Z',base);await f.scope.delegate('latest');
+ f.scope.record('user','old blue',id(),'2026-11-09T00:00:01.000Z',{...base,startMs:1000,endMs:1200});
+ assert.equal((await f.scope.delegate('late-old')).mode,'no_new_input');assert.equal(f.delivered.length,1);
+ assert.deepEqual(f.db.listMessages(f.c.id).map(m=>m.content),['old blue','latest green']);
+ assert.ok(f.scope.events(0).some(e=>e.kind==='voice_user_context'));assert.match(f.scope.checkpoint().text,/old blue/);
+});
+test('withheld speech is explicitly identified in both ordinary and Dot recovery context',t=>{
+ const f=fixture(t),meta={callId:'test',startMs:1,endMs:100,timed:true,withheld:true};
+ f.scope.record('assistant','not heard',id(),'2026-11-09T00:00:00.001Z',meta);
+ assert.match(f.scope.checkpoint().text,/"withheld":true/);
+ const dot=new ConversationVoiceScope(f.store,user,f.dot.id,f.hooks);dot.record('assistant','dot not heard',id(),'2026-11-09T00:00:00.001Z',meta);
+ assert.match(dot.checkpoint().text,/"withheld":true/);assert.equal(f.db.listPendingPrompts(f.dot.id).length,0);
+});

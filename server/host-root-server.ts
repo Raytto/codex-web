@@ -361,7 +361,7 @@ function handleConnection(socket: Socket): void {
       if (message.type === "codex_account_reset") {
         if (activeJobId) throw new Error("Cannot manage Codex accounts through an active job connection");
         validateHostUser(message.userId);
-        void codexAccountManager.consumeResetCredit(message.accountId, message.attemptId, message.autoExpiresAt).then(
+        void codexAccountManager.consumeResetCredit(message.accountId, message.attemptId, message.autoExpiresAt, message.autoLowQuota).then(
           (result) => { send(socket, { type: "codex_account_reset_result", requestId: message.requestId, result }); socket.end(); },
           (error) => sendRequestFailure(socket, message.requestId, error),
         );

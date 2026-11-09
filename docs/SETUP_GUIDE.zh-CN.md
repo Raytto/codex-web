@@ -26,7 +26,7 @@ Codex 的 ChatGPT 登录和 API Key 登录是两种授权方式；可用额度�
 | 网站登录 | 基础必填 | 本人生成密码哈希和随机会话密钥 | `.env` 的 `APP_*`、`SESSION_SECRET` | 无合法配置不能安全上线；验证登录/退出；停服务或禁用账号 |
 | Codex 执行 | 文字任务必需 | 官方设备授权；另可使用本人 API 账号 | 对应执行器的 Codex Home；不是网站密码字段 | 任务提示授权不可用；验证一次真实任务；在该执行器退出 Codex |
 | Gemini / Antigravity | 可选 | Google 官方 OAuth | 设置 → 账号管理 → 目标节点 → 添加 Gemini 账号 | 未登录不提供相应模型；验证真实 Gemini 任务；退出/移除该节点账号 |
-| 录音转写 | 可选、有云调用费用 | Model Studio 的地域/工作空间 API Key 与兼容接口 | `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`DASHSCOPE_ASR_MODEL` | 未配置不可转写；录一条短语验证文本；清空 key 并重新创建 app |
+| 录音转写 | 可选、有云调用费用 | Model Studio 地域/工作空间 Key，或独立 OpenAI API 项目 | [选择 provider 并填写其专属配置](VOICE_TRANSCRIPTION_PROVIDERS.md) | 未配置不可转写；录一条短语验证文本；清空对应 key 并重新创建 app |
 | 持续语音 | 可选、独立 API 访问及费用 | OpenAI API 项目与 GPT-Live 访问权限 | `CODEX_WEB_LIVE_*`，服务端私有密钥文件 | 默认关闭；验证通话与原任务回执；设 `CODEX_WEB_LIVE_ENABLED=false` |
 | API 记忆提炼 | 可选、独立模型调用费用 | 本人选择的兼容文本模型供应商 | `PERSONAL_MEMORY_PROVIDER=api` 和 `PERSONAL_MEMORY_API_KEY/BASE_URL/MODEL` | 缺任一配置不提炼；检查个人记忆状态与来源；关闭个人记忆或清空配置 |
 | Codex 记忆提炼 | API 路径的可选替代 | 该用户执行器已有 Codex 授权 | `PERSONAL_MEMORY_PROVIDER=codex-cli`、`PERSONAL_MEMORY_MODEL`、`PERSONAL_MEMORY_EFFORT` | 无模型配置不提炼；检查审计结果；切回 api 或关闭个人记忆 |
@@ -36,7 +36,7 @@ Codex 的 ChatGPT 登录和 API Key 登录是两种授权方式；可用额度�
 
 ### 录音转写
 
-此发布的录音转写使用支持 `input_audio` 的 OpenAI-compatible **Chat Completions 音频模型**。它不是 OpenAI `/audio/transcriptions` 文件接口，不能只换 URL 就宣称兼容。另一个开发中的转写适配不属于本发布。
+本发布可选择两种录音转写：默认兼容 DashScope 的 Chat Completions 音频输入，或独立的 OpenAI 文件转写适配器。两者的请求协议和配置不同。详见[录音转写配置](VOICE_TRANSCRIPTION_PROVIDERS.md)。以下步骤适用于 DashScope。
 
 1. 在 [Model Studio 申请 API Key](https://help.aliyun.com/en/model-studio/get-api-key)，选择自己的地域与工作空间。
 2. 从[Qwen-Omni 官方说明](https://help.aliyun.com/en/model-studio/qwen-omni)取得同地域的兼容接口和具有音频输入能力的模型。把 base URL 填入 `DASHSCOPE_BASE_URL`，不要附加 `/chat/completions`；模型填入 `DASHSCOPE_ASR_MODEL`。示例占位值不能直接调用。
@@ -113,4 +113,9 @@ PP Dot 已包含在公开源码中：固定总管会话、跨项目委派、任�
 
 备份 → 固定旧提交/镜像 → 拉取 `main` → 构建 → 初始化权限 → 启动 → 登录 → 文字任务/附件 → 原有状态 → 逐项启用能力 → 恢复演练。旧镜像不要打开已经由新版本迁移的数据库，回滚需成套恢复匹配的状态快照。详见[构建与回滚](BUILD_AND_STORAGE.md)和[本轮迁移边界](UPGRADE_20261108.md)。
 
-当前语音边界：网络拥塞后，迟到的旧音频可能重新进入播放队列，转写聚合顺序也不等于真实播放顺序。新话轮优先、过时播报抑制的补修尚未纳入本发布。可使用显式停止播报/挂断控制；本版本不承诺弱网下只播放最新话轮，需在自己的真机验收。
+
+内存保护的完整启用、验证与关闭步骤见[可选任务内存保护](TASK_MEMORY_GUARD.md)。
+
+已包含持续语音恢复修复：插话时阻断旧播放，重建连接后旧音频/转写不能恢复旧回答；保留带时间的转写段。网络丢失期间仍可能需要重复截断的句子，真实麦克风、iOS 与付费云链路需在自己的安装中验收。
+
+PP Dot 的任务预览、分类与节点目录检查已包含；公开默认使用目标节点当前选择，安装者可通过 `CODEX_WEB_DOT_ROUTING_POLICY` 配置类型/难度到模型和深度的映射，见[选型说明](DOT_ROUTING.md)。没有内置私人偏好。

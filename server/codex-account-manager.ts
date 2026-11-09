@@ -1,3 +1,4 @@
+import type { ResetQuota } from "../remote-worker/src/codex-reset-policy.js";
 import { consumeAccountResetCredit, type ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
 import { readAccountResetCredits } from "../remote-worker/src/codex-usage-reader.js";
 import { unavailableResetCredits, type CodexResetCredits } from "../remote-worker/src/codex-reset-credits.js";
@@ -9,6 +10,7 @@ import { applyCodexProxyEnvironment, selectCodexEgress } from "./codex-egress.js
 import { copyValidatedCodexAuth, validateCodexAuthPayload, withSharedCodexAuthLock } from "./shared-codex-auth.js";
 
 export type CodexAccountView = {
+  resetAccountKey?: string;
   id: string;
   label: string;
   email: string | null;
@@ -16,6 +18,7 @@ export type CodexAccountView = {
   active: boolean;
   createdAt: string;
   lastUsedAt: string | null;
+  autoResetEnabled?: boolean;
   quotaRemainingPercent?: number | null;
   quotaResetAt?: string | null;
   quotaUpdatedAt?: string | null;
@@ -98,6 +101,11 @@ export class CodexAccountManager {
   }
 
   private readonly usageReads = new Map<string, Promise<CodexResetCredits>>();
+  private readonly quotaCache = new Map<string, ResetQuota & { updatedAt: string }>();
+  private quotaView(id: string) {
+    const quota = this.quotaCache.get(id);
+    return quota ? { quotaRemainingPercent: quota.remainingPercent, quotaResetAt: quota.resetAt, quotaUpdatedAt: quota.updatedAt } : {};
+  }
   private readonly usageCache = new Map<string, CodexResetCredits>();
 
   async listAccounts(refreshUsage = false): Promise<{ accounts: CodexAccountView[]; activeAccountId: string }> {
@@ -113,7 +121,7 @@ export class CodexAccountManager {
     }
     if (!refreshUsage) return state;
     const current = await this.listAccounts();
-    return { ...current, accounts: current.accounts.map((account) => ({ ...account, resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
+    return { ...current, accounts: current.accounts.map((account) => ({ ...account, ...this.quotaView(account.id), resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
   }
 
   private refreshResetCredits(accountId: string): Promise<CodexResetCredits> {
@@ -130,6 +138,7 @@ export class CodexAccountManager {
       return readAccountResetCredits({
         executable: this.codexExecutable, authFile: source, expectedAccountId: account.codexAccountId,
         temporaryRoot: path.join(this.root, "account-usage"),
+        onQuota: quota => { if (quota) this.quotaCache.set(accountId, { ...quota, updatedAt: new Date().toISOString() }); },
         env: applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl),
         commitAuth: (file) => this.copyAuth(file, source, account.codexAccountId),
       });
@@ -143,7 +152,7 @@ export class CodexAccountManager {
 
   private readonly resetOperations = new Map<string, { attemptId: string; promise: Promise<ResetConsumption> }>();
 
-  consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
+  consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string, autoLowQuota?: string): Promise<ResetConsumption> {
     if (!ENTRY_ID.test(accountId)) return Promise.reject(new Error("账号标识无效。"));
     const pending = this.resetOperations.get(accountId);
     if (pending) return pending.attemptId === attemptId ? pending.promise : Promise.reject(new Error("此账号正在使用重置卡，请等待当前操作完成。"));
@@ -155,7 +164,7 @@ export class CodexAccountManager {
       const egress = await selectCodexEgress({ signal: AbortSignal.timeout(5_000) });
       return consumeAccountResetCredit({ executable: this.codexExecutable, authFile: source,
         expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.root, "account-usage"),
-        journalRoot: path.join(this.root, "reset-receipts", accountId), attemptId, autoExpiresAt,
+        journalRoot: path.join(this.root, "reset-receipts", accountId), attemptId, autoExpiresAt, autoLowQuota,
         env: applyCodexProxyEnvironment({ ...process.env }, egress.proxyUrl),
         commitAuth: (file) => this.copyAuth(file, source, account.codexAccountId),
       });
@@ -429,6 +438,7 @@ export class CodexAccountManager {
   private view(account: AccountMetadata, activeId: string): CodexAccountView {
     return {
       id: account.id,
+      resetAccountKey: crypto.createHash("sha256").update(`pp-agent-reset-account:${account.codexAccountId}`).digest("hex"),
       label: account.label,
       email: account.email,
       accountHint: account.codexAccountId.length > 6 ? `••••••${account.codexAccountId.slice(-6)}` : "已验证",

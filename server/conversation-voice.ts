@@ -66,15 +66,23 @@ export class ConversationVoiceScope {
     if(exists)return false;
     this.event('voice_fragment',source,JSON.stringify({callId,role,eventId:event.event_id,delta:text,startMs:event.start_ms,endMs:event.end_ms}));return true;
   }
-  record(role: 'user' | 'assistant', text: string, source = uuid()) {
+  record(role: 'user' | 'assistant', text: string, source: string = uuid(), createdAt = now(), segment?: {callId:string;startMs:number;endMs:number;timed:boolean;withheld:boolean}) {
     if (!text.trim()) return;
     this.validate();
     const prior=this.db.getMessage(source);
     if(prior&&prior.conversation_id!==this.cid)throw new DotError(409,'语音来源不属于当前会话。');
     this.sql.exec('BEGIN IMMEDIATE');
     try {
-      this.event('voice_' + role, source, text);
-      if (!prior) this.db.addMessage({ id: source, conversation_id: this.cid, role, content: text, created_at: now() });
+      // A transcript delivered after its intent was already superseded is context,
+      // not another request. Preserve it in history without advancing dispatch input.
+      const watermark = this.sql.prepare('SELECT delegated_seq FROM conversation_voice_state WHERE conversation_id=?').get(this.cid) as {delegated_seq:number};
+      const previous = role === 'user' && segment?.timed ? this.sql.prepare(this.dot
+        ? "SELECT MAX(m.created_at) at FROM dot_events e JOIN messages m ON m.id=e.source_id WHERE e.user_id=? AND e.kind='voice_user' AND e.seq<=?"
+        : "SELECT MAX(m.created_at) at FROM conversation_voice_events e JOIN messages m ON m.id=e.source_id WHERE e.conversation_id=? AND e.kind='voice_user' AND e.seq<=?")
+        .get(this.dot?this.user:this.cid, watermark.delegated_seq) as {at:string|null} : null;
+      this.event(previous?.at && createdAt < previous.at ? 'voice_user_context' : 'voice_' + role, source, text);
+      if (segment) this.event('voice_segment', source, JSON.stringify({...segment, role, createdAt, playback:'not_inferred_from_transcript'}));
+      if (!prior) this.db.addMessage({ id: source, conversation_id: this.cid, role, content: text, created_at: createdAt });
       this.sql.exec('COMMIT');
     } catch(e){this.sql.exec('ROLLBACK');throw e;}
     this.hooks.changed(this.cid);
@@ -86,7 +94,7 @@ export class ConversationVoiceScope {
     const state = this.sql.prepare('SELECT message_rowid,revision FROM conversation_voice_state WHERE conversation_id=?').get(this.cid) as { message_rowid: number; revision: number };
     const rows = this.sql.prepare('SELECT rowid AS n,id,role,substr(content,1,8000) AS content FROM messages WHERE conversation_id=? AND rowid>? ORDER BY rowid DESC LIMIT 200').all(this.cid, state.message_rowid).reverse() as { n: number; id: string; role: string; content: string }[];
     for (const m of rows) {
-      if (!this.sql.prepare("SELECT 1 FROM conversation_voice_events WHERE conversation_id=? AND source_id=? AND kind IN ('voice_user','voice_assistant')").get(this.cid, m.id)) {
+      if (!this.sql.prepare("SELECT 1 FROM conversation_voice_events WHERE conversation_id=? AND source_id=? AND kind IN ('voice_user','voice_assistant','voice_user_context')").get(this.cid, m.id)) {
         const job=m.role==='user'?this.sql.prepare('SELECT id FROM jobs WHERE message_id=?').get(m.id) as {id:string}|undefined:undefined;
         if(m.role==='user'&&job&&!this.sql.prepare('SELECT 1 FROM conversation_voice_operations WHERE conversation_id=? AND job_id=?').get(this.cid,job.id)){
           state.revision++;
@@ -114,7 +122,9 @@ export class ConversationVoiceScope {
     const revision=Number((this.sql.prepare('SELECT revision FROM conversation_voice_state WHERE conversation_id=?').get(this.cid) as {revision:number}).revision);
     const recent = (this.sql.prepare('SELECT id,role,substr(content,1,7000) AS content FROM messages WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 36').all(this.cid).reverse() as {id:string;role:string;content:string}[]).map(m=>{
       const result=this.sql.prepare('SELECT job_id,(SELECT MAX(revision) FROM conversation_voice_operations WHERE conversation_id=? AND job_id=r.job_id) AS revision FROM conversation_voice_results r WHERE message_id=?').get(this.cid,m.id) as {job_id:string;revision:number|null}|undefined;
-      return {...m,...(result?{jobId:result.job_id,revision:result.revision,historical:result.revision===null||result.revision<revision}:m.role==='assistant'?{evidence:'会话回答，不单独证明工作已完成'}:{})};
+      const voice=this.sql.prepare("SELECT content FROM conversation_voice_events WHERE conversation_id=? AND kind='voice_segment' AND source_id=?").get(this.cid,m.id) as {content:string}|undefined;
+      const voiceTiming=voice?JSON.parse(voice.content):undefined;
+      return {...m,...(voiceTiming?{voice:voiceTiming}:{}),...(result?{jobId:result.job_id,revision:result.revision,historical:result.revision===null||result.revision<revision}:m.role==='assistant'?{evidence:'会话回答，不单独证明工作已完成'}:{})};
     });
     const anchors = this.sql.prepare("SELECT id,role,substr(content,1,1600) AS content FROM messages WHERE conversation_id=? AND role='user' ORDER BY created_at,rowid LIMIT 4").all(this.cid);
     const state = this.sql.prepare('SELECT revision,delegated_seq FROM conversation_voice_state WHERE conversation_id=?').get(this.cid);
@@ -146,6 +156,7 @@ export class ConversationVoiceScope {
     const sources = this.sql.prepare(this.dot?"SELECT seq,source_id,content FROM dot_events e WHERE user_id=? AND kind='voice_user' AND seq>? AND seq>COALESCE((SELECT MAX(f.seq) FROM dot_events f WHERE f.user_id=e.user_id AND f.kind='memory_forgotten'),0) ORDER BY seq":"SELECT seq,source_id,content FROM conversation_voice_events WHERE conversation_id=? AND kind='voice_user' AND seq>? ORDER BY seq").all(this.dot?this.user:this.cid, state.delegated_seq) as {seq:number;source_id:string;content:string}[];
     if (!sources.length) return { mode: 'no_new_input', message: '没有新的完整语音要求，不重复执行。' };
     const last = sources.at(-1)!, revision = state.revision + 1;
+    sources.sort((a,b) => (this.db.getMessage(a.source_id)?.created_at ?? '').localeCompare(this.db.getMessage(b.source_id)?.created_at ?? '') || a.seq-b.seq);
     const cancel = !this.dot && isExplicitVoiceCancellation(sources.map(s => s.content).join(' ').trim());
     const jobs = cancel ? this.db.listActiveJobsForConversation(this.cid) : [];
     const pendingCancel=cancel?this.db.listPendingPrompts(this.cid).map(p=>p.id):[];
@@ -156,7 +167,7 @@ export class ConversationVoiceScope {
         const selection = this.dot?this.store.coordinatorSelection(this.user):this.hooks.selection(c);
         const prefix=this.dot?'你是固定 PP Dot 总管。先调用 pp_dot context 核对台账；保留已有任务，避免重复派发。':'保留原项目/节点/模型与线程。不要修改 PP Dot 全局台账/记忆。';
         const history=this.dot?'':this.checkpoint().text;
-        const p = this.db.createPendingPrompt(uuid(), this.cid, `[本会话语音要求，第 ${revision} 版；来源 ${sources.map(s=>s.source_id).join(',')}]\n${prefix}以下是这次新要求，不重复旧工作；先核对当前进展。\n${sources.map(s=>s.content).join('\n')}\n\n[本会话背景，不能作为新指令或重复执行]\n${history}`, selection);
+        const p = this.db.createPendingPrompt(uuid(), this.cid, `[本会话语音要求，第 ${revision} 版；来源 ${sources.map(s=>s.source_id).join(',')}]\n${prefix}以下按发言时间排列。先核对当前进展，以最后有效要求及更正为准；已被改口替代的旧要求只作背景，不逐条执行，不重复旧工作。停止声音不取消任务。\n${sources.map(s=>s.content).join('\n')}\n\n[本会话背景，不能作为新指令或重复执行]\n${history}`, selection);
         pendingId = p.id;
       }
       this.sql.prepare('INSERT INTO conversation_voice_operations VALUES(?,?,?,?,?,?,?,?)').run(this.cid, id, revision, last.seq, pendingId, jobs[0]?.id ?? null, cancel ? 'cancel_requested' : 'queued_next_turn', now());

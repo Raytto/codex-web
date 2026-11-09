@@ -45,6 +45,7 @@ import { mergeMessagePages, preservePrependedScrollTop, resolveUnreadScrollTarge
 import { useAsyncMarkdownMath } from "./markdown-math";
 import { buildProcessJournal, isNarrativeActivity } from "./process-journal";
 import { resolveProcessStatus } from "./process-status";
+import { conversationWaitingLabel } from "./conversation-waiting";
 import { buildSubagentActivity, subagentStatusLabel, type SubagentActivitySummary, type SubagentView } from "./subagent-activity";
 import { resetProjectConversationPage } from "./project-conversation-page";
 import { formatContextUsage, formatRolloutBytes, ROLLOUT_WARNING_BYTES, shouldWarnAboutRollout } from "./rollout-capacity";
@@ -72,6 +73,7 @@ import { ConversationVoicePanel } from "./conversation/ConversationVoiceInput";
 import { useConversationState } from "./conversation/useConversationState";
 import { useVoiceInput } from "./conversation/useVoiceInput";
 import type { VoiceInputContext } from "./conversation/useVoiceInput";
+import type { VoiceUploadOptions } from "./api";
 import { ConversationMessageList } from "./conversation/ConversationMessageList";
 import { ConversationComposerReference } from "./conversation/ConversationComposer";
 import { SettingMenu } from "./conversation/SettingMenu";
@@ -799,10 +801,11 @@ type SearchVoiceInputProps = {
   query: string;
   projectId?: string | null;
   disabled?: boolean;
+  onClear: () => void;
   onTranscript: (text: string) => void;
 };
 
-function SearchVoiceInput({ query, projectId, disabled = false, onTranscript }: SearchVoiceInputProps) {
+function SearchVoiceInput({ query, projectId, disabled = false, onClear, onTranscript }: SearchVoiceInputProps) {
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
   const [voiceElapsed, setVoiceElapsed] = useState(0);
   const [voiceError, setVoiceError] = useState("");
@@ -989,9 +992,9 @@ function SearchVoiceInput({ query, projectId, disabled = false, onTranscript }: 
   useEffect(() => () => { discardRecordingRef.current = true; if (recorderRef.current?.state === "recording") recorderRef.current.stop(); releaseAudio(); }, []);
 
   return <>
-    <button type="button" className={`search-mic-button ${voiceState !== "idle" ? "active" : ""} ${longPressArmed ? "long-press-armed" : ""}`} onClick={handleClick} onPointerDown={beginPress} onPointerMove={movePress} onPointerUp={endPress} onPointerCancel={() => clearPress()} onContextMenu={(event) => event.preventDefault()} disabled={disabled || voiceState === "transcribing"} title={voiceState === "recording" ? "停止并搜索" : "语音搜索（长按说话）"} aria-label={voiceState === "recording" ? "停止并搜索" : "语音搜索"}>
+    {query.length > 0 ? <button type="button" className="search-clear-button" onClick={() => { setVoiceError(""); onClear(); }} title="清空搜索" aria-label="清空搜索"><X size={17} /></button> : <button type="button" className={`search-mic-button ${voiceState !== "idle" ? "active" : ""} ${longPressArmed ? "long-press-armed" : ""}`} onClick={handleClick} onPointerDown={beginPress} onPointerMove={movePress} onPointerUp={endPress} onPointerCancel={() => clearPress()} onContextMenu={(event) => event.preventDefault()} disabled={disabled || voiceState === "transcribing"} title={voiceState === "recording" ? "停止并搜索" : "语音搜索（长按说话）"} aria-label={voiceState === "recording" ? "停止并搜索" : "语音搜索"}>
       {voiceState === "recording" ? <Square size={15} fill="currentColor" /> : voiceState === "transcribing" ? <LoaderCircle className="spin" size={16} /> : <Mic size={17} />}
-    </button>
+    </button>}
     {voiceState !== "idle" && <div className={`search-voice-panel ${voiceState}`}>
       {voiceState === "recording" ? <><button type="button" className="search-voice-cancel" onClick={cancelRecording} title="取消录音" aria-label="取消录音"><X size={13} /></button><canvas ref={waveformRef} aria-label="实时音量波形" /><time>{formatVoiceDuration(voiceElapsed)}</time><button type="button" className="search-voice-stop" onClick={finishRecording} title="停止并搜索" aria-label="停止并搜索"><Square size={10} fill="currentColor" /></button></> : <><LoaderCircle className="spin" size={15} /><span>正在识别语音关键词…</span></>}
     </div>}
@@ -1137,6 +1140,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth);
   const [query, setQuery] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [input, setInput] = useConversationState(composerScope, "");
   const [askAgentQuote, setAskAgentQuote] = useConversationState(composerScope, "");
   const [files, setFiles] = useConversationState<File[]>(composerScope, []);
@@ -1452,11 +1456,11 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setDetail((current) => current?.conversation.id === conversation.id ? { ...current, conversation } : current);
   }, []);
 
-  const persistComposerDraft = useCallback((conversationId: string, content: string, quoteExcerpt: string, keepalive = false) => {
+  const persistComposerDraft = useCallback((conversationId: string, content: string, quoteExcerpt: string, keepalive = false, voiceTranscriptionIds: string[] = []) => {
     const signature = composerDraftSignature(content, quoteExcerpt);
     const operation = (draftSaveQueuesRef.current.get(conversationId) ?? Promise.resolve()).catch(() => undefined).then(async () => {
       if (selectedIdRef.current === conversationId && !editingPendingRef.current) setDraftSaveState.for(conversationId, "saving");
-      const result = await api.saveConversationDraft(conversationId, content, quoteExcerpt, keepalive && new Blob([content, quoteExcerpt]).size < 60_000);
+      const result = await api.saveConversationDraft(conversationId, content, quoteExcerpt, keepalive && new Blob([content, quoteExcerpt]).size < 60_000, voiceTranscriptionIds);
       draftMutationGenerationRef.current.set(conversationId, (draftMutationGenerationRef.current.get(conversationId) ?? 0) + 1);
       draftSyncedSignaturesRef.current.set(conversationId, signature);
       const cached = draftCacheRef.current.get(conversationId);
@@ -3097,7 +3101,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
 
   useEffect(() => {
     if (!selectedId || detail?.conversation.id !== selectedId || !detail.pendingPrompts.some(prompt =>
-      prompt.voiceSubmission && ["queued", "processing"].includes(prompt.voiceSubmission.state))) return;
+      prompt.voiceSubmission && (["queued", "processing"].includes(prompt.voiceSubmission.state) || ["requested", "sending"].includes(prompt.voiceSubmission.steer_state ?? "")))) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible" && selectedIdRef.current === selectedId) void reconcile(selectedId);
     }, 3_000);
@@ -3480,7 +3484,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     finally { finishMutation(); setSubmitting(false); }
   }
 
-  async function persistVoiceDraft(conversationId: string | null, content: string, quoteExcerpt: string) {
+  async function persistVoiceDraft(conversationId: string | null, content: string, quoteExcerpt: string, transcriptionId: string) {
     if (!conversationId) return;
     const selected = selectedIdRef.current === conversationId;
     const cached = draftCacheRef.current.get(conversationId);
@@ -3495,7 +3499,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       setDraftSaveState("unsaved");
     }
     try {
-      await persistComposerDraft(conversationId, content, quoteExcerpt);
+      await persistComposerDraft(conversationId, content, quoteExcerpt, false, [transcriptionId]);
     } catch (reason) {
       if (selectedIdRef.current === conversationId) setError(reason instanceof Error ? reason.message : "语音转写草稿保存失败");
     }
@@ -3539,7 +3543,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     }
   }
 
-  async function sendVoiceRecording(audio: Blob, fileName: string, context: VoiceInputContext, voiceTranscriptionIds: string[]) {
+  async function sendVoiceRecording(audio: Blob, fileName: string, context: VoiceInputContext, voiceTranscriptionIds: string[], upload: VoiceUploadOptions) {
     setError(""); setComposerError(""); setNotice(""); setSubmitting(true);
     let finishMutation: (() => void) | undefined;
     let targetId = context.conversationId;
@@ -3557,7 +3561,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         await api.uploadConversationDraftFiles(id, files);
         setFiles([]);
       }
-      await api.sendVoiceMessage(id, audio, fileName, context.clientRecordingId, context.draftText, context.quoteExcerpt, voiceTranscriptionIds);
+      await api.sendVoiceMessage(id, audio, fileName, context.clientRecordingId, context.draftText, context.quoteExcerpt, voiceTranscriptionIds, upload);
       draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
       draftCacheRef.current.delete(id);
       setComposerDraft.for(id, null); setInput.for(id, ""); setAskAgentQuote.for(id, ""); setFiles.for(id, []);
@@ -3691,11 +3695,13 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     const action = job?.status === "running" ? "引导当前任务" : "插入任务";
     steeringRef.current.add(id); setSteering(true); setError("");
     try {
-      await api.steerPendingPrompt(id, prompt.id);
-      // Remove the accepted item immediately; sidebar/detail refresh is background work.
+      const result = await api.steerPendingPrompt(id, prompt.id);
+      // Keep deferred acknowledgements visible; only delivered items leave the queue.
       draftMutationGenerationRef.current.set(id, (draftMutationGenerationRef.current.get(id) ?? 0) + 1);
       setDetail((current) => current?.conversation.id === id
-        ? { ...current, pendingPrompts: current.pendingPrompts.filter((item) => item.id !== prompt.id) }
+        ? { ...current, pendingPrompts: result.mode === "deferred" && result.pendingPrompt
+          ? current.pendingPrompts.map(item => item.id === prompt.id ? result.pendingPrompt! : item)
+          : current.pendingPrompts.filter((item) => item.id !== prompt.id) }
         : current);
       void reconcile(id);
     } catch (reason) {
@@ -3933,7 +3939,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     : undefined;
   const account = resolveAccountIdentity(session);
   const isConversationUploading = (id: string) => Boolean(setSubmitting.get(id) || setSteering.get(id) || voiceTransfers[id] || setDraftUploads.get(id).some((upload) => upload.status === "uploading" || upload.status === "retrying"));
-  const conversationRow = (conversation: Conversation, projectId?: string) => <div
+  const conversationRow = (conversation: Conversation, projectId?: string) => {
+    const waitingLabel = conversationWaitingLabel(conversation, maintenancePhase);
+    return <div
     key={conversation.id}
     className={`conversation-row ${!judgmentVisible && !opportunityVisible && !recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
     draggable={Boolean(projectId && !query)}
@@ -3972,8 +3980,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         ? <span className="conversation-cold-icon" role="img" aria-label="已冷存储" title="已冷存储"><FolderArchive size={14} aria-hidden="true" /></span>
         : conversation.status === "running" || conversation.external_status === "running"
         ? <LoaderCircle size={14} className="spin" role="img" aria-label="正在执行" />
-        : Boolean(conversation.has_pending_work) && !conversation.active_wake_count
-          ? <CircleDashed size={14} className="conversation-waiting" role="img" aria-label={maintenancePhase === "idle" ? "等待发送" : "等待维护结束后发送"} />
+        : waitingLabel
+          ? <CircleDashed size={14} className="conversation-waiting spin" role="img" aria-label={waitingLabel}><title>{waitingLabel}</title></CircleDashed>
           : null}
     </button>
     {!isConversationUploading(conversation.id) && Boolean(conversation.active_wake_count) && conversation.status !== "running" && conversation.external_status !== "running" && <button
@@ -3987,6 +3995,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <button type="button" className="task-menu-trigger" data-task-menu aria-label={`任务 ${conversation.title} 操作`} aria-haspopup="menu" aria-expanded={taskMenu?.conversationId === conversation.id} title="任务操作" onClick={(event) => toggleTaskMenu(conversation, event.currentTarget)}><MoreHorizontal size={15} /></button>
     </div>
   </div>;
+  };
 
   function beginSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (window.matchMedia("(max-width: 720px)").matches) return;
@@ -4024,7 +4033,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="关闭"><X size={19} /></button>
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
-      <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
+      <div className="search-box"><Search size={16} /><input ref={searchInputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onClear={() => { setQuery(""); searchInputRef.current?.focus(); }} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
       <ExtensionsSidebar dot={Boolean(session.dotEligible) && features.ppDot !== false && <DotEntry onOpen={selectProjectConversation} onError={setError} />} judgments={features.judgmentBook && <JudgmentSidebar selected={judgmentVisible} query={query} onOpen={()=>openJudgments()} />} key={session.accountId} accountId={session.accountId!} query={query} onSettings={() => setFeatureSelectionOpen(true)} opportunities={features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />} boards={features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />} />
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
@@ -4252,18 +4261,16 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
           }} onBlur={(event) => {
             if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
           }}>
-            <summary className="context-capsule-trigger" aria-label={`会话上下文与操作：${workspaceTitle} · ${workspaceSubtitle}`} aria-haspopup="dialog" aria-expanded={conversationMenuOpen} aria-controls="conversation-context-panel" onKeyDown={(event) => {
+            <summary className="context-capsule-trigger" title={`${workspaceTitle} · ${workspaceSubtitle}`} aria-label={`会话上下文与操作：${workspaceTitle} · ${workspaceSubtitle}`} aria-haspopup="dialog" aria-expanded={conversationMenuOpen} aria-controls="conversation-context-panel" onKeyDown={(event) => {
               if (event.key !== "ArrowDown") return;
               event.preventDefault();
               if (conversationMenuRef.current) conversationMenuRef.current.open = true;
-              requestAnimationFrame(() => conversationMenuRef.current?.querySelector<HTMLButtonElement>("[role=menuitem]:not(:disabled), .context-panel-close")?.focus());
+              requestAnimationFrame(() => conversationMenuRef.current?.querySelector<HTMLButtonElement>("[role=menuitem]:not(:disabled)")?.focus());
             }}>
               <span className="workspace-context-copy"><strong>{workspaceTitle}</strong><small>{workspaceSubtitle}</small></span>
               <ChevronDown size={16} aria-hidden="true" />
             </summary>
             <div id="conversation-context-panel" className="conversation-menu-panel ui-dialog" role="dialog" aria-label="会话上下文与操作">
-              <div className="context-panel-heading"><span>当前上下文</span><button className="icon-button context-panel-close" aria-label="关闭会话操作" onClick={() => { if (conversationMenuRef.current) { conversationMenuRef.current.open = false; conversationMenuRef.current.querySelector("summary")?.focus(); } }}><X size={18} /></button></div>
-              <div className="context-full-names"><strong>{workspaceTitle}</strong><span>{workspaceSubtitle}</span></div>
               {selectedConversation && <>
               <div className="conversation-menu-actions" role="menu" aria-label="会话操作" onKeyDown={(event) => {
                 if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
@@ -4341,7 +4348,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         onRemoveEditingFile={(fileId) => setRemovedEditingFileIds((current) => [...current, fileId])}
         onRestoreEditingFile={(fileId) => setRemovedEditingFileIds((current) => current.filter((id) => id !== fileId))}
         onVoiceActivityChange={(active) => { voiceInputActiveRef.current = active; setVoiceInputActive(active); }}
-        onVoiceTranscript={(conversationId, content, quoteExcerpt) => { void persistVoiceDraft(conversationId, content, quoteExcerpt); }}
+        onVoiceTranscript={(conversationId, content, quoteExcerpt, transcriptionId) => { void persistVoiceDraft(conversationId, content, quoteExcerpt, transcriptionId); }}
         onVoiceSendRecording={sendVoiceRecording}
         onVoiceSendAfterTranscription={(conversationId, content, quoteExcerpt, voiceTranscriptionIds) => { void sendVoiceTranscription(conversationId, content, quoteExcerpt, voiceTranscriptionIds); }}
         onSend={(message, voiceTranscriptionIds) => void send(message, voiceTranscriptionIds)} onCancel={job && selectedId ? () => void api.cancelConversation(selectedId).then(() => reconcile(selectedId)) : undefined} />}
@@ -5219,15 +5226,20 @@ function PendingVoiceStatus({ prompt, disabled, onRetry }: { prompt: PendingProm
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
   const voice = prompt.voiceSubmission!;
-  const failed = voice.state === "failed";
+  const failed = voice.state === "failed" || voice.steer_state === "failed";
+  const action = voice.steer_action === "insert" ? "发送" : "引导";
+  const status = voice.steer_state === "failed" ? `自动${action}未完成，请核对后重试或编辑`
+    : voice.steer_state === "sending" || (voice.state === "completed" && voice.steer_state === "requested") ? `正在自动${action}…`
+    : voice.state === "failed" ? `识别失败，音频和附件已保留${voice.steer_state === "requested" ? `；重试识别完成后会自动${action}` : ""}`
+    : `正在进行语音识别…${voice.steer_state === "requested" ? `语音识别完成后会自动${action}` : ""}`;
   return <div className={`pending-voice-status ${failed ? "failed" : ""}`} role="status" aria-live="polite">
     {failed ? <CircleAlert size={13} /> : <LoaderCircle className="spin" size={13} />}
-    <span>{failed ? "识别失败，音频和附件已保留" : "正在进行语音识别…"}</span>
-    {failed && <button type="button" disabled={disabled || retrying} onClick={() => {
+    <span>{status}</span>
+    {voice.state === "failed" && <button type="button" disabled={disabled || retrying} onClick={() => {
       setRetrying(true); setError("");
       void onRetry(prompt).catch(reason => setError(reason instanceof Error ? reason.message : "重试失败")).finally(() => setRetrying(false));
     }}>重试识别</button>}
-    {(error || (failed && voice.error)) && <span className="pending-voice-error">{error || voice.error}</span>}
+    {(error || voice.steer_error || (failed && voice.error)) && <span className="pending-voice-error">{error || voice.steer_error || voice.error}</span>}
   </div>;
 }
 
@@ -5531,11 +5543,11 @@ function PendingQueue({ prompts, busy, actionMode, runningModel, runningEffort, 
           {prompt.quote_excerpt && <small><CornerUpLeft size={11} />含引用</small>}
           {prompt.files.length > 0 && <small><Paperclip size={11} />{prompt.files.length} 个附件</small>}
         </div>
-        {prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed" && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
+        {prompt.voiceSubmission && (prompt.voiceSubmission.state !== "completed" || prompt.voiceSubmission.steer_state) && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
         <div className="pending-queue-actions">
-          {canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel, prompt.reasoning_effort, runningEffort) && <button type="button" className="steer-action" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onSteer(prompt)} title={actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
-          <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && prompt.voiceSubmission.state !== "completed")} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
-          <button type="button" disabled={busy} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
+          {(prompt.voiceSubmission?.steer_state || canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel, prompt.reasoning_effort, runningEffort)) && <button type="button" className="steer-action" disabled={busy || prompt.voiceSubmission?.state === "failed" || prompt.voiceSubmission?.state === "cancelled" || prompt.voiceSubmission?.steer_state === "requested" || prompt.voiceSubmission?.steer_state === "sending"} onClick={() => onSteer(prompt)} title={prompt.voiceSubmission?.steer_state === "requested" ? `语音识别完成后会自动${prompt.voiceSubmission.steer_action === "insert" ? "发送" : "引导"}` : actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
+          <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && (prompt.voiceSubmission.state !== "completed" || prompt.voiceSubmission.steer_state === "requested" || prompt.voiceSubmission.steer_state === "sending"))} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
+          <button type="button" disabled={busy || prompt.voiceSubmission?.steer_state === "sending"} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
       </article>)}
     </div>
@@ -5617,7 +5629,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   onVoiceActivityChange: (active: boolean, retained?: boolean, uploading?: boolean) => void;
   onSend: (message?: string, voiceTranscriptionIds?: string[]) => void;
   onVoiceTranscript: (conversationId: string | null, content: string, quoteExcerpt: string, transcriptionId: string) => void;
-  onVoiceSendRecording: (audio: Blob, fileName: string, context: VoiceInputContext, ids: string[]) => Promise<void>;
+  onVoiceSendRecording: (audio: Blob, fileName: string, context: VoiceInputContext, ids: string[], upload: VoiceUploadOptions) => Promise<void>;
   onVoiceSendAfterTranscription: (conversationId: string | null, content: string, quoteExcerpt: string, transcriptionIds: string[]) => void;
   onCancel?: () => void;
 }) {
@@ -5838,8 +5850,8 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
       }} onChange={(value) => onReasoningChange(value as ReasoningEffort)} />
     </div>
       <div className="composer-submit-actions">
-        {voice.state === "idle" && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving || dotCallActive} title={dotCallActive ? "请先挂断通话再录音" : "录音输入"} aria-label="录音输入"><Mic size={18} /></button>}
-        {active && <ConversationCallControl conversationId={conversationId} disabled={submitting || selectionSaving || voice.state !== "idle"} />}
+        {voice.state === "idle" && !voice.starting && <button type="button" className="mic-button" onClick={() => void startRecording()} disabled={submitting || selectionSaving || dotCallActive} title={dotCallActive ? "请先挂断通话再录音" : "录音输入"} aria-label="录音输入"><Mic size={18} /></button>}
+        {active && <ConversationCallControl conversationId={conversationId} disabled={submitting || selectionSaving || voice.starting || voice.state !== "idle"} />}
         {primaryAction === "stop" && onCancel
           ? <button type="button" className="send-button stop" onClick={onCancel} title="停止当前显示的任务" aria-label="停止当前显示的任务"><Square size={15} fill="currentColor" /></button>
           : <button type="button" className="send-button" onClick={() => voice.state === "recording" ? finishRecording(true) : onSend(undefined, currentVoiceTranscriptionIds())} disabled={submitting || selectionSaving || draftUploads.length > 0 || voice.state === "transcribing" || (voice.state !== "recording" && !input.trim() && !askAgentQuote && files.length === 0 && draftFiles.length === 0 && !hasRetainedEditingFile)} title={voice.state === "recording" ? "发送语音" : "发送"} aria-label={voice.state === "recording" ? "发送语音" : "发送"}>{submitting || voice.state === "transcribing" ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={18} />}</button>}

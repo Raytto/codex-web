@@ -222,7 +222,7 @@ async function handle(message: ServerMessage): Promise<void> {
       else if (message.action === "login_cancel") login = codexAccounts.cancelLogin(message.loginId ?? "");
       else if (message.action === "activate") { state = codexAccounts.activate(message.accountId ?? ""); restart = true; }
       else if (message.action === "delete") state = codexAccounts.delete(message.accountId ?? "");
-      else if (message.action === "reset_credit") resetResult = await codexAccounts.consumeResetCredit(message.accountId ?? "", message.attemptId ?? "", message.autoExpiresAt);
+      else if (message.action === "reset_credit") resetResult = await codexAccounts.consumeResetCredit(message.accountId ?? "", message.attemptId ?? "", message.autoExpiresAt, message.autoLowQuota);
       const response: Extract<WorkerMessage, { type: "codex_accounts_result" }> = {
         type: "codex_accounts_result", requestId: message.requestId, ok: true,
       };

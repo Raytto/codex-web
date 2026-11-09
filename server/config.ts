@@ -5,6 +5,7 @@ import { workflowCapacity } from "./workflow-store.js";
 import path from "node:path";
 import os from "node:os";
 import dotenv from "dotenv";
+import { loadTranscriptionConfig, type TranscriptionConfig } from "./transcription-config.js";
 import {
   READER_V1_MAX_CONCURRENT_READS,
   READER_V1_MAX_FILE_BYTES,
@@ -21,7 +22,7 @@ export {
 
 dotenv.config({ path: path.join(process.cwd(), ".env") });
 
-export type AppConfig = {
+export type AppConfig = TranscriptionConfig & {
   instance: PublicInstanceConfig;
   hostProjectName: string;
   host: string;
@@ -154,6 +155,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     remoteWorkerEnrollmentToken: overrides.remoteWorkerEnrollmentToken ?? (process.env.REMOTE_WORKER_ENROLLMENT_TOKEN || ""),
     remoteWorkerReleaseRoot: overrides.remoteWorkerReleaseRoot ?? (process.env.REMOTE_WORKER_RELEASE_ROOT || path.join(projectRoot, "worker-release")),
     publicBaseUrl: overrides.publicBaseUrl ?? (process.env.PUBLIC_BASE_URL || ""),
+    ...loadTranscriptionConfig(overrides),
     dashscopeApiKey: overrides.dashscopeApiKey ?? (process.env.DASHSCOPE_API_KEY || ""),
     dashscopeBaseUrl: (overrides.dashscopeBaseUrl ?? process.env.DASHSCOPE_BASE_URL ?? "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, ""),
     dashscopeModel: overrides.dashscopeModel ?? (process.env.DASHSCOPE_ASR_MODEL || "qwen3.8-omni-flash"),

@@ -1,3 +1,4 @@
+import { lowQuotaKey, resetQuota, validLowQuotaKey } from "./codex-reset-policy.js";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -13,7 +14,7 @@ export type ResetConsumption = {
 const outcomes = ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"];
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Receipt = { attemptId: string; accountId: string; creditId: string | null; outcome?: ResetOutcome;
-  source?: "manual" | "auto_expiry"; createdAt?: string; completedAt?: string; autoExpiresAt?: string };
+  source?: "manual" | "auto_expiry" | "auto_quota"; createdAt?: string; completedAt?: string; autoExpiresAt?: string; autoLowQuota?: string };
 
 export function autoResetAttemptId(accountId: string, expiresAt: string): string {
   // The upstream account and expiration, not a machine-local UUID: duplicate saved
@@ -42,24 +43,30 @@ function writeReceipt(file: string, value: Receipt) {
   fs.renameSync(temporary, file);
 }
 
-export function consumeAccountResetCredit(options: AccountSessionOptions & { journalRoot: string; attemptId: string; autoExpiresAt?: string }): Promise<ResetConsumption> {
+export function consumeAccountResetCredit(options: AccountSessionOptions & { journalRoot: string; attemptId: string; autoExpiresAt?: string; autoLowQuota?: string }): Promise<ResetConsumption> {
   if (!uuid.test(options.attemptId)) return Promise.reject(new Error("重置请求标识无效。"));
   if (options.autoExpiresAt !== undefined) {
     if (!Number.isFinite(Date.parse(options.autoExpiresAt)) || new Date(options.autoExpiresAt).toISOString() !== options.autoExpiresAt) return Promise.reject(new Error("自动重置到期时间无效。"));
     options = { ...options, attemptId: autoResetAttemptId(options.expectedAccountId, options.autoExpiresAt) };
   }
+  if (options.autoLowQuota !== undefined) {
+    if (options.autoExpiresAt !== undefined || !validLowQuotaKey(options.autoLowQuota)) return Promise.reject(new Error("自动用卡额度条件无效。"));
+    options = { ...options, attemptId: autoResetAttemptId(options.expectedAccountId, `quota:${options.autoLowQuota}`) };
+  }
   const key = path.resolve(options.journalRoot);
   const pending = inFlight.get(key);
   if (pending) return pending.attemptId === options.attemptId ? pending.promise : Promise.reject(new Error("此账号正在使用重置卡，请等待当前操作完成。"));
-  const promise = withAccountSession(options, (rpc) => redeemEarliestReset(rpc, options.journalRoot, options.expectedAccountId, options.attemptId, options.autoExpiresAt))
+  const promise = withAccountSession(options, (rpc) => redeemEarliestReset(rpc, options.journalRoot, options.expectedAccountId, options.attemptId, options.autoExpiresAt, options.autoLowQuota))
     .finally(() => inFlight.delete(key));
   inFlight.set(key, { attemptId: options.attemptId, promise });
   return promise;
 }
 
 /** Durable pinning means a lost response never causes a retry to select a second card. */
-export async function redeemEarliestReset(rpc: AccountRpc, root: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
+export async function redeemEarliestReset(rpc: AccountRpc, root: string, accountId: string, attemptId: string, autoExpiresAt?: string, autoLowQuota?: string): Promise<ResetConsumption> {
   if (!uuid.test(attemptId)) throw new Error("重置请求标识无效。");
+  const automatic = autoExpiresAt !== undefined || autoLowQuota !== undefined;
+  if (autoLowQuota !== undefined && (autoExpiresAt !== undefined || !validLowQuotaKey(autoLowQuota))) throw new Error("自动用卡额度条件无效。");
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const activeFile = path.join(root, "pending.json");
   const receiptFile = (id: string) => path.join(root, `${id}.json`);
@@ -69,18 +76,23 @@ export async function redeemEarliestReset(rpc: AccountRpc, root: string, account
   if (!receipt) receipt = read(activeFile);
   if (receipt && uuid.test(receipt.attemptId)) receipt = read(receiptFile(receipt.attemptId)) ?? receipt;
   if (receipt && (receipt.accountId !== accountId || !uuid.test(receipt.attemptId))) throw new Error("重置操作身份不匹配，请核对账号。");
-  if (autoExpiresAt !== undefined && receipt?.outcome && receipt.attemptId !== attemptId) {
+  if (automatic && receipt?.outcome && receipt.attemptId !== attemptId) {
     // A crash after saving a result can leave the pending pointer behind.
     if (read(activeFile)?.attemptId === receipt.attemptId) fs.rmSync(activeFile, { force: true });
     receipt = null;
   }
-  if (autoExpiresAt !== undefined && receipt && (receipt.source !== "auto_expiry" || receipt.autoExpiresAt !== autoExpiresAt)) {
+  if (automatic && receipt && (autoLowQuota !== undefined
+    ? receipt.source !== "auto_quota" || receipt.autoLowQuota !== autoLowQuota
+    : receipt.source !== "auto_expiry" || receipt.autoExpiresAt !== autoExpiresAt)) {
     throw new Error("此账号有另一笔未确认的重置操作，自动使用已暂停。");
   }
   if (receipt && receipt.attemptId !== attemptId) writeReceipt(receiptFile(attemptId), receipt);
   const limits = await rpc("account/rateLimits/read", {});
   if (limits.accountId !== accountId) throw new Error("未能核实账号身份，未使用新的重置卡。");
   if (!receipt) {
+    if (autoLowQuota !== undefined && lowQuotaKey(resetQuota(limits), normalizeResetCredits(limits)) !== autoLowQuota) {
+      return { attemptId, outcome: "notDue", resetCredits: normalizeResetCredits(limits), quota: resetQuota(limits), refreshed: true };
+    }
     if (autoExpiresAt !== undefined) {
       const summary = normalizeResetCredits(limits);
       if (Date.parse(autoExpiresAt) <= Date.now() || (summary.state === "ok" && summary.expiryStatus === "complete" && summary.earliestExpiresAt !== autoExpiresAt)) {
@@ -97,8 +109,8 @@ export async function redeemEarliestReset(rpc: AccountRpc, root: string, account
         throw new Error("最早到期卡尚未进入最后一小时或已变化，未自动使用。");
       }
     }
-    receipt = { accountId, attemptId, creditId, source: autoExpiresAt ? "auto_expiry" : "manual",
-      createdAt: new Date().toISOString(), ...(autoExpiresAt ? { autoExpiresAt } : {}),
+    receipt = { accountId, attemptId, creditId, source: autoLowQuota ? "auto_quota" : autoExpiresAt ? "auto_expiry" : "manual",
+      createdAt: new Date().toISOString(), ...(autoExpiresAt ? { autoExpiresAt } : {}), ...(autoLowQuota ? { autoLowQuota } : {}),
       ...(creditId ? {} : { outcome: "noCredit" as const, completedAt: new Date().toISOString() }) };
     // Save the pending pointer first: any crash before sending still pins the same credit/key.
     writeReceipt(activeFile, receipt);
@@ -118,14 +130,7 @@ export async function redeemEarliestReset(rpc: AccountRpc, root: string, account
     const updated = await rpc("account/rateLimits/read", {});
     if (updated.accountId !== accountId) throw new Error("identity mismatch");
     resetCredits = normalizeResetCredits(updated);
-    const buckets = updated.rateLimitsByLimitId as Record<string, unknown> | undefined;
-    const bucket = (buckets?.codex ?? updated.rateLimits) as { primary?: { usedPercent?: number; resetsAt?: number }; secondary?: { usedPercent?: number; resetsAt?: number } } | undefined;
-    const windows = [bucket?.primary, bucket?.secondary].filter((v): v is { usedPercent: number; resetsAt?: number } => typeof v?.usedPercent === "number" && Number.isFinite(v.usedPercent));
-    windows.sort((a, b) => b.usedPercent - a.usedPercent);
-    if (windows[0]) {
-      const reset = Number(windows[0].resetsAt) * 1000;
-      quota = { remainingPercent: Math.max(0, Math.min(100, 100 - windows[0].usedPercent)), resetAt: windows[0].resetsAt != null && Number.isFinite(new Date(reset).getTime()) ? new Date(reset).toISOString() : null };
-    }
+    quota = resetQuota(updated);
     refreshed = resetCredits.state === "ok" && quota !== null;
   } catch { /* The receipt is already durable; report success with refresh pending. */ }
   return { attemptId: receipt.attemptId, outcome: receipt.outcome!, resetCredits, quota, refreshed };

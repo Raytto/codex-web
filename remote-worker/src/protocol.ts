@@ -11,7 +11,7 @@ export type RuntimeStatus = { installedVersion: string; latestVersion: string | 
 export type WorkerUpdateResult = { requestId: string; targetVersion: string; targetRef: string; ok: boolean; installedVersion: string; installedRef: string | null; installedCommit: string | null; message?: string };
 export type ContextUsage = { threadId: string; inputTokens: number; modelContextWindow: number | null };
 export type CodexQuotaUsage = { remainingPercent: number | null; resetAt?: string | null; resetCredits?: import("./codex-reset-credits.js").CodexResetCredits };
-export type CodexAccountView = { id: string; label: string; email: string | null; accountHint: string; active: boolean; createdAt: string; lastUsedAt: string | null; quotaRemainingPercent?: number | null; quotaResetAt?: string | null; quotaUpdatedAt?: string | null; resetCredits?: import("./codex-reset-credits.js").CodexResetCredits | null };
+export type CodexAccountView = { resetAccountKey?: string; id: string; label: string; email: string | null; accountHint: string; active: boolean; createdAt: string; lastUsedAt: string | null; quotaRemainingPercent?: number | null; quotaResetAt?: string | null; quotaUpdatedAt?: string | null; resetCredits?: import("./codex-reset-credits.js").CodexResetCredits | null };
 export type CodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
 export type CodexAccountLoginView = { id: string; status: "starting" | "waiting_for_user" | "succeeded" | "failed" | "cancelled"; verificationUrl: string | null; userCode: string | null; error: string | null; account: CodexAccountView | null; createdAt: string; expiresAt: string };
 
@@ -98,7 +98,7 @@ export type ServerMessage =
   | { type: "worker_update"; requestId: string; targetVersion: string; targetRef: string }
   | { type: "worker_update_result_ack"; requestId: string }
   | { type: "worker_config"; requestId: string; capacity: number }
-  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string }
+  | { type: "codex_accounts"; requestId: string; action: "list" | "login_start" | "login_status" | "login_cancel" | "activate" | "delete" | "reset_credit"; label?: string; loginId?: string; accountId?: string; threadIds?: string[]; refreshUsage?: boolean; attemptId?: string; autoExpiresAt?: string; autoLowQuota?: string }
   | { type: "heartbeat_ack"; at: string };
 export type WorkerMessage =
   | ({ type: "gemini_accounts_result"; requestId: string; ok: boolean; message?: string } & GeminiAccountResult)

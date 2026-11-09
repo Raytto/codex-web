@@ -125,7 +125,7 @@ The base image contains the application, one pinned Codex CLI, Python/uv, Git an
 | Capability | Configuration |
 | --- | --- |
 | Office/PDF conversion and document libraries | Build `documents` for LibreOffice, Poppler, fonts and Python document/data packages; see [building and storage](docs/BUILD_AND_STORAGE.md) |
-| Voice transcription | Set your own `DASHSCOPE_API_KEY`, HTTPS `DASHSCOPE_BASE_URL`, a supported `DASHSCOPE_ASR_MODEL` and HTTPS `PUBLIC_BASE_URL`; audio and bounded context go to that service |
+| Voice transcription | Choose DashScope audio input or OpenAI file transcription, with your own API account/model; audio and bounded context go to the selected service. See [provider setup](docs/VOICE_TRANSCRIPTION_PROVIDERS.md) |
 | Personal-memory extraction | Set `PERSONAL_MEMORY_API_KEY`, `PERSONAL_MEMORY_BASE_URL` and a model; no external extraction runs without configuration |
 | Host bridge / Remote Worker | Select trusted executors and configure identities and paths; see [deployment options](docs/DEPLOYMENT_OPTIONS.md) and the [Worker guide](remote-worker/README.md) |
 | Gemini / Antigravity | Explicitly add and authorize an account on a supported, configured node; the base image contains no extra model CLI; see [multi-engine execution](docs/MULTI_ENGINE.md) |

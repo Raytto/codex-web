@@ -69,7 +69,7 @@ fs.appendFileSync(${JSON.stringify(path.join(root, "methods"))},m.method+'\\n');
 if(m.method==='initialize')return console.log(JSON.stringify({id:m.id,result:{}}));
 if(m.method!=='account/rateLimits/read')throw Error('unexpected method');
 const a=JSON.parse(fs.readFileSync(file));if(a.tokens.refresh_token){a.tokens.refresh_token='rotated-fixture';fs.writeFileSync(file,JSON.stringify(a));}
-console.log(JSON.stringify({id:m.id,result:{accountId:process.env.FAKE_WRONG_ACCOUNT?'other':a.tokens.account_id,rateLimitResetCredits:{availableCount:3,credits:null}}}));
+console.log(JSON.stringify({id:m.id,result:{accountId:process.env.FAKE_WRONG_ACCOUNT?'other':a.tokens.account_id,rateLimits:{primary:{usedPercent:99.5,resetsAt:1924992000}},rateLimitResetCredits:{availableCount:3,credits:null}}}));
 });`);
   return { root, authority, executable };
 }
@@ -93,6 +93,9 @@ test("server account refresh commits rotated auth under the existing lock, dedup
   const [one, two] = await Promise.all([manager.listAccounts(true), manager.listAccounts(true)]);
   assert.equal(one.activeAccountId, before.activeAccountId); assert.equal(two.activeAccountId, before.activeAccountId);
   assert.equal(one.accounts[0].resetCredits?.availableCount, 3);
+  assert.equal(one.accounts[0].quotaRemainingPercent, 0.5);
+  assert.equal(one.accounts[0].quotaResetAt, new Date(1924992000*1000).toISOString());
+  assert.ok(one.accounts[0].quotaUpdatedAt);
   assert.equal(JSON.parse(fs.readFileSync(f.authority, "utf8")).tokens.refresh_token, "rotated-fixture");
   assert.equal(fs.readFileSync(path.join(f.root, "methods"), "utf8").split("account/rateLimits/read").length - 1, 1);
   assert.doesNotMatch(JSON.stringify(one), /access-fixture|rotated-fixture|account-fixture/);

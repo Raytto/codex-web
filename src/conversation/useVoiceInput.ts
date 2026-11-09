@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { api } from "../api";
+import { api, type VoiceUploadOptions } from "../api";
 import type { ConversationVoiceState } from "./conversation-types";
 import { deleteVoiceDraft, getVoiceDraft, purgeExpiredVoiceDrafts, requestPersistentVoiceStorage, saveVoiceDraft, type VoiceDraftRecord } from "./voice-draft-store";
 
@@ -17,11 +17,11 @@ export type UseVoiceInputOptions = {
   maxDurationMs?: number;
   fileNamePrefix?: string;
   unsupportedMessage?: string;
-  onUploadRecording?: (audio: Blob, fileName: string, context: VoiceInputContext) => Promise<void>;
+  onUploadRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, upload: VoiceUploadOptions) => Promise<void>;
   // Transfers ownership of the durable recording to a queue. Resolves at
   // handoff, without waiting for the network; the queue must clean up the draft.
   onQueueRecording?: (draft: VoiceDraftRecord) => Promise<void>;
-  onSendRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, transcriptionIds: string[]) => Promise<void>;
+  onSendRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, transcriptionIds: string[], upload: VoiceUploadOptions) => Promise<void>;
   onTranscript?: (text: string, transcriptionId: string, context?: VoiceInputContext) => void;
   onSendAfterTranscription?: (text: string, transcriptionIds: string[], context?: VoiceInputContext) => void;
 };
@@ -39,6 +39,7 @@ export type VoiceInputController = {
   state: ConversationVoiceState;
   starting: boolean;
   uploading: boolean;
+  uploadProgress: number | null;
   elapsed: number;
   error: string;
   notice: string;
@@ -75,6 +76,7 @@ export function formatVoiceDuration(seconds: number): string {
 
 export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputController {
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [state, setState] = useState<ConversationVoiceState>("idle");
   const [starting, setStarting] = useState(false);
   const acquiringRef = useRef(false);
@@ -209,17 +211,19 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
 
   const submitDraft = useCallback(async (draft: VoiceDraftRecord, session: VoiceInputContext) => {
     const current = optionsRef.current;
+    setUploadProgress(null);
+    const upload: VoiceUploadOptions = { onUploadProgress: setUploadProgress };
     try {
       const callbacks = sessionCallbacksRef.current ?? current;
       if (callbacks.onQueueRecording) {
         await callbacks.onQueueRecording(draft);
       } else if (callbacks.onUploadRecording) {
         setUploading(true);
-        await callbacks.onUploadRecording(draft.blob, draft.fileName, session);
+        await callbacks.onUploadRecording(draft.blob, draft.fileName, session, upload);
       } else if (draft.sendAfterTranscription && callbacks.onSendRecording && !session.pendingPromptId) {
         setUploading(true);
         const sameTarget = transcriptionConversationIdRef.current === session.conversationId && !transcriptionPendingPromptIdRef.current;
-        await callbacks.onSendRecording(draft.blob, draft.fileName, session, sameTarget ? transcriptionIdsRef.current : []);
+        await callbacks.onSendRecording(draft.blob, draft.fileName, session, sameTarget ? transcriptionIdsRef.current : [], upload);
         transcriptionIdsRef.current = []; setTranscriptionIds([]);
       } else {
         setUploading(true);
@@ -228,6 +232,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
           draftText: session.draftText,
           attachmentNames: session.attachmentNames,
           clientRecordingId: draft.id,
+          ...upload,
           onUploadComplete: () => setUploading(false),
         });
         const sameTarget = transcriptionConversationIdRef.current === session.conversationId
@@ -255,12 +260,14 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
       setNotice("");
       setError("");
       setUploading(false);
+      setUploadProgress(null);
       changeState("idle");
       setElapsed(0);
       sessionRef.current = null;
       sessionCallbacksRef.current = null;
     } catch (reason) {
       setUploading(false);
+      setUploadProgress(null);
       const message = reason instanceof Error ? reason.message : "语音识别失败，请重试。";
       const failed = { ...draft, conversationId: session.conversationId, status: "retryable" as const, retryCount: draft.retryCount + 1, lastError: message, updatedAt: new Date().toISOString() };
       activeDraftRef.current = failed;
@@ -540,6 +547,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   return {
     state,
     uploading,
+    uploadProgress,
     starting,
     elapsed,
     error,

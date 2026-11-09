@@ -267,9 +267,9 @@ export class HostRootWorkerClient {
     );
   }
 
-  consumeResetCredit(userId: string, accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
+  consumeResetCredit(userId: string, accountId: string, attemptId: string, autoExpiresAt?: string, autoLowQuota?: string): Promise<ResetConsumption> {
     const requestId = crypto.randomUUID();
-    return this.singleRequest({ type: "codex_account_reset", requestId, userId, accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}) },
+    return this.singleRequest({ type: "codex_account_reset", requestId, userId, accountId, attemptId, ...(autoExpiresAt ? { autoExpiresAt } : {}), ...(autoLowQuota ? { autoLowQuota } : {}) },
       (message) => message.type === "codex_account_reset_result" && message.requestId === requestId ? message.result : undefined,
       undefined, 90_000);
   }

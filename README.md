@@ -126,7 +126,7 @@ ssh -L 37821:127.0.0.1:37821 user@your-server
 | 能力 | 启用条件与说明 |
 | --- | --- |
 | Office、PDF 转换及文档库 | 构建 `documents` 镜像，增加 LibreOffice、Poppler、字体和 Python 文档/数据包；见[构建指南](docs/BUILD_AND_STORAGE.md) |
-| 语音转写 | 配置自己的 `DASHSCOPE_API_KEY`、HTTPS `DASHSCOPE_BASE_URL`、可用的 `DASHSCOPE_ASR_MODEL` 和 HTTPS `PUBLIC_BASE_URL`；音频和有界上下文会发送到所配置的服务 |
+| 语音转写 | 选择 DashScope 音频输入或 OpenAI 文件转写，分别配置自己的 API 账号与模型；音频和有界上下文发送到所选服务。见[录音转写配置](docs/VOICE_TRANSCRIPTION_PROVIDERS.md) |
 | 个人记忆提取 | 配置 `PERSONAL_MEMORY_API_KEY`、`PERSONAL_MEMORY_BASE_URL` 及模型；未配置时不调用外部提取服务 |
 | 宿主桥 / Remote Worker | 显式选择可信执行器、配置身份和路径；详见[分层部署](docs/DEPLOYMENT_OPTIONS.md)与[Worker 指南](remote-worker/README.md) |
 | Gemini / Antigravity | 在已配置的受支持节点上显式添加账号并授权；基础镜像不附带额外模型 CLI；见[多引擎说明](docs/MULTI_ENGINE.md) |

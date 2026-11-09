@@ -35,7 +35,10 @@ export function ConversationVoicePanel({ voice, className, panelClassName, contr
         <canvas ref={voice.waveformRef} aria-label="实时音量波形" />
         <time>{formatVoiceDuration(voice.elapsed)}</time>
         <button type="button" className="voice-stop" onClick={() => voice.finish(false)} aria-label="停止录音并识别" title="停止并转成文字"><Square size={12} fill="currentColor" /></button>
-      </> : <><LoaderCircle className="spin" size={17} /><span>{voice.uploading ? "正在上传语音，请稍候…" : "正在识别语音…"}</span></>}
+      </> : <><LoaderCircle className="spin" size={17} /><span>{voice.uploading
+        ? voice.uploadProgress === 100 ? "语音已上传 100%，正在确认…"
+          : voice.uploadProgress === null ? "正在上传语音，请稍候…" : `正在上传语音 ${voice.uploadProgress}%`
+        : "正在识别语音…"}</span></>}
     </div>}
     <div className={`conversation-voice-wrap ${className ?? ""} ${controlClassName ?? ""}`}>
       {voice.draftRestoring && <span className="voice-draft-restoring" role="status" aria-live="polite"><LoaderCircle className="spin" size={13} />正在恢复未发送语音…</span>}
@@ -48,7 +51,7 @@ export function ConversationVoicePanel({ voice, className, panelClassName, contr
       {voice.draftStorageError && <span className="voice-draft-storage-error" role="alert">{voice.draftStorageError}</span>}
       {voice.notice && <span className="voice-notice" role="status" aria-live="polite"><Check size={13} />{voice.notice}</span>}
       {voice.error && <span className={`voice-error ${readerVariant ? "reader-ask-error" : ""}`} role="alert"><span>{voice.error}</span><button type="button" onClick={voice.clearError} aria-label="关闭语音错误"><X size={13} /></button></span>}
-      {state === "idle" && onStart && !voice.pendingDraft && !voice.draftRestoring && <button type="button" className={`mic-button ${micClassName ?? ""} ${className ?? ""}`} onClick={onStart} disabled={micDisabled} aria-label="语音输入" title="语音输入"><Mic size={18} /></button>}
+      {state === "idle" && !voice.starting && onStart && !voice.pendingDraft && !voice.draftRestoring && <button type="button" className={`mic-button ${micClassName ?? ""} ${className ?? ""}`} onClick={onStart} disabled={micDisabled} aria-label="语音输入" title="语音输入"><Mic size={18} /></button>}
     </div>
   </>;
 }

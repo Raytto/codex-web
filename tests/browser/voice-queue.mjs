@@ -69,20 +69,20 @@ try {
   const composer = () => page.locator('.composer:visible');
   const queue = () => page.getByRole('region', { name: '待发送任务队列' });
   const noChatMessage = async () => assert.equal(await page.locator('.message.user').count(), 0, 'queued voice must not appear as a chat message');
-  const record = async text => {
+  const record = async (text, expectedMessages = 0) => {
     await composer().locator('textarea').fill(text);
     await composer().getByRole('button', { name: '录音输入', exact: true }).click();
     const response = page.waitForResponse(r => r.url().endsWith('/voice-messages'));
     await composer().getByRole('button', { name: '发送语音', exact: true }).click();
     assert.equal((await response).status(), 202);
     await queue().getByText('正在进行语音识别…', { exact: true }).waitFor();
-    await noChatMessage();
+    assert.equal(await page.locator('.message.user').count(), expectedMessages, 'recognition must not add a chat placeholder');
     return (await api('GET', '/conversations/' + conversation.id)).pendingPrompts.at(-1).id;
   };
   const first = await record('typed context');
   assert.equal(await queue().getByTitle('编辑', { exact: true }).isDisabled(), true);
-  assert.equal(await queue().getByTitle('立即插入并发送这项任务').isDisabled(), true);
-  report.checks.push('recognizing_only_in_queue_and_actions_locked');
+  assert.equal(await queue().getByTitle('立即插入并发送这项任务').isEnabled(), true);
+  report.checks.push('recognizing_only_in_queue_edit_locked_insert_available');
   await page.reload(); await queue().getByText('正在进行语音识别…', { exact: true }).waitFor(); await noChatMessage();
   report.checks.push('recognition_survives_reload_without_chat_placeholder');
   gates[0].resolve(); await instance.waitForBackgroundTasks();
@@ -114,7 +114,7 @@ try {
   // A separate blank task keeps the remaining pending assertions independent.
   const next = (await api('POST', '/conversations', { projectId: project.id, reuseEmpty: false })).conversation;
   await page.evaluate(({ account, id }) => localStorage.setItem(`cww:account:${encodeURIComponent(account)}:selected-conversation`, id), { account: auth.accountId, id: next.id });
-  conversation.id = next.id; await page.reload();
+  conversation.id = next.id; await page.goto(origin + '/?conversation=' + next.id);
   await page.setViewportSize({ width: 390, height: 844 });
   const retry = await record('retry context'); gates[1].resolve(); await instance.waitForBackgroundTasks();
   await queue().getByRole('button', { name: '重试识别', exact: true }).waitFor(); await noChatMessage();
@@ -133,6 +133,52 @@ try {
   await queue().getByTitle('删除', { exact: true }).click();
   await queue().waitFor({ state: 'hidden' }); await noChatMessage();
   report.checks.push('delete_removes_pending_voice');
+  const runningConversation = instance.db.getConversation(conversation.id);
+  const runningJob = instance.db.createJob(crypto.randomUUID(), conversation.id, null, { model: runningConversation.agent_model, reasoningEffort: runningConversation.reasoning_effort });
+  instance.db.updateJob(runningJob.id, 'running');
+  instance.db.updateConversation(conversation.id, { status: 'running' });
+  let steerCalls = 0;
+  instance.runner.steer = async (jobId, text) => {
+    assert.equal(jobId, runningJob.id); assert.match(text, /deferred context/);
+    steerCalls++; return 'fixture-turn';
+  };
+  await page.reload();
+  const armed = await record('deferred context');
+  assert.equal(await queue().getByTitle('立即引导当前任务').isEnabled(), true);
+  const armedResponse = page.waitForResponse(r => r.url().endsWith('/steer'));
+  await queue().getByTitle('立即引导当前任务').click(); assert.equal((await armedResponse).status(), 202);
+  const status = '正在进行语音识别…语音识别完成后会自动引导';
+  await queue().getByText(status, { exact: true }).waitFor();
+  assert.equal(await queue().getByTitle('语音识别完成后会自动引导').isDisabled(), true);
+  report.checks.push('steer_during_recognition_acknowledged_disabled_and_visible');
+  await page.reload(); await queue().getByText(status, { exact: true }).waitFor();
+  const sizes = [[382,580],[382,618],[594,368],[594,406],[669,867],[669,902],[951,585],[951,620],[385,571],[385,609],[390,844],[402,874],[1440,900],[1280,800]];
+  for (const [width,height] of sizes) {
+    await page.setViewportSize({ width, height });
+    await queue().getByText(status, { exact: true }).scrollIntoViewIfNeeded();
+    const layout = await queue().evaluate(el => { const r=el.getBoundingClientRect(); return {left:r.left,right:r.right,width:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth}; });
+    assert.ok(layout.left>=-1 && layout.right<=layout.width+1 && !layout.overflow, JSON.stringify({width,height,layout}));
+    assert.equal(await queue().getByTitle('语音识别完成后会自动引导').isDisabled(), true);
+  }
+  await page.screenshot({ path: output + '/deferred-steer.png' });
+  report.checks.push('deferred_intent_survives_reload_and_14_viewports');
+  await page.close(); gates[3].resolve(); await instance.waitForBackgroundTasks();
+  assert.equal(steerCalls, 1); assert.equal(instance.db.getPendingPrompt(armed), undefined);
+  assert.equal(instance.db.listMessages(conversation.id).length, 1);
+  page = await context.newPage(); await page.goto(origin + '/?conversation=' + conversation.id);
+  await page.locator('.message.user').filter({ hasText: 'deferred context' }).waitFor();
+  assert.equal(await queue().count(), 0);
+  report.checks.push('closed_page_still_delivers_single_steer_and_reopen_shows_message');
+  const fallback = await record('ended task context', 1);
+  await queue().getByTitle('立即引导当前任务').click();
+  await queue().getByText(status, { exact: true }).waitFor();
+  instance.db.finishJob(runningJob.id, conversation.id, 'completed');
+  gates[4].resolve(); await instance.waitForBackgroundTasks();
+  assert.equal(steerCalls, 1); assert.equal(instance.db.getPendingPrompt(fallback), undefined);
+  assert.equal(instance.db.listActiveJobsForConversation(conversation.id).length, 1);
+  assert.equal(instance.db.listMessages(conversation.id).length, 2);
+  await page.locator('.message.user').filter({ hasText: 'ended task context' }).waitFor();
+  report.checks.push('finished_current_task_falls_back_to_one_new_queued_job');
   assert.deepEqual(report.pageErrors, []); report.ok = true;
 } catch (e) {
   report.error = String(e.stack); process.exitCode = 1;

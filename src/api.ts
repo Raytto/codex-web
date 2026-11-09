@@ -38,6 +38,7 @@ export type CodexAccount = {
   active: boolean;
   createdAt: string;
   lastUsedAt: string | null;
+  autoResetEnabled?: boolean;
   quotaRemainingPercent?: number | null;
   quotaResetAt?: string | null;
   quotaUpdatedAt?: string | null;
@@ -77,6 +78,8 @@ export type GeminiAccountLogin = {
   expiresAt: string;
 };
 export type Conversation = {
+  // Queued work is always visible; explicit completion states apply only with a finite cap.
+  workflow_state?: "queued" | "active" | "blocked" | "closing" | "completed" | "aborted" | null;
   is_dot_coordinator?: number;
   id: string; project_id: string | null; title: string; title_source: "default" | "ai" | "manual" | "legacy"; status: "idle" | "running"; external_status: "idle" | "running"; sync_origin: "codex_web" | "codex_app"; remote_updated_at: number; pinned_at: string | null; sidebar_order: number; has_unread_result: number; unread_anchor_message_id: string | null; has_pending_work: number; active_wake_count: number; next_wake_at: string | null; active_wake_mode: WakePlan["mode"] | null; active_wake_label: string | null; project_move_blocked: number; rollout_bytes: number | null; last_active_at: string; cold_storage_state: "local" | "uploading" | "remote_verified" | "evicting" | "cold" | "restoring" | "error"; cold_storage_generation: number; cold_storage_revision: number; cold_storage_manifest_sha256: string | null; cold_storage_archive_sha256: string | null; cold_storage_archive_bytes: number | null; cold_storage_remote_path: string | null; cold_storage_error: string | null; archived_at: string | null; created_at: string; updated_at: string;
 };
@@ -199,7 +202,7 @@ export type Message = {
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; attachment_references: string[]; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
-  voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null };
+  voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null; steer_state: "requested" | "sending" | "failed" | null; steer_action: "steer" | "insert" | null; steer_error: string | null };
   id: string;
   conversation_id: string;
   content: string;
@@ -501,15 +504,25 @@ type RequestOptions = { allowStatuses?: readonly number[]; timeoutMs?: number };
 const COMPOSER_REQUEST_TIMEOUT_MS = 45_000;
 const COMPOSER_UPLOAD_TIMEOUT_MS = 600_000;
 
-// Upload completion is distinct from cloud recognition for the proofreading route.
-function transcribeWithUploadProgress<T>(path: string, body: FormData, uploaded: () => void): Promise<T> {
+export type VoiceUploadOptions = {
+  onUploadProgress?: (percent: number | null) => void;
+  onUploadComplete?: () => void;
+};
+
+// Byte transfer is distinct from server acceptance and cloud recognition.
+function voiceRequestWithUploadProgress<T>(path: string, body: FormData, options: VoiceUploadOptions): Promise<T> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${BASE_PATH}/api${path}`);
     xhr.withCredentials = true;
     xhr.timeout = COMPOSER_UPLOAD_TIMEOUT_MS;
     if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
-    xhr.upload.onload = uploaded;
+    xhr.upload.onprogress = (event) => options.onUploadProgress?.(event.lengthComputable && event.total > 0
+      ? Math.min(100, Math.max(0, Math.floor(event.loaded / event.total * 100))) : null);
+    xhr.upload.onload = () => {
+      options.onUploadProgress?.(100);
+      options.onUploadComplete?.();
+    };
     xhr.onload = () => {
       let data: { error?: string } = {};
       try { data = JSON.parse(xhr.responseText); } catch { /* Report the response status below. */ }
@@ -519,6 +532,7 @@ function transcribeWithUploadProgress<T>(path: string, body: FormData, uploaded:
     xhr.onerror = () => reject(new Error("语音上传连接中断，录音已保留，请重试。"));
     xhr.ontimeout = () => reject(new Error("语音识别确认超时，录音已保留，请重试。"));
     xhr.onabort = () => reject(new Error("语音请求已中止，录音已保留。"));
+    options.onUploadProgress?.(0);
     xhr.send(body);
   });
 }
@@ -576,6 +590,7 @@ export const api = {
   login: (username: string, password: string) => request<Session>("/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
   systemStatus: () => request<SystemStatus>("/system/status"),
+  setCodexAutoReset: (executorId: string, accountId: string, enabled: boolean) => request<{ enabled: boolean }>(`/codex-accounts/${encodeURIComponent(accountId)}/auto-reset`, { method: "PATCH", body: JSON.stringify({ executorId, enabled }) }),
   codexResetHistory: (executorId: string) => request<{ records: import("../server/codex-reset-auto-use.js").AutoResetRecord[]; enabled: boolean; supported: boolean }>(`/codex-accounts/reset-history?executorId=${encodeURIComponent(executorId)}`),
   consumeCodexResetCredit: (executorId: string, accountId: string, attemptId: string) => request<import("../remote-worker/src/codex-reset-consumer.js").ResetConsumption>(`/codex-accounts/${encodeURIComponent(accountId)}/reset-credit`, { method: "POST", body: JSON.stringify({ executorId, attemptId }) }),
   refreshCodexAccountUsage: (executorId: string) => request<CodexAccountsState>("/codex-accounts/refresh-usage", { method: "POST", body: JSON.stringify({ executorId }) }),
@@ -743,9 +758,9 @@ export const api = {
   triggerWake: (conversationId: string, wakePlanId: string) => request<{ status: string; wakePlan: WakePlan }>(
     `/conversations/${conversationId}/wake-plans/${wakePlanId}/trigger`, { method: "POST" },
   ),
-  saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false) => request<{ composerDraft: ComposerDraft | null }>(
+  saveConversationDraft: (id: string, content: string, quoteExcerpt = "", keepalive = false, voiceTranscriptionIds: string[] = []) => request<{ composerDraft: ComposerDraft | null }>(
     `/conversations/${id}/draft`,
-    { method: "PUT", body: JSON.stringify({ content, quoteExcerpt }), keepalive }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
+    { method: "PUT", body: JSON.stringify({ content, quoteExcerpt, voiceTranscriptionIds }), keepalive }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   uploadConversationDraftFiles: (id: string, files: File[], signal?: AbortSignal) => {
     const body = new FormData();
@@ -775,15 +790,16 @@ export const api = {
     files.forEach((file) => body.append("files", file));
     return request<PendingMutationResponse>(`/conversations/${id}/messages`, { method: "POST", body }, { timeoutMs: files.length ? COMPOSER_UPLOAD_TIMEOUT_MS : COMPOSER_REQUEST_TIMEOUT_MS });
   },
-  sendVoiceMessage: (id: string, audio: Blob, fileName: string, clientRecordingId: string, message: string, quoteExcerpt: string, voiceTranscriptionIds: string[]) => {
+  sendVoiceMessage: (id: string, audio: Blob, fileName: string, clientRecordingId: string, message: string, quoteExcerpt: string, voiceTranscriptionIds: string[], upload: VoiceUploadOptions = {}) => {
     const body = new FormData();
     body.set("audio", audio, fileName); body.set("clientRecordingId", clientRecordingId);
     body.set("message", message); body.set("quoteExcerpt", quoteExcerpt);
     body.set("voiceTranscriptionIds", JSON.stringify(voiceTranscriptionIds));
+    if (upload.onUploadProgress || upload.onUploadComplete) return voiceRequestWithUploadProgress<{ accepted: boolean; pendingPrompt: PendingPrompt | null }>(`/conversations/${id}/voice-messages`, body, upload);
     return request<{ accepted: boolean; pendingPrompt: PendingPrompt | null }>(`/conversations/${id}/voice-messages`, { method: "POST", body }, { timeoutMs: COMPOSER_UPLOAD_TIMEOUT_MS });
   },
   retryVoiceMessage: (id: string, pendingId: string) => request<{ accepted: boolean }>(`/conversations/${id}/pending-prompts/${pendingId}/retry-voice`, { method: "POST" }),
-  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; projectId?: string; draftText?: string; attachmentNames?: string[]; purpose?: "composer" | "search"; clientRecordingId?: string; onUploadComplete?: () => void } = {}) => {
+  transcribeAudio: (audio: Blob, fileName: string, context: { conversationId?: string; projectId?: string; draftText?: string; attachmentNames?: string[]; purpose?: "composer" | "search"; clientRecordingId?: string } & VoiceUploadOptions = {}) => {
     const body = new FormData();
     body.set("audio", audio, fileName);
     body.set("conversationId", context.conversationId ?? "");
@@ -792,7 +808,7 @@ export const api = {
     body.set("purpose", context.purpose ?? "composer");
     body.set("attachmentNames", JSON.stringify(context.attachmentNames ?? []));
     body.set("clientRecordingId", context.clientRecordingId ?? "");
-    if (context.onUploadComplete) return transcribeWithUploadProgress<{ text: string; transcriptionId: string }>("/transcriptions", body, context.onUploadComplete);
+    if (context.onUploadProgress || context.onUploadComplete) return voiceRequestWithUploadProgress<{ text: string; transcriptionId: string }>("/transcriptions", body, context);
     return request<{ text: string; transcriptionId: string }>("/transcriptions", { method: "POST", body });
   },
   reorderPendingPrompts: (conversationId: string, ids: string[]) => request<{ pendingPrompts: PendingPrompt[] }>(
@@ -819,7 +835,7 @@ export const api = {
   deletePendingPrompt: (conversationId: string, promptId: string) => request<void>(
     `/conversations/${conversationId}/pending-prompts/${promptId}`, { method: "DELETE" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
-  steerPendingPrompt: (conversationId: string, promptId: string) => request<{ ok: true; mode: "steer" | "insert"; turnId?: string; job?: Job }>(
+  steerPendingPrompt: (conversationId: string, promptId: string) => request<{ ok: true; mode: "steer" | "insert" | "deferred"; pendingPrompt?: PendingPrompt; turnId?: string; job?: Job }>(
     `/conversations/${conversationId}/pending-prompts/${promptId}/steer`, { method: "POST" }, { timeoutMs: COMPOSER_REQUEST_TIMEOUT_MS },
   ),
   cancelJob: (id: string) => request<{ ok: true }>(`/jobs/${id}/cancel`, { method: "POST" }),

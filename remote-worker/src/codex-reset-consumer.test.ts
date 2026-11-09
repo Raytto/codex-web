@@ -188,3 +188,79 @@ test("automatic isolated CLI sessions share a per-account expiry key across mach
   assert.equal(fs.readFileSync(authFile, 'utf8'), before); assert.deepEqual(fs.readdirSync(options.temporaryRoot), []);
   assert.doesNotMatch(JSON.stringify([first, second]), /private-fixture|creditId|fixture-account/);
 });
+
+test("low-quota guard rechecks fresh limits, pins earliest card, and recovers an ambiguous operation without spending another", async t => {
+  const { lowQuotaKey, resetQuota } = await import('./codex-reset-policy.js');
+  const { normalizeResetCredits } = await import('./codex-reset-credits.js');
+  const root = temporary(t), data = limits();
+  data.rateLimitsByLimitId.codex.secondary.usedPercent = 99;
+  const key = lowQuotaKey(resetQuota(data), normalizeResetCredits(data))!;
+  assert.ok(key);
+  const attempt = autoResetAttemptId('fixture-account', `quota:${key}`); let calls = 0;
+  const rpc = async (method: string, params: unknown) => {
+    if (method === 'account/rateLimits/read') return calls ? limits([credit('next', future()+5000)]) : data;
+    calls++; assert.deepEqual(params, { idempotencyKey: attempt, creditId: 'early' });
+    if (calls === 1) throw Error('lost response');
+    return { outcome: 'alreadyRedeemed' };
+  };
+  await assert.rejects(redeemEarliestReset(rpc, root, 'fixture-account', attempt, undefined, key), /lost response/);
+  const recovered = await redeemEarliestReset(rpc, root, 'fixture-account', attempt, undefined, key);
+  assert.equal(recovered.outcome, 'alreadyRedeemed'); assert.equal(calls, 2);
+  await redeemEarliestReset(rpc, root, 'fixture-account', attempt, undefined, key); assert.equal(calls,2);
+  const receipt = JSON.parse(fs.readFileSync(path.join(root,`${attempt}.json`),'utf8'));
+  assert.equal(receipt.source,'auto_quota'); assert.equal(receipt.autoLowQuota,key);
+  for (const value of [limits(), { ...data, rateLimitsByLimitId: {} }, limits([])]) {
+    const skipped = await redeemEarliestReset(async method => { assert.equal(method,'account/rateLimits/read'); return value; }, temporary(t), 'fixture-account', crypto.randomUUID(), undefined, key);
+    assert.equal(skipped.outcome,'notDue');
+  }
+});
+
+test("low quota keys reject unknown, stale, partial, and above-threshold windows and cross Worker parser correctly", async () => {
+  const { lowQuotaKey, resetQuota } = await import('./codex-reset-policy.js');
+  const { normalizeResetCredits } = await import('./codex-reset-credits.js');
+  const data = limits(), summary = normalizeResetCredits(data);
+  for (const [used, eligible] of [[98.99,false],[99,true],[99.5,true],[100,true],[101,true],[-1,false],[NaN,false]] as const) {
+    data.rateLimitsByLimitId.codex.primary.usedPercent = used;
+    assert.equal(Boolean(lowQuotaKey(resetQuota(data), summary)),eligible);
+  }
+  assert.equal(lowQuotaKey({ remainingPercent: NaN, resetAt: new Date(future()*1000).toISOString() },summary),null);
+  assert.equal(lowQuotaKey({ remainingPercent: 0, resetAt: '2000-01-01T00:00:00.000Z' },summary),null);
+  data.rateLimitsByLimitId.codex.primary.usedPercent=100;
+  const key = lowQuotaKey(resetQuota(data),summary)!;
+  const payload={type:'codex_accounts',requestId:crypto.randomUUID(),action:'reset_credit',accountId:crypto.randomUUID(),attemptId:crypto.randomUUID(),autoLowQuota:key};
+  assert.ok(parseServerMessage(JSON.stringify(payload)).ok);
+  for(const patch of [{autoLowQuota:true},{autoLowQuota:'[]'},{action:'list'},{autoExpiresAt:new Date().toISOString()}])
+    assert.equal(parseServerMessage(JSON.stringify({...payload,...patch})).ok,false);
+  assert.notEqual(autoResetAttemptId('first',`quota:${key}`), autoResetAttemptId('second',`quota:${key}`));
+});
+
+test("low-quota isolated CLI sessions deduplicate across machine journals with the real transport", async t => {
+  const { lowQuotaKey, resetQuota } = await import("./codex-reset-policy.js");
+  const { normalizeResetCredits } = await import("./codex-reset-credits.js");
+  const root = temporary(t), authFile = path.join(root, 'auth.json'), executable = path.join(root, 'fake.js');
+  const log = path.join(root, 'requests'), consumed = path.join(root, 'upstream-receipt');
+  const due = Math.floor(Date.now() / 1000) + 1800, expiry = new Date(due * 1000).toISOString();
+  fs.writeFileSync(authFile, JSON.stringify({ tokens: { account_id: 'fixture-account', refresh_token: 'private-fixture', access_token: 'fixture' } }));
+  const before = fs.readFileSync(authFile, 'utf8');
+  const data = limits([credit("due", due)]); data.rateLimitsByLimitId.codex.primary.usedPercent = 100;
+  const quotaKey = lowQuotaKey(resetQuota(data), normalizeResetCredits(data))!;
+  fs.writeFileSync(executable, `const fs=require('fs'),readline=require('readline'),path=require('path');
+    if(JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME,'auth.json'))).tokens.refresh_token)throw Error('refresh not stripped');
+    readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(!m.id)return;let result={};
+      if(m.method==='account/rateLimits/read')result=${JSON.stringify(data)};
+      if(m.method==='account/rateLimitResetCredit/consume'){
+        fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(m.params)+'\\n');
+        if(fs.existsSync(${JSON.stringify(consumed)})){if(fs.readFileSync(${JSON.stringify(consumed)},'utf8')!==m.params.idempotencyKey)throw Error('duplicate physical spend');result={outcome:'alreadyRedeemed'};}
+        else{fs.writeFileSync(${JSON.stringify(consumed)},m.params.idempotencyKey);result={outcome:'reset'};}
+      } console.log(JSON.stringify({id:m.id,result}));});`);
+  const options = { executable, authFile, expectedAccountId: 'fixture-account', temporaryRoot: path.join(root, 'temp'), autoLowQuota: quotaKey };
+  const first = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'server'), attemptId: crypto.randomUUID() });
+  const second = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'worker'), attemptId: crypto.randomUUID() });
+  const replay = await consumeAccountResetCredit({ ...options, journalRoot: path.join(root, 'server'), attemptId: crypto.randomUUID() });
+  assert.equal(first.outcome, 'reset'); assert.equal(second.outcome, 'alreadyRedeemed'); assert.equal(replay.outcome, 'reset');
+  assert.equal(first.attemptId, second.attemptId); assert.equal(first.attemptId, autoResetAttemptId('fixture-account', `quota:${quotaKey}`));
+  const requests = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(requests.length, 2); assert.deepEqual(requests[0], requests[1]);
+  assert.equal(fs.readFileSync(authFile, 'utf8'), before); assert.deepEqual(fs.readdirSync(options.temporaryRoot), []);
+  assert.doesNotMatch(JSON.stringify([first, second]), /private-fixture|creditId|fixture-account/);
+});

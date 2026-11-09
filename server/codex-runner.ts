@@ -1,5 +1,6 @@
 import { garbageCollectConversationRecords } from "./conversation-cold-storage.js";
 import { taskMemoryError, taskMemoryErrorCode, TASK_MEMORY_POLL_MS } from "./task-memory.js";
+import { autoResetPreference } from "./codex-reset-auto-use.js";
 import { ExecutionUncertainError } from "./execution-ownership.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { bindEngineSession, recordEngineNativeId, engineHandoffContext } from "./agent-engine-sessions.js";
@@ -412,11 +413,11 @@ export class CodexRunner {
     return this.withAccountQuotas(executorId, state);
   }
 
-  async consumeResetCredit(userId: string, accountId: string, attemptId: string, executorId = HOST_EXECUTOR_ID, autoExpiresAt?: string) {
+  async consumeResetCredit(userId: string, accountId: string, attemptId: string, executorId = HOST_EXECUTOR_ID, autoExpiresAt?: string, autoLowQuota?: string) {
     if (!isHostRootUser(userId)) throw new Error("当前账号不能管理 Codex 账号");
     const result = executorId === HOST_EXECUTOR_ID
-      ? await this.hostWorkerClient.consumeResetCredit(userId, accountId, attemptId, autoExpiresAt)
-      : await this.remoteWorkers.consumeResetCredit(executorId, accountId, attemptId, autoExpiresAt);
+      ? await this.hostWorkerClient.consumeResetCredit(userId, accountId, attemptId, autoExpiresAt, autoLowQuota)
+      : await this.remoteWorkers.consumeResetCredit(executorId, accountId, attemptId, autoExpiresAt, autoLowQuota);
     if (result.outcome === "notDue") this.db.setAccountResetCredits(executorId, accountId, result.resetCredits);
     else this.db.setAccountCodexQuota(executorId, accountId, { remainingPercent: result.quota?.remainingPercent ?? null,
       resetAt: result.quota?.resetAt ?? null, resetCredits: result.resetCredits });
@@ -466,10 +467,17 @@ export class CodexRunner {
     return {
       ...state,
       accounts: state.accounts.map((account) => {
+        const previous = this.db.getExecutorCodexQuota(executorId, account.id);
+        if (typeof account.quotaRemainingPercent === "number" && account.quotaUpdatedAt
+          && (!previous || Date.parse(account.quotaUpdatedAt) > Date.parse(previous.updatedAt))) {
+          this.db.setAccountCodexQuota(executorId, account.id, { remainingPercent: account.quotaRemainingPercent,
+            resetAt: account.quotaResetAt ?? null }, account.quotaUpdatedAt);
+        }
         const quota = this.db.getExecutorCodexQuota(executorId, account.id);
         if (account.resetCredits) this.db.setAccountResetCredits(executorId, account.id, account.resetCredits);
         return {
           ...account,
+          autoResetEnabled: autoResetPreference(this.db.sqlite, executorId, account.id, account.resetAccountKey),
           quotaRemainingPercent: quota?.remainingPercent ?? null,
           quotaResetAt: quota?.resetAt ?? null,
           quotaUpdatedAt: quota?.updatedAt ?? null,

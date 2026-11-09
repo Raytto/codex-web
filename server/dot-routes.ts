@@ -20,7 +20,8 @@ export async function dotAction(store: DotStore, user: string, action: string, i
     if (action === 'task_detail') {
         store.reconcile(user);
         const task = store.task(user, id);
-        return { task, job:store.sql.prepare('SELECT id,status FROM jobs WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(task.conversation_id), resultMessage:store.sql.prepare("SELECT id,content FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY created_at DESC,rowid DESC LIMIT 1").get(task.conversation_id), files: store.db.listFiles(task.conversation_id).filter(f => f.kind === 'output') };
+        const created = store.sql.prepare("SELECT content FROM dot_events WHERE user_id=? AND kind='task_created' AND source_id=?").get(user,id) as {content:string}|undefined;
+        return { task, routing:created ? JSON.parse(created.content).routing : undefined, job:store.sql.prepare('SELECT id,status FROM jobs WHERE conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(task.conversation_id), resultMessage:store.sql.prepare("SELECT id,content FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY created_at DESC,rowid DESC LIMIT 1").get(task.conversation_id), files: store.db.listFiles(task.conversation_id).filter(f => f.kind === 'output') };
     }
     if (action === 'search') {
         if(typeof data.sourceId==='string') return {events:store.sql.prepare('SELECT seq,kind,source_id,content,created_at FROM dot_events WHERE user_id=? AND source_id=?').all(user,data.sourceId)};
@@ -29,7 +30,9 @@ export async function dotAction(store: DotStore, user: string, action: string, i
             throw new DotError(400, '请输入检索词。');
         return { events: store.sql.prepare('SELECT seq,kind,source_id,content,created_at FROM dot_events WHERE user_id=? AND content LIKE ? ORDER BY seq DESC LIMIT 30').all(user, `%${q}%`), memories:store.memories(user).filter(m=>m.content.includes(q)) };
     }
+    if (action === 'task_preview') return store.previewTask(user, data);
     if (action === 'task_create') {
+        await store.prepareTask(user, data);
         const task = store.createTask(user, data);
         hooks.changed(task.conversation_id);
         return { task };

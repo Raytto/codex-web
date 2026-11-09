@@ -116,3 +116,37 @@ test("Gemini usage capability and sanitized snapshots cross the server schema wi
   assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok, true);
   for (const extra of [{ access_token: "must-not-cross" }, { remainingCredits: -1 }, { quotaUpdatedAt: "invalid" }]) assert.equal(parseRemoteWorkerMessage(JSON.stringify({ ...message, usage: { ...message.usage, ...extra } })).ok, false);
 });
+
+test("real Worker account views and fresh quota snapshots pass both ends of account transport", async t => {
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const { RemoteCodexAccountManager } = await import('../remote-worker/src/codex-accounts.js');
+  const { isPersistableWorkerMessage } = await import('../remote-worker/src/protocol-validation.js');
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'account-wire-')); const home=path.join(root,'home');fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home,'auth.json'),JSON.stringify({tokens:{account_id:'synthetic-upstream-account',id_token:'header.e30.signature',access_token:'fixture-access',refresh_token:'fixture-refresh'}}));
+  const manager=new RemoteCodexAccountManager({stateRoot:path.join(root,'state'),codexHome:home,codexExecutable:()=>'',assertSwitchAllowed(){throw Error('must not switch');}});
+  t.after(()=>{manager.close();fs.rmSync(root,{recursive:true,force:true});});
+  const state=manager.listAccounts(); assert.match(state.accounts[0].resetAccountKey!,/^[a-f0-9]{64}$/);
+  const now=new Date().toISOString();
+  for (const extra of [{},{quotaRemainingPercent:0.5,quotaResetAt:now,quotaUpdatedAt:now},{quotaRemainingPercent:null,quotaResetAt:null,quotaUpdatedAt:null}]) {
+    const account={...state.accounts[0],...extra};
+    for (const payload of [{state:{...state,accounts:[account]}},{login:{id:crypto.randomUUID(),status:'succeeded',verificationUrl:null,userCode:null,error:null,account,createdAt:now,expiresAt:now}}]) {
+      const message={type:'codex_accounts_result',requestId:crypto.randomUUID(),ok:true,...payload};
+      assert.equal(isPersistableWorkerMessage(message),true);
+      const parsed=parseRemoteWorkerMessage(JSON.stringify(message));assert.equal(parsed.ok,true,'server must accept actual Worker view fields');
+      if(parsed.ok)assert.deepEqual(parsed.message,message);
+    }
+  }
+  for(const extra of [{resetAccountKey:'invalid'},{quotaRemainingPercent:101},{quotaRemainingPercent:-1},{quotaUpdatedAt:'invalid'},{access_token:'must-not-cross'}]) {
+    const message={type:'codex_accounts_result',requestId:crypto.randomUUID(),ok:true,state:{...state,accounts:[{...state.accounts[0],...extra}]}};
+    assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok,false);
+  }
+});
+
+test("automatic notDue receipts pass both Worker and server validation without allowing unknown outcomes", async () => {
+  const { isPersistableWorkerMessage }=await import('../remote-worker/src/protocol-validation.js');
+  const now=new Date().toISOString();const message={type:'codex_accounts_result',requestId:crypto.randomUUID(),ok:true,
+    resetResult:{attemptId:crypto.randomUUID(),outcome:'notDue',refreshed:false,quota:null,
+      resetCredits:{availableCount:0,earliestExpiresAt:null,expiryStatus:'complete',state:'ok',updatedAt:now,checkedAt:now}}};
+  assert.equal(isPersistableWorkerMessage(message),true);assert.equal(parseRemoteWorkerMessage(JSON.stringify(message)).ok,true);
+  assert.equal(parseRemoteWorkerMessage(JSON.stringify({...message,resetResult:{...message.resetResult,outcome:'unknown'}})).ok,false);
+});

@@ -90,6 +90,14 @@ const resetCredits = z.object({
   earliestExpiresAt: iso.nullable(), expiryStatus: z.enum(["complete", "partial", "unknown"]),
   state: z.enum(["ok", "unavailable", "auth_required", "error"]), updatedAt: iso.nullable(), checkedAt: iso,
 }).strict();
+const codexAccount = z.object({
+  id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1),
+  active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable(),
+  resetAccountKey: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  quotaRemainingPercent: finite.min(0).max(100).nullable().optional(),
+  quotaResetAt: usageDate.nullable().optional(), quotaUpdatedAt: usageDate.nullable().optional(),
+  resetCredits: resetCredits.nullable().optional(),
+}).strict();
 const quotaUsage = z.object({ remainingPercent: finite.min(0).max(100).nullable(), resetAt: iso.nullable().optional(), resetCredits: resetCredits.optional() }).strict();
 
 const event = z.discriminatedUnion("type", [
@@ -183,19 +191,19 @@ const remoteWorkerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("worker_config_result"), requestId: uuid, ok: z.boolean(), capacity: z.number().int().min(0).max(8).optional(), message: text(2_000, 1).optional() }).strict(),
   z.object({
     type: z.literal("codex_accounts_result"), requestId: uuid, ok: z.boolean(),
-    resetResult: z.object({ attemptId: uuid, outcome: z.enum(["reset", "alreadyRedeemed", "nothingToReset", "noCredit"]),
+    resetResult: z.object({ attemptId: uuid, outcome: z.enum(["reset", "alreadyRedeemed", "nothingToReset", "noCredit", "notDue"]),
       resetCredits, quota: z.object({ remainingPercent: z.number().min(0).max(100), resetAt: iso.nullable() }).strict().nullable(),
       refreshed: z.boolean(),
     }).strict().optional(),
     state: z.object({
-      accounts: z.array(z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable(), resetCredits: resetCredits.nullable().optional() }).strict()).max(20),
+      accounts: z.array(codexAccount).max(20),
       activeAccountId: uuid,
     }).strict().optional(),
     login: z.object({
       id: uuid, status: z.enum(["starting", "waiting_for_user", "succeeded", "failed", "cancelled"]),
       verificationUrl: text(2_000, 8).nullable(), userCode: z.string().regex(/^[A-Z0-9]{4}-[A-Z0-9]{5}$/).nullable(),
       error: text(2_000, 1).nullable(),
-      account: z.object({ id: uuid, label: text(60, 1), email: text(254, 3).nullable(), accountHint: text(40, 1), active: z.boolean(), createdAt: iso, lastUsedAt: iso.nullable(), resetCredits: resetCredits.nullable().optional() }).strict().nullable(),
+      account: codexAccount.nullable(),
       createdAt: iso, expiresAt: iso,
     }).strict().optional(),
     restart: z.boolean().optional(), message: text(2_000, 1).optional(),

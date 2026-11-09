@@ -1,3 +1,4 @@
+import { resetQuota, type ResetQuota } from "./codex-reset-policy.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,6 +9,7 @@ import { normalizeResetCredits, unavailableResetCredits, type CodexResetCredits 
 export async function readAccountResetCredits(options: {
   executable: string; authFile: string; expectedAccountId: string; temporaryRoot: string;
   env?: NodeJS.ProcessEnv;
+  onQuota?: (quota: ResetQuota | null) => void;
   // The caller must hold its credential lifecycle lock through commitAuth.
   commitAuth?: (temporaryAuth: string) => void;
 }): Promise<CodexResetCredits> {
@@ -70,6 +72,7 @@ export async function readAccountResetCredits(options: {
           const accountId = message.result?.accountId;
           result = accountId && accountId !== options.expectedAccountId
             ? unavailableResetCredits("error") : normalizeResetCredits(message.result);
+          if (accountId === options.expectedAccountId) options.onQuota?.(resetQuota(message.result));
           finish();
         }
       });

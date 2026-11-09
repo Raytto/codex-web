@@ -1,3 +1,4 @@
+import type { ResetQuota } from "./codex-reset-policy.js";
 import { consumeAccountResetCredit, type ResetConsumption } from "./codex-reset-consumer.js";
 import { readAccountResetCredits } from "./codex-usage-reader.js";
 import { type CodexResetCredits } from "./codex-reset-credits.js";
@@ -7,8 +8,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 export type CodexAccountView = {
+  resetAccountKey?: string;
   id: string; label: string; email: string | null; accountHint: string; active: boolean;
   createdAt: string; lastUsedAt: string | null;
+  quotaRemainingPercent?: number | null; quotaResetAt?: string | null; quotaUpdatedAt?: string | null;
   resetCredits?: import("./codex-reset-credits.js").CodexResetCredits | null;
 };
 export type CodexAccountsState = { accounts: CodexAccountView[]; activeAccountId: string };
@@ -64,6 +67,11 @@ export class RemoteCodexAccountManager {
   }
 
   private readonly usageReads = new Map<string, Promise<CodexResetCredits>>();
+  private readonly quotaCache = new Map<string, ResetQuota & { updatedAt: string }>();
+  private quotaView(id: string) {
+    const quota = this.quotaCache.get(id);
+    return quota ? { quotaRemainingPercent: quota.remainingPercent, quotaResetAt: quota.resetAt, quotaUpdatedAt: quota.updatedAt } : {};
+  }
   private readonly usageCache = new Map<string, CodexResetCredits>();
 
   async listAccountsWithUsage(): Promise<CodexAccountsState> {
@@ -78,6 +86,7 @@ export class RemoteCodexAccountManager {
         pending = readAccountResetCredits({ executable: this.options.codexExecutable(),
           authFile: account.active ? this.authorityFile : this.accountAuthFile(account.id), expectedAccountId: metadata.codexAccountId,
           temporaryRoot: path.join(this.options.stateRoot, "codex-accounts", "usage"),
+          onQuota: quota => { if (quota) this.quotaCache.set(account.id, { ...quota, updatedAt: new Date().toISOString() }); },
         }).then((value) => { this.usageCache.set(account.id, value); return value; }).finally(() => this.usageReads.delete(account.id));
         this.usageReads.set(account.id, pending);
       }
@@ -85,10 +94,10 @@ export class RemoteCodexAccountManager {
     }));
     // Do not return a pre-read active-account state after a concurrent switch.
     const current = this.listAccounts();
-    return { ...current, accounts: current.accounts.map((account) => ({ ...account, resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
+    return { ...current, accounts: current.accounts.map((account) => ({ ...account, ...this.quotaView(account.id), resetCredits: state.accounts.find((item) => item.id === account.id)?.resetCredits })) };
   }
 
-  async consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string): Promise<ResetConsumption> {
+  async consumeResetCredit(accountId: string, attemptId: string, autoExpiresAt?: string, autoLowQuota?: string): Promise<ResetConsumption> {
     if (!ENTRY_ID.test(accountId)) throw new Error("账号标识无效。");
     const registry = this.ensureRegistry();
     const account = registry.accounts.find((item) => item.id === accountId);
@@ -97,7 +106,7 @@ export class RemoteCodexAccountManager {
       return await consumeAccountResetCredit({ executable: this.options.codexExecutable(),
         authFile: registry.activeAccountId === accountId ? this.authorityFile : this.accountAuthFile(accountId),
         expectedAccountId: account.codexAccountId, temporaryRoot: path.join(this.options.stateRoot, "codex-accounts", "usage"),
-        journalRoot: path.join(this.options.stateRoot, "codex-accounts", "reset-receipts", accountId), attemptId, autoExpiresAt,
+        journalRoot: path.join(this.options.stateRoot, "codex-accounts", "reset-receipts", accountId), attemptId, autoExpiresAt, autoLowQuota,
       });
     } finally { this.usageCache.delete(accountId); }
   }
@@ -293,7 +302,7 @@ export class RemoteCodexAccountManager {
     return { accounts: registry.accounts.map((account) => this.view(account, registry.activeAccountId)), activeAccountId: registry.activeAccountId };
   }
   private view(account: AccountMetadata, activeId: string): CodexAccountView {
-    return { id: account.id, label: account.label, email: account.email, accountHint: `••••••${account.codexAccountId.slice(-6)}`, active: account.id === activeId, createdAt: account.createdAt, lastUsedAt: account.lastUsedAt };
+    return { id: account.id, resetAccountKey: crypto.createHash("sha256").update(`pp-agent-reset-account:${account.codexAccountId}`).digest("hex"), label: account.label, email: account.email, accountHint: `••••••${account.codexAccountId.slice(-6)}`, active: account.id === activeId, createdAt: account.createdAt, lastUsedAt: account.lastUsedAt };
   }
   private loginView(session: LoginSession): CodexAccountLoginView {
     return { id: session.id, status: session.status, verificationUrl: session.verificationUrl, userCode: session.userCode, error: session.error, account: session.account, createdAt: session.createdAt, expiresAt: session.expiresAt };

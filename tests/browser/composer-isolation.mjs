@@ -18,15 +18,15 @@ process.env.PLAYWRIGHT_BROWSERS_PATH = browserCache;
 const { chromium } = await import(playwrightRoot + '/index.mjs');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'composer-ui-'));
 const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {promise,resolve};};
-const proof=deferred();
-TranscriptionService.prototype.transcribe=async (_file,context)=>context.draftText==='proof A'?proof.promise:'recognized fixture';
+const proof=deferred(), progressProof=deferred();
+TranscriptionService.prototype.transcribe=async (_file,context)=>context.draftText==='proof A'?proof.promise:context.draftText==='progress proof'?progressProof.promise:'recognized fixture';
 const instance=createApp({projectRoot:repo,dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),codexHome:path.join(root,'codex-home'),pythonRuntimeRoot:path.join(root,'python'),hostRootSocketPath:'',hostTenantRoot:'',hostKnowledgeRoot:'',personalMemoryApiKey:'',personalMemoryBaseUrl:'',dashscopeApiKey:'',dashscopeBaseUrl:'',username:'owner',passwordHash:bcrypt.hashSync('local-test',4),sessionSecret:'isolation-test-secret-atleast32bytes',queueAutoStart:false,basePath:'/codex-web'});
 const server=instance.app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));const origin='http://127.0.0.1:'+server.address().port+'/codex-web';
 const deadline=setTimeout(()=>{throw new Error('Composer regression timed out');},180000);
 let browser,page;const report={checks:[],errors:[]};const gates=[];
 try {
  browser=await chromium.launch({headless:true,args:['--disable-gpu'],env:{...process.env,HOME:root,TMPDIR:root}});
- const context=await browser.newContext({viewport:{width:1440,height:900}});await installRecorder(context,Buffer.from('isolated browser recorder fixture').toString('base64'));
+ const context=await browser.newContext({viewport:{width:1440,height:900}});await installRecorder(context,Buffer.alloc(256*1024, 65).toString('base64'));
  const login=await context.request.post(origin+'/api/auth/login',{data:{username:'owner',password:'local-test'}});assert.equal(login.status(),200);const session=await login.json();
  const api=async(method,url,data)=>{const r=await context.request.fetch(origin+'/api'+url,{method,headers:{Origin:origin,'X-CSRF-Token':session.csrfToken},...(data===undefined?{}:{data})});assert.ok(r.ok(),url+':'+r.status());return r.status()===204?null:r.json();};
  const project=(await api('GET','/projects')).projects.find(p=>p.is_default);const conv=[];
@@ -65,7 +65,43 @@ try {
  // A transfer icon wins even if server status is running.
  await page.route('**/api/conversations**',async route=>{if(route.request().method()!=='GET')return route.continue();const r=await route.fetch();let data;try{data=await r.json();}catch{return route.fulfill({response:r});}for(const c of data.conversations??[])if(c.id===a)c.status='running';await route.fulfill({response:r,json:data});});
  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await select('isolation A');const again=await hold('**/conversations/'+a+'/voice-messages');await input().fill('priority A');await composer().getByRole('button',{name:'录音输入',exact:true}).click();await composer().getByRole('button',{name:'发送语音',exact:true}).click();await again.started.promise;const row=page.locator('.conversation-select').filter({hasText:'isolation A'});await row.getByRole('img',{name:'正在上传到服务器'}).waitFor();assert.equal(await row.getByRole('img',{name:'正在执行',exact:true}).count(),0);again.gate.resolve();await waitEmpty();report.checks.push('client_upload_indicator_precedes_server_running');
- assert.equal(report.errors.length,0,report.errors.join('\n'));await page.setViewportSize({width:390,height:844});await page.screenshot({path:base+'/mobile-isolation.png'});assert.ok(await input().isEnabled());report.checks.push('mobile_layout_remains_editable');report.ok=true;
+ assert.equal(report.errors.length,0,report.errors.join('\n'));await page.setViewportSize({width:390,height:844});await page.screenshot({path:base+'/mobile-isolation.png'});assert.ok(await input().isEnabled());report.checks.push('mobile_layout_remains_editable');
+ // Native XHR byte events under a throttled connection, for both voice actions.
+ await page.unrouteAll({behavior:'wait'});
+ const cdp=await context.newCDPSession(page);await cdp.send('Network.enable');
+ await page.evaluate(()=>{
+   window.voiceProgressLabels=[];
+   new MutationObserver(()=>{
+     const label=[...document.querySelectorAll('.composer .voice-panel.transcribing')].find(e=>e.getClientRects().length)?.textContent;
+     if(label && window.voiceProgressLabels.at(-1)!==label)window.voiceProgressLabels.push(label);
+   }).observe(document.body,{subtree:true,childList:true,characterData:true});
+ });
+ for(const mode of ['proofread','send']){
+   await page.setViewportSize(mode==='proofread'?{width:1440,height:900}:{width:390,height:844});
+   await input().fill(mode==='proofread'?'progress proof':'progress send');
+   await composer().getByRole('button',{name:'录音输入',exact:true}).click();
+   await page.evaluate(()=>{window.voiceProgressLabels=[];});
+   await cdp.send('Network.emulateNetworkConditions',{offline:false,latency:80,downloadThroughput:1024*1024,uploadThroughput:64*1024});
+   const response=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith(mode==='proofread'?'/api/transcriptions':'/'+a+'/voice-messages'));
+   await composer().getByRole('button',{name:mode==='proofread'?'停止录音并识别':'发送语音',exact:true}).click();
+   await page.waitForFunction(()=>window.voiceProgressLabels.some(s=>/正在上传语音 ([1-9]|[1-9][0-9])%/.test(s)));
+   assert.ok((await input().inputValue()).includes('progress'),'input stays intact during upload');
+   await composer().locator('.voice-panel.transcribing').screenshot({path:base+'/'+mode+'-upload-progress.png'});
+   if(mode==='proofread'){
+     await composer().getByText('正在识别语音…',{exact:true}).waitFor();
+     assert.equal(await input().inputValue(),'progress proof');progressProof.resolve('proofread progress result');
+   }
+   assert.equal((await response).status(),mode==='proofread'?200:202);
+   await cdp.send('Network.emulateNetworkConditions',{offline:false,latency:0,downloadThroughput:-1,uploadThroughput:-1});
+   if(mode==='proofread')await page.waitForFunction(()=>[...document.querySelectorAll('.composer textarea')].some(e=>e.getClientRects().length&&e.value.includes('proofread progress result')));else await waitEmpty();
+   const labels=await page.evaluate(()=>window.voiceProgressLabels);
+   const numbers=labels.map(s=>/正在上传语音 (\d+)%/.exec(s)).filter(Boolean).map(m=>Number(m[1]));
+   assert.ok(numbers.length>=2);assert.ok(numbers.every((n,i)=>i===0||n>=numbers[i-1]));
+   if(mode==='send')assert.ok(labels.includes('语音已上传 100%，正在确认…'));
+   (report.uploadLabels??={})[mode]=labels;
+   report.checks.push(mode+'_native_upload_percentage_and_completion');
+ }
+ await cdp.detach();report.ok=true;
 } catch(e){report.error=String(e.stack);process.exitCode=1;if(page)await page.screenshot({path:base+'/failure.png'}).catch(()=>{});}finally{
- clearTimeout(deadline);for(const g of gates)g.resolve();proof.resolve('cleanup');await browser?.close();instance.beginShutdown();await instance.waitForBackgroundTasks();server.closeAllConnections();await new Promise(r=>server.close(r));instance.db.close();fs.rmSync(root,{recursive:true,force:true});fs.writeFileSync(base+'/local-isolation-result.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
+ clearTimeout(deadline);for(const g of gates)g.resolve();proof.resolve('cleanup');progressProof.resolve('cleanup');await browser?.close();instance.beginShutdown();await instance.waitForBackgroundTasks();server.closeAllConnections();await new Promise(r=>server.close(r));instance.db.close();fs.rmSync(root,{recursive:true,force:true});fs.writeFileSync(base+'/local-isolation-result.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report));
 }

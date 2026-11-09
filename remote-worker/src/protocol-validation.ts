@@ -1,3 +1,4 @@
+import { validLowQuotaKey } from "./codex-reset-policy.js";
 import { isTransferSpec } from "./node-transfer-types.js";
 import { REMOTE_TRANSFER_MAX_FILE_BYTES } from "./transfer-policy.js";
 import type { RunRequest, ServerMessage, ThreadSnapshot, WorkerMessage } from "./protocol.js";
@@ -112,6 +113,7 @@ function isServerMessage(value: unknown): value is ServerMessage {
     case "codex_accounts": {
       if (!uuid(value.requestId) || !["list", "login_start", "login_status", "login_cancel", "activate", "delete", "reset_credit"].includes(String(value.action))) return false;
       if (value.action === "reset_credit" ? !uuid(value.attemptId) : value.attemptId !== undefined) return false;
+      if (value.autoLowQuota !== undefined && (value.action !== "reset_credit" || value.autoExpiresAt !== undefined || !validLowQuotaKey(value.autoLowQuota))) return false;
       if (value.autoExpiresAt !== undefined && (value.action !== "reset_credit" || typeof value.autoExpiresAt !== "string"
         || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.autoExpiresAt) || !Number.isFinite(Date.parse(value.autoExpiresAt)))) return false;
       if (value.refreshUsage !== undefined && (value.action !== "list" || typeof value.refreshUsage !== "boolean")) return false;
@@ -211,7 +213,7 @@ function resetConsumption(value: unknown): boolean {
 }
 
 function codexAccount(value: unknown): boolean {
-  return record(value) && uuid(value.id) && shortString(value.label, 60, 1)
+  return record(value) && (value.resetAccountKey === undefined || (typeof value.resetAccountKey === "string" && /^[a-f0-9]{64}$/.test(value.resetAccountKey))) && uuid(value.id) && shortString(value.label, 60, 1)
     && (value.email === null || shortString(value.email, 254, 3)) && shortString(value.accountHint, 40, 1)
     && typeof value.active === "boolean" && shortString(value.createdAt, 80, 1)
     && (value.lastUsedAt === null || shortString(value.lastUsedAt, 80, 1))
@@ -303,6 +305,6 @@ const SERVER_MESSAGE_KEYS: Record<string, readonly string[]> = {
   worker_update_result_ack: ["type", "requestId"],
   worker_config: ["type", "requestId", "capacity"],
   gemini_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "code", "refresh"],
-  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds", "refreshUsage", "attemptId", "autoExpiresAt"],
+  codex_accounts: ["type", "requestId", "action", "label", "loginId", "accountId", "threadIds", "refreshUsage", "attemptId", "autoExpiresAt", "autoLowQuota"],
   heartbeat_ack: ["type", "at"],
 };

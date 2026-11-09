@@ -68,7 +68,7 @@ export type HostRootClientMessage =
   | { type: "voice_review"; requestId: string; request: CodexVoiceReviewRequest }
   | { type: "title_agent"; requestId: string; request: ConversationTitleAgentRequest }
   | { type: "codex_upgrade"; requestId: string; userId: string; version: string }
-  | { type: "codex_account_reset"; requestId: string; userId: string; accountId: string; attemptId: string; autoExpiresAt?: string }
+  | { type: "codex_account_reset"; requestId: string; userId: string; accountId: string; attemptId: string; autoExpiresAt?: string; autoLowQuota?: string }
   | { type: "codex_accounts_list"; requestId: string; userId: string; refreshUsage?: boolean }
   | { type: "codex_account_login_start"; requestId: string; userId: string; label: string }
   | { type: "codex_account_login_status"; requestId: string; userId: string; loginId: string }

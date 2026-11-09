@@ -36,3 +36,8 @@ Official consume contract: https://learn.chatgpt.com/docs/app-server#8-earned-ra
 ## Durable automatic use near expiry
 
 Supported online authenticated nodes may consume a reset credit near its verified expiry. Missing expiry, offline nodes and unsupported Workers are skipped. Durable attempt IDs and history prevent uncontrolled repeats, and node guards reject stale account or expiry state. Logs distinguish attempted, successful and skipped outcomes. This automation is specific to Codex; Gemini usage is separate.
+
+
+## Shared low-quota automatic use
+
+Host account management and supported Remote Workers now share the account-level automatic-use preference. With valid login, known quota and an available reset entitlement, remaining quota at or below 1% may trigger automatic redemption. This consumes the account's own reset entitlement; it does not purchase one. The account-management toggle disables automatic use across nodes, while explicit manual use remains available. Check the history result and refresh the actual account quota after enabling; unknown/stale metadata or an offline node is not proof of success. Existing expiry-based behavior remains. Base tenants without the optional host/Worker account-management integration do not acquire these privileges.

@@ -199,6 +199,21 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function setAutoReset(account: CodexAccount, enabled: boolean) {
+    consuming.current = true;
+    usageGeneration.current += 1;
+    setBusyId(`auto:${account.id}`); setError(""); setNotice("");
+    try {
+      const saved = await api.setCodexAutoReset(executorId, account.id, enabled);
+      if (mounted.current && selectedMachine.current === executorId) {
+        setState(current => current && ({ ...current, accounts: current.accounts.map(item => item.id === account.id ? { ...item, autoResetEnabled: saved.enabled } : item) }));
+        setNotice(saved.enabled ? "已开启自动使用重置卡。" : "已关闭自动用卡；额度用完后任务会停止。已提交的用卡请求无法撤回。");
+      }
+    } catch (reason) {
+      if (mounted.current) setError(reason instanceof Error ? reason.message : "设置保存失败，请重试。");
+    } finally { consuming.current = false; if (mounted.current) setBusyId(""); }
+  }
+
   async function remove(account: CodexAccount) {
     if (account.active || !window.confirm(`从 ${selectedExecutor?.machineName ?? "当前机器"} 删除“${account.label}”的登录凭据？\n\n此操作不会注销 ChatGPT 网站，也不会删除 OpenAI 账号。`)) return;
     setBusyId(account.id);
@@ -302,6 +317,12 @@ export function CodexAccountDialog({ onClose }: { onClose: () => void }) {
                 {busyId === `reset:${account.id}` && <LoaderCircle className="spin" size={16} />}
                 {busyId === `reset:${account.id}` ? "正在使用…" : "使用重置卡"}
               </button>
+            </div>
+            <div className="codex-auto-reset-setting">
+              <label><input type="checkbox" checked={account.autoResetEnabled !== false} disabled={Boolean(busyId)}
+                aria-label={`${account.label} 自动使用重置卡`} onChange={event => void setAutoReset(account, event.target.checked)} />
+                <span>自动使用重置卡{busyId === `auto:${account.id}` ? " · 保存中…" : ""}</span></label>
+              <p className="dialog-description">剩余额度 ≤1%（含用尽）或重置卡将在 1 小时内到期时，优先使用最早到期的一张。同一账号在各台机器共用此开关；取消勾选后不再自动用卡，额度用完即停止。</p>
             </div>
             <div className="codex-account-actions">
               {account.active

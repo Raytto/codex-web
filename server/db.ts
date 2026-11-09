@@ -3,7 +3,7 @@ import { migrateJobEventSequence, nextJobEventSequence } from "./job-event-seque
 import { migrateConversationVoice } from "./conversation-voice-schema.js";
 import { migrateDot } from "./dot-schema.js";
 import { WorkflowStore } from "./workflow-store.js";
-import { migrateAutoReset } from "./codex-reset-auto-use.js";
+import { migrateAutoReset, migrateAutoResetPreferences } from "./codex-reset-auto-use.js";
 import { migrateJudgments } from "./judgment-schema.js";
 import { migrateOpportunities } from "./opportunity-schema.js";
 import { migrateRecurring } from "./recurring-store.js";
@@ -85,6 +85,7 @@ export type ConversationRow = {
   has_unread_result: number;
   unread_anchor_message_id: string | null;
   has_pending_work: number;
+  workflow_state: import("./workflow-store.js").WorkflowState | null;
   active_wake_count: number;
   next_wake_at: string | null;
   active_wake_mode: WakePlanMode | null;
@@ -362,6 +363,8 @@ export type VoiceTranscriptionRow = {
   message_id: string | null;
   pending_prompt_id: string | null;
   raw_text: string;
+  provider: "dashscope" | "openai";
+  usage_seconds: number | null;
   model: string;
   prompt_version: string;
   selected_terms_json: string;
@@ -554,7 +557,7 @@ export type PendingPromptRow = {
   updated_at: string;
 };
 
-export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[]; voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null } };
+export type PendingPromptWithFiles = PendingPromptRow & { files: FileRow[]; voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null; steer_state: "requested" | "sending" | "failed" | null; steer_action: "steer" | "insert" | null; steer_error: string | null } };
 
 export type WakePlanMode = "time" | "event_or_deadline";
 export type WakePlanState = "armed" | "triggered" | "cancelled";
@@ -762,6 +765,9 @@ const conversationSelect = `
     OR EXISTS (SELECT 1 FROM pending_prompts WHERE pending_prompts.conversation_id=conversations.id AND pending_prompts.status='queued')
     OR EXISTS (SELECT 1 FROM voice_submissions WHERE voice_submissions.conversation_id=conversations.id AND voice_submissions.state IN ('queued','processing','failed'))
   THEN 1 ELSE 0 END AS has_pending_work,
+  (SELECT w.state FROM workflow_conversations wc JOIN workflows w ON w.id=wc.workflow_id
+    WHERE wc.conversation_id=conversations.id
+      AND (w.state='queued' OR (SELECT capacity FROM workflow_settings WHERE id=1)>0)) AS workflow_state,
   (SELECT count(1) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS active_wake_count,
   (SELECT min(deadline_at) FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed') AS next_wake_at,
   (SELECT mode FROM wake_plans WHERE wake_plans.conversation_id=conversations.id AND wake_plans.state='armed' LIMIT 1) AS active_wake_mode,
@@ -864,6 +870,7 @@ export class AppDatabase {
       this.sqlite.exec('ALTER TABLE opportunity_voice_feedback ADD COLUMN base_revision INTEGER');
     });
     this.applyMigration(2026102302, "codex-auto-reset-uses", () => migrateAutoReset(this.sqlite));
+    this.applyMigration(2026110902, "codex-auto-reset-preferences", () => migrateAutoResetPreferences(this.sqlite));
     this.applyMigration(2026102801, "opportunity-backlog", () => {
       this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN pending_limit INTEGER CHECK(pending_limit IS NULL OR pending_limit BETWEEN 0 AND 100);
         ALTER TABLE opportunity_reviews ADD COLUMN queue_revision INTEGER NOT NULL DEFAULT 0;
@@ -904,6 +911,12 @@ export class AppDatabase {
     this.applyMigration(2026110803, "workflow-execution-ack", () => {
       this.sqlite.exec("DROP TRIGGER IF EXISTS workflow_claim");
       WorkflowStore.migrate(this.sqlite);
+    });
+    this.applyMigration(2026110804, "transcription-provider", () => {
+      this.sqlite.exec("ALTER TABLE voice_transcriptions ADD COLUMN provider TEXT NOT NULL DEFAULT 'dashscope'; ALTER TABLE voice_transcriptions ADD COLUMN usage_seconds REAL;");
+    });
+    this.applyMigration(2026110901, "composer-draft-voice-links", () => {
+      this.sqlite.exec("ALTER TABLE composer_drafts ADD COLUMN voice_transcription_ids_json TEXT NOT NULL DEFAULT '[]'");
     });
     this.workflows = new WorkflowStore(this.sqlite);
     this.workflows.adoptLegacy();
@@ -1902,6 +1915,11 @@ export class AppDatabase {
         error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         UNIQUE(user_id,client_recording_id)
       ); CREATE INDEX voice_submissions_queue_idx ON voice_submissions(state,created_at);`);
+    });
+    this.applyMigration(2026110903, "voice-deferred-steering", () => {
+      this.sqlite.exec(`ALTER TABLE voice_submissions ADD COLUMN steer_state TEXT CHECK(steer_state IN ('requested','sending','failed'));
+        ALTER TABLE voice_submissions ADD COLUMN steer_action TEXT CHECK(steer_action IN ('steer','insert'));
+        ALTER TABLE voice_submissions ADD COLUMN steer_error TEXT;`);
     });
     this.applyMigration(2026082602, "reader-sources-and-annotations", () => {
       this.sqlite.exec(`
@@ -3486,8 +3504,8 @@ export class AppDatabase {
     return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage);
   }
 
-  setAccountCodexQuota(executorId: string, accountId: string, usage: CodexQuotaUsage): boolean {
-    return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage);
+  setAccountCodexQuota(executorId: string, accountId: string, usage: CodexQuotaUsage, observedAt?: string): boolean {
+    return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage, observedAt);
   }
 
   setExecutorActiveCodexAccount(executorId: string, accountId: string): void {
@@ -3510,7 +3528,7 @@ export class AppDatabase {
     return active ? `executor:${executorId}:account:${active}` : `executor:${executorId}`;
   }
 
-  private setCodexQuotaScope(scopeId: string, usage: CodexQuotaUsage): boolean {
+  private setCodexQuotaScope(scopeId: string, usage: CodexQuotaUsage, observedAt = new Date().toISOString()): boolean {
     const remainingPercent = typeof usage.remainingPercent === "number" && Number.isFinite(usage.remainingPercent)
       ? Math.max(0, Math.min(100, usage.remainingPercent))
       : null;
@@ -3523,7 +3541,8 @@ export class AppDatabase {
       INSERT INTO codex_quota_snapshots(scope_id,remaining_percent,reset_at,updated_at)
       VALUES(?,?,?,?)
       ON CONFLICT(scope_id) DO UPDATE SET remaining_percent=excluded.remaining_percent,reset_at=excluded.reset_at,updated_at=excluded.updated_at
-    `).run(scopeId, remainingPercent, resetAt, new Date().toISOString());
+      WHERE excluded.updated_at >= codex_quota_snapshots.updated_at
+    `).run(scopeId, remainingPercent, resetAt, observedAt);
     return true;
   }
 
@@ -3845,20 +3864,21 @@ export class AppDatabase {
     id: string; userId: string; conversationId?: string | null; projectId?: string | null;
     rawText: string; model: string; promptVersion: string; selectedTermIds?: string[]; createdAt?: string; clientRecordingId?: string | null;
     audio?: { relativePath: string; mimeType: string; bytes: number; sha256: string };
+    provider?: "dashscope" | "openai"; usageSeconds?: number;
   }): VoiceTranscriptionRow {
     const now = input.createdAt ?? new Date().toISOString();
     this.sqlite.prepare(`
       INSERT INTO voice_transcriptions(
         id,user_id,client_recording_id,conversation_id,project_id,raw_text,model,prompt_version,selected_terms_json,
-        audio_relative_path,audio_mime_type,audio_bytes,audio_sha256,audio_storage_state,audio_updated_at,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        audio_relative_path,audio_mime_type,audio_bytes,audio_sha256,audio_storage_state,audio_updated_at,created_at,provider,usage_seconds
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       input.id, input.userId, input.clientRecordingId ?? null, input.conversationId ?? null, input.projectId ?? null,
       input.rawText.slice(0, 100_000), input.model, input.promptVersion,
       JSON.stringify((input.selectedTermIds ?? []).slice(0, 500)),
       input.audio?.relativePath ?? null, input.audio?.mimeType ?? null, input.audio?.bytes ?? null, input.audio?.sha256 ?? null,
       input.audio ? "local" : "none", input.audio ? now : null,
-      now,
+      now, input.provider ?? "dashscope", input.usageSeconds ?? null,
     );
     return this.sqlite.prepare("SELECT * FROM voice_transcriptions WHERE id=?").get(input.id) as VoiceTranscriptionRow;
   }
@@ -3903,13 +3923,13 @@ export class AppDatabase {
     return Number(this.sqlite.prepare("DELETE FROM voice_transcription_receipts WHERE updated_at<? AND state!='processing'").run(before).changes);
   }
 
-  validateVoiceTranscriptions(ids: string[], userId: string): boolean {
+  validateVoiceTranscriptions(ids: string[], userId: string, conversationId?: string): boolean {
     const unique = [...new Set(ids)].slice(0, 20);
     if (unique.length !== ids.length) return false;
-    const get = this.sqlite.prepare("SELECT user_id,submitted_at FROM voice_transcriptions WHERE id=?");
+    const get = this.sqlite.prepare("SELECT user_id,conversation_id,submitted_at FROM voice_transcriptions WHERE id=?");
     return unique.every((id) => {
-      const row = get.get(id) as { user_id: string; submitted_at: string | null } | undefined;
-      return row?.user_id === userId && !row.submitted_at;
+      const row = get.get(id) as { user_id: string; conversation_id: string | null; submitted_at: string | null } | undefined;
+      return row?.user_id === userId && !row.submitted_at && (conversationId === undefined || row.conversation_id === conversationId);
     });
   }
 
@@ -5116,18 +5136,40 @@ export class AppDatabase {
     return this.getComposerDraft(conversationId)!;
   }
 
-  saveComposerDraft(conversationId: string, content: string, quoteExcerpt: string | null): ComposerDraftWithFiles | undefined {
+  getComposerDraftVoiceTranscriptionIds(conversationId: string): string[] {
+    // Recover only unsent links owned by this exact account/conversation. Old
+    // clients can keep saving text without erasing links, while consumed links
+    // cannot be reused by a stale draft from another browser.
+    return (this.sqlite.prepare(`
+      SELECT v.id FROM composer_drafts d
+      JOIN conversations c ON c.id=d.conversation_id
+      JOIN json_each(d.voice_transcription_ids_json) link
+      JOIN voice_transcriptions v ON v.id=link.value
+      WHERE d.conversation_id=? AND v.conversation_id=c.id
+        AND v.user_id=c.user_id AND v.submitted_at IS NULL
+      ORDER BY CAST(link.key AS INTEGER)
+    `).all(conversationId) as { id: string }[]).map(row => row.id);
+  }
+
+  saveComposerDraft(conversationId: string, content: string, quoteExcerpt: string | null, voiceIds: string[] = []): ComposerDraftWithFiles | undefined {
+    const conversation = this.getConversation(conversationId);
+    if (voiceIds.length > 0 && (!conversation || !this.validateVoiceTranscriptions(voiceIds, conversation.user_id, conversationId))) {
+      throw new Error("Invalid draft voice transcription association");
+    }
     const existing = this.getComposerDraft(conversationId);
     if (!content && !quoteExcerpt && (!existing || existing.files.length === 0)) {
       if (existing) this.sqlite.prepare("DELETE FROM composer_drafts WHERE conversation_id=?").run(conversationId);
       return undefined;
     }
+    const retainedVoiceIds = content.trim()
+      ? [...new Set([...this.getComposerDraftVoiceTranscriptionIds(conversationId), ...voiceIds])].slice(-20) : [];
     const now = new Date().toISOString();
     this.sqlite.prepare(`
-      INSERT INTO composer_drafts(conversation_id,content,quote_excerpt,created_at,updated_at)
-      VALUES(?,?,?,?,?)
-      ON CONFLICT(conversation_id) DO UPDATE SET content=excluded.content,quote_excerpt=excluded.quote_excerpt,updated_at=excluded.updated_at
-    `).run(conversationId, content, quoteExcerpt, now, now);
+      INSERT INTO composer_drafts(conversation_id,content,quote_excerpt,voice_transcription_ids_json,created_at,updated_at)
+      VALUES(?,?,?,?,?,?)
+      ON CONFLICT(conversation_id) DO UPDATE SET content=excluded.content,quote_excerpt=excluded.quote_excerpt,
+        voice_transcription_ids_json=excluded.voice_transcription_ids_json,updated_at=excluded.updated_at
+    `).run(conversationId, content, quoteExcerpt, JSON.stringify(retainedVoiceIds), now, now);
     return this.getComposerDraft(conversationId);
   }
 
@@ -5233,7 +5275,12 @@ export class AppDatabase {
   }
 
   private pendingVoice(id: string): PendingPromptWithFiles["voiceSubmission"] {
-    return this.sqlite.prepare("SELECT id,state,error FROM voice_submissions WHERE pending_prompt_id=?").get(id) as PendingPromptWithFiles["voiceSubmission"];
+    return this.sqlite.prepare("SELECT id,state,error,steer_state,steer_action,steer_error FROM voice_submissions WHERE pending_prompt_id=?").get(id) as PendingPromptWithFiles["voiceSubmission"];
+  }
+
+  pendingVoiceActionBusy(id: string): boolean {
+    const state = this.pendingVoice(id)?.steer_state;
+    return state === "requested" || state === "sending";
   }
 
   pendingVoiceReady(id: string): boolean {
@@ -5269,20 +5316,21 @@ export class AppDatabase {
 
   beginEditingPendingPrompt(id: string): PendingPromptWithFiles | undefined {
     const prompt = this.getPendingPrompt(id);
-    if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(id)) return undefined;
+    if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(id) || this.pendingVoiceActionBusy(id)) return undefined;
+    this.sqlite.prepare("UPDATE voice_submissions SET steer_state=NULL,steer_action=NULL,steer_error=NULL WHERE pending_prompt_id=?").run(id);
     this.sqlite.prepare("UPDATE pending_prompts SET status='editing',updated_at=? WHERE id=? AND status='queued'").run(new Date().toISOString(), id);
     return this.getPendingPrompt(id);
   }
 
   restorePendingPrompt(id: string): PendingPromptWithFiles | undefined {
-    if (!this.pendingVoiceReady(id)) return undefined;
+    if (!this.pendingVoiceReady(id) || this.pendingVoiceActionBusy(id)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.prepare("UPDATE pending_prompts SET status='queued',updated_at=? WHERE id=? AND status='editing'").run(now, id);
     return this.getPendingPrompt(id);
   }
 
   updatePendingPrompt(id: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles | undefined {
-    if (!this.pendingVoiceReady(id)) return undefined;
+    if (!this.pendingVoiceReady(id) || this.pendingVoiceActionBusy(id)) return undefined;
     const result = this.sqlite.prepare(`
       UPDATE pending_prompts SET content=?,quote_excerpt=?,agent_model=?,reasoning_effort=?,status='queued',updated_at=? WHERE id=?
     `).run(content, quoteExcerpt, selection.model, selection.reasoningEffort, new Date().toISOString(), id);
@@ -5290,7 +5338,7 @@ export class AppDatabase {
   }
 
   updateEditingPendingPrompt(id: string, content: string, selection: StoredAgentSelection, quoteExcerpt: string | null = null): PendingPromptWithFiles | undefined {
-    if (!this.pendingVoiceReady(id)) return undefined;
+    if (!this.pendingVoiceReady(id) || this.pendingVoiceActionBusy(id)) return undefined;
     const result = this.sqlite.prepare(`
       UPDATE pending_prompts SET content=?,quote_excerpt=?,agent_model=?,reasoning_effort=?,updated_at=? WHERE id=? AND status='editing'
     `).run(content, quoteExcerpt, selection.model, selection.reasoningEffort, new Date().toISOString(), id);
@@ -5309,7 +5357,7 @@ export class AppDatabase {
     userId?: string;
     maximumStoredBytes?: number;
   }): PendingPromptWithFiles | undefined {
-    if (!this.pendingVoiceReady(input.id)) return undefined;
+    if (!this.pendingVoiceReady(input.id) || this.pendingVoiceActionBusy(input.id)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -5648,25 +5696,7 @@ export class AppDatabase {
   }
 
   getNextDispatchablePendingPrompt(): PendingPromptWithFiles | undefined {
-    const prompt = this.sqlite.prepare(`
-      SELECT pending.* FROM pending_prompts pending
-      JOIN conversations conversation ON conversation.id=pending.conversation_id
-      WHERE pending.status='queued' AND conversation.deleted_at IS NULL AND conversation.external_status<>'running'
-        AND NOT EXISTS (
-          SELECT 1 FROM jobs active
-          WHERE active.conversation_id=pending.conversation_id AND active.status IN ('queued','running')
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM wake_plans wake
-          WHERE wake.conversation_id=pending.conversation_id AND wake.state='armed'
-        )
-      -- Position is the user-controlled order within each conversation. Putting
-      -- it first is essential: created_at would otherwise make drag reordering
-      -- cosmetic while the original insertion order kept dispatching.
-      ORDER BY pending.position,pending.created_at,pending.id
-      LIMIT 1
-    `).get() as PendingPromptRow | undefined;
-    return prompt ? this.getPendingPrompt(prompt.id) : undefined;
+    return this.listDispatchablePendingPrompts(1)[0];
   }
 
   listDispatchablePendingPrompts(limit = 100): PendingPromptWithFiles[] {
@@ -5676,7 +5706,7 @@ export class AppDatabase {
       WHERE pending.status='queued' AND conversation.deleted_at IS NULL AND conversation.external_status<>'running'
         AND NOT EXISTS (SELECT 1 FROM voice_submissions voice JOIN pending_prompts blocked ON blocked.id=voice.pending_prompt_id
           WHERE blocked.conversation_id=pending.conversation_id AND blocked.status IN ('queued','editing')
-          AND blocked.position<=pending.position AND voice.state<>'completed')
+          AND blocked.position<=pending.position AND (voice.state<>'completed' OR voice.steer_state IS NOT NULL))
         AND NOT EXISTS (
           SELECT 1 FROM jobs active
           WHERE active.conversation_id=pending.conversation_id AND active.status IN ('queued','running')
