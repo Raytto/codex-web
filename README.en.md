@@ -14,6 +14,9 @@ Use it from a desktop or mobile browser, with conversations, files and execution
 
 ## What you can do
 
+- **Continuous voice**: Talk in the existing conversation, interrupt playback and delegate work through a separate optional Live API.
+- **Persistent coordinator**: PP Dot delegates across projects, records source-linked memory and checks actual results.
+- **Storage and recovery**: Optional encrypted chunks, on-demand cold-file restoration and independent recovery drills.
 - **Voice input**: Speak a request; the recording is transcribed and sent to the agent.
 - **Remote computers**: Send work to your own computers, use their files and tools, and retrieve results from the browser.
 - **Scheduled tasks**: Run daily, weekly or at intervals for routine checks, research and reports.
@@ -176,11 +179,11 @@ Local development requires **Node.js ≥ 22.13.0**. Configure a local `.env`, th
 ```bash
 npm ci
 npm run lint
-npm test
+npm run build
 npm run dev
 ```
 
-The development URL is `http://127.0.0.1:5173/codex-web/`. `npm test` builds and tests the application. `npm run test:worker` is separate and requires dependencies installed under `remote-worker` first. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The development URL is `http://127.0.0.1:5173/codex-web/`. The full application suite needs maintenance permissions in an isolated Linux test environment; see [CONTRIBUTING.md](CONTRIBUTING.md) for commands. `npm run test:worker` is separate and requires dependencies installed under `remote-worker` first.
 
 ## Documentation
 
@@ -194,7 +197,7 @@ The development URL is `http://127.0.0.1:5173/codex-web/`. `npm test` builds and
 | Project and personal tools | [Project boards](docs/features/PERSONAL_KANBAN.md) · [Opportunity cards](docs/OPPORTUNITY_CARDS.md) · [Judgment book](docs/JUDGMENT_BOOK.md) |
 | Reading and sharing | [Reader](docs/READER_PROGRESSIVE_LOADING.md) · [Public sharing](docs/PUBLIC_FILE_SHARING.md) · [Interactive HTML](docs/WEB_PRESENTATIONS.md) |
 | Other executors and models | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
-| Most recent public feature update | [November 4, 2026 upgrade notes](docs/UPGRADE_20261108.md) |
+| Most recent public feature update | [November 8–9, 2026 upgrade notes](docs/UPGRADE_20261108.md) |
 
 This page follows the implementation on public `main`. Historical updates and migration details live in the linked guides.
 

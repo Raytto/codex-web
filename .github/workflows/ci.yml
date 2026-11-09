@@ -20,6 +20,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y acl age ffmpeg python3
       - run: npm ci
       - run: npm run lint
-      - run: npm test
+      # Storage maintenance inspects /proc and permission tests switch tenant UIDs.
+      # Only this disposable runner's test process needs elevated permissions.
+      - name: Run application tests with Linux maintenance permissions
+        run: sudo env "PATH=$PATH" npm test
       - run: npm run test:storage-tools
       - run: cp .env.example .env && docker compose config --quiet

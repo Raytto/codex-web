@@ -177,11 +177,11 @@ sudo docker compose up -d --no-build
 ```bash
 npm ci
 npm run lint
-npm test
+npm run build
 npm run dev
 ```
 
-开发页面默认位于 `http://127.0.0.1:5173/codex-web/`。`npm test` 构建并运行应用测试；Worker 有独立的 `npm run test:worker` 入口，需要先安装 `remote-worker` 的依赖。贡献方式见[CONTRIBUTING.md](CONTRIBUTING.md)。
+开发页面默认位于 `http://127.0.0.1:5173/codex-web/`。完整应用测试需要在隔离 Linux 测试环境中以维护权限运行，具体命令见 [CONTRIBUTING.md](CONTRIBUTING.md)；Worker 有独立的 `npm run test:worker` 入口，需要先安装 `remote-worker` 的依赖。
 
 ## 文档导航
 
