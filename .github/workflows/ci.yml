@@ -43,5 +43,6 @@ jobs:
                   summary = summary.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
                   print("::error title=Application regression::" + summary)
           PYTHON
-      - run: npm run test:storage-tools
+      - name: Run storage tool tests with Linux maintenance permissions
+        run: sudo env "PATH=$PATH" npm run test:storage-tools
       - run: cp .env.example .env && docker compose config --quiet
