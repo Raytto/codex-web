@@ -23,6 +23,25 @@ jobs:
       # Storage maintenance inspects /proc and permission tests switch tenant UIDs.
       # Only this disposable runner's test process needs elevated permissions.
       - name: Run application tests with Linux maintenance permissions
-        run: sudo env "PATH=$PATH" npm test
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" npm test 2>&1 | tee "$RUNNER_TEMP/codex-web-app-tests.log"
+      - name: Publish failed test summaries
+        if: failure()
+        run: |
+          python3 - "$RUNNER_TEMP/codex-web-app-tests.log" <<'PYTHON'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1])
+          if log.exists():
+              lines = log.read_text(errors="replace").splitlines()
+              failures = [i for i, line in enumerate(lines) if re.match(r"\s*not ok \d+", line)]
+              for start in failures[:8]:
+                  end = start + 1
+                  while end < len(lines) and not re.match(r"\s*(?:# Subtest:|(?:not )?ok \d+|# tests|1\.\.)", lines[end]):
+                      end += 1
+                  summary = "\n".join(lines[start:end])[:6000]
+                  summary = summary.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print("::error title=Application regression::" + summary)
+          PYTHON
       - run: npm run test:storage-tools
       - run: cp .env.example .env && docker compose config --quiet
