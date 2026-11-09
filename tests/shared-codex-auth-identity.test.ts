@@ -20,7 +20,12 @@ test("shared auth commits tenant rotation without DAC capabilities and releases 
   fs.mkdirSync(path.dirname(target), { mode: 0o700 });
   fs.chownSync(path.dirname(target), 65_534, 65_534);
   fs.writeFileSync(source, JSON.stringify({ tokens: { access_token: "initial", refresh_token: "initial" } }), { mode: 0o600 });
-  const moduleUrl = pathToFileURL(path.resolve("server/shared-codex-auth.ts")).href;
+  // A root process without DAC capabilities cannot traverse a runner-owned
+  // private checkout. Exercise the built module from the test-owned fixture;
+  // keep auth files private and leave every capability/permission assertion intact.
+  const moduleFile = path.join(root, "shared-codex-auth.mjs");
+  fs.copyFileSync(path.resolve("dist-server/server/shared-codex-auth.js"), moduleFile);
+  const moduleUrl = pathToFileURL(moduleFile).href;
   const script = `
     import assert from 'node:assert/strict';
     import fs from 'node:fs';
@@ -44,7 +49,7 @@ test("shared auth commits tenant rotation without DAC capabilities and releases 
     await next.releaseWithoutCommit();
   `;
   const child = spawnSync("setpriv", ["--bounding-set=-dac_override,-dac_read_search", process.execPath,
-    "--import", "tsx", "--input-type=module", "-e", script], { encoding: "utf8", timeout: 20_000 });
+    "--input-type=module", "-e", script], { cwd: root, encoding: "utf8", timeout: 20_000 });
   assert.equal(child.status, 0, child.stderr);
   assert.equal(fs.statSync(target).mode & 0o777, 0o600);
   assert.equal(fs.statSync(target).uid, 65_534);
