@@ -101,10 +101,14 @@ test("new cross-layer schema changes are versioned and idempotent", (context) =>
     { version: 2026110901, name: "composer-draft-voice-links" },
     { version: 2026110902, name: "codex-auto-reset-preferences" },
     { version: 2026110903, name: "voice-deferred-steering" },
+    { version: 2026111001, name: "durable-remote-controlled-turns" },
+    { version: 2026111101, name: "storage-file-chunk-layout" },
   ]);
   assert.deepEqual((first.sqlite.prepare("PRAGMA table_info(personal_memory_runs)").all() as Array<{name:string}>).filter(column => ["provider", "reasoning_effort", "runtime_verified"].includes(column.name)).map(column => column.name), ["provider", "reasoning_effort", "runtime_verified"]);
+  const chunkEpoch=first.sqlite.prepare("SELECT updated_at FROM storage_scan_state WHERE name='file-chunk-policy-v2'").get()!.updated_at;
   first.close();
   const reopened = new AppDatabase(root, undefined, false);
+  assert.equal(reopened.sqlite.prepare("SELECT updated_at FROM storage_scan_state WHERE name='file-chunk-policy-v2'").get()!.updated_at,chunkEpoch);
   assert.equal((reopened.sqlite.prepare("SELECT count(*) AS value FROM schema_migrations").get() as { value: number }).value, migrations.length);
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(conversation_voice_state)").all() as Array<{name:string}>).some(column => column.name === "delegated_seq"));
   assert.ok((reopened.sqlite.prepare("PRAGMA table_info(job_recovery_checkpoints)").all() as Array<{ name: string }>).some((column) => column.name === "checkpoint_json"));

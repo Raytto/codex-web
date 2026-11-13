@@ -62,7 +62,7 @@ CODEX_WEB_VERIFY_BUILD=1 ./scripts/build-image.sh
 
 This runs the same Docker test stage before building the application. No tagged test image is loaded; the dedicated builder's test layers are removed at the end. Allow additional time, disk and memory. On a 4 GiB server, stop or schedule around application workloads while building; swap can prevent memory exhaustion but is **host capacity**, not image content. Do not remove a working swapfile to meet an application disk target. A larger separate build host is another option; transfer/pull the exact reviewed image and record its digest.
 
-`CODEX_CLI_VERSION` defaults to `0.162.1`; only a numeric version is accepted by the helper. `UV_VERSION` and the managed Python patch version are pinned in the Dockerfile. The Node base is a tag, so record its resolved digest, platform, source SHA and build arguments for every capacity comparison. A later OS package/base refresh may change byte totals; exact bit-for-bit reproduction additionally requires a fixed base digest and package repository snapshot.
+`CODEX_CLI_VERSION` defaults to `0.167.1`; only a numeric version is accepted by the helper. `UV_VERSION` and the managed Python patch version are pinned in the Dockerfile. The Node base is a tag, so record its resolved digest, platform, source SHA and build arguments for every capacity comparison. A later OS package/base refresh may change byte totals; exact bit-for-bit reproduction additionally requires a fixed base digest and package repository snapshot.
 
 ## Disk accounting
 
@@ -134,3 +134,7 @@ Worker release archives omit compiled regression test modules. Their source and 
 Instance upgrades now apply additive complete-task migrations `2026110802` / `2026110803`. Keep `MAX_ACTIVE_WORKFLOWS=-1` for the public unlimited default, or set an explicit positive cap. Runtime branding/base path use the restricted instance environment and need service recreation, not a new asset build. See [instance configuration](INSTANCE_CONFIGURATION.md) and [complete tasks](COMPLETE_WORKFLOWS.md).
 
 The small `cold-storage/locks` state directory is also required for local reader cleanup when cloud storage is not configured. Keep its bind mount and restricted initializer permissions; it is not a reason to make the application root writable. Existing archive ownership is not recursively changed.
+
+## Current build structure (2026-11-14)
+
+Compilation is shared by the verification and runtime branches. Worker dependency/release stages use Worker inputs independently of web-only changes. Runtime dependencies are pruned after compilation; checked process manifests retain complete dependency packages/assets for optional host and observer packaging. Browser verification scripts and office tools stay out of the default runtime. The dedicated builder still removes only its own cache. Historical measurements above are unchanged historical samples, not measurements of this update.

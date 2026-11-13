@@ -55,7 +55,7 @@ test("Gemini account routes retain owner-only authorization, CSRF, node scope an
   assert.deepEqual(calls.at(-1), { userId: HOST_ROOT_USER_ID, executorId: HOST_EXECUTOR_ID, request: { action: "usage", accountId: id, refresh: true } });
 });
 
-test("a first queued Gemini request uses its own title engine while Codex naming stays enabled", async t => {
+test("first queued Gemini and Codex requests use the same Codex title engine", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-title-api-"));
   const instance = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false,
     username: "tenant", passwordHash: bcrypt.hashSync("Tenant-Test-2026!", 8), sessionSecret: "fixture-session-secret-longer-than-thirty-two-characters" });
@@ -95,11 +95,11 @@ test("a first queued Gemini request uses its own title engine while Codex naming
   assert.equal(instance.db.getJob(gemini.body.job.id)?.agent_model, model);
   const geminiAudit = instance.db.listConversationTitleAudits(geminiId);
   assert.equal(geminiAudit.length, 1);
-  assert.equal(geminiAudit[0].model, "antigravity:gemini-title-fixture");
+  assert.equal(geminiAudit[0].model, "gpt-5.6-luna");
   assert.equal(geminiAudit[0].reasoning_effort, "low");
   assert.equal(instance.db.getConversation(geminiId)?.title_source, "ai");
   assert.equal(titleCalls.mock.callCount(), 1);
-  assert.equal(titleCalls.mock.calls[0].arguments[4], "antigravity");
+  assert.equal(titleCalls.mock.calls[0].arguments[4], "codex");
 
   const codexConversation = await owner.post("/api/conversations").set("X-CSRF-Token", csrf).send({ reuseEmpty: false }).expect(201);
   const codexId = codexConversation.body.conversation.id as string;

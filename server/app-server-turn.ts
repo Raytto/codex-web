@@ -58,6 +58,8 @@ export type AppServerTurnOptions = {
   optionalCapabilities: OptionalAgentCapabilities;
   codexEgressKind?: CodexEgressKind;
   waitAutomation?: WaitDynamicToolConfig;
+  /** Injectable acquisition backoff; production retains the abortable real clock. */
+  acquisitionWait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
 export type AppServerTurnExecution = {
@@ -239,7 +241,7 @@ class AppServerTurnClient {
         if (!(error instanceof Error) || !/^thread \S+ already has an active writer$/i.test(error.message.trim())
           || attempt >= waits.length) throw error;
         if (attempt === 0) this.callbacks.onProgress({ kind: "status", label: "正在等待上一条任务释放会话" });
-        await delay(waits[attempt], undefined, { signal: this.callbacks.signal });
+        await (this.options.acquisitionWait ?? ((ms, signal) => delay(ms, undefined, { signal })))(waits[attempt], this.callbacks.signal);
       }
     }
   }

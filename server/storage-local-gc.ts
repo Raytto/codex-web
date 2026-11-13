@@ -12,7 +12,8 @@ import {STORAGE_DAY} from './storage-lifecycle-policy.js';
 /** Only the engine's regenerable provider/catalog caches are selected. User
  * plans, generated images, rollout/history databases and installed plugins are
  * deliberately outside this deletion list and use their archive/recovery path. */
-export function collectNativeRebuildable(host:StorageHost,maxFiles=500){
+export function collectNativeRebuildable(host:StorageHost,maxFiles=500,reserve?:()=>boolean){
+ let attempted=0;const attempt=()=>attempted<maxFiles&&(!reserve||reserve())&&++attempted>0;
  const result={releasedBytes:0,files:0,debugRows:0,blocked:[] as Array<{user:string;reason:string}>},now=host.catalog.now();
  for(const user of host.db.prepare('SELECT id FROM users ORDER BY id').all()){
   const uid=String(user.id),home=storageRoot(host.catalog,host.roots,uid,'native');if(!fs.existsSync(home))continue;
@@ -36,13 +37,14 @@ export function collectNativeRebuildable(host:StorageHost,maxFiles=500){
      visited++;last=key;const st=fs.lstatSync(file);
      if(!st.isFile() || st.isSymbolicLink() || st.nlink!==1 || st.mtimeMs+7*STORAGE_DAY>now)continue;
      assertFileNotOpen(file);if(fileFingerprint(fs.lstatSync(file))!==fileFingerprint(st))continue;
+     if(!attempt()){stopped=true;break;}
      fs.unlinkSync(file);result.files++;result.releasedBytes+=st.blocks*512;
     }
    };
    for(const name of ['codex_apps_server_info','codex_apps_tools','remote_plugin_catalog'])walk(path.join(home,'cache',name),name);
    host.db.prepare('INSERT INTO storage_scan_state VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at')
     .run(scanKey,JSON.stringify({after:stopped?last:''}),now);
-   if(fs.existsSync(logs)){
+   if(fs.existsSync(logs)&&attempted<maxFiles){
     const stat=fs.lstatSync(logs);if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1)throw new Error('storage_debug_database_scope');
     const db=new DatabaseSync(logs);
     try{
@@ -51,6 +53,8 @@ export function collectNativeRebuildable(host:StorageHost,maxFiles=500){
      if(!['id','ts','level'].every(name=>columns.has(name)))throw new Error('storage_debug_schema_unsupported');
      // Engine ts is epoch seconds. Unknown/invalid historical timestamps stay
      // visible for repair; they are never treated as epoch zero and deleted.
+     const cutoff=[Math.floor((now-7*STORAGE_DAY)/1000),Math.floor((now-30*STORAGE_DAY)/1000)];
+     if(!db.prepare("SELECT 1 FROM logs WHERE ts>=1577836800 AND ts<CASE WHEN upper(level) IN ('DEBUG','TRACE','INFO') THEN ? ELSE ? END LIMIT 1").get(...cutoff)||!attempt())continue;
      db.exec('BEGIN IMMEDIATE');
      const removed=db.prepare(`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE ts>=1577836800
        AND ts<CASE WHEN upper(level) IN ('DEBUG','TRACE','INFO') THEN ? ELSE ? END ORDER BY id LIMIT 1000)`)
@@ -63,11 +67,12 @@ export function collectNativeRebuildable(host:StorageHost,maxFiles=500){
   finally{unlock?.();}
  }
  const cleaner=process.env.STORAGE_BUILD_CLEANER;
- if(cleaner){
+ if(cleaner&&attempted<maxFiles){
   const prior=host.db.prepare("SELECT updated_at FROM storage_scan_state WHERE name='build-cache-gc'").get();
   if(!prior || Number(prior.updated_at)+STORAGE_DAY<=now){
    try{
     const st=fs.lstatSync(cleaner);if(!path.isAbsolute(cleaner)||!st.isFile()||st.isSymbolicLink()||st.uid!==0||(st.mode&0o022)!==0)throw new Error('storage_build_cleaner_scope');
+    if(!attempt())throw new Error('storage_maintenance_yield');
     execFileSync(cleaner,['gc-idle'],{stdio:'ignore',timeout:120_000});
     host.db.prepare("INSERT INTO storage_scan_state VALUES('build-cache-gc','{}',?) ON CONFLICT(name) DO UPDATE SET updated_at=excluded.updated_at").run(now);
    }catch{result.blocked.push({user:'__shared__',reason:'scoped_builder_busy_or_gc_failed'});}

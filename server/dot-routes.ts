@@ -106,7 +106,7 @@ export function mountDotRoutes(api: Router, store: DotStore, live: DotLiveGatewa
     } });
     api.post('/dot/call', (req, res) => { try {
         store.owner(user(res));
-        return res.json(live.ticket(res.locals.session as SessionRow, req.body?.takeover === true));
+        return res.json(live.ticket(res.locals.session as SessionRow, req.body?.takeover === true, undefined, req.body?.protocolVersion));
     }
     catch (e) {
         return fail(res, e);

@@ -37,7 +37,7 @@ test('known-account unclassified native work has finite preservation and exact r
  }finally{t.mock.timers.reset();db.close();fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test('conservative background passes share one batch across old packages and new files, and yield to user restores',async()=>{
+for(const conservative of [true,false])test(`${conservative?'conservative':'normal'} background passes share one batch across old packages and new files, and yield to user restores`,async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'storage-bounded-pass-')),db=new AppDatabase(path.join(root,'data'),undefined,false);
  try{
   const lifecycleRoot=path.join(root,'lifecycle');fs.mkdirSync(lifecycleRoot);
@@ -46,12 +46,18 @@ test('conservative background passes share one batch across old packages and new
   const source=path.join(root,'new-file');fs.writeFileSync(source,'not yet archived');
   catalog.enroll({userId:LEGACY_USER_ID,scope:'test',sourceKey:'new',kind:'file',locator:{root:'fixture',path:'new'},name:'new',trustedUsedAt:Date.now()-90*STORAGE_DAY});
   let imports=0,files=0;
-  const host={db:db.sqlite,catalog,roots:{lifecycleRoot},inventory:()=>({}),importConversation:async()=>{imports++;},
+  const host={db:db.sqlite,catalog,roots:{lifecycleRoot},policy:{graceMs:3*STORAGE_DAY},inventory:()=>({}),writeIndex:()=>{},importConversation:async()=>{imports++;},
    source:()=>source,files:{archive:async()=>{files++;}},legacyRoots:{}} as unknown as StorageHost;
-  const result=await runStorageMaintenance(host,{conservative:true,maxItems:1});
+  const result=await runStorageMaintenance(host,{conservative,maxItems:1});
   assert.equal(imports,1);assert.equal(files,0);assert.equal(result.operationsAttempted,1);assert.equal(result.releasedBytes,0);
   db.sqlite.prepare("INSERT INTO storage_restores(user_id,kind,subject_id,attempt_id,state,stage,started_at,updated_at) VALUES(?,'file','fixture','attempt','restoring','downloading',?,?)").run(LEGACY_USER_ID,Date.now(),Date.now());
-  const busy=await runStorageMaintenance(host,{conservative:true,maxItems:1});
+  const busy=await runStorageMaintenance(host,{conservative,maxItems:1});
   assert.equal(busy.yieldedToUser,true);assert.equal(busy.operationsAttempted,0);assert.equal(imports,1);assert.equal(files,0);
+  if(!conservative){
+   db.sqlite.prepare('DELETE FROM storage_restores').run();
+   const resumed=await runStorageMaintenance(host,{maxItems:1});
+   assert.equal(resumed.operationsAttempted,1);assert.equal(resumed.filesIsolated,1);
+   assert.equal(imports,1);assert.equal(files,1);assert.equal(resumed.blockedCount,0);
+  }
  }finally{db.close();fs.rmSync(root,{recursive:true,force:true});}
 });

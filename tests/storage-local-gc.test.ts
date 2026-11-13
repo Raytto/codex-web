@@ -25,8 +25,8 @@ test('scoped cache GC respects engine lock, real TTL, cursor, symlinks and valua
   for(const [id,age,level] of [[1,8,'DEBUG'],[2,8,'ERROR'],[3,31,'ERROR'],[4,0,'INFO']] as const)logs.prepare('INSERT INTO logs VALUES(?,?,?,?)').run(id,Math.floor((now-age*STORAGE_DAY)/1000),level,'debug only');
   logs.prepare('INSERT INTO logs VALUES(5,1,\'DEBUG\',\'unknown time\')').run();logs.close();
   const unlock=acquireCodexLifecycleLock(home);try{assert.equal(collectNativeRebuildable(host).files,0);}finally{unlock();}
-  const first=collectNativeRebuildable(host,1);assert.equal(first.files,1);assert.ok(first.releasedBytes>0);assert.equal(first.debugRows,2);
-  assert.equal(collectNativeRebuildable(host,1).files,1);assert.equal(collectNativeRebuildable(host,1).files,0);
+  const first=collectNativeRebuildable(host,1);assert.equal(first.files,1);assert.ok(first.releasedBytes>0);assert.equal(first.debugRows,0);
+  assert.equal(collectNativeRebuildable(host,1).files,1);const third=collectNativeRebuildable(host,1);assert.equal(third.files,0);assert.equal(third.debugRows,2);assert.equal(third.releasedBytes,0);
   assert.ok(fs.existsSync(valuable));assert.ok(fs.existsSync(path.join(cache,'fresh')));assert.ok(fs.lstatSync(path.join(cache,'linked')).isSymbolicLink());
   assert.equal(db.sqlite.prepare("SELECT resolved_at FROM storage_issues WHERE scope='local-gc'").get()!.resolved_at,now);
   const check=new DatabaseSync(path.join(home,'logs_2.sqlite'),{readOnly:true});assert.deepEqual(check.prepare('SELECT id FROM logs ORDER BY id').all().map(r=>r.id),[2,4,5]);check.close();

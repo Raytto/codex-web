@@ -58,7 +58,7 @@ test("waiting labels preserve active execution, scheduled details and legacy que
   assert.equal(conversationWaitingLabel({ ...idle, has_pending_work: 1 }, "preparing"), "等待维护结束后发送");
   assert.equal(conversationWaitingLabel({ ...idle, has_pending_work: 1, active_wake_count: 1 }), null);
   for (const workflow_state of ["queued", "active", "blocked", "closing"] as const) {
-    assert.ok(conversationWaitingLabel({ ...idle, workflow_state, active_wake_count: 1 }));
+    assert.equal(conversationWaitingLabel({ ...idle, workflow_state, active_wake_count: 1 }), null);
     assert.equal(conversationWaitingLabel({ ...idle, workflow_state, external_status: "running" }), null);
   }
   for (const workflow_state of ["completed", "aborted"] as const) {

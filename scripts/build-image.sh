@@ -8,7 +8,7 @@ target="${CODEX_WEB_BUILD_TARGET:-runtime}"
 case "$target" in runtime|documents) ;; *) echo 'Target must be runtime or documents' >&2; exit 2 ;; esac
 commit="$(git rev-parse --verify "$ref^{commit}")"
 image="${CODEX_WEB_IMAGE:-codex-web:local}"
-cli_version="${CODEX_CLI_VERSION:-0.162.1}"
+cli_version="${CODEX_CLI_VERSION:-0.167.1}"
 [[ "$cli_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Pin a numeric Codex CLI version' >&2; exit 2; }
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo 'Commit or preserve tracked changes first; builds use only the selected Git commit.' >&2; exit 2

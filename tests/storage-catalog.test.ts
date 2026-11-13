@@ -27,22 +27,23 @@ test('catalog writes reserve the WAL writer before reads and preserve nested rol
   const peer=new DatabaseSync(path.join(root,'catalog.sqlite'));
   peer.exec('PRAGMA busy_timeout=1');
   const catalog=new StorageCatalog(db);
+  const initialNames=peer.prepare('SELECT name FROM storage_scan_state ORDER BY name').all().map(row=>row.name);
   const insert=(name:string)=>db.prepare("INSERT INTO storage_scan_state VALUES(?, '{}', 1)").run(name);
   try {
     catalog.transaction(()=>{
-      assert.equal(db.prepare('SELECT COUNT(*) n FROM storage_scan_state').get()!.n,0);
+      assert.equal(db.prepare('SELECT COUNT(*) n FROM storage_scan_state').get()!.n,initialNames.length);
       assert.throws(()=>peer.prepare("INSERT INTO storage_scan_state VALUES('peer','{}',1)").run(),/locked/);
       insert('outer');
       assert.throws(()=>catalog.transaction(()=>{insert('rolled-back-inner');throw new Error('abort-inner');}),/abort-inner/);
       catalog.transaction(()=>insert('committed-inner'));
     });
-    assert.deepEqual(peer.prepare('SELECT name FROM storage_scan_state ORDER BY name').all().map(row=>row.name),['committed-inner','outer']);
+    assert.deepEqual(peer.prepare('SELECT name FROM storage_scan_state ORDER BY name').all().map(row=>row.name),[...initialNames,'committed-inner','outer'].sort());
     assert.throws(()=>catalog.transaction(()=>{insert('rolled-back-outer');throw new Error('abort-outer');}),/abort-outer/);
     assert.equal(db.isTransaction,false);
     // A caller-owned transaction is never committed by the catalog savepoint.
     db.exec('BEGIN IMMEDIATE'); catalog.transaction(()=>insert('caller-owned')); db.exec('ROLLBACK');
     peer.prepare("INSERT INTO storage_scan_state VALUES('peer-after-commit','{}',1)").run();
-    assert.equal(peer.prepare('SELECT COUNT(*) n FROM storage_scan_state').get()!.n,3);
+    assert.equal(peer.prepare('SELECT COUNT(*) n FROM storage_scan_state').get()!.n,initialNames.length+3);
   } finally {peer.close();db.close();fs.rmSync(root,{recursive:true,force:true});}
 });
 

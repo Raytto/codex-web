@@ -14,6 +14,7 @@ import selectors
 import struct
 import sys
 import time
+from collections import deque
 
 libc = ctypes.CDLL(None, use_errno=True)
 FAN_CLOEXEC, FAN_NONBLOCK, FAN_CLASS_CONTENT = 1, 2, 4
@@ -29,9 +30,41 @@ fd = libc.fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_CONTENT, os.O_RDO
 if fd < 0:
     raise OSError(ctypes.get_errno(), 'storage_access_monitor_unavailable')
 watch, jobs, actors, recent = {}, {}, {}, {}
+output = deque()
+output_bytes = 0
+output_registered = False
+os.set_blocking(sys.stdout.fileno(), False)
 
 def emit(value):
-    print(json.dumps(value, separators=(',', ':')), flush=True)
+    # The parent may be waiting for a SQLite writer which is itself reading a
+    # watched file. Never wait for the parent's pipe while holding a kernel
+    # permission request. Markers are durable before use notifications.
+    global output_bytes, output_registered
+    body = (json.dumps(value, separators=(',', ':'))+'\n').encode('utf8')
+    if output_bytes + len(body) > 8*1024*1024:
+        # Fail closed: closing fanotify releases readers; parent restart opens
+        # an explicit observation gap. No silent dropped usage notifications.
+        raise BufferError('storage_monitor_notification_budget')
+    output.append(memoryview(body))
+    output_bytes += len(body)
+    if not output_registered:
+        selector.register(sys.stdout.fileno(), selectors.EVENT_WRITE, 'output')
+        output_registered = True
+
+def flush_output():
+    global output_bytes, output_registered
+    try:
+        written = os.write(sys.stdout.fileno(), output[0][:65536])
+    except BlockingIOError:
+        return
+    output_bytes -= written
+    if written == len(output[0]):
+        output.popleft()
+    else:
+        output[0] = output[0][written:]
+    if not output:
+        selector.unregister(sys.stdout.fileno())
+        output_registered = False
 
 def identity(pid):
     raw = open('/proc/%s/stat' % pid).read()
@@ -94,6 +127,9 @@ pending = b''
 try:
     while True:
         for key, _ in selector.select(30):
+            if key.data == 'output':
+                flush_output()
+                continue
             if key.data == 'config':
                 data = os.read(sys.stdin.fileno(), 65536)
                 if not data:

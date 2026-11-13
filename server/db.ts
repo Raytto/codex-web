@@ -1,3 +1,6 @@
+import { voicePresentation, isVoicePending } from './voice-presentation.js';
+import { migrateStorageChunkLayouts } from './storage-chunk-layout.js';
+import { normalizeTranscriptionKeyword } from './transcription-keywords.js';
 import { migrateStorageLifecycle } from "./storage-lifecycle-schema.js";
 import { migrateJobEventSequence, nextJobEventSequence } from "./job-event-sequence.js";
 import { migrateConversationVoice } from "./conversation-voice-schema.js";
@@ -15,7 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CHAT_FONT_SIZE_DEFAULT, normalizeChatFontSize } from "../src/chat-font-size.js";
-import { buildAskAgentDraft } from "../src/ask-agent-selection.js";
+import { auditRemoteRepair, migrateRemoteControlledTurns, quarantineRemoteMessage, remoteExecutionPromptHash, remoteInputKey, remotePrimaryUserItems, resolveRemoteControlledTurns, resolveRemoteSteeredInputs } from "./remote-controlled-turns.js";
 import { parseResponseAnnotatedRequest } from "../src/response-annotations.js";
 import { isDeliverablePath, normalizeStoredRelativePath, normalizeUploadFileName } from "./paths.js";
 import type { AgentOptions, ExecutorRuntimeStatus } from "./model-options.js";
@@ -25,7 +28,7 @@ import type { OptionalAgentCapabilities } from "./optional-capabilities.js";
 import { containsPersonalContext, stripPersonalContext } from "./personal-context.js";
 import type { ReadingAnnotationRow, ReadingAnnotationType, ReadingProgressRow, ReadingSourceRow, ReadingSourceVersionRow, ReadingUnitRow, ReaderFormat, ReaderVersionKind, ReaderVersionStatus } from "./reader-types.js";
 import { isModelCapacityContinuationPrompt } from "./internal-messages.js";
-import { buildTaskRecoveryCheckpoint, stripTaskRecoveryPrompt, type TaskRecoveryCheckpoint } from "./task-recovery.js";
+import { buildTaskRecoveryCheckpoint, type TaskRecoveryCheckpoint } from "./task-recovery.js";
 import { isPublicShareActive, PUBLIC_SHARE_LIFETIME_MS } from "../src/public-share.js";
 import { remotePreviewTitle } from "./title-request.js";
 
@@ -719,35 +722,11 @@ const isSuppressedControlledActivity = (payload: string): boolean => {
     return false;
   }
 };
-const normalizedMessageContent = (value: string): string => value.replace(/\r\n?/g, "\n").trim();
 const normalizePersonalMemoryStatement = (value: string): string => value
   .normalize("NFKC")
   .toLowerCase()
   .replace(/[\s`*_~，。！？；：、,.!?;:'"“”‘’（）()\[\]【】]+/g, "")
   .trim();
-const remoteUserMessageMatchesJob = (remoteContent: string, jobContent: string, jobQuoteExcerpt?: string | null): boolean => {
-  const remote = normalizedMessageContent(stripTaskRecoveryPrompt(stripPersonalContext(remoteContent)));
-  const job = normalizedMessageContent(jobQuoteExcerpt ? buildAskAgentDraft(jobContent, jobQuoteExcerpt) : jobContent);
-  if (!job || remote === job) return remote === job;
-  if (remote.startsWith(job)) {
-    const suffix = remote.slice(job.length).trimStart();
-    return suffix.startsWith("本轮附件：\n") || suffix.startsWith("<codex_web_wait_automation>");
-  }
-  const withoutWaitAutomation = remote
-    .replace(/\s*<codex_web_wait_automation>[\s\S]*?<\/codex_web_wait_automation>\s*$/u, "")
-    .trim();
-  if (!withoutWaitAutomation.endsWith(job)) return false;
-  const prefix = withoutWaitAutomation.slice(0, -job.length).trimEnd();
-  return prefix.startsWith("本轮附件：\n") || prefix.startsWith("上一次任务由用户主动终止。");
-};
-const remoteItemFallsWithinJob = (remoteCreatedAt: string, jobCreatedAt: string, jobUpdatedAt: string): boolean => {
-  const remote = Date.parse(remoteCreatedAt);
-  const started = Date.parse(jobCreatedAt);
-  const finished = Date.parse(jobUpdatedAt);
-  return Number.isFinite(remote) && Number.isFinite(started) && Number.isFinite(finished)
-    && remote >= started - 30_000
-    && remote <= finished + 30_000;
-};
 const conversationSelect = `
   conversations.*,
   EXISTS (SELECT 1 FROM dot_sessions dot WHERE dot.user_id=conversations.user_id AND dot.conversation_id=conversations.id) AS is_dot_coordinator,
@@ -788,7 +767,8 @@ export class AppDatabase {
   constructor(dataRoot: string, legacyUser: LegacyUserSeed = { username: "owner", passwordHash: "", displayName: "Owner" }, recoverJobs = true) {
     fs.mkdirSync(dataRoot, { recursive: true });
     this.sqlite = new DatabaseSync(path.join(dataRoot, "codex-web.sqlite"));
-    this.sqlite.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    try {
+    this.sqlite.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
     this.migrate(legacyUser);
     this.applyMigration(2026092903, "para-board-v1", () => migratePara(this.sqlite));
     this.applyMigration(2026093001, "para-board-order", () => {
@@ -918,13 +898,14 @@ export class AppDatabase {
     this.applyMigration(2026110901, "composer-draft-voice-links", () => {
       this.sqlite.exec("ALTER TABLE composer_drafts ADD COLUMN voice_transcription_ids_json TEXT NOT NULL DEFAULT '[]'");
     });
+    this.applyMigration(2026111101, "storage-file-chunk-layout", () => migrateStorageChunkLayouts(this.sqlite));
     this.workflows = new WorkflowStore(this.sqlite);
     this.workflows.adoptLegacy();
     if (recoverJobs) {
-      // Local running child processes cannot survive an application restart. Remote
-      // Worker turns are different: the Worker process and its Codex turn can remain
-      // alive while the Web service restarts. A persisted recovery lease lets the new
-      // gateway reattach to that exact turn without replaying it.
+      // A Web restart does not prove that a root bridge or Worker execution
+      // exited. Preserve workflow fencing until actual exit verification. A
+      // remote recovery lease lets the new gateway reattach to that exact turn
+      // without replaying it.
       const interrupted = this.sqlite.prepare(`
         SELECT job.id,job.conversation_id,conversation.deleted_at,project.executor_id
         FROM jobs job
@@ -941,6 +922,7 @@ export class AppDatabase {
           if (remoteLease) continue;
           const error = "服务重启，原运行任务已中断";
           this.captureJobRecovery(job.id, "interrupted", error);
+          this.workflows.executionUncertain(job.id, "服务重启，原执行退出尚未核验；保留名额及发布验收归属");
           const event = { seq: nextJobEventSequence(this.sqlite, job.id) };
           this.sqlite.prepare(`
             UPDATE jobs
@@ -962,7 +944,7 @@ export class AppDatabase {
           if (job.deleted_at) continue;
           const noticeMessageId = crypto.randomUUID();
           this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'assistant',?,NULL,?)")
-            .run(noticeMessageId, job.conversation_id, "上一条任务因服务重启而中断，尚未执行完成。为避免重复产生副作用，系统没有自动重试；请重新发送该任务。", now);
+            .run(noticeMessageId, job.conversation_id, "上一条任务因服务重启而中断，尚未执行完成。原任务及名额已保留；需先核验旧执行退出，再从已有回执恢复。系统没有自动重试或重放可能有副作用的指令。", now);
           this.sqlite.prepare(`
             UPDATE conversations
             SET status='idle',has_unread_result=1,unread_anchor_message_id=COALESCE(unread_anchor_message_id,?),updated_at=?
@@ -984,10 +966,14 @@ export class AppDatabase {
         throw error;
       }
     }
+    } catch (error) { this.sqlite.close(); throw error; }
   }
 
   private migrate(legacyUser: LegacyUserSeed): void {
-    this.sqlite.exec("DROP INDEX IF EXISTS jobs_queue_idx");
+    // Legacy queue indexes used a different ordering. Do not rebuild the
+    // correct index on every startup while background writers are active.
+    const queueColumns=(this.sqlite.prepare("PRAGMA index_info(jobs_queue_idx)").all() as Array<{name:string}>).map(r=>r.name);
+    if(queueColumns.length && queueColumns.join(',')!=='status,queue_seq')this.sqlite.exec("DROP INDEX jobs_queue_idx");
     this.sqlite.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -2097,6 +2083,8 @@ export class AppDatabase {
       this.sqlite.exec("CREATE TABLE IF NOT EXISTS codex_reset_credit_snapshots (scope_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL)");
     });
 
+    this.applyMigration(2026111001, "durable-remote-controlled-turns", () => migrateRemoteControlledTurns(this.sqlite));
+
     const titleAuditRecoveryAt = new Date().toISOString();
     this.sqlite.prepare(`
       UPDATE conversation_title_audits
@@ -2216,106 +2204,108 @@ export class AppDatabase {
   }
 
   private suppressImportedControlledTurns(conversationId?: string): number {
-    const assistantItems = this.sqlite.prepare(`
-      SELECT item.rowid AS mapping_rowid,item.message_id,message.content
-      FROM remote_thread_items item
-      JOIN messages message ON message.id=item.message_id
-      WHERE item.executor_id=? AND item.thread_id=? AND item.turn_id=? AND item.conversation_id=?
-        AND item.role='assistant' AND item.message_id IS NOT NULL
-      ORDER BY item.rowid
-    `);
-    const duplicateAssistant = this.sqlite.prepare(`
-      SELECT 1 FROM messages message
-      WHERE message.conversation_id=? AND message.role='assistant' AND message.content=? AND message.id<>?
-      LIMIT 1
-    `);
-    const clearMapping = this.sqlite.prepare("UPDATE remote_thread_items SET message_id=NULL WHERE rowid=?");
-    const deleteUnreferencedMessage = this.sqlite.prepare(`
-      DELETE FROM messages
-      WHERE id=?
-        AND NOT EXISTS (SELECT 1 FROM remote_thread_items item WHERE item.message_id=messages.id)
-        AND NOT EXISTS (SELECT 1 FROM files file WHERE file.message_id=messages.id)
-        AND NOT EXISTS (SELECT 1 FROM jobs job WHERE job.message_id=messages.id)
-    `);
-    const suppressActivities = this.sqlite.prepare(`
-      UPDATE remote_thread_events SET payload=?
-      WHERE executor_id=? AND thread_id=? AND turn_id=? AND conversation_id=?
-    `);
-    let repaired = 0;
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      const candidateClaims = this.sqlite.prepare(`
-        SELECT item.rowid AS mapping_rowid,item.message_id AS remote_message_id,item.created_at AS remote_created_at,
-          remote_message.content AS remote_content,job.message_id AS job_message_id,
-          job.created_at AS job_created_at,job.updated_at AS job_updated_at,job_message.content AS job_content,
-          job_message.quote_excerpt AS job_quote_excerpt
-        FROM remote_thread_items item
-        JOIN messages remote_message ON remote_message.id=item.message_id
-        JOIN jobs job ON job.conversation_id=item.conversation_id AND job.message_id IS NOT NULL
-        JOIN messages job_message ON job_message.id=job.message_id
-        WHERE item.role='user' AND item.message_id IS NOT NULL AND item.message_id<>job.message_id
-          AND (? IS NULL OR item.conversation_id=?)
-        ORDER BY item.rowid,job.created_at DESC,job.id DESC
-      `).all(conversationId ?? null, conversationId ?? null) as Array<{
-        mapping_rowid: number;
-        remote_message_id: string;
-        remote_created_at: string;
-        remote_content: string;
-        job_message_id: string;
-        job_created_at: string;
-        job_updated_at: string;
-        job_content: string;
-        job_quote_excerpt: string | null;
-      }>;
-      const claimedMappings = new Set<number>();
-      const alreadyClaimedJobs = new Set((this.sqlite.prepare(`
-        SELECT DISTINCT job.message_id
-        FROM remote_thread_items item JOIN jobs job ON job.message_id=item.message_id
-      `).all() as Array<{ message_id: string }>).map((row) => row.message_id));
-      const claimMapping = this.sqlite.prepare("UPDATE remote_thread_items SET message_id=? WHERE rowid=?");
-      for (const candidate of candidateClaims) {
-        if (claimedMappings.has(candidate.mapping_rowid) || alreadyClaimedJobs.has(candidate.job_message_id)
-          || !remoteItemFallsWithinJob(candidate.remote_created_at, candidate.job_created_at, candidate.job_updated_at)
-          || !remoteUserMessageMatchesJob(candidate.remote_content, candidate.job_content, candidate.job_quote_excerpt)) continue;
-        claimMapping.run(candidate.job_message_id, candidate.mapping_rowid);
-        deleteUnreferencedMessage.run(candidate.remote_message_id);
-        claimedMappings.add(candidate.mapping_rowid);
-        alreadyClaimedJobs.add(candidate.job_message_id);
-        repaired += 1;
-      }
-
-      const turns = this.sqlite.prepare(`
-        SELECT controlled.executor_id,controlled.thread_id,controlled.turn_id,controlled.conversation_id,
-          MAX(CASE WHEN job.status='running' THEN 1 ELSE 0 END) AS active_job
-        FROM remote_thread_items controlled
-        JOIN jobs job ON job.message_id=controlled.message_id
-        WHERE (? IS NULL OR controlled.conversation_id=?)
-        GROUP BY controlled.executor_id,controlled.thread_id,controlled.turn_id,controlled.conversation_id
-      `).all(conversationId ?? null, conversationId ?? null) as Array<{ executor_id: string; thread_id: string; turn_id: string; conversation_id: string; active_job: number }>;
-      for (const turn of turns) {
-        const items = assistantItems.all(
-          turn.executor_id, turn.thread_id, turn.turn_id, turn.conversation_id,
-        ) as Array<{ mapping_rowid: number; message_id: string; content: string }>;
-        for (const [index, item] of items.entries()) {
-          const finalItem = index === items.length - 1;
-          const hasCanonicalFinal = finalItem && Boolean(duplicateAssistant.get(turn.conversation_id, item.content, item.message_id));
-          if (!turn.active_job && finalItem && !hasCanonicalFinal) continue;
-          clearMapping.run(item.mapping_rowid);
-          deleteUnreferencedMessage.run(item.message_id);
-          repaired += 1;
-        }
-        const suppressedPayload = JSON.stringify({ kind: SUPPRESSED_CONTROLLED_ACTIVITY_KIND, label: "" });
-        const result = suppressActivities.run(
-          suppressedPayload, turn.executor_id, turn.thread_id, turn.turn_id, turn.conversation_id,
-        );
-        repaired += Number(result.changes);
-      }
+      const changed = this.repairControlledRemoteImports(conversationId);
       this.sqlite.exec("COMMIT");
-    } catch (error) {
-      this.sqlite.exec("ROLLBACK");
-      throw error;
+      return changed;
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Caller owns the transaction, shared by startup, claim and every snapshot. */
+  private repairControlledRemoteImports(conversationId?: string): number {
+    let changed = 0;
+    const threads = this.sqlite.prepare(`SELECT DISTINCT conversation_id,executor_id,thread_id FROM remote_thread_items
+      WHERE (? IS NULL OR conversation_id=?)`).all(conversationId ?? null,conversationId ?? null) as Array<{conversation_id:string;executor_id:string;thread_id:string}>;
+    for (const thread of threads) {
+      const users = this.sqlite.prepare(`SELECT i.rowid AS mapping_rowid,i.*,m.content FROM remote_thread_items i
+        JOIN messages m ON m.id=i.message_id WHERE i.conversation_id=? AND i.executor_id=? AND i.thread_id=? AND i.role='user' ORDER BY i.rowid`)
+        .all(thread.conversation_id,thread.executor_id,thread.thread_id) as Array<{mapping_rowid:number;turn_id:string;message_id:string;content:string;created_at:string;item_id:string}>;
+      const claims = resolveRemoteControlledTurns(this.sqlite,thread.conversation_id,thread.executor_id,thread.thread_id,
+        users.map(i=>({turnId:i.turn_id,content:i.content,createdAt:i.created_at})));
+      const primaryUsers = remotePrimaryUserItems(this.sqlite,thread.conversation_id,claims,
+        users.map(i=>({turnId:i.turn_id,itemId:i.item_id,content:i.content,createdAt:i.created_at})));
+      for (const item of users) {
+        if (primaryUsers.get(item.turn_id)!==item.item_id) continue;
+        const claim = claims.get(item.turn_id);
+        if (!claim || claim.messageId === item.message_id) continue;
+        // Never rebind a second genuine user send or an attachment-bearing copy.
+        if (this.sqlite.prepare('SELECT 1 FROM jobs WHERE message_id=? UNION ALL SELECT 1 FROM files WHERE message_id=?').get(item.message_id,item.message_id)) continue;
+        auditRemoteRepair(this.sqlite,thread.conversation_id,'claim_user:'+claim.source,item);
+        this.sqlite.prepare('UPDATE remote_thread_items SET message_id=? WHERE rowid=?').run(claim.messageId,item.mapping_rowid);
+        quarantineRemoteMessage(this.sqlite,thread.conversation_id,item.message_id,claim.messageId);
+        changed++;
+      }
+      const steerClaims = resolveRemoteSteeredInputs(this.sqlite,thread.conversation_id,claims,
+        users.map(i=>({turnId:i.turn_id,itemId:i.item_id,content:i.content,createdAt:i.created_at})));
+      for (const item of users) {
+        const messageId = steerClaims.get(remoteInputKey(item.turn_id,item.item_id));
+        if (!messageId || messageId===item.message_id) continue;
+        if (this.sqlite.prepare('SELECT 1 FROM files WHERE message_id=?').get(item.message_id)) continue;
+        const owner = claims.get(item.turn_id)!;
+        this.sqlite.prepare('INSERT OR IGNORE INTO remote_steered_inputs(message_id,job_id,turn_id) VALUES(?,?,?)').run(messageId,owner.jobId,item.turn_id);
+        auditRemoteRepair(this.sqlite,thread.conversation_id,'claim_steer',item);
+        this.sqlite.prepare('UPDATE remote_thread_items SET message_id=? WHERE rowid=?').run(messageId,item.mapping_rowid);
+        quarantineRemoteMessage(this.sqlite,thread.conversation_id,item.message_id,messageId);
+        changed++;
+      }
+      for (const [turnId,claim] of claims) {
+        const job = this.getJob(claim.jobId)!;
+        const items = this.sqlite.prepare(`SELECT i.rowid AS mapping_rowid,i.*,m.content FROM remote_thread_items i
+          JOIN messages m ON m.id=i.message_id WHERE i.conversation_id=? AND i.executor_id=? AND i.thread_id=? AND i.turn_id=? AND i.role='assistant' ORDER BY i.rowid`)
+          .all(thread.conversation_id,thread.executor_id,thread.thread_id,turnId) as Array<{mapping_rowid:number;message_id:string;content:string}>;
+        for (const [index,item] of items.entries()) {
+          // A real final reply is retained unless its canonical copy exists.
+          const duplicate = this.sqlite.prepare(`SELECT 1 FROM messages m WHERE m.conversation_id=? AND m.role='assistant' AND m.is_internal=0
+            AND m.content=? AND m.id<>? AND m.created_at>=? AND m.created_at<=?
+            AND NOT EXISTS(SELECT 1 FROM remote_thread_items r WHERE r.message_id=m.id)`).get(thread.conversation_id,item.content,item.message_id,job.created_at,job.updated_at);
+          const stage = this.sqlite.prepare(`SELECT 1 FROM job_events WHERE job_id=? AND event_type='progress' AND json_valid(payload)
+            AND json_extract(payload,'$.kind')='update' AND json_extract(payload,'$.detail')=?`).get(job.id,item.content);
+          const canonical = this.sqlite.prepare(`SELECT count(*) AS n FROM messages m
+            WHERE m.conversation_id=? AND m.role='assistant' AND m.is_internal=0 AND m.created_at>=? AND m.created_at<=?
+              AND NOT EXISTS(SELECT 1 FROM remote_thread_items r WHERE r.message_id=m.id)`)
+            .get(thread.conversation_id,job.created_at,job.updated_at) as {n:number};
+          // A final response can also have a progress/update event. That event
+          // alone is never proof that the visible message is merely commentary.
+          if (job.status !== 'running' && index === items.length-1 && !duplicate && !(job.status === 'completed' && stage && canonical.n === 1)) continue;
+          if (this.sqlite.prepare('SELECT 1 FROM files WHERE message_id=? UNION ALL SELECT 1 FROM jobs WHERE message_id=?').get(item.message_id,item.message_id)) continue;
+          auditRemoteRepair(this.sqlite,thread.conversation_id,'suppress_controlled_assistant',item);
+          this.sqlite.prepare('UPDATE remote_thread_items SET message_id=NULL WHERE rowid=?').run(item.mapping_rowid);
+          quarantineRemoteMessage(this.sqlite,thread.conversation_id,item.message_id);
+          changed++;
+        }
+        const events = this.sqlite.prepare(`SELECT * FROM remote_thread_events WHERE conversation_id=? AND executor_id=? AND thread_id=? AND turn_id=?`)
+          .all(thread.conversation_id,thread.executor_id,thread.thread_id,turnId) as Array<{seq:number;payload:string}>;
+        for (const event of events) {
+          if (isSuppressedControlledActivity(event.payload)) continue;
+          auditRemoteRepair(this.sqlite,thread.conversation_id,'suppress_controlled_activity',event);
+          this.sqlite.prepare('UPDATE remote_thread_events SET payload=? WHERE seq=?')
+            .run(JSON.stringify({kind:SUPPRESSED_CONTROLLED_ACTIVITY_KIND,label:""}),event.seq);
+          changed++;
+        }
+      }
     }
-    return repaired;
+    return changed;
+  }
+
+  registerRemoteExecutionInput(jobId: string, prompt: string): void {
+    this.sqlite.prepare('INSERT OR IGNORE INTO remote_execution_inputs(job_id,prompt_hash) VALUES(?,?)')
+      .run(jobId,remoteExecutionPromptHash(prompt));
+  }
+
+  recordRemoteControlledTurn(jobId: string, executorId: string, threadId: string, turnId: string): number {
+    const job = this.getJob(jobId);
+    const conversation = job && this.getConversation(job.conversation_id);
+    const project = conversation?.project_id ? this.getProject(conversation.project_id) : undefined;
+    if (!job || !conversation || project?.executor_id !== executorId || conversation.codex_thread_id !== threadId) return 0;
+    this.sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      this.sqlite.prepare(`INSERT OR IGNORE INTO remote_controlled_turns(executor_id,thread_id,turn_id,job_id,source,created_at)
+        VALUES(?,?,?,?,'accepted',?)`).run(executorId,threadId,turnId,jobId,new Date().toISOString());
+      const changed = this.repairControlledRemoteImports(conversation.id);
+      this.sqlite.exec('COMMIT');
+      return changed;
+    } catch(error) { this.sqlite.exec('ROLLBACK'); throw error; }
   }
 
   private convergeImportedRemoteAssistantTurns(): number {
@@ -2491,7 +2481,7 @@ export class AppDatabase {
       "conversations.deleted_at IS NULL",
       "conversations.archived_at IS NULL",
       "conversations.title NOT LIKE ? ESCAPE '\\' COLLATE NOCASE",
-      "EXISTS (SELECT 1 FROM messages message WHERE message.conversation_id=conversations.id AND message.content LIKE ? ESCAPE '\\' COLLATE NOCASE)",
+      "EXISTS (SELECT 1 FROM messages message WHERE message.conversation_id=conversations.id AND message.is_internal=0 AND message.content LIKE ? ESCAPE '\\' COLLATE NOCASE)",
     ];
     const parameters: Array<string | number> = [userId, escaped, escaped];
     if (options.projectId) { where.push("conversations.project_id=?"); parameters.push(options.projectId); }
@@ -3196,31 +3186,36 @@ export class AppDatabase {
         `).run(nextTitle, nextTitleSource, thread.status, thread.rolloutBytes ?? null, Math.max(0, Math.trunc(thread.updatedAt)), Math.max(0, Math.trunc(thread.updatedAt)), remoteUpdatedAt, conversation.id);
       }
 
-      const existingMessages = this.sqlite.prepare("SELECT id,role,content,quote_excerpt FROM messages WHERE conversation_id=? ORDER BY created_at,id")
-        .all(conversation.id) as Array<{ id: string; role: string; content: string; quote_excerpt: string | null }>;
+      repairedMessages += this.repairControlledRemoteImports(conversation.id);
+      const snapshotClaims = resolveRemoteControlledTurns(this.sqlite,conversation.id,executorId,thread.id,
+        thread.messages.filter(i=>i.role==='user'));
+      const steerClaims = resolveRemoteSteeredInputs(this.sqlite,conversation.id,snapshotClaims,thread.messages.filter(i=>i.role==='user'));
+      const existingMessages = this.sqlite.prepare("SELECT id,role,content,quote_excerpt,created_at FROM messages WHERE conversation_id=? AND is_internal=0 ORDER BY created_at,id")
+        .all(conversation.id) as Array<{ id: string; role: string; content: string; quote_excerpt: string | null; created_at: string }>;
       const controlledJobMessageIds = new Set((this.sqlite.prepare("SELECT message_id FROM jobs WHERE conversation_id=? AND message_id IS NOT NULL")
         .all(conversation.id) as Array<{ message_id: string }>).map((row) => row.message_id));
+      const canonicalUserIds = new Set([...controlledJobMessageIds,
+        ...(this.sqlite.prepare('SELECT message_id FROM remote_steered_inputs WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)')
+          .all(conversation.id) as Array<{message_id:string}>).map(i=>i.message_id)]);
       const controlledTurns = new Set((this.sqlite.prepare(`
           SELECT DISTINCT item.turn_id
           FROM remote_thread_items item
           JOIN jobs job ON job.message_id=item.message_id
           WHERE item.executor_id=? AND item.thread_id=? AND item.conversation_id=?
         `).all(executorId, thread.id, conversation.id) as Array<{ turn_id: string }>).map((row) => row.turn_id));
+      for (const turnId of snapshotClaims.keys()) controlledTurns.add(turnId);
       // Capacity continuation turns are generated inside an already-visible Codex Web
       // Job. They remain in the Codex thread for recovery/audit, but must not be
       // replayed as fresh user/assistant bubbles by the desktop observer.
       for (const item of thread.messages) {
         if (item.role !== "user") continue;
         const parsed = parseResponseAnnotatedRequest(item.content);
-        if (isModelCapacityContinuationPrompt(stripPersonalContext(parsed?.content ?? item.content))) {
+        if (controlledJobMessageIds.size > 0 && isModelCapacityContinuationPrompt(parsed?.content ?? item.content)) {
           controlledTurns.add(item.turnId);
         }
       }
       const matchedExistingIds = new Set((this.sqlite.prepare("SELECT message_id FROM remote_thread_items WHERE conversation_id=? AND message_id IS NOT NULL")
         .all(conversation.id) as Array<{ message_id: string }>).map((row) => row.message_id));
-      const activeJobMessage = activeJob?.message_id
-        ? existingMessages.find((message) => message.id === activeJob.message_id)
-        : undefined;
       const preferredAssistantItemByTurn = new Map<string, string>();
       const touchedRemoteTurns = new Set<string>();
       for (const item of thread.messages) {
@@ -3229,19 +3224,40 @@ export class AppDatabase {
       }
       for (const activity of thread.activities ?? []) touchedRemoteTurns.add(activity.turnId);
       let existingCursor = 0;
+      const primaryUserItems = remotePrimaryUserItems(this.sqlite,conversation.id,snapshotClaims,thread.messages.filter(i=>i.role==='user'));
       for (const item of thread.messages) {
         const parsed = item.role === "user" ? parseResponseAnnotatedRequest(item.content) : null;
-        const content = stripTaskRecoveryPrompt(stripPersonalContext(parsed?.content ?? item.content));
+        const content = parsed?.content ?? item.content;
         const quoteExcerpt = parsed?.quoteExcerpt ?? null;
         const alreadyMapped = this.sqlite.prepare(`
           SELECT message_id FROM remote_thread_items WHERE executor_id=? AND thread_id=? AND turn_id=? AND item_id=?
         `).get(executorId, thread.id, item.turnId, item.itemId) as { message_id: string | null } | undefined;
         if (alreadyMapped) {
+          const steerId=steerClaims.get(remoteInputKey(item.turnId,item.itemId));
+          const protectedPrior = steerId && alreadyMapped.message_id && alreadyMapped.message_id!==snapshotClaims.get(item.turnId)?.messageId
+            && this.sqlite.prepare('SELECT 1 FROM files WHERE message_id=? UNION ALL SELECT 1 FROM jobs WHERE message_id=?')
+              .get(alreadyMapped.message_id,alreadyMapped.message_id);
+          if (protectedPrior) continue;
+          if (steerId && alreadyMapped.message_id!==steerId) {
+            // A previous delta may have aliased the steer to the Job's first
+            // input. Use the fresh raw snapshot, never its joined canonical text.
+            auditRemoteRepair(this.sqlite,conversation.id,'refresh_steer_mapping',{
+              executor_id:executorId,thread_id:thread.id,turn_id:item.turnId,item_id:item.itemId,message_id:alreadyMapped.message_id,
+            });
+            this.sqlite.prepare('UPDATE remote_thread_items SET message_id=? WHERE executor_id=? AND thread_id=? AND turn_id=? AND item_id=?')
+              .run(steerId,executorId,thread.id,item.turnId,item.itemId);
+            this.sqlite.prepare('INSERT OR IGNORE INTO remote_steered_inputs(message_id,job_id,turn_id) VALUES(?,?,?)')
+              .run(steerId,snapshotClaims.get(item.turnId)!.jobId,item.turnId);
+            if (alreadyMapped.message_id) quarantineRemoteMessage(this.sqlite,conversation.id,alreadyMapped.message_id,steerId);
+            alreadyMapped.message_id=steerId;
+            canonicalUserIds.add(steerId);
+            repairedMessages+=1;
+          }
           if (alreadyMapped.message_id && controlledJobMessageIds.has(alreadyMapped.message_id)) controlledTurns.add(item.turnId);
           if (alreadyMapped.message_id) {
             const current = this.sqlite.prepare("SELECT content,quote_excerpt FROM messages WHERE id=?")
               .get(alreadyMapped.message_id) as { content: string; quote_excerpt: string | null } | undefined;
-            if (current && !controlledJobMessageIds.has(alreadyMapped.message_id)
+            if (current && !canonicalUserIds.has(alreadyMapped.message_id)
               && (current.content !== content || current.quote_excerpt !== quoteExcerpt)) {
               this.sqlite.prepare("UPDATE messages SET content=?,quote_excerpt=? WHERE id=?")
                 .run(content, quoteExcerpt, alreadyMapped.message_id);
@@ -3251,16 +3267,24 @@ export class AppDatabase {
           continue;
         }
         let matchedMessageId: string | null = null;
-        if (item.role === "user" && controlledJobActive && activeJobMessage && !matchedExistingIds.has(activeJobMessage.id)
-          && remoteUserMessageMatchesJob(content, activeJobMessage.content, activeJobMessage.quote_excerpt)) {
-          matchedMessageId = activeJobMessage.id;
-          matchedExistingIds.add(activeJobMessage.id);
-          controlledTurns.add(item.turnId);
-        } else {
+        const primaryUser = item.role === "user" && primaryUserItems.get(item.turnId) === item.itemId;
+        const claim = primaryUser ? snapshotClaims.get(item.turnId) : undefined;
+        const steeredMessageId = item.role === "user" ? steerClaims.get(remoteInputKey(item.turnId,item.itemId)) : undefined;
+        if (steeredMessageId) {
+          matchedMessageId = steeredMessageId;
+          canonicalUserIds.add(steeredMessageId);
+          matchedExistingIds.add(steeredMessageId);
+          this.sqlite.prepare('INSERT OR IGNORE INTO remote_steered_inputs(message_id,job_id,turn_id) VALUES(?,?,?)').run(steeredMessageId,snapshotClaims.get(item.turnId)!.jobId,item.turnId);
+        } else if (claim && !isModelCapacityContinuationPrompt(item.content)) {
+          matchedMessageId = claim.messageId;
+          matchedExistingIds.add(claim.messageId);
+        } else if (!controlledTurns.has(item.turnId) || (item.role === "user" && !primaryUser)) {
           for (let index = existingCursor; index < existingMessages.length; index += 1) {
             const candidate = existingMessages[index];
-            if (matchedExistingIds.has(candidate.id) || candidate.role !== item.role || candidate.content.trim() !== content.trim()
-              || (candidate.quote_excerpt ?? null) !== quoteExcerpt) continue;
+            if (controlledJobMessageIds.has(candidate.id) || matchedExistingIds.has(candidate.id)
+              || candidate.role !== item.role || candidate.content.trim() !== content.trim()
+              || (candidate.quote_excerpt ?? null) !== quoteExcerpt
+              || (item.role === 'user' && candidate.created_at !== item.createdAt)) continue;
             matchedMessageId = candidate.id;
             matchedExistingIds.add(candidate.id);
             existingCursor = index + 1;
@@ -3268,7 +3292,7 @@ export class AppDatabase {
           }
         }
         if (matchedMessageId && controlledJobMessageIds.has(matchedMessageId)) controlledTurns.add(item.turnId);
-        const suppressControlledPlayback = controlledTurns.has(item.turnId);
+        const suppressControlledPlayback = controlledTurns.has(item.turnId) && (item.role === "assistant" || primaryUser);
         if (!matchedMessageId && !suppressControlledPlayback) {
           matchedMessageId = crypto.randomUUID();
           this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,?,?,?,?)")
@@ -3282,6 +3306,7 @@ export class AppDatabase {
           VALUES(?,?,?,?,?,?,?,?)
         `).run(executorId, thread.id, item.turnId, item.itemId, conversation.id, matchedMessageId, item.role, item.createdAt || remoteUpdatedAt);
       }
+      repairedMessages += this.repairControlledRemoteImports(conversation.id);
       for (const activity of thread.activities ?? []) {
         const suppressControlledPlayback = controlledTurns.has(activity.turnId) || containsPersonalContext(activity.detail ?? "");
         const payload = JSON.stringify({
@@ -3498,23 +3523,30 @@ export class AppDatabase {
     return this.setCodexQuotaScope(scopeId, usage);
   }
 
-  setExecutorCodexQuota(executorId: string, usage: CodexQuotaUsage, accountId?: string): boolean {
+  setExecutorCodexQuota(executorId: string, usage: CodexQuotaUsage, accountId?: string, observedAt = new Date().toISOString()): boolean {
     if (!executorId) return false;
-    if (accountId) this.setExecutorActiveCodexAccount(executorId, accountId);
-    return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage);
+    const ownsTransaction=!this.sqlite.isTransaction;
+    if(ownsTransaction)this.sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      if (accountId) this.setExecutorActiveCodexAccount(executorId, accountId, observedAt);
+      const changed=this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage, observedAt);
+      if(ownsTransaction)this.sqlite.exec('COMMIT');
+      return changed;
+    }catch(error){if(ownsTransaction&&this.sqlite.isTransaction)this.sqlite.exec('ROLLBACK');throw error;}
   }
 
   setAccountCodexQuota(executorId: string, accountId: string, usage: CodexQuotaUsage, observedAt?: string): boolean {
     return this.setCodexQuotaScope(this.executorCodexQuotaScope(executorId, accountId), usage, observedAt);
   }
 
-  setExecutorActiveCodexAccount(executorId: string, accountId: string): void {
+  setExecutorActiveCodexAccount(executorId: string, accountId: string, observedAt = new Date().toISOString()): void {
     if (!executorId || !/^[0-9a-f-]{36}$/i.test(accountId)) throw new Error("执行机器 Codex 账号状态无效");
     this.sqlite.prepare(`
       INSERT INTO executor_codex_account_state(executor_id,active_account_id,updated_at)
       VALUES(?,?,?)
       ON CONFLICT(executor_id) DO UPDATE SET active_account_id=excluded.active_account_id,updated_at=excluded.updated_at
-    `).run(executorId, accountId, new Date().toISOString());
+      WHERE excluded.updated_at >= executor_codex_account_state.updated_at
+    `).run(executorId, accountId, observedAt);
   }
 
   getExecutorActiveCodexAccount(executorId: string): string | null {
@@ -3811,7 +3843,7 @@ export class AppDatabase {
   getLatestAssistantMessage(conversationId: string): Pick<MessageRow, "id" | "content"> | undefined {
     return this.sqlite.prepare(`
       SELECT id,content FROM messages
-      WHERE conversation_id=? AND role='assistant'
+      WHERE conversation_id=? AND role='assistant' AND is_internal=0
       ORDER BY created_at DESC,id DESC LIMIT 1
     `).get(conversationId) as Pick<MessageRow, "id" | "content"> | undefined;
   }
@@ -3960,13 +3992,35 @@ export class AppDatabase {
     }
   }
 
-  listVoiceLexiconTerms(userId: string, projectId: string | null, limit = 100): VoiceLexiconTermRow[] {
-    return this.sqlite.prepare(`
+  selectVoiceLexiconTerms(userId: string, projectId: string | null, limit = 200) {
+    const candidates = this.sqlite.prepare(`
       SELECT * FROM voice_lexicon_terms
       WHERE user_id=? AND status='active' AND (project_id IS NULL OR project_id IS ?)
       ORDER BY pinned DESC,rank_index DESC,weighted_errors DESC,voice_opportunities DESC,canonical_text
-      LIMIT ?
-    `).all(userId, projectId, Math.max(1, Math.min(100, Math.trunc(limit)))) as VoiceLexiconTermRow[];
+    `).all(userId, projectId) as VoiceLexiconTermRow[];
+    const terms: VoiceLexiconTermRow[] = [], seen = new Set<string>();
+    let invalid = 0, duplicates = 0, limitDropped = 0;
+    const max = Math.max(1, Math.min(200, Math.trunc(limit) || 200));
+    for (const row of candidates) {
+      const value = normalizeTranscriptionKeyword(row.canonical_text);
+      if (!value) { invalid++; continue; }
+      const key = value.toLowerCase();
+      if (seen.has(key)) { duplicates++; continue; }
+      seen.add(key);
+      if (terms.length >= max) { limitDropped++; continue; }
+      terms.push({ ...row, canonical_text: value });
+    }
+    return { terms, diagnostics: { candidates: candidates.length, invalid, duplicates, limitDropped } };
+  }
+
+  listVoiceLexiconTerms(userId: string, projectId: string | null, limit = 200): VoiceLexiconTermRow[] {
+    return this.selectVoiceLexiconTerms(userId, projectId, limit).terms;
+  }
+
+  suppressedVoiceLexiconTerms(userId: string, projectId: string | null): string[] {
+    return (this.sqlite.prepare(`SELECT canonical_text FROM voice_lexicon_terms
+      WHERE user_id=? AND status='suppressed' AND (project_id IS NULL OR project_id IS ?)`)
+      .all(userId, projectId) as {canonical_text:string}[]).map(r => r.canonical_text);
   }
 
   setVoiceLexiconTermDisabled(userId: string, termId: string, disabled: boolean): boolean {
@@ -4199,7 +4253,7 @@ export class AppDatabase {
       FROM messages message
       JOIN conversations conversation ON conversation.id=message.conversation_id
       WHERE conversation.user_id=? AND conversation.deleted_at IS NULL
-        AND message.role='user' AND message.created_at>=?
+        AND message.role='user' AND message.is_internal=0 AND message.created_at>=?
         AND NOT EXISTS (SELECT 1 FROM dot_sessions ds WHERE ds.conversation_id=conversation.id)
     `).run(userId, since).changes);
   }
@@ -4212,7 +4266,7 @@ export class AppDatabase {
       FROM personal_memory_outbox outbox
       JOIN messages message ON message.id=outbox.message_id
       JOIN conversations conversation ON conversation.id=message.conversation_id
-      WHERE outbox.user_id=? AND outbox.status='pending' AND conversation.deleted_at IS NULL
+      WHERE outbox.user_id=? AND outbox.status='pending' AND conversation.deleted_at IS NULL AND message.is_internal=0
         AND NOT EXISTS (SELECT 1 FROM dot_sessions ds WHERE ds.conversation_id=conversation.id)
         AND (outbox.next_attempt_at IS NULL OR outbox.next_attempt_at<=?)
         AND outbox.created_at<=?
@@ -4291,7 +4345,7 @@ export class AppDatabase {
     const messageForUser = this.sqlite.prepare(`
       SELECT message.id,message.conversation_id,message.content,message.created_at
       FROM messages message JOIN conversations conversation ON conversation.id=message.conversation_id
-      WHERE message.id=? AND conversation.user_id=? AND conversation.deleted_at IS NULL AND message.role='user'
+      WHERE message.id=? AND conversation.user_id=? AND conversation.deleted_at IS NULL AND message.role='user' AND message.is_internal=0
     `);
     const findEntry = this.sqlite.prepare(`
       SELECT * FROM personal_memory_entries WHERE user_id=? AND kind=? AND canonical_key=?
@@ -4609,7 +4663,9 @@ export class AppDatabase {
   }
 
   listMessages(conversationId: string): Array<MessageRow & { files: FileRow[] }> {
-    const messages = this.sqlite.prepare("SELECT * FROM messages WHERE conversation_id=? AND is_internal=0 ORDER BY created_at,id").all(conversationId) as MessageRow[];
+    const view=voicePresentation(this,conversationId);
+    const stored = this.sqlite.prepare("SELECT * FROM messages WHERE conversation_id=? AND is_internal=0 ORDER BY created_at,id").all(conversationId) as MessageRow[];
+    const messages=[...stored.filter(m=>!view.hidden.has(m.id)),...view.messages].sort((a,b)=>a.created_at.localeCompare(b.created_at)||a.id.localeCompare(b.id));
     const files = this.sqlite.prepare("SELECT * FROM files WHERE conversation_id=? ORDER BY created_at,id").all(conversationId) as FileRow[];
     return messages.map((message) => ({
       ...message,
@@ -4619,6 +4675,12 @@ export class AppDatabase {
 
   listMessagesPage(conversationId: string, beforeMessageId?: string, limit = 30): MessagePage | undefined {
     const pageSize = Math.min(100, Math.max(1, Math.trunc(limit)));
+    if(voicePresentation(this,conversationId).active){
+      let all=this.listMessages(conversationId);
+      if(beforeMessageId){const at=all.findIndex(m=>m.id===beforeMessageId);if(at<0)return undefined;all=all.slice(0,at);}
+      const hasMore=all.length>pageSize,messages=all.slice(-pageSize);
+      return {messages,hasMore,nextCursor:hasMore?messages[0].id:null};
+    }
     let newestFirst: MessageRow[];
     if (beforeMessageId) {
       const cursor = this.getMessage(beforeMessageId);
@@ -5734,6 +5796,7 @@ export class AppDatabase {
       `).get(pendingId, pendingId) as { value: number } | undefined;
       this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,is_scheduled,created_at) VALUES(?,?,'user',?,?,?,?)")
         .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, scheduled ? 1 : 0, now);
+      if(isVoicePending(this,pendingId))this.sqlite.prepare('UPDATE messages SET is_internal=1 WHERE id=?').run(messageId);
       this.sqlite.prepare("UPDATE files SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
       this.sqlite.prepare("UPDATE voice_transcriptions SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
       const next = this.sqlite.prepare("SELECT COALESCE(MAX(queue_seq),0)+1 AS value FROM jobs").get() as { value: number };
@@ -5757,7 +5820,7 @@ export class AppDatabase {
     return this.getJob(jobId);
   }
 
-  materializeSteeredPrompt(pendingId: string, messageId: string): MessageRow | undefined {
+  materializeSteeredPrompt(pendingId: string, messageId: string, delivery?: {jobId:string;turnId:string}): MessageRow | undefined {
     const prompt = this.getPendingPrompt(pendingId);
     if (!prompt || prompt.status !== "queued" || !this.pendingVoiceReady(pendingId)) return undefined;
     const now = new Date().toISOString();
@@ -5765,9 +5828,17 @@ export class AppDatabase {
     try {
       this.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,quote_excerpt,created_at) VALUES(?,?,'user',?,?,?)")
         .run(messageId, prompt.conversation_id, prompt.content, prompt.quote_excerpt, now);
+      if(isVoicePending(this,pendingId))this.sqlite.prepare('UPDATE messages SET is_internal=1 WHERE id=?').run(messageId);
       this.sqlite.prepare("UPDATE files SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
       this.sqlite.prepare("UPDATE voice_transcriptions SET message_id=?,pending_prompt_id=NULL WHERE pending_prompt_id=?").run(messageId, pendingId);
       this.sqlite.prepare("DELETE FROM pending_prompts WHERE id=?").run(pendingId);
+      if (delivery) {
+        const job = this.getJob(delivery.jobId);
+        if (!job || job.conversation_id !== prompt.conversation_id) throw new Error('Steer delivery ownership mismatch');
+        this.sqlite.prepare('INSERT INTO remote_steered_inputs(message_id,job_id,turn_id) VALUES(?,?,?)')
+          .run(messageId,delivery.jobId,delivery.turnId);
+        this.repairControlledRemoteImports(prompt.conversation_id);
+      }
       this.sqlite.prepare("UPDATE conversations SET updated_at=? WHERE id=?").run(now, prompt.conversation_id);
       this.sqlite.exec("COMMIT");
     } catch (error) {

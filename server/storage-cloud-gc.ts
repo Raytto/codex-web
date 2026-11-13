@@ -14,7 +14,8 @@ const eligible=`SELECT v.id FROM storage_versions v JOIN storage_items i ON i.id
 /** Only expired recovery material/events are collected. Unique business
  * originals and native recovery units require their explicit reference policy
  * and are not inferred disposable by an age or a missing filesystem path. */
-export async function collectStorageCloud(catalog:StorageCatalog,remote:Remote,limit=64):Promise<{versions:number;chunks:number;descriptors:number;cipherBytesRemoved:number;blocked:string[]}>{
+export async function collectStorageCloud(catalog:StorageCatalog,remote:Remote,limit=64,reserve?:()=>boolean):Promise<{versions:number;chunks:number;descriptors:number;cipherBytesRemoved:number;blocked:string[]}>{
+ let attempted=0;const attempt=()=>attempted<limit&&(!reserve||reserve())&&++attempted>0;
  const result={versions:0,chunks:0,descriptors:0,cipherBytesRemoved:0,blocked:[] as string[]},db=catalog.db,now=catalog.now();
  if(!db.prepare("SELECT 1 FROM storage_backup_points WHERE state='verified' AND restore_tested_at IS NOT NULL").get()){result.blocked.push('storage_independent_recovery_drill_required');return result;}
  catalog.transaction(()=>{
@@ -23,7 +24,7 @@ export async function collectStorageCloud(catalog:StorageCatalog,remote:Remote,l
   const queued=new Set(db.prepare('SELECT version_id FROM storage_gc_versions').all().map(r=>String(r.version_id)));
   for(const id of candidates.filter(id=>!queued.has(id)).slice(0,limit))db.prepare('INSERT OR IGNORE INTO storage_gc_versions VALUES(?,?)').run(id,now);
   for(const row of db.prepare('SELECT version_id FROM storage_gc_versions WHERE queued_at<=? LIMIT ?').all(now-grace,limit)){
-   const id=String(row.version_id);if(!allowed.has(id))continue;
+   const id=String(row.version_id);if(!allowed.has(id))continue;if(!attempt())break;
    db.prepare('DELETE FROM storage_references WHERE version_id=? AND expires_at<=?').run(id,now);
    db.prepare('DELETE FROM storage_version_chunks WHERE version_id=?').run(id);
    db.prepare('UPDATE storage_items SET current_version=NULL WHERE current_version=?').run(id);
@@ -41,6 +42,7 @@ export async function collectStorageCloud(catalog:StorageCatalog,remote:Remote,l
    db.prepare('INSERT OR IGNORE INTO storage_gc_chunks(chunk_id,queued_at,remote_path,remote_file_id,ciphertext_bytes) VALUES(?,?,?,?,?)').run(c.id,now,c.remote_path,c.remote_file_id??null,c.ciphertext_bytes);
  });
  for(const row of db.prepare("SELECT * FROM storage_gc_chunks WHERE deleted_at IS NULL AND (queued_at<=? OR state='deleting') LIMIT ?").all(now-grace,limit)){
+  if(!attempt())break;
   const id=String(row.chunk_id),name=String(row.remote_path),bytes=Number(row.ciphertext_bytes);
   try{
    const canDelete=catalog.transaction(()=>{
@@ -63,6 +65,7 @@ export async function collectStorageCloud(catalog:StorageCatalog,remote:Remote,l
   }catch(e){const reason=e instanceof Error?e.message:'storage_gc_failed';db.prepare('UPDATE storage_gc_chunks SET last_error=? WHERE chunk_id=?').run(reason,id);result.blocked.push(reason);}
  }
  for(const point of db.prepare("SELECT * FROM storage_backup_points WHERE state='retired' AND retired_at<=? LIMIT ?").all(now-grace,limit)){
+  if(!attempt())break;
   try{
    const name=String(point.remote_path),body=String(point.manifest_json),bytes=Buffer.byteLength(body);let file;
    try{file=await remote.locate(name);}catch(e){if(!(e instanceof Error) || e.message!=='storage_cloud_object_missing')throw e;}

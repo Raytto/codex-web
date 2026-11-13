@@ -122,6 +122,30 @@ export class WorkflowStore {
   forEntity(kind: string, id: string): WorkflowRow | undefined { return this.sql.prepare("SELECT w.* FROM workflows w JOIN workflow_entities e ON e.workflow_id=w.id WHERE e.kind=? AND e.entity_id=?").get(kind,id) as WorkflowRow | undefined; }
   forConversation(id: string): WorkflowRow | undefined { return this.sql.prepare("SELECT w.* FROM workflows w JOIN workflow_conversations c ON c.workflow_id=w.id WHERE c.conversation_id=?").get(id) as WorkflowRow | undefined; }
   list(userId?: string): WorkflowRow[] { return this.sql.prepare("SELECT * FROM workflows WHERE state NOT IN ('completed','aborted')"+(userId?" AND user_id=?":"")+" ORDER BY priority DESC,seq").all(...(userId?[userId]:[])) as WorkflowRow[]; }
+  /** Read-only, user-scoped explanation; never grants admission or exposes external source keys. */
+  waitingFor(conversationId: string): string | null {
+    const current = this.forConversation(conversationId);
+    if (!current || current.state !== "queued" || this.capacity() < 1) return null;
+    if (this.admissionBlock(conversationId)?.code !== "workflow_limit") return null;
+    const predecessors = this.list().filter(w => w.id !== current.id && (w.state !== "queued"
+      || w.priority > current.priority || (w.priority === current.priority && w.seq < current.seq)));
+    if (!predecessors.length) return null;
+    const owner = predecessors.find(w => w.state !== "queued") ?? predecessors[0]!;
+    if (owner.user_id !== current.user_id) return "等待其他账号的前序任务完成并释放名额";
+    const running = this.sql.prepare(`SELECT 1 FROM workflow_entities e JOIN jobs j ON j.id=e.entity_id
+      WHERE e.workflow_id=? AND e.kind='job' AND j.status='running' LIMIT 1`).get(owner.id);
+    const armed = this.sql.prepare(`SELECT 1 FROM workflow_conversations c JOIN wake_plans p ON p.conversation_id=c.conversation_id
+      WHERE c.workflow_id=? AND p.state='armed' LIMIT 1`).get(owner.id);
+    const pending = this.sql.prepare(`SELECT 1 FROM workflow_entities e JOIN jobs j ON j.id=e.entity_id
+      WHERE e.workflow_id=? AND e.kind='job' AND j.status='queued' LIMIT 1`).get(owner.id);
+    const state = running ? "正在执行" : owner.state === "closing" ? "正在收尾"
+      : armed ? "等待定时续跑" : pending && owner.state !== "queued" ? "等待恢复执行"
+      : owner.state === "blocked" ? "等待处理" : owner.state === "queued" ? "尚未准入"
+      : "等待续跑或验收";
+    const source = owner.source_key ? "外部维护" : "本地任务";
+    const phase = owner.reason || (owner.phase !== "执行中" ? owner.phase : "");
+    return `等待「${owner.title}」：${state}（${source}${phase ? ` · ${phase}` : ""}）${predecessors.length > 1 ? `，另有 ${predecessors.length - 1} 项在前` : ""}`;
+  }
   prioritize(id:string, priority:number, reason:string): WorkflowRow {
     if(!Number.isSafeInteger(priority)||priority<0||priority>10000||!reason.trim())throw new Error('优先级及人工排序理由无效');
     const result=this.sql.prepare("UPDATE workflows SET priority=?,reason=?,revision=revision+1,updated_at=? WHERE id=? AND state='queued'")
@@ -141,17 +165,18 @@ export class WorkflowStore {
         EXISTS(SELECT 1 FROM wake_plans p WHERE p.conversation_id=c.conversation_id AND p.state='armed')))`)
       .run(new Date().toISOString());
   }
-  block(conversationId: string): string | null {
+  block(conversationId: string): string | null { return this.admissionBlock(conversationId)?.label ?? null; }
+  admissionBlock(conversationId:string): {code:'workflow_limit'|'workflow_exit_unverified'|'workflow_closing'|'workflow_paused';label:string}|null {
     const w=this.forConversation(conversationId); if(!w) return null;
-    if ((this.sql.prepare("SELECT paused FROM workflow_settings WHERE id=1").get() as {paused:number}).paused) return "修改队列已暂停，等待核查";
-    if(terminal(w)) return "原修改已结束，等待新任务登记";
-    if(w.state==='closing') return "本项正在核验收尾，尚未释放";
-    if(this.sql.prepare("SELECT 1 FROM workflow_runs WHERE workflow_id=? AND settled=0 LIMIT 1").get(w.id)) return "等待本项上一执行者确认退出";
+    if ((this.sql.prepare("SELECT paused FROM workflow_settings WHERE id=1").get() as {paused:number}).paused) return {code:"workflow_paused",label:"修改队列已暂停，等待核查"};
+    if(terminal(w)) return {code:"workflow_limit",label:"原修改已结束，等待新任务登记"};
+    if(w.state==='closing') return {code:"workflow_closing",label:"本项正在核验收尾，尚未释放"};
+    if(this.sql.prepare("SELECT 1 FROM workflow_runs WHERE workflow_id=? AND settled=0 LIMIT 1").get(w.id)) return {code:"workflow_exit_unverified",label:"等待本项上一执行者确认退出"};
     const n=this.capacity();
     if(w.state==='queued' && n>0){
       const held=this.list().filter(x=>x.state!=='queued');
       const ahead=this.list().filter(x=>x.state==='queued' && (x.priority>w.priority || (x.priority===w.priority && x.seq<w.seq))).length;
-      if(held.length+ahead>=n) return `等待完整修改任务名额（上限 ${n}；前序尚未验收收尾）`;
+      if(held.length+ahead>=n) return {code:"workflow_limit",label:`等待完整修改任务名额（上限 ${n}；前序尚未验收收尾）`};
     }
     return null;
   }
@@ -227,13 +252,32 @@ export class WorkflowStore {
       this.sql.exec('COMMIT');
     }catch(e){this.sql.exec('ROLLBACK');throw e;}
   }
-  /** Explicit operator recovery only; never called by a timer or TTL expiry. */
-  recover(id:string, reason:string): void {
-    const w=this.get(id);if(!w || terminal(w) || !reason.trim())throw new Error('恢复对象或核验理由无效');
-    if(this.sql.prepare("SELECT 1 FROM jobs j JOIN workflow_entities e ON e.entity_id=j.id AND e.kind='job' WHERE e.workflow_id=? AND j.status='running'").get(id))throw new Error('仍有运行 Job，不能接管');
-    this.sql.prepare("UPDATE workflow_runs SET settled=1 WHERE workflow_id=?").run(id);
-    this.sql.prepare("DELETE FROM workflow_entities WHERE kind='unsettled' AND workflow_id=?").run(id);
-    this.sql.prepare("UPDATE workflows SET state='blocked',phase='已核验执行退出，等待恢复',reason=?,epoch=epoch+1,revision=revision+1 WHERE id=?").run(reason,id);
+  recoveryStatus(id:string) {
+    const workflow=this.get(id);if(!workflow)throw new Error('修改任务不存在');
+    const runs=this.sql.prepare(`SELECT r.job_id,r.epoch,r.settled,j.status FROM workflow_runs r
+      LEFT JOIN jobs j ON j.id=r.job_id WHERE r.workflow_id=? AND r.settled=0 ORDER BY r.job_id`).all(id) as Array<{job_id:string;epoch:number;settled:number;status:string|null}>;
+    const releases=this.sql.prepare('SELECT instance,request_id,sha FROM workflow_releases WHERE workflow_id=?').all(id);
+    const running=runs.some(r=>r.status==='running');
+    const phase=terminal(workflow)?'terminal':running?'executing':runs.length?'exit_unverified'
+      :workflow.state==='queued'?'waiting_capacity':releases.length?'pending_acceptance'
+      :this.hasPending(id)?'waiting_continuation':'ready_to_resume';
+    return {phase,revision:workflow.revision,epoch:workflow.epoch,runs,releases,
+      recoveryRequired:phase==='exit_unverified',automaticReplay:false,capacityRetained:!terminal(workflow)&&workflow.state!=='queued'};
+  }
+  /** Explicit operator recovery after actual process/Worker/deployment checks.
+   * CAS and run identities prevent an old inspection from settling a new run. */
+  recover(id:string, reason:string, expected?:{revision:number;runIds:string[]}): void {
+    this.sql.exec('BEGIN IMMEDIATE');
+    try {
+      const w=this.get(id);if(!w || terminal(w) || !reason.trim())throw new Error('恢复对象或核验理由无效');
+      const status=this.recoveryStatus(id);
+      if(expected && (w.revision!==expected.revision || JSON.stringify(status.runs.map(r=>r.job_id).sort())!==JSON.stringify([...expected.runIds].sort())))throw new Error('恢复核验已过期，请重新核对执行身份');
+      if(this.sql.prepare("SELECT 1 FROM jobs j JOIN workflow_entities e ON e.entity_id=j.id AND e.kind='job' WHERE e.workflow_id=? AND j.status='running'").get(id))throw new Error('仍有运行 Job，不能接管');
+      this.sql.prepare("UPDATE workflow_runs SET settled=1 WHERE workflow_id=? AND settled=0").run(id);
+      this.sql.prepare("DELETE FROM workflow_entities WHERE kind='unsettled' AND workflow_id=?").run(id);
+      this.sql.prepare("UPDATE workflows SET state='blocked',phase='已核验执行退出，等待恢复',reason=?,epoch=epoch+1,revision=revision+1,updated_at=? WHERE id=?").run(reason,new Date().toISOString(),id);
+      this.sql.exec('COMMIT');
+    }catch(error){this.sql.exec('ROLLBACK');throw error;}
   }
   cancelQueued(id:string,userId:string): void {
     this.sql.exec('BEGIN IMMEDIATE');

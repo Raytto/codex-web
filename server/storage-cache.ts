@@ -28,7 +28,8 @@ export function nativeWarmCopies(host:StorageHost){
  * process leases remain protected; every pressure eviction still gets its
  * own real three-day quarantine. Physical high-water limits also account for
  * these quarantines rather than claiming upload/isolation released bytes. */
-export async function enforceWarmCacheBudget(host:StorageHost,maxItems=32){
+export async function enforceWarmCacheBudget(host:StorageHost,maxItems=32,reserve?:()=>boolean){
+ let attempted=0;const attempt=()=>attempted<maxItems&&(!reserve||reserve())&&++attempted>0;
  const entries:Array<{item:StorageItem;bytes:number}>=[];let warmBytes=0;
  for(const item of host.db.prepare(`SELECT i.* FROM storage_items i JOIN storage_versions v ON v.id=i.current_version
    WHERE v.restored_at IS NOT NULL AND i.scope!='backup-material' AND i.kind!='native-history' ORDER BY i.last_used_at,i.id`).all() as StorageItem[]){
@@ -42,6 +43,7 @@ export async function enforceWarmCacheBudget(host:StorageHost,maxItems=32){
  for(const {item,bytes} of entries){
   if(warmBytes<=host.policy.hotBytes || isolated>=maxItems)break;
   if(item.last_used_at+15*60_000>host.catalog.now()){blocked.push({itemId:item.id,reason:'recently_used_cache'});continue;}
+  if(!attempt())break;
   try{
    await verifyVersionPresent(host,item.user_id,item.current_version!);
    await host.files.archive(item.user_id,item.id,{cachePressure:true});
@@ -53,6 +55,7 @@ export async function enforceWarmCacheBudget(host:StorageHost,maxItems=32){
  for(const entry of natives){
   if(warmBytes<=host.policy.hotBytes || isolated>=maxItems)break;
   if(entry.lastUsedAt+15*60_000>host.catalog.now()){blocked.push({itemId:entry.id,reason:'recently_used_cache'});continue;}
+  if(!attempt())break;
   try{
    for(const version of entry.versions)await verifyVersionPresent(host,entry.userId,version);
    const orphan=entry.conversationId.startsWith('orphan:')?{userId:entry.userId,executor:entry.userId===host.roots.hostUserId?'local-host':'tenant-local'}:undefined;

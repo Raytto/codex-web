@@ -42,7 +42,8 @@ export class ConversationTitleService {
   async generate(input: ConversationTitleGenerationInput): Promise<string | null> {
     const prompt = buildConversationTitlePrompt(input);
     if (!prompt) return null;
-    const output = await this.execute(input.userId, input.executorId, prompt, CONVERSATION_TITLE_TIMEOUT_MS, input.engineId);
+    // Naming is an auxiliary task, independent of the conversation's engine.
+    const output = await this.execute(input.userId, input.executorId, prompt, CONVERSATION_TITLE_TIMEOUT_MS, "codex");
     return parseConversationTitleOutput(output);
   }
 }

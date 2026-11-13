@@ -87,6 +87,8 @@ export type ColdManifest = {
 };
 
 export type ColdStorageRoots = {
+  /** In-process retry clock; omitted in normal/serialized runtime roots. */
+  retryWait?: (milliseconds: number) => void;
   dataRoot: string;
   tenantRoot: string;
   hostRootCodexHome: string;
@@ -429,6 +431,7 @@ function candidateFor(sqlite: DatabaseSync, roots: ColdStorageRoots, row: Storag
 export function defaultColdStorageRoots(overrides: Partial<ColdStorageRoots> = {}): ColdStorageRoots {
   const stateRoot = process.env.CODEX_WEB_STATE_ROOT || path.join(process.cwd(), ".state");
   return {
+    retryWait: overrides.retryWait,
     dataRoot: overrides.dataRoot ?? path.join(stateRoot, "data"),
     tenantRoot: overrides.tenantRoot ?? path.join(stateRoot, "tenants"),
     hostRootCodexHome: overrides.hostRootCodexHome ?? path.join(stateRoot, "owner-codex-home"),
@@ -542,7 +545,7 @@ function remoteTree(roots: ColdStorageRoots, remotePath: string): string {
     // an invalid listing with an empty directory and upload a duplicate.
     if (!listing.split(/\r?\n/).some((line) => line.trim() === remotePath)) throw new Error(`云端目录读取失败: ${remotePath}`);
     return listing;
-  });
+  }, roots.retryWait);
 }
 
 function ensureRemoteDirectory(roots: ColdStorageRoots, remotePath: string): void {
@@ -553,10 +556,10 @@ function ensureRemoteDirectory(roots: ColdStorageRoots, remotePath: string): voi
     if (!listing.split(/\r?\n/).some((line) => line.trim() === `当前目录: ${remotePath}`)) throw new Error(`云端目录读取失败: ${remotePath}`);
   };
   retryColdOperation(() => {
-    try { retryColdOperation(verify); return; } catch { /* create below */ }
+    try { retryColdOperation(verify, roots.retryWait); return; } catch { /* create below */ }
     runAliyun(roots, ["mkdir", "--driveId", roots.driveId, remotePath], 120_000);
     verify();
-  });
+  }, roots.retryWait);
 }
 
 export function ensureRemotePath(roots: ColdStorageRoots, remotePath: string): void {
@@ -580,7 +583,7 @@ export function uploadColdArchive(roots: ColdStorageRoots, stage: string, remote
     if (remoteObjectVisible(roots, remotePath)) return;
     runAliyun(roots, ["upload", "--driveId", roots.driveId, "--np", "--retry", "5", "--timeout", "120", stage, remoteDirectory]);
     if (!remoteObjectVisible(roots, remotePath)) throw new Error("归档上传后云端精确对象不可见");
-  });
+  }, roots.retryWait);
 }
 
 export function stageForUpload(roots: ColdStorageRoots, source: string): string {

@@ -3,6 +3,7 @@ import type { AppConfig } from "./config.js";
 import { AppDatabase, type VoiceReviewSource, type VoiceTermEvidenceInput } from "./db.js";
 import { VOICE_LEXICON_CODEX_MODEL } from "./codex-voice-review.js";
 import { removePersistedVoiceRecording } from "./voice-recording.js";
+import { reportBackgroundError, shortSqliteAttempt } from "./sqlite-contention.js";
 
 const PROMPT_VERSION = "voice-lexicon-v2";
 const STOP_TERMS = new Set([
@@ -56,9 +57,9 @@ export class VoiceLexiconService {
 
   start(): void {
     if (this.timer || this.stopped) return;
-    this.timer = setInterval(() => void this.pump(), this.config.voiceLexiconPollMs);
+    this.timer = setInterval(() => void this.pump().catch(error => reportBackgroundError("voice_lexicon_pump", error)), this.config.voiceLexiconPollMs);
     this.timer.unref();
-    setImmediate(() => void this.pump());
+    setImmediate(() => void this.pump().catch(error => reportBackgroundError("voice_lexicon_pump", error)));
   }
 
   stop(): void {
@@ -71,12 +72,12 @@ export class VoiceLexiconService {
     if (this.busy || this.stopped) return;
     this.busy = true;
     try {
-      this.db.recoverInterruptedVoiceReviews();
-      this.db.pruneVoiceTranscriptionReceipts(new Date(Date.now() - 24 * 60 * 60_000).toISOString());
-      const removedAudio = this.db.pruneVoiceTranscriptions(
+      shortSqliteAttempt(this.db.sqlite, () => this.db.recoverInterruptedVoiceReviews());
+      shortSqliteAttempt(this.db.sqlite, () => this.db.pruneVoiceTranscriptionReceipts(new Date(Date.now() - 24 * 60 * 60_000).toISOString()));
+      const removedAudio = shortSqliteAttempt(this.db.sqlite, () => this.db.pruneVoiceTranscriptions(
         new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
         new Date(Date.now() - 90 * 24 * 60 * 60_000).toISOString(),
-      );
+      ));
       for (const relativePath of removedAudio) {
         try { removePersistedVoiceRecording(this.config.dataRoot, relativePath); }
         catch (error) { console.warn(JSON.stringify({ event: "voice_recording_prune_failed", error: error instanceof Error ? error.message : String(error) })); }

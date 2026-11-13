@@ -3,6 +3,7 @@ import readline from "node:readline";
 import { antigravityLaunch, ANTIGRAVITY_MODEL_PREFIX } from "./antigravity-runtime.js";
 import { runDirectoryEnvironment, type RunDirectories } from "./run-directories.js";
 import type { ContextUsage, CodexQuotaUsage } from "./protocol.js";
+import { ANTIGRAVITY_PROGRESS_INSTRUCTIONS, antigravityToolProgress } from "./antigravity-progress.js";
 
 type JsonObject = Record<string, unknown>;
 export type AntigravityTurnOptions = {
@@ -94,8 +95,9 @@ export class AntigravityExecution {
       child.on("close", (code, signal) => { lines.close(); void this.finish(code, signal); });
       this.timer = setTimeout(() => this.fail(new Error("Gemini 引擎启动超过 120 秒未响应，请检查账号登录与节点网络。")), 120_000);
       callbacks.onProgress({ kind: "status", label: options.threadId ? "正在恢复 Gemini 会话" : "正在启动 Gemini" });
-      const prompt = options.threadInstructions
-        ? `<codex_web_runtime_instructions>\n${options.threadInstructions}\n</codex_web_runtime_instructions>\n\n${options.prompt}`
+      const instructions = [options.threadInstructions, options.titleOnly ? "" : ANTIGRAVITY_PROGRESS_INSTRUCTIONS].filter(Boolean).join("\n\n");
+      const prompt = instructions
+        ? `<codex_web_runtime_instructions>\n${instructions}\n</codex_web_runtime_instructions>\n\n${options.prompt}`
         : options.prompt;
       // The official stream input accepts text only. Sending one event and then
       // closing stdin after result prevents accidental multi-turn execution.
@@ -186,17 +188,13 @@ export class AntigravityExecution {
       if (error && /permission|denied|approval/i.test(`${text(error.type)} ${text(error.message)}`)) this.permissionFailure = "Gemini 的工具操作被权限规则拒绝，任务未完整完成。";
       const parameters = asObject(tool.parameters) ?? {};
       const done = step.state === "DONE";
-      if (name === "run_command") {
-        this.callbacks.onProgress({ kind: "command", label: error ? "Gemini 处理步骤执行失败" : done ? "本机处理步骤完成" : "正在执行本机处理步骤", detail: text(parameters.CommandLine ?? parameters.command) });
-      } else if (["write_to_file", "replace_file_content", "multi_replace_file_content"].includes(name)) {
+      if (["write_to_file", "replace_file_content", "multi_replace_file_content"].includes(name)) {
         const target = text(parameters.TargetFile ?? parameters.AbsolutePath ?? parameters.path);
         if (done && !error && target) {
           if (!this.reportedFiles.has(target)) { this.reportedFiles.add(target); this.callbacks.onChangedFile?.(target); }
-          this.callbacks.onProgress({ kind: "file", label: "已更新文件", files: [target] });
         }
-      } else {
-        this.callbacks.onProgress({ kind: "tool", label: done ? "Gemini 工具步骤完成" : "Gemini 正在使用工具", detail: name });
       }
+      this.callbacks.onProgress(antigravityToolProgress(name, parameters, done, Boolean(error)));
       if (error) this.callbacks.onProgress({ kind: "error", label: text(error.message).slice(0, 1000) || "Gemini 工具步骤失败" });
     }
     const subagents = asObject(step.subagent_info)?.subagents;

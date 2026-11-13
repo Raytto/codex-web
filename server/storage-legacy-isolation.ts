@@ -72,7 +72,8 @@ export function legacyIsolationDue(db:DatabaseSync,now=Date.now(),graceDays=3):L
   if(!Number.isFinite(graceDays)||graceDays<3)throw new Error('legacy_grace_too_short');
   return db.prepare(`SELECT * FROM storage_legacy_generations WHERE released_at IS NULL AND isolated_path IS NOT NULL
     AND COALESCE(blocked_reason,'')!='storage_original_host_not_present'
-    AND isolated_at<=? ORDER BY isolated_at`).all(now-graceDays*STORAGE_DAY) as LegacyGeneration[];
+    AND isolated_at<=? ORDER BY COALESCE((SELECT last_seen_at FROM storage_issues
+     WHERE scope='legacy-purge' AND source_key=kind||':'||subject_id||':'||generation AND resolved_at IS NULL),0),isolated_at`).all(now-graceDays*STORAGE_DAY) as LegacyGeneration[];
 }
 
 /** Existing subject lock is required. Caller reconciles live activity and
@@ -82,6 +83,8 @@ export function purgeLegacyGeneration(db:DatabaseSync,row:LegacyGeneration,optio
   const now=options.now??Date.now(),grace=options.graceDays??3;
   try{
     const current=db.prepare('SELECT * FROM storage_legacy_generations WHERE kind=? AND subject_id=? AND generation=?').get(row.kind,row.subject_id,row.generation) as LegacyGeneration;
+    for(const key of ['user_id','manifest_sha256','remote_drive','remote_path','archive_sha256','archive_bytes','isolated_path','isolated_at'] as const)
+      if(current[key]!==row[key])throw new Error('legacy_generation_changed_before_purge');
     if(current.released_at)return {releasedBytes:0,alreadyMissing:true};
     if(!options.remoteVerified || !current.verified_at || !current.isolated_at || grace<3 || current.isolated_at+grace*STORAGE_DAY>now)throw new Error('legacy_purge_not_verified_or_due');
     if(hash(current.manifest_json)!==current.manifest_sha256)throw new Error('legacy_manifest_hash');

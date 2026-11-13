@@ -25,7 +25,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  Archive, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleAlert, CircleDashed, Clock, Download, Eye, File as FileIcon, FileImage, FileText, Folder, FolderArchive, FolderOpen, Gauge, HardDrive,
+  Archive, ArrowUp, BookOpen, Bot, Check, ChevronDown, CircleAlert, Clock, Download, Eye, File as FileIcon, FileImage, FileText, Folder, FolderArchive, FolderOpen, Gauge, HardDrive,
   Copy, CornerUpLeft, GripVertical, KeyRound, LayoutDashboard, LoaderCircle, LogOut, Menu, Mic, Minus, Monitor, MonitorUp, Moon, MoreHorizontal, Paperclip, Pause, Pencil, Pin, PinOff, Play, Plus, RefreshCw, RotateCcw, Search, Settings2, Share2, Square, SquarePen, Sun,
   Trash2, X,
 } from "lucide-react";
@@ -38,7 +38,7 @@ import { conversationLocation, readConversationLocation } from "./conversation-l
 import { resolveAccountIdentity } from "./account-identity";
 import { accountSelectionStorageKeys, chooseSelectedProject, clearLegacySelectionStorage, readStoredSelection, writeStoredSelection } from "./account-selection-storage";
 import { CHAT_FONT_SIZE_DEFAULT, CHAT_FONT_SIZE_MAX, CHAT_FONT_SIZE_MIN, normalizeChatFontSize } from "./chat-font-size";
-import { resolveScrollFollow } from "./scroll-follow";
+import { observeMessageLayout, resolveScrollFollow } from "./scroll-follow";
 import { applyThemePreference, GUEST_READER_THEME_PREFERENCE_KEY, readStoredThemePreference, resolveTheme, THEME_PREFERENCE_KEY, type ResolvedTheme, type ThemePreference } from "./theme";
 import { ASK_AGENT_SELECTION_MAX_CHARS, normalizeAskAgentSelection, visibleSelectionBounds } from "./ask-agent-selection";
 import { mergeMessagePages, preservePrependedScrollTop, resolveUnreadScrollTarget } from "./message-history";
@@ -1407,20 +1407,27 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }
 
   const refreshList = useCallback(async (reset = false, projectId = activeProjectIdRef.current, preserveSearchMatches = true) => {
+    const requestedQuery = queryRef.current;
+    const pageGeneration = projectPageGenerationRef.current[projectId ?? ""] ?? 0;
     if (!session.projectMode) {
       if (reset) conversationLimitRef.current = CONVERSATION_PAGE_SIZE;
       else conversationLimitRef.current = Math.max(CONVERSATION_PAGE_SIZE, conversationsRef.current.length);
     }
     const projectLimit = Math.max(
       PROJECT_CONVERSATION_PAGE_SIZE,
-      reset ? PROJECT_CONVERSATION_PAGE_SIZE : projectConversationPagesRef.current[projectId ?? ""]?.conversations.length ?? 0,
+      projectConversationPagesRef.current[projectId ?? ""]?.conversations.length ?? 0,
     );
     const response = await api.conversations({
       projectId: session.projectMode ? projectId ?? undefined : undefined,
-      query: queryRef.current,
+      query: requestedQuery,
       limit: session.projectMode ? projectLimit : queryRef.current ? 100 : conversationLimitRef.current,
       offset: 0,
     });
+    // Refreshes started before an expansion, collapse or search cannot undo it.
+    if (queryRef.current !== requestedQuery || (session.projectMode && projectId && (
+      (projectPageGenerationRef.current[projectId] ?? 0) !== pageGeneration
+      || (projectConversationPagesRef.current[projectId]?.conversations.length ?? 0) > projectLimit
+    ))) return projectConversationPagesRef.current[projectId ?? ""]?.conversations ?? conversationsRef.current;
     let result = session.projectMode && projectId
       ? retainProjectConversationPage(response, projectId)
       : retainSelectedConversation(response, retainedConversationRef.current, projectId ?? undefined);
@@ -1502,8 +1509,20 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const refreshActivity = useCallback(async (id: string) => {
     const snapshot = await api.conversationActivity(id);
     applyActivitySnapshot(id, snapshot, true);
+    setDetail(current => current?.conversation.id === id ? { ...current, workflow: snapshot.workflow, workflowCapacity: snapshot.workflowCapacity } : current);
     return snapshot;
   }, [applyActivitySnapshot]);
+
+  useEffect(() => {
+    if (!selectedId || !detail?.workflow || ["completed", "aborted"].includes(detail.workflow.state)) return;
+    let busy = false;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible" || busy) return;
+      busy = true;
+      void refreshActivity(selectedId).catch(() => undefined).finally(() => { busy = false; });
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [selectedId, detail?.workflow?.id, detail?.workflow?.state, refreshActivity]);
 
   const refreshDetail = useCallback(async (id: string, activate = false) => {
     if (activate) {
@@ -1522,7 +1541,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       setActivitiesLoading(true);
       return result;
     }
-    const unreadAnchorMessageId = result.conversation.has_unread_result
+    // First-unread navigation belongs to opening/restoring a task. A result
+    // arriving in the visible chat must preserve bottom-follow or history view.
+    const openingConversation = activate || !messagesRef.current;
+    const unreadAnchorMessageId = openingConversation && result.conversation.has_unread_result
       ? result.conversation.unread_anchor_message_id
       : null;
     let preparedUnreadHistory = false;
@@ -1879,7 +1901,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     return { conversations, hasMore: state.titleHasMore || state.bodyHasMore };
   }
 
-  const projectIdsKey = projects.map((project) => project.id).join("|");
+  const projectIdsKey = projects.map((project) => project.id).sort().join("|");
   useEffect(() => {
     if (!session.projectMode || !projectsLoaded || projects.length === 0) return;
     let cancelled = false;
@@ -2132,16 +2154,17 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     lastScrollTopRef.current = messages.scrollTop;
     autoFollowRef.current = false;
   }, [detail?.messages.length]);
+  const followMessageLayout = useCallback(() => {
+    const messages = messagesRef.current;
+    if (!messages || !autoFollowRef.current) return;
+    messages.scrollTop = messages.scrollHeight;
+    lastScrollTopRef.current = messages.scrollTop;
+  }, []);
   useEffect(() => {
     if (!autoFollowRef.current) return;
-    const frame = window.requestAnimationFrame(() => {
-      const messages = messagesRef.current;
-      if (!messages || !autoFollowRef.current) return;
-      messages.scrollTop = messages.scrollHeight;
-      lastScrollTopRef.current = messages.scrollTop;
-    });
+    const frame = window.requestAnimationFrame(followMessageLayout);
     return () => window.cancelAnimationFrame(frame);
-  }, [detail?.messages.length, detail?.wakePlan?.id, activities, sending]);
+  }, [detail?.messages.length, detail?.wakePlan?.id, activities, sending, followMessageLayout]);
   useEffect(() => {
     if (conversationMenuRef.current) conversationMenuRef.current.open = false;
     setConversationMenuOpen(false);
@@ -3125,7 +3148,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         timers.delete(detail.projectId!);
         const changedConversations = conversations.get(detail.projectId!) ?? new Set<string>();
         conversations.delete(detail.projectId!);
-        void refreshList(true, detail.projectId);
+        void refreshList(false, detail.projectId);
         const selected = selectedIdRef.current;
         if (selected && changedConversations.has(selected)) void reconcile(selected);
       }, 250);
@@ -3668,7 +3691,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setSubmitting(true); setError("");
     const finishMutation = beginComposerMutation(selectedId);
     try {
-      if (editingPending.content.trim() || editingPending.quote_excerpt) await api.restorePendingPrompt(selectedId, editingPending.id);
+      if (editingPending.content.trim() || editingPending.quote_excerpt || editingPending.files.length) await api.restorePendingPrompt(selectedId, editingPending.id);
       else await api.deletePendingPrompt(selectedId, editingPending.id);
       if (selectedIdRef.current !== selectedId) return;
       inputRef.current = ""; askAgentQuoteRef.current = "";
@@ -3981,7 +4004,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         : conversation.status === "running" || conversation.external_status === "running"
         ? <LoaderCircle size={14} className="spin" role="img" aria-label="正在执行" />
         : waitingLabel
-          ? <CircleDashed size={14} className="conversation-waiting spin" role="img" aria-label={waitingLabel}><title>{waitingLabel}</title></CircleDashed>
+          ? <Clock size={14} className="conversation-waiting" role="img" aria-label={waitingLabel}><title>{waitingLabel}</title></Clock>
           : null}
     </button>
     {!isConversationUploading(conversation.id) && Boolean(conversation.active_wake_count) && conversation.status !== "running" && conversation.external_status !== "running" && <button
@@ -4329,7 +4352,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       <ConversationVoiceWorkspace>
       {currentDetail?.conversation.cold_storage_state === "restoring" && <ConversationRestoreStatus key={currentDetail.conversation.id} conversationId={currentDetail.conversation.id} compact/>}
       {conversationLinkError ? <section className="conversation-loading" role="alert"><span>{conversationLinkError}</span><button type="button" onClick={() => { resolvingLinkRef.current = true; setConversationRoute({ ...readConversationLocation(window.location.href), fromHistory: true }); }}>重试打开会话</button></section>
-        : currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
+        : currentDetail ? <Chat detail={currentDetail} activities={activities} activitiesLoading={activitiesLoading} sending={sending} loadingOlderMessages={loadingOlderMessages} messagesRef={messagesRef} onMessageLayout={followMessageLayout} onMessagesScroll={handleMessagesScroll} onAskAgent={askAgentAbout} onFetchRemoteFile={fetchRemoteMessageFile} remoteFileFetchEnabled={remoteFileFetchEnabled} userInitials={account.initials} chatFontSize={chatFontSize} onCancelWake={cancelWakePlan} onPostponeWake={postponeWakePlan} onTriggerWake={triggerWakePlan} onEditWake={() => openWakeDetails(currentDetail.conversation)} />
         : loadingConversation ? <ConversationLoading conversationId={selectedId??undefined} restoring={restoringConversationSelection} state={conversationLoad?.id === selectedId ? conversationLoad.state : undefined} onRetry={() => { if (selectedId) { setError(""); void reconcile(selectedId, true); } }} />
         : <Welcome onSuggestion={(text) => setInput(text)} />}
       {(error || composerError) && <TransientNotice className="toast" role="alert" message={error || composerError} revision={`${errorRevision}:${composerScope}:${composerErrorNotice.revision}`} onDismiss={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><span>{error || composerError}</span>{cleanupRetry && <button type="button" onClick={() => void deleteConversation(cleanupRetry, true)}>重试清理</button>}<button aria-label="关闭错误提示" onClick={() => { setError(""); setComposerError(""); setCleanupRetry(null); }}><X size={16} /></button></TransientNotice>}
@@ -5106,7 +5129,7 @@ function ErrorBubble({ content }: { content: string }) {
   </div>;
 }
 
-function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
+function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMessages, messagesRef, onMessageLayout, onMessagesScroll, onAskAgent, onFetchRemoteFile, remoteFileFetchEnabled, userInitials, chatFontSize, onCancelWake, onPostponeWake, onTriggerWake, onEditWake }: { detail: ConversationDetail; activities: JobEvent[]; activitiesLoading: boolean; sending: boolean; loadingOlderMessages: boolean; messagesRef: React.RefObject<HTMLDivElement | null>; onMessageLayout: () => void; onMessagesScroll: (event: React.UIEvent<HTMLDivElement>) => void; onAskAgent: (selectedText: string) => void; onFetchRemoteFile: (messageId: string, sourcePath: string) => Promise<WorkFile>; remoteFileFetchEnabled: boolean; userInitials: string; chatFontSize: number; onCancelWake: (plan: WakePlan) => Promise<void>; onPostponeWake: (plan: WakePlan) => Promise<void>; onTriggerWake: (plan: WakePlan) => Promise<void>; onEditWake: () => void }) {
   const citationFiles = detail.messages.flatMap((message) => message.files);
   const latestJobError = detail.latestJob && ["failed", "interrupted"].includes(detail.latestJob.status)
     ? detail.latestJob.error?.trim() ?? ""
@@ -5121,6 +5144,10 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
     ? detail.workflow : undefined;
   const chatRef = useRef<HTMLElement>(null);
   const [askSelection, setAskSelection] = useState<AskAgentSelection | null>(null);
+  useEffect(() => {
+    const messages = messagesRef.current;
+    if (messages) return observeMessageLayout(messages, onMessageLayout);
+  }, [detail.conversation.id, messagesRef, onMessageLayout]);
 
   useEffect(() => {
     let frame = 0;
@@ -5200,7 +5227,7 @@ function Chat({ detail, activities, activitiesLoading, sending, loadingOlderMess
           timeLabel: formatMessageDateTime(message.created_at),
           timeTitle: formatFullDateTime(message.created_at),
           hideQuote: errorNotice,
-          beforeContent: !errorNotice && message.role !== "assistant" && message.attachment_references.length > 0 ? <div className="message-reference" title={message.attachment_references.join("、")}><Paperclip size={14} /><span><strong>引用</strong>{message.attachment_references.join("、")}</span></div> : null,
+          beforeContent: message.voice_playback === "unconfirmed" ? <small className="live-label">语音转写（部分内容可能未播出）</small> : !errorNotice && message.role !== "assistant" && message.attachment_references.length > 0 ? <div className="message-reference" title={message.attachment_references.join("、")}><Paperclip size={14} /><span><strong>引用</strong>{message.attachment_references.join("、")}</span></div> : null,
           renderAssistant: () => errorNotice ? <ErrorBubble content={message.content} /> : <><AssistantMarkdown content={message.content} files={message.files} citationFiles={citationFiles} messageId={message.id} remoteFileFetchEnabled={remoteFileFetchEnabled} onFetchRemoteFile={onFetchRemoteFile} />{message.content && <AssistantCopyButton content={message.content} messageId={message.id} />}</>,
           renderUser: () => errorNotice ? <ErrorBubble content={message.content} /> : <><p data-agent-selectable="true">{message.content}</p><ParaCollectButton messageId={message.id} /></>,
           afterContent: !errorNotice && (message.files.length > 0 || remoteFiles.length > 0) ? <div className="file-grid">
@@ -5270,11 +5297,13 @@ function ProcessPanel({ activities, loading, runningModel, workflow, activeAttem
   const waitingForWorkflow = workflow?.state === "queued";
   const idleWorkflow = Boolean(workflow && !activeAttempt);
   const compact = idleWorkflow || ((queued || waitingForWorkflow) && !journal.length && !plan?.items?.length && !subagents.agents.length);
-  const workflowTitle = waitingForWorkflow ? "正在排队" : workflow?.state === "closing" ? "正在收尾" : workflow?.state === "blocked" ? "等待处理" : idleWorkflow ? "等待续跑或验收" : undefined;
-  const workflowHint = waitingForWorkflow ? (queueStatus?.label?.includes("完整修改任务") ? "前项验收收尾后自动开始" : queueStatus?.label || "排队中，获准后自动开始") : workflow?.state === "closing" ? "确认执行结束后继续下一项" : workflow?.state === "blocked" ? "本项尚未收尾，后续任务继续排队" : idleWorkflow ? "本项完成前，后续任务继续排队" : workflow && workflow.phase !== "执行中" ? workflow.phase : undefined;
+  const exitUnverified = workflow?.recovery?.phase === "exit_unverified";
+  const pendingAcceptance = !activeAttempt && workflow?.recovery?.phase === "pending_acceptance";
+  const workflowTitle = exitUnverified ? "等待核验退出" : pendingAcceptance ? "发布待验收" : waitingForWorkflow ? "正在排队" : workflow?.state === "closing" ? "正在收尾" : workflow?.state === "blocked" ? "等待处理" : idleWorkflow ? "等待续跑或验收" : undefined;
+  const workflowHint = exitUnverified ? (workflow?.reason || "先核验旧执行退出，再恢复原任务；名额继续保留") : pendingAcceptance ? "发布已登记，仍需真实验收和收尾" : waitingForWorkflow ? (workflow?.waitingFor || (queueStatus?.label?.includes("完整修改任务") ? "前项验收收尾后自动开始" : queueStatus?.label || "排队中，获准后自动开始")) : workflow?.state === "closing" ? "确认执行结束后继续下一项" : workflow?.state === "blocked" ? (workflow.reason || workflow.phase || "本项尚未收尾，后续任务继续排队") : idleWorkflow ? "本项完成前，后续任务继续排队" : workflow && workflow.phase !== "执行中" ? workflow.phase : undefined;
 
   return <div className={`activity-card${compact ? " activity-compact" : ""}`} role="status" aria-live="polite">
-    <div className="activity-title">{waitingForWorkflow || idleWorkflow ? <Clock size={17} /> : <LoaderCircle className="spin" size={17} />}<strong>{workflowTitle ?? (queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理")}</strong><span title={workflow?.reason || undefined}>{workflowHint ?? (queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : (runningModel?.startsWith("antigravity:") ? "Antigravity 不支持运行中引导，补充消息将在完成后发送" : runningModel ? "完成前持续保留，可随时引导" : "完成前持续保留，补充消息可加入队列"))}</span></div>
+    <div className="activity-title">{waitingForWorkflow || idleWorkflow ? <Clock size={17} /> : <LoaderCircle className="spin" size={17} />}<strong>{workflowTitle ?? (queued ? "正在排队" : retrying ? "正在自动重试" : "正在处理")}</strong><span title={workflow?.waitingFor || workflow?.reason || undefined}>{workflowHint ?? (queued ? (queueStatus?.label || (queueStatus?.jobsAhead ? `前面还有 ${queueStatus.jobsAhead} 个任务，完成后自动开始` : "即将自动开始")) : retrying ? latestStatus?.label : starting ? "正在准备执行" : (runningModel?.startsWith("antigravity:") ? "阶段说明和具体操作会在下方实时更新" : runningModel ? "完成前持续保留，可随时引导" : "完成前持续保留，补充消息可加入队列"))}</span></div>
     {!idleWorkflow && plan?.items && <div className="process-plan"><div className="process-section-title"><strong>执行计划</strong><span>{completedPlanItems}/{plan.items.length}</span></div><ul>
       {plan.items.map((item, index) => <li className={item.completed ? "completed" : index === completedPlanItems ? "current" : ""} key={`${item.text}-${index}`}><span>{item.completed ? <Check size={12} /> : index === completedPlanItems ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><p>{item.text}</p></li>)}
     </ul></div>}
@@ -5546,7 +5575,7 @@ function PendingQueue({ prompts, busy, actionMode, runningModel, runningEffort, 
         {prompt.voiceSubmission && (prompt.voiceSubmission.state !== "completed" || prompt.voiceSubmission.steer_state) && <PendingVoiceStatus prompt={prompt} disabled={busy} onRetry={onRetryVoice} />}
         <div className="pending-queue-actions">
           {(prompt.voiceSubmission?.steer_state || canRunPendingPromptImmediately(actionMode, prompt.agent_model, runningModel, prompt.reasoning_effort, runningEffort)) && <button type="button" className="steer-action" disabled={busy || prompt.voiceSubmission?.state === "failed" || prompt.voiceSubmission?.state === "cancelled" || prompt.voiceSubmission?.steer_state === "requested" || prompt.voiceSubmission?.steer_state === "sending"} onClick={() => onSteer(prompt)} title={prompt.voiceSubmission?.steer_state === "requested" ? `语音识别完成后会自动${prompt.voiceSubmission.steer_action === "insert" ? "发送" : "引导"}` : actionMode === "steer" ? "立即引导当前任务" : "立即插入并发送这项任务"}><CornerUpLeft size={14} /><span>{actionLabel}</span></button>}
-          <button type="button" disabled={busy || Boolean(prompt.voiceSubmission && (prompt.voiceSubmission.state !== "completed" || prompt.voiceSubmission.steer_state === "requested" || prompt.voiceSubmission.steer_state === "sending"))} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
+          <button type="button" disabled={busy || prompt.voiceDelegation || Boolean(prompt.voiceSubmission && (prompt.voiceSubmission.state !== "completed" || prompt.voiceSubmission.steer_state === "requested" || prompt.voiceSubmission.steer_state === "sending"))} onClick={() => onEdit(prompt)} title="编辑"><Pencil size={14} /></button>
           <button type="button" disabled={busy || prompt.voiceSubmission?.steer_state === "sending"} onClick={() => onDelete(prompt)} title="删除"><Trash2 size={14} /></button>
         </div>
       </article>)}
@@ -5798,7 +5827,6 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     hasAttachments: files.length > 0 || draftFiles.length > 0 || draftUploads.length > 0 || hasRetainedEditingFile,
     voiceActive: voice.state !== "idle",
   });
-  const awaitingInstruction = Boolean(editingPending && !editingPending.content.trim() && !editingPending.quote_excerpt);
   const hasUnsentDraft = !editingPending && Boolean(input || askAgentQuote || draftFiles.length || draftUploads.length);
   const draftStatusLabel = draftUploads.length > 0 ? "正在上传附件…"
     : draftSaveState === "saving" ? "正在保存草稿…"
@@ -5816,7 +5844,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
   return <div className={`composer-wrap ${compactWrap ? "compact" : ""}`}>
     {pendingPrompts.length > 0 && <PendingQueue prompts={pendingPrompts} busy={pendingBusy} actionMode={pendingActionMode} runningModel={runningModel} runningEffort={runningEffort} waitingForWake={waitingForWake}
       onReorder={onReorderPending} onEdit={onEditPending} onDelete={onDeletePending} onSteer={onSteerPending} onRetryVoice={onRetryVoice} />}
-    {editingPending && <div className={`editing-pending-banner ${awaitingInstruction ? "awaiting-instruction" : ""}`}><span>{awaitingInstruction ? <Paperclip size={13} /> : <Pencil size={13} />}{awaitingInstruction ? `已上传 ${editingPending.files.length} 个文件，请输入具体操作` : "正在编辑待发送任务"}</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />{awaitingInstruction ? "清除文件" : "取消编辑"}</button></div>}
+    {editingPending && <div className="editing-pending-banner"><span><Pencil size={13} />正在编辑待发送任务</span><button type="button" onClick={onCancelPendingEdit} disabled={submitting}><X size={14} />取消编辑</button></div>}
     <div ref={composerRef} className={`composer ${composerExpanded ? "expanded" : "compact"}`}
       onBlurCapture={(event) => {
         const next = event.relatedTarget;
@@ -5839,7 +5867,7 @@ function Composer({ active = true, accountId, conversationId, input, setInput, a
     </span>)}</div>}
     {files.length > 0 && <div className="pending-files">{files.map((file, index) => <span key={`${file.name}-${index}`}><FileIcon size={14} /><span className="attachment-chip-name">{file.name}</span><button type="button" aria-label={`移除附件 ${file.name}`} title="移除附件" onClick={() => setFiles(files.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div>}
     {pasteNotice && <div className="paste-notice" role="status" aria-live="polite"><Check size={14} />{pasteNotice}</div>}
-    <textarea ref={textareaRef} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : awaitingInstruction ? "请输入要如何处理刚才上传的文件…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
+    <textarea ref={textareaRef} value={input} onFocus={() => setInputFocused(true)} onChange={(e) => setInput(e.target.value)} onKeyDown={keyDown} onPaste={pasted} placeholder={voice.state === "recording" ? "可以继续输入文字；发送后在云端识别…" : editingPending ? "修改这条待发送任务…" : askAgentQuote ? "输入你想询问的问题…" : sending ? "继续输入，新任务会先进入待发送队列…" : "给 Agent 发送任务，或粘贴、拖入文件…"} rows={1} disabled={submitting || voice.state === "transcribing"} />
     <ConversationVoicePanel voice={voice} />
     <div className="composer-actions"><div className="composer-primary-actions"><button type="button" className="attach-button" onClick={() => fileInput.current?.click()} disabled={submitting} title="添加文件" aria-label="添加文件"><Paperclip size={17} /><span>添加文件</span></button><input ref={fileInput} type="file" multiple hidden onChange={(e) => { addFiles(e.target.files); e.currentTarget.value = ""; }} />
       <SettingMenu className="model" label="模型" value={selectedModel} options={modelOptions} placeholder="加载中" unavailableValueLabel={agentOptions ? `${selectedModel}（当前不可用）` : undefined} title={selectedModelOption?.description || "选择任务使用的模型"} disabled={submitting || selectionSaving || !agentOptions} open={openSettingMenu === "model"} onOpenIntent={() => setSettingMenuIntent(true)} onOpenIntentCancel={() => setSettingMenuIntent(false)} onOpenChange={(open) => {

@@ -1,3 +1,4 @@
+import { MAX_CHUNK_CIPHERTEXT_BYTES } from './storage-chunk-layout.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -166,7 +167,7 @@ export class AliyunStorageReader {
     this.writeScope(remote);const stateRoot=this.config.writeStateRoot;
     if(!stateRoot || !path.isAbsolute(stateRoot))throw new Error('storage_upload_journal_required');
     fs.mkdirSync(stateRoot,{recursive:true,mode:0o700});
-    const st=fs.lstatSync(source);if(!st.isFile()||st.isSymbolicLink()||st.size>600*1024**2)throw new Error('storage_upload_source_budget');
+    const st=fs.lstatSync(source);if(!st.isFile()||st.isSymbolicLink()||st.size>MAX_CHUNK_CIPHERTEXT_BYTES)throw new Error('storage_upload_source_budget');
     const sha1=crypto.createHash('sha1');for await(const data of fs.createReadStream(source))sha1.update(data as Buffer);const hash=sha1.digest('hex');
     const journal=path.join(stateRoot,crypto.createHash('sha256').update(remote).digest('hex')+'.json');
     type Intent={remote:string;bytes:number;sha1:string;fileId?:string;uploadId?:string};
@@ -198,7 +199,7 @@ export class AliyunStorageReader {
     const url=new URL(parts[0].upload_url);
     if(url.protocol!=='https:'||!['aliyuncs.com','aliyundrive.com','aliyundrive.net','aliyundrive.cloud','alipan.com','alicdn.com'].some(h=>url.hostname===h||url.hostname.endsWith('.'+h)))throw new Error('storage_upload_host_invalid');
     let response:Response;const stream=fs.createReadStream(source);
-    try{response=await this.transferFetch(url.href,{method:'PUT',body:stream,duplex:'half',headers:{'content-length':String(st.size)},redirect:'error',signal:AbortSignal.timeout(10*60_000)} as unknown as RequestInit);}
+    try{response=await this.transferFetch(url.href,{method:'PUT',body:stream,duplex:'half',headers:{'content-length':String(st.size)},redirect:'error',signal:AbortSignal.timeout(30*60_000)} as unknown as RequestInit);}
     catch{throw new Error('storage_cloud_upload_network');}finally{stream.destroy();}
     await response.body?.cancel();if(!response.ok)throw new Error(`storage_cloud_upload_http_${response.status}`);
     const complete=await this.api('complete',{file_id:intent.fileId,upload_id:intent.uploadId});

@@ -1,3 +1,4 @@
+import {VOICE_PROTOCOL_VERSION} from '../src/voice-protocol.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -11,6 +12,7 @@ import {HOST_ROOT_USER_ID as user} from '../server/host-root-user.js';
 import {DotStore} from '../server/dot-store.js';
 import {ConversationVoiceScope,isExplicitVoiceCancellation,type VoiceHooks} from '../server/conversation-voice.js';
 import {migrateConversationVoice} from '../server/conversation-voice-schema.js';
+import {VoiceTranscripts} from '../server/voice-transcripts.js';
 import {DotLiveGateway} from '../server/dot-live.js';
 const id=()=>crypto.randomUUID(),selection={model:'gpt-6-astra',reasoningEffort:'xhigh'};
 function fixture(t:test.TestContext){
@@ -115,9 +117,11 @@ test('voice tickets bind account/session/conversation and reject foreign origin,
  const server=http.createServer();gateway.attach(server);await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const port=(server.address() as {port:number}).port;
  const attempt=(token:string,requestOrigin=origin)=>new Promise<number>((resolve,reject)=>{const ws=new WebSocket(`ws://127.0.0.1:${port}/api/dot/live`,['pp-dot',token],{origin:requestOrigin});ws.on('unexpected-response',(_q,res)=>{res.resume();ws.terminate();resolve(res.statusCode!);});ws.on('open',()=>{ws.close();reject(Error('must reject before upstream'));});ws.on('error',()=>{});});
  try{
-  const first=gateway.ticket(session,false,f.c.id);assert.equal(first.conversationId,f.c.id);assert.equal(await attempt(first.ticket,'http://wrong-origin.invalid'),401);assert.equal(await attempt(first.ticket),401);
-  const expired=gateway.ticket(session,false,f.c.id);(gateway as any).tickets.get(expired.ticket).expires=0;assert.equal(await attempt(expired.ticket),401);
-  const revoked=gateway.ticket(session,false,f.c.id);f.db.deleteSession(tokenHash);assert.equal(await attempt(revoked.ticket),401);
+  for(const version of [undefined,null,1,'2',{},3])assert.throws(()=>gateway.ticket(session,true,f.c.id,version),/刷新/);
+  assert.equal((gateway as any).tickets.size,0);
+  const first=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION);assert.equal(first.conversationId,f.c.id);assert.equal(await attempt(first.ticket,'http://wrong-origin.invalid'),401);assert.equal(await attempt(first.ticket),401);
+  const expired=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION);(gateway as any).tickets.get(expired.ticket).expires=0;assert.equal(await attempt(expired.ticket),401);
+  const revoked=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION);f.db.deleteSession(tokenHash);assert.equal(await attempt(revoked.ticket),401);
   assert.equal(f.db.sqlite.prepare('SELECT COUNT(*) n FROM conversation_voice_calls').get()!.n,0);
  }finally{await gateway.close();await new Promise<void>(r=>server.close(()=>r()));}
 });
@@ -131,7 +135,7 @@ test('transcript and source event commit together and a foreign source cannot wr
 test('transcript identity and timing survive recreation without collapsing repeated words',t=>{
  const f=fixture(t),a={delta:' go',start_ms:100,end_ms:200};assert.equal(f.scope.fragment('user',a,'call'),true);assert.equal(f.scope.fragment('user',a,'call'),false);
  const resumed=new ConversationVoiceScope(f.store,user,f.c.id,f.hooks);assert.equal(resumed.fragment('user',a,'call'),false);assert.equal(resumed.fragment('user',{...a,start_ms:300,end_ms:400},'call'),true);
- const events=resumed.events(0);assert.equal(events.length,2);assert.equal(JSON.parse(events[1]!.content).startMs,300);assert.equal(JSON.parse(events[1]!.content).delta,' go');assert.equal(f.db.listPendingPrompts(f.c.id).length,0);
+ const events=resumed.events(0).filter(e=>e.kind==='voice_fragment');assert.equal(events.length,2);assert.equal(JSON.parse(events[1]!.content).startMs,300);assert.equal(JSON.parse(events[1]!.content).delta,' go');assert.equal(f.db.listPendingPrompts(f.c.id).length,0);
 });
 
 // A cold native thread no longer means the local conversation text is unavailable.
@@ -167,4 +171,137 @@ test('withheld speech is explicitly identified in both ordinary and Dot recovery
  assert.match(f.scope.checkpoint().text,/"withheld":true/);
  const dot=new ConversationVoiceScope(f.store,user,f.dot.id,f.hooks);dot.record('assistant','dot not heard',id(),'2026-11-09T00:00:00.001Z',meta);
  assert.match(dot.checkpoint().text,/"withheld":true/);assert.equal(f.db.listPendingPrompts(f.dot.id).length,0);
+});
+
+test('continuous voice updates one new display bubble while dispatch consumes immutable fragments once',async t=>{
+ const f=fixture(t),birth=Date.now(),transcripts=new VoiceTranscripts(s=>f.scope.record(s.role,s.text,s.source,s.createdAt,s));
+ for(let i=0;i<45;i++){
+  const e={event_id:'voice-'+i,delta:i===0?'Please write ':' one',start_ms:i*1300,end_ms:i*1300+500};
+  assert.ok(f.scope.fragment('user',e,'long-call',birth));transcripts.add('user',e,'long-call',birth);transcripts.flush();
+ }
+ const messages=f.db.listMessages(f.c.id);assert.equal(messages.length,1);assert.match(messages[0]!.content,/Please write/);
+ assert.equal(f.scope.events(0).filter(e=>e.kind==='voice_input').length,45);
+ await f.scope.delegate('request');await f.scope.delegate('repeat');assert.equal(f.delivered.length,1);
+ const e={event_id:'new-correction',delta:' change to green',start_ms:59000,end_ms:60000};f.scope.fragment('user',e,'long-call',birth);transcripts.add('user',e,'long-call',birth);transcripts.flush();
+ assert.equal(f.db.listMessages(f.c.id).length,1);
+ await f.scope.delegate('correction');assert.equal(f.delivered.length,2);
+ const second=f.db.listPendingPrompts(f.c.id).at(-1)!;assert.match(second.content,/change to green/);
+ // Display updates must not become accepted_text or new message_user events.
+ f.scope.reconcile();assert.equal(f.scope.events(0).filter(e=>e.kind==='message_user').length,0);
+});
+test('late earlier fragment updates the current bubble but never re-dispatches consumed input',async t=>{
+ const f=fixture(t),birth=Date.now(),transcripts=new VoiceTranscripts(s=>f.scope.record(s.role,s.text,s.source,s.createdAt,s));
+ const newer={event_id:'later',delta:'new request',start_ms:3000,end_ms:4000};f.scope.fragment('user',newer,'call',birth);transcripts.add('user',newer,'call',birth);transcripts.flush();await f.scope.delegate('one');
+ const old={event_id:'late-old',delta:'earlier context ',start_ms:1000,end_ms:2000};f.scope.fragment('user',old,'call',birth);transcripts.add('user',old,'call',birth);transcripts.flush();await f.scope.delegate('two');
+ assert.equal(f.delivered.length,1);assert.equal(f.db.listMessages(f.c.id).length,1);assert.match(f.db.listMessages(f.c.id)[0]!.content,/earlier context new request/);
+});
+test('pending delegation receipt survives scope recreation until a real outcome is persisted',t=>{
+ const f=fixture(t);f.scope.event('voice_delegation_requested','pending',JSON.stringify({callId:'old'}));
+ const resumed=new ConversationVoiceScope(f.store,user,f.c.id,f.hooks);assert.deepEqual(resumed.pendingDelegations().map(x=>x.id),['pending']);
+ resumed.event('voice_delegation_resolved','pending',JSON.stringify({mode:'queued_next_turn'}));assert.deepEqual(resumed.pendingDelegations(),[]);
+});
+
+test('voice delegation is internal in new jobs and legacy history; typed JSON remains literal',async t=>{
+ const f=fixture(t);f.scope.record('user','Please check weather.');await f.scope.delegate('weather');
+ const pending=f.db.listPendingPrompts(f.c.id)[0],job=f.db.materializePendingPrompt(pending.id,id(),id())!;
+ assert.equal(f.db.getMessage(job.message_id!)?.is_internal,1);
+ assert.match(f.db.getMessage(job.message_id!)!.content,/本会话背景/);
+ // This exact old bug is compatibility-projected, never edited or dispatched.
+ f.db.sqlite.prepare('UPDATE messages SET is_internal=0 WHERE id=?').run(job.message_id!);
+ const before=f.db.getMessage(job.message_id!)!.content;
+ const text='User discussion {"callId":"literal-uuid","event_id":"example"}';f.scope.record('user',text);
+ assert.deepEqual(f.db.listMessages(f.c.id).map(m=>m.content),['Please check weather.',text]);
+ assert.equal(f.db.listMessagesPage(f.c.id,undefined,1)!.messages[0].content,text);
+ assert.equal(f.db.getMessage(job.message_id!)!.content,before);assert.equal(f.delivered.length,1);
+});
+
+test('turn projection preserves long speech, true replies, late ordering and repeated events',t=>{
+ const f=fixture(t),birth=Date.now(),call='long';
+ const put=(role:'user'|'assistant',n:number,text:string,start:number,end:number,extra={})=>{
+   f.scope.fragment(role,{event_id:String(n),delta:text,start_ms:start,end_ms:end,presentationVersion:1,...extra},call,birth);
+ };
+ put('user',1,'中文 first ',0,1000);put('user',2,'改口 ',5000,6000);put('user',3,'long '.repeat(2000),130000,131000);
+ put('assistant',4,'tool-only generated',132000,133000,{withheld:true});
+ put('user',5,'end',150000,151000);
+ assert.equal(f.db.listMessages(f.c.id).length,1);assert.ok(f.db.listMessages(f.c.id)[0].content.length>8000);
+ put('assistant',6,'A1',152000,153000);f.scope.playback(call,[[152000,153000]]);
+ put('user',7,'U2',153010,154000);put('assistant',8,'A2',154010,155000);f.scope.playback(call,[[152000,153000],[154010,155000]]);
+ put('user',9,'late ',2000,3000);put('user',9,'late ',2000,3000);
+ const messages=f.db.listMessages(f.c.id);assert.deepEqual(messages.map(m=>m.role),['user','assistant','user','assistant']);
+ assert.match(messages[0].content,/first late 改口/);assert.equal(messages[2].content,'U2');
+ const next=f.db.listMessagesPage(f.c.id,undefined,2)!;assert.equal(next.hasMore,true);
+ assert.equal(f.db.listMessagesPage(f.c.id,next.nextCursor!,2)!.messages.length,2);
+ assert.equal(f.db.listPendingPrompts(f.c.id).length,0);
+ const resumed=new ConversationVoiceScope(f.store,user,f.c.id,f.hooks);assert.deepEqual(resumed.db.listMessages(f.c.id),messages);
+});
+
+test('unplayed generation never splits input; real media epoch is a boundary with explicit word uncertainty',t=>{
+ const f=fixture(t),birth=Date.now(),call='audible';
+ const put=(role:'user'|'assistant',eid:string,text:string,start:number,end:number,epoch:number)=>f.scope.fragment(role,{event_id:eid,delta:text,start_ms:start,end_ms:end,presentationVersion:1,outputEpoch:epoch},call,birth);
+ put('user','u1','first ',0,1000,1);put('assistant','unheard','never played',2000,3000,1);put('user','u1b','continued',5000,6000,2);
+ assert.deepEqual(f.db.listMessages(f.c.id).map(m=>m.content),['first continued']);
+ put('assistant','heard','actual response; exact tail unknown',7000,8000,2);f.scope.playback(call,[],[2]);put('user','u2','second turn',10000,11000,3);
+ const shown=f.db.listMessages(f.c.id) as any[];assert.deepEqual(shown.map(m=>m.role),['user','assistant','user']);assert.equal(shown[1].voice_playback,'unconfirmed');assert.equal(shown[2].content,'second turn');
+});
+test('recovery within one dialogue can continue speech; another call cannot merge across history',()=>{
+ const t=new VoiceTranscripts(()=>{}),birth=Date.now();
+ t.add('user',{event_id:'one',delta:'before ',start_ms:0,end_ms:100,dialogue_id:'same'},'physical1',birth);
+ t.add('user',{event_id:'two',delta:'after',start_ms:0,end_ms:100,dialogue_id:'same'},'physical2',birth+5000);
+ t.add('user',{event_id:'three',delta:'new call',start_ms:0,end_ms:100},'new-call',birth+60000);
+ assert.deepEqual(t.segments().map(s=>s.text),['before after','new call']);
+});
+
+test('a reply overlapping the final input token still separates the next interruption',()=>{
+ const turns=new VoiceTranscripts(()=>{}),birth=Date.now();
+ const put=(role:'user'|'assistant',id:string,text:string,start:number,end:number,withheld=false)=>turns.add(role,{event_id:id,delta:text,start_ms:start,end_ms:end,playback:'audible'},'overlap',birth,withheld);
+ put('user','u1','Tell a story',60000,68000);
+ put('assistant','a1','Sure!',68200,68400);
+ // The final user token arrives late and shares the first response timestamp.
+ put('user','u1-tail',' please.',68200,68400);
+ put('assistant','a2',' A lighthouse',69000,69800);
+ put('assistant','unplayed',' omitted',70200,70400,true);
+ put('assistant','a3',' stood',70400,70600);
+ put('user','u2','Stop; say green.',72600,78600);
+ put('assistant','a4','green',78600,78800);
+ const visible=turns.segments().filter(s=>!s.withheld);
+ assert.deepEqual(visible.map(s=>[s.role,s.text]),[['user','Tell a story please.'],['assistant','Sure! A lighthouse stood'],['user','Stop; say green.'],['assistant','green']]);
+});
+
+test('approximate reply timing cannot detach a final token without a new caller onset',t=>{
+ const f=fixture(t),birth=Date.now(),call='final-token';
+ const put=(role:'user'|'assistant',id:string,text:string,start:number,end:number,epoch:number)=>f.scope.fragment(role,{event_id:id,delta:text,start_ms:start,end_ms:end,presentationVersion:1,outputEpoch:epoch},call,birth);
+ put('user','u1','Only say green, no ',0,126000,1);
+ put('assistant','a1','green',126400,126600,1);f.scope.playback(call,[],[1]);
+ put('user','u1-tail','task',126600,126800,1);
+ assert.deepEqual(f.db.listMessages(f.c.id).map(m=>m.content),['Only say green, no task','green']);
+ put('user','u2','New request',128000,129000,2);
+ assert.deepEqual(f.db.listMessages(f.c.id).map(m=>m.content),['Only say green, no task','green','New request']);
+});
+
+test('redacted 17-input historical fixture projects original speech without the 5211-character wrapper',async t=>{
+ const f=fixture(t),birth=Date.UTC(2026,0,1);
+ const fragments=JSON.parse(fs.readFileSync(new URL('./fixtures/voice-history-redacted.json',import.meta.url),'utf8'));
+ assert.equal(fragments.filter((x:any)=>x.role==='user').length,17);
+ for(const e of fragments)f.scope.fragment(e.role,e,'fixture-call',birth);
+ await f.scope.delegate('fixture-operation');const p=f.db.listPendingPrompts(f.c.id)[0],job=f.db.materializePendingPrompt(p.id,id(),id())!;
+ const wrapper=(f.db.getMessage(job.message_id!)!.content+'x'.repeat(5211)).slice(0,5211);
+ f.db.sqlite.prepare('UPDATE messages SET is_internal=0,content=? WHERE id=?').run(wrapper,job.message_id!);
+ const before=f.db.sqlite.prepare('SELECT count(*) n FROM jobs WHERE conversation_id=?').get(f.c.id)!.n;
+ const messages=f.db.listMessages(f.c.id);
+ for(const role of ['user','assistant'])assert.equal(messages.filter(m=>m.role===role).map(m=>m.content).join(''),fragments.filter((e:any)=>e.role===role).sort((a:any,b:any)=>a.start_ms-b.start_ms).map((e:any)=>e.delta).join(''));
+ assert.ok(messages.every(m=>!m.content.includes('[本会话语音要求')&&!m.files.length));
+ assert.equal(f.db.getMessage(job.message_id!)!.content,wrapper);
+ assert.equal(f.db.sqlite.prepare('SELECT count(*) n FROM jobs WHERE conversation_id=?').get(f.c.id)!.n,before);
+});
+
+test('ticket keeps one owner-scoped dialogue across browser reconnects without mixing other calls',t=>{
+ const f=fixture(t);const keys=['CODEX_WEB_LIVE_ENABLED','CODEX_WEB_LIVE_API_KEY_FILE','CODEX_WEB_LIVE_ENDPOINT','CODEX_WEB_LIVE_MODEL'];const previous=keys.map(k=>process.env[k]);
+ t.after(()=>keys.forEach((k,i)=>{if(previous[i]===undefined)delete process.env[k];else process.env[k]=previous[i]}));
+ process.env.CODEX_WEB_LIVE_ENABLED='true';process.env.CODEX_WEB_LIVE_API_KEY_FILE=path.join(f.root,'fixture-key');process.env.CODEX_WEB_LIVE_ENDPOINT='wss://voice.example.invalid/live';process.env.CODEX_WEB_LIVE_MODEL='synthetic-live';fs.writeFileSync(process.env.CODEX_WEB_LIVE_API_KEY_FILE,'synthetic-no-network-credential');
+ const gateway=new DotLiveGateway(f.store,{dataRoot:f.root,basePath:'',publicBaseUrl:'http://localhost'} as any,()=>{});gateway.hooks=f.hooks;
+ const sid=id();f.db.createSession(sid,'csrf',new Date(Date.now()+300000).toISOString(),user);const session=f.db.getSession(sid)!,dialogue=id();
+ const first=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION,dialogue),second=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION,dialogue),other=gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION,id());
+ assert.equal((gateway as any).tickets.get(first.ticket).dialogueId,(gateway as any).tickets.get(second.ticket).dialogueId);
+ assert.notEqual((gateway as any).tickets.get(first.ticket).dialogueId,(gateway as any).tickets.get(other.ticket).dialogueId);
+ assert.throws(()=>gateway.ticket(session,false,f.c.id,VOICE_PROTOCOL_VERSION,'invalid'),/标识无效/);void gateway.close();
 });

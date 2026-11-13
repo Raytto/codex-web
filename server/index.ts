@@ -1,3 +1,5 @@
+import { AppDatabase } from './db.js';
+import { retrySqliteBusy } from './sqlite-contention.js';
 import fs from "node:fs";
 import path from "node:path";
 import pino from "pino";
@@ -8,7 +10,11 @@ import { loadProductionConfig } from "./config.js";
 // Configuration must fail closed before createApp creates directories, opens
 // SQLite, performs migrations, or starts any background refresh.
 const startupConfig = loadProductionConfig();
-const { app, db, config, dotLive, remoteWorkers, nodeTransfers, runner, resumableUploads, personalMemory, beginShutdown, waitForBackgroundTasks } = createApp(startupConfig);
+const initializedDatabase = await retrySqliteBusy(() => new AppDatabase(startupConfig.dataRoot, { username: startupConfig.username, passwordHash: startupConfig.passwordHash, displayName: "Codex" }), { label: "database_startup", maxMs: 60_000, attempts: 10 });
+const { app, db, config, dotLive, remoteWorkers, nodeTransfers, runner, resumableUploads, personalMemory, beginShutdown, waitForBackgroundTasks } = (() => {
+  try { return createApp(startupConfig, initializedDatabase); }
+  catch (error) { initializedDatabase.close(); throw error; }
+})();
 fs.mkdirSync(path.join(config.dataRoot, "logs"), { recursive: true });
 const logger = pino(pino.destination({ dest: path.join(config.dataRoot, "logs", "app.log"), sync: false }));
 

@@ -34,10 +34,16 @@ test("OpenAI submission uses account enabled terms, excludes later messages, per
   insert.run(term,LEGACY_USER_ID,"atlas","AtlasWidget","active",now,now);
   insert.run(crypto.randomUUID(),other,"private","OtherTenantTerm","active",now,now);
   f.db.setVoiceLexiconTermDisabled(LEGACY_USER_ID,term,true);
+  const hiddenFixed=crypto.randomUUID();insert.run(hiddenFixed,LEGACY_USER_ID,"pdf-fixed","PDF","suppressed",now,now);
+  for(let i=0;i<113;i++)insert.run(crypto.randomUUID(),LEGACY_USER_ID,`eligible-${i}`,`EligibleTerm${i}`,"active",now,now);
+  for(let i=0;i<12;i++)f.db.sqlite.prepare("INSERT INTO messages(id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?)").run(crypto.randomUUID(),f.input.conversation.id,i%2?"user":"assistant",`history-${i}`,`2026-01-01T00:00:${String(i).padStart(2,'0')}.000Z`);
   let calls=0;
   const service=new VoiceSubmissionService(f.config,f.db,{audioRoot:f.audioRoot,transcribe:async(_file,context,options)=>{
     const words=selectTranscriptionKeywords(context?.personalizedTerms??[]).values;
     assert.equal(words.includes("OtherTenantTerm"),false);
+    assert.equal(words.filter(w=>w.startsWith("EligibleTerm")).length,113);
+    assert.ok(context?.excludedTerms?.includes("PDF"));
+    assert.deepEqual(context?.recentMessages?.map(m=>m.content),Array.from({length:10},(_,i)=>`history-${i+2}`));
     assert.equal(words.includes("AtlasWidget"),calls!==0);
     assert.equal(context?.recentMessages?.some(m=>m.content==="future-message"),false);
     options?.onUsage?.(3); calls++;return "识别文本";

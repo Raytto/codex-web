@@ -1,5 +1,6 @@
 import { garbageCollectConversationRecords } from "./conversation-cold-storage.js";
 import { taskMemoryError, taskMemoryErrorCode, TASK_MEMORY_POLL_MS } from "./task-memory.js";
+import { retrySqliteBusy, shortSqliteAttempt } from './sqlite-contention.js';
 import { autoResetPreference } from "./codex-reset-auto-use.js";
 import { ExecutionUncertainError } from "./execution-ownership.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
@@ -408,7 +409,7 @@ export class CodexRunner {
     const state = executorId === HOST_EXECUTOR_ID
       ? await this.hostWorkerClient.listCodexAccounts(userId, refreshUsage)
       : await this.remoteWorkers.listCodexAccounts(executorId, refreshUsage);
-    this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId);
+    await retrySqliteBusy(() => shortSqliteAttempt(this.db.sqlite, () => this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId)), { label: "executor_account_persist" });
     if (previousAccountId !== state.activeAccountId) this.remoteWorkers.emit("quota_usage", { executorId });
     return this.withAccountQuotas(executorId, state);
   }
@@ -451,7 +452,7 @@ export class CodexRunner {
     const state = executorId === HOST_EXECUTOR_ID
       ? await this.hostWorkerClient.activateCodexAccount(userId, accountId)
       : await this.remoteWorkers.activateCodexAccount(executorId, accountId);
-    this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId);
+    await retrySqliteBusy(() => shortSqliteAttempt(this.db.sqlite, () => this.db.setExecutorActiveCodexAccount(executorId, state.activeAccountId)), { label: "executor_account_persist" });
     this.remoteWorkers.emit("quota_usage", { executorId });
     return this.withAccountQuotas(executorId, state);
   }
@@ -783,6 +784,11 @@ export class CodexRunner {
           if (payload && typeof payload === "object" && "kind" in payload && payload.kind === "input_accepted") {
             const accepted = payload as { threadId?: string; turnId?: string };
             if (attemptState && accepted.threadId === remoteThreadId && typeof accepted.turnId === "string") {
+              if (remoteWorkerId && project && engine === "codex") {
+                if (this.db.recordRemoteControlledTurn(jobId, project.executor_id, accepted.threadId, accepted.turnId)) {
+                  this.remoteWorkers.emit("thread_lifecycle", { conversationId });
+                }
+              }
               attemptState.acceptedTurnId = accepted.turnId;
               attemptState.continuation = true;
               if (personalContextSnapshot) {
@@ -847,6 +853,10 @@ export class CodexRunner {
           this.publish(jobId, "progress", { kind: "retry", label: `正在进行第 ${retryAttempt} 次连接重试` });
         }
         if (remoteWorkerId && project) {
+          if (!options.resumeRemote && engine === "codex") {
+            this.db.registerRemoteExecutionInput(jobId, attemptRemotePrompt);
+            this.db.registerRemoteExecutionInput(jobId, appendWaitAutomationInstructions(attemptRemotePrompt, continuationAttempt ? false : legacyWaitInstructions));
+          }
           const result = await eventQueue.waitFor(options.resumeRemote
             ? this.remoteWorkers.resume(jobId, remoteWorkerId, callbacks)
             : this.remoteWorkers.run(remoteWorkerId, {

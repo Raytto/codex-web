@@ -14,6 +14,24 @@ import { createJobAutomationToken } from '../server/wake-automation.js';
 const id=()=>crypto.randomUUID();
 const selection={model:'gpt-6.1-sol',reasoningEffort:'high'} as const;
 const evidence={kind:'artifact',summary:'verified result',functionalVerified:true,cleanupVerified:true,backgroundWorkFinished:true,checks:[{name:'real behavior',passed:true}]};
+
+test('recovery diagnoses the actual blocker and CAS cannot settle an execution observed before a state change',t=>{
+ const {db,job}=fixture(t),a=job(),b=job();db.updateJob(a.j.id,'running');
+ const w=db.workflows.forConversation(a.c.id)!;
+ assert.equal(db.workflows.recoveryStatus(w.id).phase,'executing');
+ db.finishJob(a.j.id,a.c.id,'interrupted');db.workflows.executionUncertain(a.j.id,'lost transport');
+ const status=db.workflows.recoveryStatus(w.id);
+ assert.equal(status.phase,'exit_unverified');assert.equal(status.automaticReplay,false);
+ assert.equal(db.workflows.admissionBlock(a.c.id)?.code,'workflow_exit_unverified');
+ assert.equal(db.workflows.recoveryStatus(db.workflows.forConversation(b.c.id)!.id).phase,'waiting_capacity');
+ assert.throws(()=>db.workflows.recover(w.id,'operator verified',{revision:status.revision-1,runIds:[a.j.id]}),/过期/);
+ assert.throws(()=>db.workflows.recover(w.id,'operator verified',{revision:status.revision,runIds:[]}),/过期/);
+ assert.equal(db.sqlite.prepare('SELECT settled FROM workflow_runs WHERE job_id=?').get(a.j.id)!.settled,0);
+ db.workflows.recover(w.id,'local processes, remote worker and deployment verified stopped',{revision:status.revision,runIds:[a.j.id]});
+ assert.equal(db.getJob(a.j.id)!.status,'interrupted');assert.equal(db.getJob(b.j.id)!.status,'queued');
+ assert.equal(db.workflows.get(w.id)!.state,'blocked');assert.equal(db.workflows.recoveryStatus(w.id).phase,'ready_to_resume');
+ assert.throws(()=>db.updateJob(b.j.id,'running'),/WORKFLOW_LIMIT/);
+});
 function fixture(t:test.TestContext, capacity=1){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-'));
  const db=new AppDatabase(root);db.workflows.configure(capacity);
@@ -200,4 +218,44 @@ test('unlimited mode rejects epochless credentials for new attempts but preserve
  app.db.sqlite.prepare('UPDATE workflows SET epoch=0 WHERE id=?').run(app.db.workflows.forEntity('job',j.id)!.id);
  app.db.sqlite.prepare('UPDATE workflow_runs SET epoch=0 WHERE job_id=?').run(j.id);
  await request(app.app).post(url).set('Authorization','Bearer '+token).send({action:'status'}).expect(200);
+});
+
+test('queue explanation names external owner without a fabricated conversation and preserves admission', t => {
+ const {db,job}=fixture(t);const c=db.createConversation(id(),'排队验收');
+ const external=db.workflows.external('queue-visibility-fixture',c.user_id,'外部同步验收');
+ const queued=job(c.id);
+ assert.equal(external.state,'active');
+ assert.equal(db.sqlite.prepare('SELECT count(*) n FROM workflow_conversations WHERE workflow_id=?').get(external.id)!.n,0);
+ assert.match(db.workflows.waitingFor(queued.c.id)!,/外部同步验收.*等待续跑或验收.*外部维护/);
+ assert.throws(()=>db.updateJob(queued.j.id,'running'),/WORKFLOW_LIMIT/);
+ db.sqlite.prepare("UPDATE workflows SET state='blocked',reason='等待人工核验' WHERE id=?").run(external.id);
+ assert.match(db.workflows.waitingFor(queued.c.id)!,/等待处理.*等待人工核验/);
+ db.sqlite.prepare("UPDATE workflows SET state='closing' WHERE id=?").run(external.id);
+ assert.match(db.workflows.waitingFor(queued.c.id)!,/正在收尾/);
+ db.sqlite.prepare("UPDATE workflows SET state='completed' WHERE id=?").run(external.id);
+ assert.equal(db.workflows.waitingFor(queued.c.id),null);
+ db.updateJob(queued.j.id,'running');
+});
+
+test('queue explanation follows local running, durable waits and queued recovery without releasing ownership',t=>{
+ const {db,job}=fixture(t);const owner=job(),next=job();db.updateJob(owner.j.id,'running');
+ assert.match(db.workflows.waitingFor(next.c.id)!,/正在执行.*本地任务/);
+ const plan=db.createWakePlan({id:id(),conversationId:owner.c.id,createdByJobId:owner.j.id,mode:'time',label:'验收',deadlineAt:new Date(Date.now()+3600000).toISOString(),successPrompt:'verify',failurePrompt:'verify',timeoutPrompt:'verify',selection,newConversation:false});
+ db.finishJob(owner.j.id,owner.c.id,'completed');db.workflows.settled(owner.j.id);
+ assert.match(db.workflows.waitingFor(next.c.id)!,/等待定时续跑/);
+ const event=db.recordWakeEvent(plan.id,'queue-visible-deadline','deadline',null,id());
+ const resumed=db.materializePendingPrompt(event.pendingPrompt!.id,id(),id())!;
+ assert.match(db.workflows.waitingFor(next.c.id)!,/等待恢复执行/);
+ assert.throws(()=>db.updateJob(next.j.id,'running'),/WORKFLOW_LIMIT/);
+ db.updateJob(resumed.id,'running');finish(db,resumed.id);
+ assert.equal(db.workflows.waitingFor(next.c.id),null);
+});
+
+test('queue explanations redact other-account owner metadata and disappear in unlimited mode',t=>{
+ const {db,job}=fixture(t);
+ const other=id();db.sqlite.prepare("INSERT INTO users(id,username,display_name,password_hash,status,role,created_at,updated_at) VALUES(?,?,?,'','active','member',?,?)").run(other,other,'other',new Date().toISOString(),new Date().toISOString());
+ db.workflows.external('private-source',other,'PRIVATE-OWNER-TITLE');
+ const next=job();
+ assert.equal(db.workflows.waitingFor(next.c.id),'等待其他账号的前序任务完成并释放名额');
+ db.workflows.configure(-1);assert.equal(db.workflows.waitingFor(next.c.id),null);
 });

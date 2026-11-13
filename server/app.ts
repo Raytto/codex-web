@@ -1,12 +1,13 @@
 import { personalMemoryConfigured } from "./personal-memory.js";
 import { availableHostMemory, memoryDispatchBlock, TASK_MEMORY_POLL_MS, MEMORY_WAIT_MESSAGE, MEMORY_GUARD_MESSAGE } from "./task-memory.js";
+import { isVoicePending, publicVoicePending } from './voice-presentation.js';
+import { guardedCallback, isSqliteBusy, startupSqliteRetry } from './sqlite-contention.js';
 import { routeDotTask } from './dot-task-routing.js';
 import { publicInstanceConfig, renderInstanceHtml } from './instance-config.js';
 import { DotError, DotStore, DOT_INSTRUCTIONS } from "./dot-store.js";
 import { DotLiveGateway } from "./dot-live.js";
 import { mountDotRoutes, mountDotAutomation } from "./dot-routes.js";
 import { validateCompletionEvidence } from "./workflow-store.js";
-import { ANTIGRAVITY_TITLE_MODEL, ANTIGRAVITY_TITLE_EFFORT } from "./conversation-title.js";
 import { engineForModel } from "../remote-worker/src/agent-engine.js";
 import { liveSteeringUnavailableReason } from "../src/agent-steering-capability.js";
 import { AUTO_RESET_INTERVAL_MS, CodexResetAutoUse } from "./codex-reset-auto-use.js";
@@ -84,7 +85,6 @@ const COOKIE_NAME = "cww_session";
 // Keep unknown-user login work comparable without using any real account hash.
 const DUMMY_PASSWORD_HASH = "$2b$12$3GJ6fV5pZgwKqptJCLdFg.f3pVLsyOugC100TH0YpmvlfA3brYgDe";
 const CONVERSATION_MESSAGE_PAGE_SIZE = 30;
-const FILE_INSTRUCTION_GUIDANCE = "文件已上传，请输入具体操作，例如“把图片背景改为白色”或“汇总这些表格”。收到明确指令后才会开始处理。";
 const PUBLIC_FILE_READER_MAX_BYTES = 5 * 1024 * 1024;
 type AuthenticatedRequest = Request & { appSession?: SessionRow; requestId?: string };
 
@@ -117,22 +117,23 @@ export function projectDisplayName(name: string, executor: Pick<ExecutorView, "k
   return executor?.kind === "remote_worker" ? `[${executor.machineName}]${name}` : name;
 }
 
-export function createApp(overrides: Partial<AppConfig> = {}) {
+export function createApp(overrides: Partial<AppConfig> = {}, initializedDatabase?: AppDatabase) {
   const config = loadConfig(overrides);
   fs.mkdirSync(config.dataRoot, { recursive: true });
   fs.mkdirSync(config.tenantRoot, { recursive: true });
-  const db = new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: "Codex" });
-  db.workflows.configure(config.maxActiveWorkflows);
-  db.recoverVoiceTranscriptionReceipts();
-  const remoteWorkers = new RemoteWorkerGateway(config, db);
+  const db = initializedDatabase ?? new AppDatabase(config.dataRoot, { username: config.username, passwordHash: config.passwordHash, displayName: "Codex" });
+  const initialize = startupSqliteRetry(db.sqlite);
+  initialize("workflow_startup", () => db.workflows.configure(config.maxActiveWorkflows));
+  initialize("voice_receipt_startup", () => db.recoverVoiceTranscriptionReceipts());
+  const remoteWorkers = initialize("worker_metadata_startup", () => new RemoteWorkerGateway(config, db));
   const remoteFileDelivery = new RemoteFileDelivery(db, config.dataRoot, remoteWorkers);
   const transferHost = new HostRootWorkerClient(config.hostRootSocketPath);
-  const nodeTransfers = new NodeTransferCoordinator(db.sqlite,
+  const nodeTransfers = initialize("transfer_metadata_startup", () => new NodeTransferCoordinator(db.sqlite,
     async (executor, spec) => {
       if (executor === HOST_EXECUTOR_ID) await transferHost.startNodeTransfer(HOST_ROOT_USER_ID, spec);
       else await remoteWorkers.startNodeTransfer(executor, spec);
     }, `${(config.publicBaseUrl || `http://127.0.0.1:${config.port}${config.basePath}`).replace(/^http/, "ws").replace(/\/$/, "")}/api/node-transfers/connect`,
-    executor => executor === HOST_EXECUTOR_ID ? Boolean(config.hostRootSocketPath) : remoteWorkers.transferCapable(executor));
+    executor => executor === HOST_EXECUTOR_ID ? Boolean(config.hostRootSocketPath) : remoteWorkers.transferCapable(executor)));
   remoteWorkers.transferBusy = executor => nodeTransfers.isBusy(executor);
   function tenantExecutorView(): ExecutorView {
     return {
@@ -169,7 +170,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       display_name: projectDisplayName(project.name, executor),
     };
   }
-  const projectAgentsTemplate = db.ensureAppSetting(PROJECT_AGENTS_TEMPLATE_SETTING, DEFAULT_PROJECT_AGENTS_TEMPLATE);
+  const projectAgentsTemplate = initialize("project_template_startup", () => db.ensureAppSetting(PROJECT_AGENTS_TEMPLATE_SETTING, DEFAULT_PROJECT_AGENTS_TEMPLATE));
   function ensureUserDefaultProject(userId: string) {
     const user = db.getUser(userId);
     if (!user) throw new Error("用户不存在");
@@ -185,8 +186,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       hostRoot ? HOST_EXECUTOR_ID : TENANT_LOCAL_EXECUTOR_ID,
     );
   }
-  for (const user of db.listUsers()) ensureUserDefaultProject(user.id);
-  migrateExistingOutputFiles(config, db);
+  for (const user of db.listUsers()) initialize("default_project_startup", () => ensureUserDefaultProject(user.id));
+  migrateExistingOutputFiles(config, db, operation => initialize("output_metadata_startup", operation));
   const subscribers = new Map<string, Set<Response>>();
   let shuttingDown = false;
 
@@ -258,9 +259,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return selection;
   }
 
-  for (const user of db.listUsers()) userAgentSelection(user.id);
+  for (const user of db.listUsers()) initialize("user_selection_startup", () => userAgentSelection(user.id));
   for (const conversation of db.listConversations()) {
-    if (conversation.agent_model || conversation.reasoning_effort) conversationAgentSelection(conversation);
+    if (conversation.agent_model || conversation.reasoning_effort) initialize("conversation_selection_startup", () => conversationAgentSelection(conversation));
   }
 
   function publish(jobId: string, eventType: string, payload: unknown): void {
@@ -333,7 +334,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       db.sqlite.exec('BEGIN IMMEDIATE');
       try {
         db.sqlite.prepare('INSERT INTO dot_steers(pending_id,job_id,state,created_at) VALUES(?,?,?,?)').run(pendingId,running.id,'sending',new Date().toISOString());
-        db.addMessage({id:newId(),conversation_id:pending.conversation_id,role:'user',content:pending.content,created_at:new Date().toISOString()});
+        const mid=newId();
+        db.addMessage({id:mid,conversation_id:pending.conversation_id,role:'user',content:pending.content,created_at:new Date().toISOString()});
+        if(isVoicePending(db,pendingId))db.sqlite.prepare('UPDATE messages SET is_internal=1 WHERE id=?').run(mid);
         db.deletePendingPrompt(pendingId);
         db.sqlite.exec('COMMIT');
       } catch(e) { db.sqlite.exec('ROLLBACK'); throw e; }
@@ -417,22 +420,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
     return { conversation, state: "error" };
   }
-  for (const storage of db.listConversationStorageByState("restoring")) {
-    const conversation = db.getConversation(storage.conversation_id);
-    if (conversation) scheduleColdRestore(conversation.id, conversation.user_id);
-  }
-  const hostRootUser = db.listUsers().find((user) => isHostRootUser(user.id));
-  if (hostRootUser) {
-    void runner.refreshExecutorRuntime(hostRootUser.id, HOST_EXECUTOR_ID, true)
-      .then((runtime) => { db.upsertExecutorRuntime(HOST_EXECUTOR_ID, runtime); remoteWorkers.emit("status", HOST_EXECUTOR_ID); })
-      .catch(() => undefined);
-  }
   const transcription = new TranscriptionService(config);
-  const voiceSubmissions = new VoiceSubmissionService(config, db, transcription, (id) => {
+  const voiceSubmissions = initialize("voice_submission_startup", () => new VoiceSubmissionService(config, db, transcription, (id) => {
     const conversation = db.getConversation(id);
     if (conversation && !conversation.deleted_at) publishConversationChanged(conversation);
-  }, () => { if (config.queueAutoStart) scheduleQueuePump(); }, deliverPendingPrompt);
-  const opportunityVoice = new OpportunityVoiceService(config, db, transcription);
+  }, () => { if (config.queueAutoStart) scheduleQueuePump(); }, deliverPendingPrompt));
+  const opportunityVoice = initialize("opportunity_voice_startup", () => new OpportunityVoiceService(config, db, transcription));
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs, engineId) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs, engineId));
   const personalMemory = new PersonalMemoryService(config, db,
@@ -666,7 +659,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (shuttingDown) return;
     const immediate = setImmediate(() => {
       backgroundImmediates.delete(immediate);
-      if (!shuttingDown) trackBackground(label, task());
+      if (!shuttingDown) trackBackground(label, Promise.resolve().then(task));
     });
     backgroundImmediates.add(immediate);
   }
@@ -779,7 +772,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function startSystemStatusMonitor(): void {
     if (systemStatusTimer) return;
     lastPublishedSystemStatus = JSON.stringify(systemStatusPayload(HOST_ROOT_USER_ID));
-    systemStatusTimer = setInterval(pollSystemStatus, 250);
+    systemStatusTimer = setInterval(() => guardedCallback("system_status", pollSystemStatus), 250);
     systemStatusTimer.unref();
   }
 
@@ -821,6 +814,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   const ACTIVITY_RETAINED_STAGE_FEEDBACK_LIMIT = 5;
 
   function conversationActivityPayload(conversation: ConversationRow) {
+    const workflow = db.workflows.forConversation(conversation.id);
     const latestJob = db.getLatestJobForConversation(conversation.id) ?? null;
     const activeJobs = db.listActiveJobsForConversation(conversation.id);
     const activeJobRow = activeJobs.find((job) => job.status === "running") ?? activeJobs[0] ?? null;
@@ -832,6 +826,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const remoteTurnId = conversation.codex_thread_id ? db.getLatestRemoteTurnId(conversation.id) : null;
     const remoteActivities = conversation.codex_thread_id ? db.listRemoteThreadActivities(conversation.id, 50, remoteTurnId) : [];
     return {
+      workflow: workflow ? {...workflow, recovery: db.workflows.recoveryStatus(workflow.id), waitingFor: db.workflows.waitingFor(conversation.id)} : null,
+      workflowCapacity: config.maxActiveWorkflows,
       conversationStatus: conversation.status,
       externalStatus: conversation.external_status,
       hasUnreadResult: Boolean(conversation.has_unread_result),
@@ -1065,7 +1061,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   }
 
   function agentPrompt(content: string, quoteExcerpt?: string | null): string {
-    return quoteExcerpt ? buildAskAgentDraft(content, quoteExcerpt) : content;
+    return quoteExcerpt ? buildAskAgentDraft(content, quoteExcerpt) : content.trim() ? content : "[平台附件上下文：用户本轮仅发送附件，未填写正文。请实际查看附件并结合已有会话理解；意图不足时自然询问。此说明不是用户原话。]";
   }
 
   function scheduleGeneratedConversationTitle(conversationId: string, content: string, jobId?: string, trigger: "first_message" | "remote_import" = "first_message", messageId?: string, triggerMessageId?: string): void {
@@ -1073,7 +1069,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const conversation = db.getConversation(conversationId);
     if (!conversation || conversation.title_source !== "default") return;
     const engineId = engineForModel((jobId ? db.getJob(jobId)?.agent_model : null) ?? conversation.agent_model);
-    if (engineId === "antigravity" && (!ANTIGRAVITY_TITLE_MODEL || !ANTIGRAVITY_TITLE_EFFORT)) return;
     const project = conversation.project_id ? db.getProject(conversation.project_id) : undefined;
     if (!project) return;
     // Submission and queue dispatch can both reach this function, including
@@ -1082,7 +1077,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const latestAudit = db.getLatestConversationTitleAudit(conversationId);
     if (latestAudit?.status === "running" || (!triggerMessageId && latestAudit?.status === "succeeded")) return;
     if (latestAudit?.status === "failed") {
-      if (latestAudit.error === "worker_upgrade_required" && !remoteWorkers.supportsTitleAgent(project.executor_id, engineId)) return;
+      if (latestAudit.error === "worker_upgrade_required" && !remoteWorkers.supportsTitleAgent(project.executor_id, "codex")) return;
       const remoteTitleNowAvailable = latestAudit.error === "worker_upgrade_required";
       const completedAt = latestAudit.completed_at ? Date.parse(latestAudit.completed_at) : Date.now();
       // Repeated remote imports keep their cooldown; an explicit new message
@@ -1103,14 +1098,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const startedMs = Date.now();
     db.createConversationTitleAudit({
       id: auditId, conversation_id: conversation.id, user_id: conversation.user_id, project_id: project.id,
-      executor_id: project.executor_id, trigger, model: engineId === "antigravity" ? ANTIGRAVITY_TITLE_MODEL : CONVERSATION_TITLE_CODEX_MODEL,
-      reasoning_effort: engineId === "antigravity" ? ANTIGRAVITY_TITLE_EFFORT : CONVERSATION_TITLE_REASONING_EFFORT, prompt_version: engineId === "antigravity" ? "antigravity-title-v1" : CONVERSATION_TITLE_PROMPT_VERSION,
+      executor_id: project.executor_id, trigger, model: CONVERSATION_TITLE_CODEX_MODEL,
+      reasoning_effort: CONVERSATION_TITLE_REASONING_EFFORT, prompt_version: CONVERSATION_TITLE_PROMPT_VERSION,
       request_excerpt: conversationTitleAuditExcerpt(requestText), request_sha256: crypto.createHash("sha256").update(requestText, "utf8").digest("hex"),
       context_json: JSON.stringify({
         projectName: project.name, projectDirectory: directoryName, attachmentNames,
         requestCharacters: Array.from(requestText).length, executorName: executor?.machineName ?? null,
         executorKind: executor?.kind ?? null, codexVersion: executor?.runtime?.installedVersion ?? null,
-        sourceMessageId: messageId ?? null, triggerMessageId: triggerMessageId ?? null, engineId,
+        sourceMessageId: messageId ?? null, triggerMessageId: triggerMessageId ?? null, engineId: "codex", conversationEngineId: engineId,
       }),
       started_at: startedAt,
     });
@@ -1186,7 +1181,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (recordCancellation) for (const job of activeJobs) recordUserCancelledJob(job);
   }
 
-  type DispatchBlock = "workflow_limit" | "memory_watermark" | "memory_unavailable" | "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
+  type DispatchBlock = "workflow_exit_unverified" | "workflow_closing" | "workflow_paused" | "workflow_limit" | "memory_watermark" | "memory_unavailable" | "global_limit" | "user_limit" | "executor_limit" | "disk_watermark" | "executor_unavailable" | "cold_storage";
 
   let diskSpaceSample: { sampledAt: number; bytes: number } | null = null;
   function availableDiskBytes(forceRefresh = false): number {
@@ -1212,7 +1207,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function dispatchBlock(conversationId: string): DispatchBlock | null {
     const conversation = db.getConversation(conversationId);
     if (!conversation) return "executor_unavailable";
-    if (db.workflows.block(conversationId)) return "workflow_limit";
+    const workflowBlock=db.workflows.admissionBlock(conversationId);
+    if(workflowBlock)return workflowBlock.code;
     if(config.storageLifecycleEnabled){
       const nativePending=Boolean(db.sqlite.prepare(`SELECT 1 FROM storage_native_units WHERE conversation_id=? AND state IN ('verified','isolating','isolated','evicting','cold','restoring')
         AND EXISTS(SELECT 1 FROM json_each(manifest_json,'$.lineage.threads') t WHERE json_extract(t.value,'$.id')=?)`).get(conversationId,conversation.codex_thread_id));
@@ -1257,6 +1253,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   function dispatchBlockLabel(reason: DispatchBlock): string {
     return ({
+      workflow_exit_unverified: "等待本项上一执行者确认退出（核验后恢复原任务，不重放指令）",
+      workflow_closing: "本项正在核验收尾，名额尚未释放",
+      workflow_paused: "修改队列已暂停，等待核查",
       workflow_limit: "等待完整修改任务完成验收和收尾（暂不启动设计或执行）",
       memory_watermark: MEMORY_WAIT_MESSAGE,
       memory_unavailable: MEMORY_GUARD_MESSAGE,
@@ -2106,7 +2105,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.json(dotLive.availability(session,String(req.params.id)));
   });
   api.post('/conversations/:id/voice', (req,res)=>{
-    try {return res.json(dotLive.ticket(res.locals.session as SessionRow,req.body?.takeover===true,String(req.params.id)));}
+    try {return res.json(dotLive.ticket(res.locals.session as SessionRow,req.body?.takeover===true,String(req.params.id),req.body?.protocolVersion,req.body?.dialogueId));}
     catch(e){return res.status(e instanceof DotError?e.status:400).json({error:e instanceof Error?e.message:'无法开始通话。'});}
   });
 
@@ -3262,7 +3261,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.get("/workflows", (req,res) => {
     const session=res.locals.session as SessionRow;
-    return res.json({capacity:config.maxActiveWorkflows,workflows:db.workflows.list(session.user_id)});
+    return res.json({capacity:config.maxActiveWorkflows,workflows:db.workflows.list(session.user_id).map(w=>({...w,recovery:db.workflows.recoveryStatus(w.id)}))});
   });
   api.post("/workflows/:id/cancel", (req,res) => {
     const session=res.locals.session as SessionRow;
@@ -3286,10 +3285,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const messagePage = db.listMessagesPage(conversation.id, undefined, conversationMessagePageSize(req.query.limit))!;
     const safeMessages = safeConversationMessages(conversation, messagePage.messages);
     const agentSelection = conversationAgentSelection(conversation);
-    const pendingPrompts = db.listPendingPrompts(conversation.id);
-    const editingPrompt = db.listPendingPrompts(conversation.id, "editing")[0] ?? null;
+    const pendingPrompts = db.listPendingPrompts(conversation.id).map(p=>publicVoicePending(db,p));
+    const editing = db.listPendingPrompts(conversation.id, "editing")[0];
+    const editingPrompt = editing ? publicVoicePending(db,editing) : null;
     const composerDraft = db.getComposerDraft(conversation.id) ?? null;
     const wakePlan = db.getActiveWakePlan(conversation.id) ?? null;
+    const workflow = db.workflows.forConversation(conversation.id);
     return res.json({
       conversation,
       agentSelection,
@@ -3299,8 +3300,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       editingPrompt,
       composerDraft,
       wakePlan: publicWakePlan(wakePlan),
-      workflow: db.workflows.forConversation(conversation.id) ?? null,
-      workflowCapacity: config.maxActiveWorkflows,
       wakeEvents: wakePlan ? db.listWakeEvents(wakePlan.id) : [],
       ...activity,
       rolloutBytes,
@@ -3871,11 +3870,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         if (Array.isArray(parsed)) attachmentNames = parsed.filter((value): value is string => typeof value === "string").slice(0, 12);
       } catch {}
       const recentMessages = conversation
-        ? db.listMessages(conversation.id).slice(-4).map((message) => ({ role: message.role, content: message.content }))
+        ? db.listMessages(conversation.id).slice(-10).map((message) => ({ role: message.role, content: message.content }))
         : [];
-      const selectedLexicon = formatVoiceLexiconTerms(db.listVoiceLexiconTerms(
-        session.user_id, conversation?.project_id ?? project?.id ?? null, config.voiceLexiconMaxTerms,
-      ));
+      const lexiconProjectId = conversation?.project_id ?? project?.id ?? null;
+      const lexiconSelection = db.selectVoiceLexiconTerms(session.user_id, lexiconProjectId, config.voiceLexiconMaxTerms);
+      const selectedLexicon = formatVoiceLexiconTerms(lexiconSelection.terms);
       const attachments = conversation ? (() => {
         const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, conversation.id);
         const available = db.listFiles(conversation.id).filter((candidate) => candidate.kind === "upload").reverse();
@@ -3900,6 +3899,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
             attachmentNames,
             attachments,
             recentMessages,
+            projectTitle: lexiconProjectId ? db.getActiveProjectForUser(lexiconProjectId, session.user_id)?.name : undefined,
+            keywordSelection: lexiconSelection.diagnostics,
+            excludedTerms: db.suppressedVoiceLexiconTerms(session.user_id, lexiconProjectId),
             personalizedTerms: ["Codex Web", ...selectedLexicon.lines],
           }, { onUsage: seconds => { usageSeconds = seconds; } });
           const transcriptionId = newId();
@@ -4004,36 +4006,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
     if (useComposerDraft && editingPrompt) return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
 
-    if (!prompt && !quoteExcerpt) {
-      if (useComposerDraft) {
-        const awaiting = db.materializeComposerDraftAsPending(newId(), conversation.id, "", selection, null, "editing");
-        attachVoiceTranscriptions(voiceTranscriptionIds, session, conversation.id, { pendingPromptId: awaiting.id });
-        return res.status(202).json({ pendingPrompt: awaiting, editingPrompt: awaiting, queued: false, needsInstruction: true, guidance: FILE_INSTRUCTION_GUIDANCE });
-      }
-      if (editingPrompt?.content.trim() || editingPrompt?.quote_excerpt) {
-        removeUnregisteredUploads(uploaded);
-        return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
-      }
-      if (editingPrompt && editingPrompt.files.length + uploaded.length > 12) {
-        removeUnregisteredUploads(uploaded);
-        return res.status(400).json({ error: "等待指令的附件最多保留 12 个。" });
-      }
-      const createdAwaiting = editingPrompt ?? db.createPendingPrompt(newId(), conversation.id, "", selection);
-      const awaiting = editingPrompt ?? db.beginEditingPendingPrompt(createdAwaiting.id);
-      if (!awaiting) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "等待指令的文件状态已经变化，请刷新后重试。" }); }
-      const rows = pendingUploadRows(conversation.id, awaiting.id, uploaded);
-      let persisted: PendingPromptWithFiles | undefined;
-      try {
-        persisted = db.updatePendingPromptWithFiles({
-          id: awaiting.id, expectedUpdatedAt: awaiting.updated_at, content: "", quoteExcerpt: null,
-          selection, nextStatus: "editing", newFiles: rows,
-          userId: session.user_id, maximumStoredBytes: maximumStoredBytesForUser(session.user_id),
-        });
-      } catch (error) { removeUnregisteredUploads(uploaded); throw error; }
-      if (!persisted) { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "等待指令的文件状态已经变化，请刷新后重试。" }); }
-      attachVoiceTranscriptions(voiceTranscriptionIds, session, conversation.id, { pendingPromptId: persisted.id });
-      return res.status(202).json({ pendingPrompt: persisted, editingPrompt: persisted, queued: false, needsInstruction: true, guidance: FILE_INSTRUCTION_GUIDANCE });
-    }
 
     if (editingPrompt) {
       if (editingPrompt.content.trim() || editingPrompt.quote_excerpt) {
@@ -4111,7 +4083,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if ((!config.storageLifecycleEnabled && conversation.cold_storage_state !== "local")) return res.status(409).json({ code: "COLD_STORAGE_RESTORE_REQUIRED", state: conversation.cold_storage_state, error: "历史正在恢复，请恢复完成后再调整待发送任务。" });
     db.touchConversationActivity(conversation.id);
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((id: unknown): id is string => typeof id === "string") : [];
-    try { return res.json({ pendingPrompts: db.reorderPendingPrompts(conversation.id, ids) }); }
+    try { return res.json({ pendingPrompts: db.reorderPendingPrompts(conversation.id, ids).map(p=>publicVoicePending(db,p)) }); }
     catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "调整顺序失败。" }); }
   });
 
@@ -4124,6 +4096,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const prompt = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!prompt || prompt.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
     if (db.listPendingPrompts(conversation.id, "editing").length > 0) return res.status(409).json({ error: "请先完成或取消正在编辑的待发送任务。" });
+    if(isVoicePending(db,prompt.id))return res.status(409).json({error:"请通过新消息或语音补充要求。"});
     const editingPrompt = db.beginEditingPendingPrompt(prompt.id);
     return editingPrompt ? res.json({ editingPrompt }) : res.status(409).json({ error: "待发送队列已经变化，请刷新后重试。" });
   });
@@ -4136,11 +4109,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     db.touchConversationActivity(conversation.id);
     const prompt = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!prompt || prompt.conversation_id !== conversation.id) return res.status(404).json({ error: "待发送任务不存在。" });
-    if (!prompt.content.trim() && !prompt.quote_excerpt) return res.status(409).json({ error: "请先输入具体操作，或者清除这批待处理文件。" });
+    if (!prompt.content.trim() && !prompt.quote_excerpt && !prompt.files.length) return res.status(409).json({ error: "请输入内容、添加引用或上传文件。" });
     const restored = db.restorePendingPrompt(prompt.id);
     if (!restored) return res.status(409).json({ error: "该任务当前不在编辑状态。" });
     if (config.queueAutoStart) await pumpQueue();
-    return res.json({ pendingPrompt: db.getPendingPrompt(prompt.id) ?? null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null, queued: true, ...maintenanceQueueMetadata() });
+    const pending = db.getPendingPrompt(prompt.id);
+    return res.json({ pendingPrompt: pending ? publicVoicePending(db, pending) : null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null, queued: true, ...maintenanceQueueMetadata() });
   });
 
   api.put("/conversations/:id/pending-prompts/:promptId", upload.array("files", 12), async (req, res) => {
@@ -4153,6 +4127,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const pending = db.getPendingPromptForUser(String(req.params.promptId), session.user_id);
     if (!pending || pending.conversation_id !== conversation.id) { removeUnregisteredUploads(uploaded); return res.status(404).json({ error: "待发送任务不存在。" }); }
     if (pending.status !== "editing") { removeUnregisteredUploads(uploaded); return res.status(409).json({ error: "请先点击编辑。" }); }
+    if(isVoicePending(db,pending.id)){removeUnregisteredUploads(uploaded);return res.status(409).json({error:"请通过新消息或语音补充要求。"});}
     const capacityRejection = rejectUploadsOutsideCapacity(res, session.user_id, uploaded);
     if (capacityRejection) return capacityRejection;
     const prompt = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 100_000) : "";
@@ -4183,7 +4158,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     try {
       updated = db.updatePendingPromptWithFiles({
         id: pending.id, expectedUpdatedAt: pending.updated_at, content: prompt || quoteExcerpt ? prompt : "", quoteExcerpt,
-        selection, nextStatus: prompt || quoteExcerpt ? "queued" : "editing", newFiles: rows,
+        selection, nextStatus: "queued", newFiles: rows,
         removeFileIds: removed.map((file) => file.id),
         userId: session.user_id, maximumStoredBytes: maximumStoredBytesForUser(session.user_id),
       });
@@ -4193,9 +4168,6 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, conversation.id);
     for (const file of removed) {
       try { fs.rmSync(resolveInside(workspace, file.relative_path), { force: true }); } catch {}
-    }
-    if (!prompt && !quoteExcerpt) {
-      return res.status(202).json({ pendingPrompt: db.getPendingPrompt(pending.id) ?? null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null, needsInstruction: true, guidance: FILE_INSTRUCTION_GUIDANCE });
     }
     if (config.queueAutoStart) await pumpQueue();
     return res.json({ pendingPrompt: db.getPendingPrompt(pending.id) ?? null, activeJob: db.getActiveJobForConversation(conversation.id) ?? null, queued: true, ...maintenanceQueueMetadata() });
@@ -4228,10 +4200,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const unavailable = liveSteeringUnavailableReason(running, pending);
     if (unavailable) throw new Error(unavailable);
     const turnId = await runner.steer(running.id, agentPrompt(pending.content, pending.quote_excerpt), pending.files);
-    const message = db.materializeSteeredPrompt(pending.id, newId());
+    const message = db.materializeSteeredPrompt(pending.id, newId(), {jobId:running.id,turnId});
     if (!message) throw new Error("引导已送达，但本地记录队列发生变化，请刷新确认。");
+    publishConversationChanged(db.getConversation(pending.conversation_id)!);
     publishQueuePositions();
-    return { ok: true, mode: "steer", turnId, message };
+    return { ok: true, mode: "steer", turnId, message: message.is_internal ? {id:message.id} : message };
   }
 
   api.post("/conversations/:id/pending-prompts/:promptId/steer", async (req, res) => {
@@ -4641,6 +4614,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       index: false,
       maxAge: "1h",
       setHeaders: (res, filePath) => {
+        if (/^pp-dot-(audio|playback)-worklet\.js$/.test(path.basename(filePath))) {
+          res.setHeader("Cache-Control", "no-store");
+        }
         if (filePath.startsWith(path.join(distPath, "assets") + path.sep)) {
           res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
         }
@@ -4654,6 +4630,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   if (config.basePath) app.get(config.basePath, (_req, res) => res.redirect(308, `${config.basePath}/`));
   app.use(config.basePath || "/", router);
   app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
+    if(isSqliteBusy(error)){res.setHeader('Retry-After','2');return res.status(503).json({code:'DATABASE_BUSY',retryable:true,error:'数据库暂时繁忙，请稍后重试。'});}
     const requestId = String(res.locals.requestId ?? crypto.randomUUID());
     if (error instanceof multer.MulterError) {
       const partial = [
@@ -4672,6 +4649,18 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return res.status(500).json({ code: "INTERNAL_ERROR", requestId, error: "服务器内部错误。" });
   });
 
+  // External work starts only after every synchronous initialization step has
+  // succeeded. A metadata retry cannot launch a second restore/model/tool run.
+  for (const storage of db.listConversationStorageByState("restoring")) {
+    const conversation = db.getConversation(storage.conversation_id);
+    if (conversation) scheduleColdRestore(conversation.id, conversation.user_id);
+  }
+  const hostRootUser = db.listUsers().find((user) => isHostRootUser(user.id));
+  if (hostRootUser) {
+    void runner.refreshExecutorRuntime(hostRootUser.id, HOST_EXECUTOR_ID, true)
+      .then((runtime) => { db.upsertExecutorRuntime(HOST_EXECUTOR_ID, runtime); remoteWorkers.emit("status", HOST_EXECUTOR_ID); })
+      .catch(() => undefined);
+  }
   scheduleBackground("startup_gc_and_orphan_sweep", async () => {
       db.prunePublicShareAccessEvents(new Date(Date.now() - 180 * 24 * 60 * 60 * 1_000).toISOString());
       for (const candidate of db.listConversationCleanupCandidates()) {
@@ -4753,7 +4742,7 @@ function redactInternalError(value: string): string {
     .slice(0, 2_000);
 }
 
-export function migrateExistingOutputFiles(config: AppConfig, db: AppDatabase): number {
+export function migrateExistingOutputFiles(config: AppConfig, db: AppDatabase, persist: (operation: () => void) => void = operation => operation()): number {
   let migrated = 0;
   for (const file of db.listFiles()) {
     if (file.kind !== "output" || isPersistedDeliverablePath(file.relative_path)) continue;
@@ -4765,7 +4754,7 @@ export function migrateExistingOutputFiles(config: AppConfig, db: AppDatabase): 
     catch { continue; }
     if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
     const storedPath = persistDeliverableSync(config.dataRoot, workspace, file.relative_path, file.id);
-    db.updateFilePath(file.id, storedPath);
+    persist(() => db.updateFilePath(file.id, storedPath));
     migrated += 1;
   }
   return migrated;

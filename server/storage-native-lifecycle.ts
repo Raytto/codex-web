@@ -1,3 +1,4 @@
+import { LEGACY_CHUNK_BYTES } from './storage-chunk-layout.js';
 import {nativeOwnership} from './storage-native-ownership.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -80,7 +81,7 @@ export class StorageNativeLifecycle {
       trustedUsedAt:unit.last_used_at,timeBasis:'native-thread-business-time',recoveryDependency:unit.retention_days===60});
     this.catalog.link(unit.user_id,item.id,'native-conversation',unit.conversation_id);
     const prior=item.current_version?this.catalog.version(unit.user_id,item.current_version):null;
-    this.guardItem(item,file);const stat=fs.statSync(file),data=await this.chunks.archiveFile(unit.user_id,file);
+    this.guardItem(item,file);const stat=fs.statSync(file),data=await this.chunks.archiveFile(unit.user_id,file,{firstSeenAt:item.enrolled_at});
     const v=this.catalog.registerVersion(unit.user_id,item.id,data);
     const m:FileManifest={format:'pp-storage-file-v1',userId:unit.user_id,itemId:item.id,versionId:v.id,name,locator,
       sha256:data.sha256,bytes:data.bytes,mode:stat.mode&0o777,uid:stat.uid,gid:stat.gid,chunks:data.chunks.map(c=>c.id)};
@@ -182,7 +183,7 @@ export class StorageNativeLifecycle {
               // snapshot can be recreated only after rechecking native hashes.
               if(fs.existsSync(file))fs.unlinkSync(file);
               let page:NativeHistoryPage;const release=this.locked(home);
-              try{page=snapshotNativeHistoryPage(home,m.history,table,cursor,file,this.chunks.policy.chunkBytes);}finally{release();}
+              try{page=snapshotNativeHistoryPage(home,m.history,table,cursor,file,Math.min(this.chunks.policy.chunkBytes,LEGACY_CHUNK_BYTES));}finally{release();}
               try{
                 const member=await this.prepareFile(unit,file,{root:'native-snapshots',path:relative},path.basename(relative));
                 const part={...page,...member};m.parts.push(part);this.save(unit,m);previous=part;cursor=page.cursor;

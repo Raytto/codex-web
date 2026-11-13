@@ -4,6 +4,7 @@ import {createPortal} from 'react-dom';
 import {Phone,PhoneOff,Mic,MicOff,Pause,Play,VolumeX,MessageSquare,ArrowUpRight} from 'lucide-react';
 import {request} from './api';
 import {VoiceRecovery} from './voice-recovery';
+import {VOICE_PROTOCOL_VERSION, VOICE_REFRESH_MESSAGE, verifyVoiceWorklet, isPhysicalRecoveryReason} from './voice-protocol';
 import {startCallRingback} from './call-ringback';
 import './conversation-voice.css';
 const post=<T,>(url:string,body:unknown={})=>request<T>(url,{method:'POST',body:JSON.stringify(body)});
@@ -21,6 +22,7 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
   const [availability,setAvailability]=useState<Availability|null>(null),[permissionDenied,setPermissionDenied]=useState(false),[callOwner,setCallOwner]=useState<Owner|null>(null),[error,setError]=useState(''),[state,setState]=useState('ended'),[muted,setMuted]=useState(false),[callControls,setCallControls]=useState(false),[busy,setBusy]=useState(false),[inputLevel,setInputLevel]=useState(0),[outputLevel,setOutputLevel]=useState(0),[buffering,setBuffering]=useState(false),[waiting,setWaiting]=useState(false),[execution,setExecution]=useState('');
   const callConversation=useRef<Owner|null>(null),busyRef=useRef(false),permissionCleanup=useRef<(()=>void)|null>(null),ringback=useRef<(()=>void)|null>(null);
     const generation = useRef(0);
+    const dialogueId = useRef(crypto.randomUUID());
     const socket = useRef<WebSocket | null>(null), ctx = useRef<AudioContext | null>(null), stream = useRef<MediaStream | null>(null), capture = useRef<AudioWorkletNode | null>(null), playback = useRef<AudioWorkletNode | null>(null), intentional = useRef(false), retry = useRef(0), reconnect = useRef<ReturnType<typeof setTimeout> | null>(null), alive = useRef(true), activeCall = useRef(false), currentMuted = useRef(false), ready = useRef(false);
     const recoveryState=useRef<VoiceRecovery|null>(null),transportTimer=useRef<ReturnType<typeof setInterval>|null>(null),pendingPing=useRef(0);
 
@@ -46,9 +48,11 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
         const ticket = await post<{
             ticket: string;
             path: string;
-        }>(`/conversations/${callConversation.current!.id}/voice`, { takeover });
+            protocolVersion: number;
+        }>(`/conversations/${callConversation.current!.id}/voice`, { takeover, protocolVersion:VOICE_PROTOCOL_VERSION, dialogueId:dialogueId.current });
         if (!alive.current || intentional.current || epoch!==generation.current)
             return;
+        if(ticket.protocolVersion!==VOICE_PROTOCOL_VERSION)throw new Error(VOICE_REFRESH_MESSAGE);
         const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${ticket.path}`, ['pp-dot', ticket.ticket]);
         socket.current = ws;
         ws.onmessage = e => {
@@ -66,7 +70,7 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
                     activeCall.current = true;
                     retry.current = 0;
                     if (event.callId && recoveryState.current?.bind(event.callId,event.recoveryId)) {
-                        ready.current = true;
+                        ready.current = true;setError('');
                         playback.current?.port.postMessage({type:'bind',callId:event.callId,recoveryId:event.recoveryId});
                         send({ type: 'mute', muted: currentMuted.current });
                     }
@@ -85,6 +89,9 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
                 if(delayed){recoveryState.current?.freeze();playback.current?.port.postMessage({type:'invalidate',reason:'transport_delay'});}
             }
             if(event.type==='resync_required'){recoveryState.current?.freeze();playback.current?.port.postMessage({type:'invalidate',reason:event.reason});}
+            if(event.type==='playback_ready'&&event.mediaFence&&recoveryState.current?.resumePlayback(event.callId,event.recoveryId)){
+                playback.current?.port.postMessage({type:'resume',callId:event.callId,recoveryId:event.recoveryId,mediaFence:event.mediaFence});setError('');setState(currentMuted.current?'muted':'listening');
+            }
             if(event.type==='recovery_ready')recoveryState.current?.recoveryReady(event.recoveryId);
             if (event.type === 'audio'&&recoveryState.current?.accepts(event.callId,event.recoveryId)){
                 if(pendingPing.current&&performance.now()-pendingPing.current>1800){recoveryState.current?.freeze();playback.current?.port.postMessage({type:'invalidate',reason:'transport_delay'});return;}
@@ -99,10 +106,11 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
                 if (event.code) {
                     intentional.current = true;
                     cleanupAudio();
+                    setState('failed');
                 }
             }
         };
-        ws.onclose = () => { if(epoch!==generation.current||socket.current!==ws)return; ready.current=false; playback.current?.port.postMessage({type:'invalidate',reason:'transport_lost'});recover(); };
+        ws.onclose = () => { if(epoch!==generation.current||socket.current!==ws||intentional.current)return; ready.current=false; playback.current?.port.postMessage({type:'invalidate',reason:'transport_lost'});recover(); };
         ws.onerror = () => { if (alive.current && epoch===generation.current) {
             stopRingback();setError('通话连接中断，正在核对恢复。'); } };
     }
@@ -114,16 +122,17 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
             reconnect.current=setTimeout(()=>{if(epoch===generation.current&&!intentional.current)void start(false,true,true);},1500*2**attempt);
         }else if(alive.current){setState(intentional.current?'ended':'failed');setError('通话连接未能恢复。请重试连接；后台任务保持原状态。');}
     }
-    async function start(takeover = false, resume=false, automatic=false) { if (busyRef.current)return;if(recordingBusy){setError('请先结束录音输入，再继续实时通话。');return;} if(!resume&&!takeover){if(!availability?.available||!conversationId)return;currentMuted.current=false;setMuted(false);setExecution('');callConversation.current={id:conversationId,title:availability.title??'当前会话'};setCallOwner(callConversation.current);}if(!callConversation.current)return;onActivityChange(true);busyRef.current=true;generation.current++;const epoch=generation.current;setBusy(true);setCallControls(true); setError(''); intentional.current = false; if(!automatic)retry.current = 0; setState('connecting'); setWaiting(false); try {
+    async function start(takeover = false, resume=false, automatic=false) { if (busyRef.current)return;if(recordingBusy){setError('请先结束录音输入，再继续实时通话。');return;} if(!resume&&!takeover){if(!availability?.available||!conversationId)return;dialogueId.current=crypto.randomUUID();currentMuted.current=false;setMuted(false);setExecution('');callConversation.current={id:conversationId,title:availability.title??'当前会话'};setCallOwner(callConversation.current);}if(!callConversation.current)return;onActivityChange(true);busyRef.current=true;generation.current++;const epoch=generation.current;setBusy(true);setCallControls(true); setError(''); intentional.current = false; if(!automatic)retry.current = 0; setState('connecting'); setWaiting(false); try {
         const audio = new AudioContext();
         ctx.current = audio;
+        audio.onstatechange=()=>{if(epoch!==generation.current)return;send({type:'diagnostic',reason:'context_state',contextState:audio.state,visibility:document.visibilityState});if(audio.state==='suspended')setError('麦克风处理暂时暂停，返回通话可恢复。');};
         await audio.resume();
         if(epoch!==generation.current || !alive.current || intentional.current){void audio.close();return;}
         playRingback();
         const media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }, video: false });
         if(!alive.current||intentional.current||epoch!==generation.current){media.getTracks().forEach(t=>t.stop());void audio.close();return;}
         stream.current = media;media.getAudioTracks().forEach(t=>t.enabled=!currentMuted.current);
-        await Promise.all([audio.audioWorklet.addModule(`${BASE_PATH}/pp-dot-audio-worklet.js`),audio.audioWorklet.addModule(`${BASE_PATH}/pp-dot-playback-worklet.js`)]);
+        await Promise.all([audio.audioWorklet.addModule(`${BASE_PATH}/pp-dot-audio-worklet.js?v=${VOICE_PROTOCOL_VERSION}`),audio.audioWorklet.addModule(`${BASE_PATH}/pp-dot-playback-worklet.js?v=${VOICE_PROTOCOL_VERSION}`)]);
         if(epoch!==generation.current){media.getTracks().forEach(t=>t.stop());void audio.close();return;}
         if(!alive.current||intentional.current){cleanupAudio();return;}
         const output = new AudioWorkletNode(audio,'pp-dot-playback',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
@@ -138,28 +147,33 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
             if(data.type==='invalidate'){
                 stopRingback();setOutputLevel(0);setBuffering(false);setWaiting(false);
                 transport.invalidate(data.recoveryId,data.reason,data.at,data.speechStart);
-                setState(data.reason==='stop_audio'?'output_stopped':'resynchronizing');
+                const physical=isPhysicalRecoveryReason(data.reason);
+                setState(data.reason==='stop_audio'?'output_stopped':physical?'resynchronizing':currentMuted.current?'muted':'listening');
+                send({type:'diagnostic',reason:data.reason,source:'worklet',contextState:audio.state,visibility:document.visibilityState});
             }
             if(data.type==='played'&&transport.accepts(data.callId,data.recoveryId))send(data);
             if(data.type==='level'&&data.recoveryId===transport.recoveryId){setOutputLevel(data.rms);if(data.rms>.006)setWaiting(false);setBuffering(data.buffering&&data.queuedMs>0);}
         };
         const node = new AudioWorkletNode(audio, 'pp-dot-capture');
         capture.current = node;
+        await Promise.all([verifyVoiceWorklet(output.port),verifyVoiceWorklet(node.port)]);
+        if(epoch!==generation.current||intentional.current||!alive.current)return;
         const microphone=audio.createMediaStreamSource(media);microphone.connect(node);microphone.connect(output);
         node.connect(audio.destination);
         node.port.onmessage = ({data}) => {
             if(epoch!==generation.current||capture.current!==node)return;
             const pcm=new Int16Array(data.pcm),level=Math.sqrt(pcm.reduce((n,x)=>n+(x/32768)**2,0)/Math.max(pcm.length,1));
             setInputLevel(currentMuted.current?0:level);if(currentMuted.current)return;
-            if(audio.currentTime-data.at>1.8&&!transport.blocked){transport.freeze();output.port.postMessage({type:'invalidate',reason:'capture_delay'});setError('页面处理曾暂停，正在恢复最新发言。若漏掉内容，请完整重复该句。');}
+            if(audio.currentTime-data.at>1.8&&!transport.blocked){transport.freeze();output.port.postMessage({type:'invalidate',reason:'capture_delay'});send({type:'diagnostic',reason:'capture_delay',rttMs:(audio.currentTime-data.at)*1000,contextState:audio.state,visibility:document.visibilityState});}
             let binary='';for(const b of new Uint8Array(data.pcm))binary+=String.fromCharCode(b);
             transport.capture({audio:btoa(binary),seq:data.seq,at:data.at},audio.currentTime);
         };
         transportTimer.current=setInterval(()=>{
             if(epoch!==generation.current||socket.current?.readyState!==WebSocket.OPEN)return;
-            if(socket.current.bufferedAmount>64000){transport.freeze();output.port.postMessage({type:'invalidate',reason:'input_congestion'});return;}
+            if(socket.current.bufferedAmount>256000){transport.freeze();output.port.postMessage({type:'invalidate',reason:'input_congestion'});return;}
             const now=performance.now();
-            if(pendingPing.current&&now-pendingPing.current>1800){transport.freeze();output.port.postMessage({type:'invalidate',reason:'transport_delay'});return;}
+            if(pendingPing.current&&now-pendingPing.current>15000){transport.freeze();output.port.postMessage({type:'invalidate',reason:'upstream_unresponsive'});return;}
+            if(pendingPing.current&&now-pendingPing.current>1800){transport.freeze();output.port.postMessage({type:'invalidate',reason:'transport_delay'});}
             if(!pendingPing.current){pendingPing.current=now;send({type:'ping',at:now});}
             if(!currentMuted.current)transport.drain(audio.currentTime);
             if(transport.accepts(transport.callId,transport.recoveryId))setState(transport.synchronizing?'resynchronizing':currentMuted.current?'muted':'listening');
@@ -181,7 +195,7 @@ export function ConversationVoiceProvider({conversationId,enabled,recordingBusy,
     const connected=['connecting','listening','muted','reconnecting','resynchronizing','output_stopped'].includes(state);
     const labels:Record<string,string>={connecting:'正在连接',reconnecting:'正在恢复连接',resynchronizing:inputLevel>0.01?'正在听你说 · 同步中':'正在同步最新发言',output_stopped:'播报已停止 · 可以继续说',listening:outputLevel>0.006?'正在说话':buffering?'正在准备回答':inputLevel>0.01?'正在听你说':waiting?'正在思考':'正在倾听',muted:outputLevel>0.006?'正在说话 · 麦克风已静音':'麦克风已静音',paused:'通话已暂停',failed:'连接失败',ended:'通话已结束'};
     const status=labels[state]??state;
-    const value:Controls={selectedId:conversationId,owner:callOwner,available:Boolean(enabled&&!recordingBusy&&availability?.available&&availability.conversationId===conversationId&&!permissionDenied&&typeof navigator.mediaDevices?.getUserMedia==='function'&&typeof window.AudioWorkletNode==='function'),connected,state,body:Boolean(callOwner?.id===conversationId&&callControls),status,error,busy,muted,inputLevel,outputLevel,execution,start:()=>void start(),takeover:()=>void start(true,true),resume:()=>void start(false,true),pause:()=>hangup(true),end:()=>hangup(),mute:toggleMute,stop:()=>{setOutputLevel(0);playback.current?.port.postMessage({type:'invalidate',reason:'stop_audio'});},chat:()=>setCallControls(false),show:()=>setCallControls(true)};
+    const value:Controls={selectedId:conversationId,owner:callOwner,available:Boolean(enabled&&!recordingBusy&&availability?.available&&availability.conversationId===conversationId&&!permissionDenied&&typeof navigator.mediaDevices?.getUserMedia==='function'&&typeof window.AudioWorkletNode==='function'),connected,state,body:Boolean(callOwner?.id===conversationId&&callControls),status,error,busy,muted,inputLevel,outputLevel,execution,start:()=>void start(),takeover:()=>void start(true,true),resume:()=>void start(false,true),pause:()=>hangup(true),end:()=>hangup(),mute:toggleMute,stop:()=>{setOutputLevel(0);playback.current?.port.postMessage({type:'invalidate',reason:'stop_audio'});},chat:()=>setCallControls(false),show:()=>{setCallControls(true);if(ctx.current?.state==='suspended')void ctx.current.resume().then(()=>setError('')).catch(()=>setError('无法恢复麦克风，请暂停后继续。'));}};
     const elsewhere=Boolean(callOwner&&(!workspaceVisible||callOwner.id!==conversationId));
     return <VoiceContext.Provider value={value}>{children}{elsewhere&&createPortal(<aside className="voice-presence" aria-label="其他会话中的通话"><button onClick={()=>{onOpen(callOwner!.id);setCallControls(true);}}><Phone size={18}/><span>{callOwner!.title} · {status}</span><ArrowUpRight size={16}/></button><button onClick={toggleMute} aria-label={muted?'开启麦克风':'静音'}>{muted?<MicOff/>:<Mic/>}</button><button onClick={()=>hangup()} aria-label="结束通话"><PhoneOff/></button></aside>,document.body)}<span className="voice-sr-only" aria-live="polite">{callOwner?status:''}</span></VoiceContext.Provider>;
 }

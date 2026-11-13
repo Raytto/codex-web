@@ -47,8 +47,8 @@ try {
   await page.addInitScript(({ accountId, projectId, id }) => { const prefix = 'cww:account:' + encodeURIComponent(accountId) + ':'; localStorage.setItem(prefix + 'selected-project', projectId); localStorage.setItem(prefix + 'selected-conversation', id); }, { accountId: session.accountId, projectId: project.id, id });
   await page.goto(origin); await page.locator('.composer textarea').waitFor();
   const menu = page.locator('.conversation-menu-panel');
-  const open = async () => { if (!(await menu.isVisible())) await page.getByLabel('会话操作', { exact: true }).click(); };
-  const close = async () => { if (await menu.isVisible()) await page.getByLabel('会话操作', { exact: true }).click(); };
+  const open = async () => { if (!(await menu.isVisible())) await page.locator('.conversation-menu > summary').click(); };
+  const close = async () => { if (await menu.isVisible()) await page.locator('.conversation-menu > summary').click(); };
   await open(); await menu.getByText('Codex 上下文', { exact: true }).waitFor(); await menu.getByText('83%', { exact: true }).waitFor(); assert.equal(await menu.getByText('Rollout 文件', { exact: true }).count(), 1); report.checks.push('codex_context_quota_rollout_preserved');
   await close(); await page.locator('.composer textarea').focus(); await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click(); await page.getByRole('option', { name: /Gemini Metrics Fixture/ }).click(); await open(); await menu.getByText('Antigravity 上下文', { exact: true }).waitFor();
   assert.equal(await menu.getByText('套餐额度', { exact: true }).count(), 0); assert.equal(await menu.getByText('Rollout 文件', { exact: true }).count(), 0); await menu.getByTitle('最近一次请求使用的输入上下文 / 当前模型上下文窗口', { exact: true }).getByText('暂无数据', { exact: true }).waitFor(); report.checks.push('gemini_selection_hides_codex_quota_rollout_and_stale_codex_usage');
@@ -65,7 +65,7 @@ try {
     await page.locator('.pending-queue').waitFor();
     assert.equal(await page.locator('.engine-capability-note').count(), 0);
     assert.equal(await page.getByRole('button', { name: '引导', exact: true }).count(), 0);
-    await page.waitForFunction(() => document.querySelector('.activity-title')?.textContent.includes('Antigravity 不支持运行中引导'));
+    await page.waitForFunction(() => document.querySelector('.activity-title')?.textContent.includes('阶段说明和具体操作会在下方实时更新'));
     assert.equal(await page.getByText('完成前持续保留，可随时引导', { exact: true }).count(), 0);
     await page.locator('.composer textarea').focus();
     await page.locator('.composer').getByRole('button', { name: '模型', exact: true }).click();

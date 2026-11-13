@@ -1,3 +1,4 @@
+import {VOICE_PROTOCOL_VERSION} from '../src/voice-protocol.js';
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import crypto from 'node:crypto';import bcrypt from 'bcryptjs';import request from 'supertest';import WebSocket from 'ws';
 import {createApp} from '../server/app.js';import {HOST_ROOT_USER_ID as user} from '../server/host-root-user.js';import {createJobAutomationToken} from '../server/wake-automation.js';
 const id=()=>crypto.randomUUID(),selection={model:'gpt-6-astra',reasoningEffort:'xhigh'};
@@ -22,13 +23,19 @@ test('Dot real HTTP/WS routes enforce owner, CSRF, Origin, live coordinator toke
  const port=(server.address() as {port:number}).port;
  await new Promise<void>((resolve,reject)=>{const ws=new WebSocket(`ws://127.0.0.1:${port}/api/dot/live`,['pp-dot','invalid'],{origin:'https://evil.invalid'});ws.on('unexpected-response',(_r,res)=>{assert.equal(res.statusCode,401);res.resume();ws.terminate();resolve()});ws.on('error',()=>{});ws.on('open',()=>reject(Error('unauthorized websocket opened')))});
  // Missing configuration is a supported default: no file/key/proxy discovery.
- await a.post('/api/dot/call').set('X-CSRF-Token',csrf).send({}).expect(503);
+ await a.post('/api/dot/call').set('X-CSRF-Token',csrf).send({protocolVersion:VOICE_PROTOCOL_VERSION}).expect(503);
  const keys=['CODEX_WEB_LIVE_ENABLED','CODEX_WEB_LIVE_API_KEY_FILE','CODEX_WEB_LIVE_ENDPOINT','CODEX_WEB_LIVE_MODEL'] as const,prior=keys.map(k=>process.env[k]);
  try {
   process.env.CODEX_WEB_LIVE_ENABLED='true'; process.env.CODEX_WEB_LIVE_API_KEY_FILE=path.join(root,'fixture-key');
   process.env.CODEX_WEB_LIVE_ENDPOINT='wss://voice.example.invalid/live'; process.env.CODEX_WEB_LIVE_MODEL='fixture-live';
   fs.writeFileSync(process.env.CODEX_WEB_LIVE_API_KEY_FILE,'synthetic-no-network-credential');
-  const ticket=(await a.post('/api/dot/call').set('X-CSRF-Token',csrf).send({}).expect(200)).body.ticket;
+  for(const url of ['/api/dot/call','/api/conversations/'+cid+'/voice']){
+   for(const protocolVersion of [undefined,null,1,'2',3]){
+    const denied=await a.post(url).set('X-CSRF-Token',csrf).send({protocolVersion,takeover:true}).expect(409);assert.match(denied.body.error,/刷新/);
+   }
+  }
+  assert.equal((app.dotLive as any).tickets.size,0);
+  const ticket=(await a.post('/api/dot/call').set('X-CSRF-Token',csrf).send({protocolVersion:VOICE_PROTOCOL_VERSION}).expect(200)).body.ticket;
   assert.equal(typeof ticket,'string');
   await new Promise<void>((resolve,reject)=>{const ws=new WebSocket(`ws://127.0.0.1:${port}/api/dot/live`,['pp-dot',ticket],{origin:'https://evil.invalid'});ws.on('unexpected-response',(_r,res)=>{assert.equal(res.statusCode,401);res.resume();ws.terminate();resolve()});ws.on('error',()=>{});ws.on('open',()=>reject(Error('cross-origin call opened')))});
   assert.equal(app.db.sqlite.prepare('SELECT COUNT(*) n FROM dot_calls').get()?.n,0);

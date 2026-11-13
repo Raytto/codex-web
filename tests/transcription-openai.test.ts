@@ -1,3 +1,4 @@
+import { TRANSCRIPTION_FIXED_TERMS } from '../server/transcription-keywords.js';
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -38,8 +39,8 @@ test("provider compatibility and explicit language/proxy configuration", () => {
   assert.equal(transcriptionIdentity({...c,transcriptionProvider:"openai"}).model,"gpt-transcribe");
 });
 test("keyword validation keeps whole canonical terms and prompt excludes the keyword list", () => {
-  const picked=selectTranscriptionKeywords([" PP Agent ","PP  Agent","", "  ", "<bad>","line\rbreak","line\nbreak","x".repeat(161),"AtlasWidget","AtlasWidget"]);
-  assert.deepEqual(picked.values,["PP Agent","AtlasWidget"]); assert.equal(picked.skipped,8);
+  const picked=selectTranscriptionKeywords([" Codex Web ","Codex  Web","", "  ", "<bad>","line\rbreak","line\nbreak","x".repeat(161),"AtlasWidget","AtlasWidget"]);
+  assert.deepEqual(picked.values,["Codex Web","AtlasWidget"]); assert.equal(picked.skipped,8);
   assert.deepEqual(selectTranscriptionKeywords(["12345678","AB"],2).values,["AB"]);
   const prompt=buildOpenAITranscriptionPrompt({draftText:"Project background",personalizedTerms:["AtlasWidget"],recentMessages:[{role:"system",content:"not context"}]},100);
   assert.match(prompt,/Project background/); assert.doesNotMatch(prompt,/AtlasWidget|not context|常用技术词/);
@@ -50,23 +51,23 @@ test("actual serialized multipart separates context, keyword and language arrays
     count++; assert.match(String(url),/\/v1\/audio\/transcriptions$/);
     const wire=new Request(String(url),init); const bytes=await wire.arrayBuffer();
     const form=await new Response(bytes,{headers:{"content-type":wire.headers.get("content-type")!}}).formData();
-    assert.deepEqual(form.getAll("keywords[]"),["PP Agent","AtlasWidget"]);
+    assert.deepEqual(form.getAll("keywords[]"),[...TRANSCRIPTION_FIXED_TERMS,"AtlasWidget"]);
     assert.deepEqual(form.getAll("languages[]"),["zh","en"]); assert.equal(form.has("language"),false);
     assert.equal(form.get("model"),"gpt-transcribe");assert.equal(form.get("response_format"),"json");
     assert.match(String(form.get("prompt")),/Project background/);assert.doesNotMatch(String(form.get("prompt")),/AtlasWidget/);
     assert.equal((form.get("file") as File).type,"audio/wav");
-    assert.deepEqual([...form.keys()].sort(),["file","keywords[]","keywords[]","languages[]","languages[]","model","prompt","response_format"].sort());
+    assert.deepEqual([...form.keys()].sort(),["file",...Array(TRANSCRIPTION_FIXED_TERMS.length+1).fill("keywords[]"),"languages[]","languages[]","model","prompt","response_format"].sort());
     return Response.json({text:"不改成 12，keep 20 ms.",usage:{type:"duration",seconds:1}});
   }) as typeof fetch;
   const service=new TranscriptionService(f.config,fake,async (_i,o)=>fs.writeFileSync(o,wav()),async()=>{images++;return [];});
   const name=crypto.randomUUID()+".wav";const original=wav();fs.writeFileSync(path.join(service.audioRoot,name),original);
-  assert.equal(await service.transcribe(name,{draftText:"Project background",personalizedTerms:["PP Agent","AtlasWidget"],attachments:[{name:"photo.png",mimeType:"image/png"}]},{onUsage:s=>{seconds=s;}}),"不改成 12，keep 20 ms.");
+  assert.equal(await service.transcribe(name,{draftText:"Project background",personalizedTerms:["Codex Web","AtlasWidget"],attachments:[{name:"photo.png",mimeType:"image/png"}]},{onUsage:s=>{seconds=s;}}),"不改成 12，keep 20 ms.");
   assert.equal(seconds,1);assert.equal(count,1);assert.equal(images,0);assert.deepEqual(fs.readFileSync(path.join(service.audioRoot,name)),original);
   assert.deepEqual(fs.readdirSync(service.audioRoot),[name]);
 });
 test("permanent errors, empty 200, transient retry, duration usage and cancellation", async t => {
   const f=setup(t);
-  const base={...f,prompt:"background",keywords:["PP Agent"],timing:()=>{},retryDelays:[0,0],options:{}};
+  const base={...f,prompt:"background",keywords:["Codex Web"],timing:()=>{},retryDelays:[0,0],options:{}};
   for(const [status,body,match] of [
     [401,{},/认证/],[403,{},/权限/],[400,{},/参数/],[413,{},/大小/],
     [429,{error:{code:"credit_balance_exhausted"}},/额度不足/],[200,{text:" "},/清晰语音/],

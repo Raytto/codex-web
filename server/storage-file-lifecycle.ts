@@ -34,12 +34,14 @@ function fileLock(directory:string,id:string):()=>void {
   return ()=>fs.closeSync(fd);
 }
 export function assertFileNotOpen(file:string):void {
+  const deadline=performance.now()+500;
   if(process.platform!=='linux')throw new Error('storage_process_inspection_unsupported');
   if(!fs.existsSync(file))return;
   const st=fs.lstatSync(file),key=`${st.dev}:${st.ino}`;
   for(const pid of fs.readdirSync('/proc').filter(p=>/^\d+$/.test(p) && Number(p)!==process.pid)){
     try{
       for(const fd of fs.readdirSync(`/proc/${pid}/fd`)){
+        if(performance.now()>deadline)throw new Error('storage_process_inspection_budget');
         try{const s=fs.statSync(`/proc/${pid}/fd/${fd}`);if(`${s.dev}:${s.ino}`===key)throw new Error('storage_file_in_use');}
         catch(e){if(!['ENOENT','ESRCH'].includes((e as NodeJS.ErrnoException).code??''))throw e;}
       }
@@ -102,7 +104,7 @@ export class StorageFileLifecycle {
       this.guard(item,source);
       settleStandaloneSqlite(source);
       const before=fs.lstatSync(source),accessRevision=item.revision;
-      const archived=await this.chunks.archiveFile(userId,source);
+      const archived=await this.chunks.archiveFile(userId,source,{firstSeenAt:item.enrolled_at});
       if(cached && (cached.sha256!==archived.sha256 || cached.logical_bytes!==archived.bytes))throw new Error('storage_cache_copy_changed');
       // Reads and writers can proceed during upload; any real use aborts eviction.
       item=this.catalog.item(userId,itemId);
@@ -124,10 +126,14 @@ export class StorageFileLifecycle {
       this.catalog.db.prepare(`INSERT INTO storage_replicas(id,user_id,version_id,path,purpose,created_at,verified_at,allocated_bytes,state)
         VALUES(?,?,?,?,'isolation',?,?,?,'planned')`).run(replicaId,userId,version.id,isolated,this.catalog.now(),this.catalog.version(userId,version.id).verified_at!,before.blocks*512);
       this.catalog.db.prepare("UPDATE storage_versions SET state='isolating' WHERE id=?").run(version.id);
+      // Hashing can take seconds for a large object. Do it before reserving
+      // the shared writer; the inode/size/mtime/ctime fingerprint is checked
+      // again under the transaction immediately before the atomic rename.
+      if(sha256Path(source)!==version.sha256 || fileFingerprint(fs.lstatSync(source))!==archived.fingerprint)throw new Error('storage_evict_recheck_failed');
       return this.catalog.transaction(()=>{
         const current=this.catalog.item(userId,itemId);this.guard(current,source);
         if(!eligible(current) || current.current_version!==version.id || current.last_used_at!==item.last_used_at
-          || fileFingerprint(fs.lstatSync(source))!==archived.fingerprint || sha256Path(source)!==version.sha256)throw new Error('storage_evict_recheck_failed');
+          || fileFingerprint(fs.lstatSync(source))!==archived.fingerprint)throw new Error('storage_evict_recheck_failed');
         // Directory rename is atomic. The recorded generation is independent of
         // the currently warm version and never overwritten on the next cycle.
         fs.renameSync(source,isolated);syncDirectory(path.dirname(source));syncDirectory(path.dirname(isolated));
@@ -135,7 +141,7 @@ export class StorageFileLifecycle {
         this.catalog.db.prepare("UPDATE storage_replicas SET isolated_at=?,state='present' WHERE id=?").run(this.catalog.now(),replicaId);
         this.catalog.audit(userId,itemId,version.id,'isolated',before.blocks*512,{replica:replicaId});
         return this.catalog.db.prepare('SELECT * FROM storage_replicas WHERE id=?').get(replicaId) as StorageReplica;
-      });
+      },'storage_file_isolate');
     }catch(e){this.catalog.block(userId,itemId,e instanceof Error?e.message:'storage_archive_failed');throw e;}
     finally{release();}
   }

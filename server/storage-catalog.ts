@@ -35,13 +35,19 @@ const validTime = (value: number) => Number.isSafeInteger(value) && value > 0;
 export class StorageCatalog {
   constructor(readonly db: DatabaseSync, readonly now: () => number = Date.now) {}
 
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, operation = "storage_metadata"): T {
     // These are write transactions. Acquire the writer before the first read
     // so another connection cannot invalidate a deferred WAL snapshot.
     if(!this.db.isTransaction){
+      const waiting = performance.now();
       this.db.exec('BEGIN IMMEDIATE');
+      const acquired = performance.now();
       try{const result=fn();this.db.exec('COMMIT');return result;}
       catch(error){if(this.db.isTransaction)this.db.exec('ROLLBACK');throw error;}
+      finally {
+        const holdMs = Math.round(performance.now()-acquired), waitMs = Math.round(acquired-waiting);
+        if(holdMs>=250 || waitMs>=250) console.warn(JSON.stringify({event:'sqlite_write_transaction',operation,pid:process.pid,holdMs,waitMs}));
+      }
     }
     const savepoint = `storage_${crypto.randomBytes(8).toString('hex')}`;
     this.db.exec(`SAVEPOINT ${savepoint}`);

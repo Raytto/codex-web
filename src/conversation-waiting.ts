@@ -4,6 +4,7 @@ type WaitingConversation = Pick<Conversation, "status" | "external_status" | "wo
 
 export function conversationWaitingLabel(conversation: WaitingConversation, maintenancePhase = "idle"): string | null {
   if (conversation.status === "running" || conversation.external_status === "running") return null;
+  if (conversation.active_wake_count) return null; // The existing clickable clock opens the durable wait details.
   switch (conversation.workflow_state) {
     case "queued": return "正在排队";
     case "blocked": return "等待处理";

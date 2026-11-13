@@ -6,7 +6,7 @@ import path from "node:path";
 import { startAppServerTurn } from "../server/app-server-turn.js";
 import { DEFAULT_OPTIONAL_AGENT_CAPABILITIES } from "../server/optional-capabilities.js";
 
-function fixture(t: TestContext, mode = "ok") {
+function fixture(t: TestContext, mode = "ok", acquisitionWait?: (ms: number, signal: AbortSignal) => Promise<void>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "app-server-lifecycle-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const executablePath = path.join(root, "codex");
@@ -45,7 +45,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const controller = new AbortController();
   const progress: unknown[] = [];
   const run = (threadId: string | null = "root") => startAppServerTurn({
-    executablePath, cwd:root, env:{...process.env, CODEX_HOME:root, FAKE_MODE:mode}, threadId,
+    acquisitionWait, executablePath, cwd:root, env:{...process.env, CODEX_HOME:root, FAKE_MODE:mode}, threadId,
     prompt:"perform one action", imagePaths:[], model:"test", reasoningEffort:"low", library:root,
     shellEnvironment:{}, networkAccessEnabled:false, webSearchMode:"cached",
     optionalCapabilities:DEFAULT_OPTIONAL_AGENT_CAPABILITIES, codexEgressKind:"unchanged",
@@ -64,9 +64,11 @@ test("completed result waits for writer exit before the next immediate resume", 
 });
 
 test("transient writer contention retries acquisition and submits user input once", async t => {
-  const f = fixture(t,"busy");
+  const waits:number[]=[];
+  const f = fixture(t,"busy",async(ms,signal)=>{signal.throwIfAborted();waits.push(ms);});
   assert.equal(await f.run().result, "done");
   assert.equal(f.requests().filter(x=>x === "thread/resume").length, 3);
+  assert.deepEqual(waits,[250,500]);
   assert.equal(f.requests().filter(x=>x === "turn/start").length, 1);
   assert.ok(f.progress.some(p => (p as {label?:string}).label?.includes("释放会话")));
 });
@@ -100,9 +102,11 @@ test("writer text in a failed turn never replays user actions", async t => {
 });
 
 test("persistent contention has a bounded retry budget and never starts a turn", {timeout:20_000}, async t => {
-  const f = fixture(t,"always-busy");
+  const waits:number[]=[];
+  const f = fixture(t,"always-busy",async(ms,signal)=>{signal.throwIfAborted();waits.push(ms);});
   await assert.rejects(f.run().result,/active writer/);
   assert.equal(f.requests().filter(x=>x === "thread/resume").length, 7);
+  assert.deepEqual(waits,[250,500,1000,2000,4000,4000]);
   assert.equal(f.requests().includes("turn/start"), false);
 });
 

@@ -19,21 +19,22 @@ function digest(db:DatabaseSync,jobId:string,first:number,last:number):{sha256:s
 
 /** One bounded, consistent date/job slice. No event is deleted here, and the
  * independent sequence watermark is already installed by the DB migration. */
-export function prepareEventBatch(catalog:StorageCatalog,jobId:string,directory:string,budgetBytes=256*1024**2):Batch|null {
+export function prepareEventBatch(catalog:StorageCatalog,jobId:string,directory:string,budgetBytes=1024**2):Batch|null {
   const old=catalog.db.prepare('SELECT * FROM storage_event_batches WHERE job_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1').get(jobId) as Batch|undefined;
   if(old)return old;
   const job=catalog.db.prepare(`SELECT j.status,c.user_id FROM jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.id=?`).get(jobId);
   if(!job || ['running','queued'].includes(String(job.status)))throw new Error('storage_event_job_not_terminal');
   if(budgetBytes<1024 || budgetBytes>512*1024**2)throw new Error('storage_event_batch_budget');
+  budgetBytes=Math.min(budgetBytes,1024**2);
   fs.mkdirSync(directory,{recursive:true,mode:0o700});const id=crypto.randomUUID(),file=path.join(directory,`${id}.jsonl`);
   const fd=fs.openSync(file,'wx',0o600);let finished=false;
   try{
-    const value=catalog.transaction(()=>{
+    const snapshot=(()=>{
       const oldest=catalog.db.prepare('SELECT created_at FROM job_events WHERE job_id=? ORDER BY seq LIMIT 1').get(jobId);
       if(!oldest || typeof oldest.created_at!=='string' || !Number.isFinite(Date.parse(oldest.created_at)))return null;
       const day=oldest.created_at.slice(0,10),cutoff=new Date(catalog.now()-30*STORAGE_DAY).toISOString();
       const iterable=catalog.db.prepare(`SELECT seq,event_type,payload,created_at FROM job_events
-        WHERE job_id=? AND created_at<? AND substr(created_at,1,10)=? ORDER BY seq LIMIT 100000`).iterate(jobId,cutoff,day) as IterableIterator<Event>;
+        WHERE job_id=? AND created_at<? AND substr(created_at,1,10)=? ORDER BY seq LIMIT 256`).iterate(jobId,cutoff,day) as IterableIterator<Event>;
       let bytes=0,count=0,first=0,last=0,lastAt=0;const hash=crypto.createHash('sha256');
       for(const row of iterable){
         const body=line(row),size=Buffer.byteLength(body);if(size>budgetBytes)throw new Error('storage_event_single_row_exceeds_batch');
@@ -47,13 +48,26 @@ export function prepareEventBatch(catalog:StorageCatalog,jobId:string,directory:
       // event. Require the entire selected range to match the snapshot.
       const actual=digest(catalog.db,jobId,first,last);
       if(actual.sha256!==sha256 || actual.count!==count)throw new Error('storage_event_noncontiguous_partition');
+      return {first,last,count,sha256,lastAt,day};
+    })();
+    if(!snapshot)return null;
+    const {first,last,count,sha256,lastAt,day}=snapshot;
+    const value=catalog.transaction(()=>{
+      // File writes and fsync happen without the main DB writer. Revalidate
+      // this small bounded range after acquiring it; no stale snapshot delete.
+      const old=catalog.db.prepare('SELECT * FROM storage_event_batches WHERE job_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1').get(jobId) as Batch|undefined;
+      if(old)throw new Error('storage_event_batch_concurrent');
+      const job=catalog.db.prepare(`SELECT j.status,c.user_id FROM jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.id=?`).get(jobId);
+      if(!job || ['running','queued'].includes(String(job.status)))throw new Error('storage_event_job_became_active');
+      const actual=digest(catalog.db,jobId,first,last);
+      if(actual.sha256!==sha256 || actual.count!==count)throw new Error('storage_event_rows_changed');
       const item=catalog.enroll({userId:String(job.user_id),scope:'events',sourceKey:id,kind:'events',
         locator:{root:'events',path:`${id}.jsonl`},name:`events-${jobId}-${day}-${first}-${last}.jsonl`,trustedUsedAt:lastAt,timeBasis:'event-created-at'});
       catalog.link(String(job.user_id),item.id,'event-job',jobId);
       catalog.db.prepare(`INSERT INTO storage_event_batches(id,user_id,job_id,first_seq,last_seq,event_count,sha256,item_id,created_at,expires_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id,job.user_id,jobId,first,last,count,sha256,item.id,catalog.now(),lastAt+180*STORAGE_DAY);
       return catalog.db.prepare('SELECT * FROM storage_event_batches WHERE id=?').get(id) as Batch;
-    });finished=Boolean(value);return value;
+    },'storage_event_register');finished=Boolean(value);return value;
   }finally{fs.closeSync(fd);if(!finished)fs.unlinkSync(file);}
 }
 
@@ -67,6 +81,9 @@ export async function archiveEventBatch(lifecycle:StorageFileLifecycle,batch:Bat
     // recovery checkpoints may pin this immutable version beyond 180 days.
     catalog.reference(batch.user_id,version.id,'event-retention',batch.id,batch.expires_at);
     if(catalog.db.prepare('SELECT 1 FROM job_recovery_checkpoints WHERE job_id=?').get(batch.job_id))catalog.reference(batch.user_id,version.id,'recovery-events',batch.job_id);
+    // Old batches may predate the bound. Refuse oversized destructive work;
+    // retain originals and their verified cloud copy for operator reconciliation.
+    if(batch.event_count>256 || version.logical_bytes>1024**2)throw new Error('storage_event_legacy_batch_requires_partition');
     return catalog.transaction(()=>{
       const job=catalog.db.prepare('SELECT status FROM jobs WHERE id=?').get(batch.job_id);
       if(!job || ['running','queued'].includes(String(job.status)))throw new Error('storage_event_job_became_active');
@@ -78,7 +95,7 @@ export async function archiveEventBatch(lifecycle:StorageFileLifecycle,batch:Bat
       catalog.db.prepare('UPDATE storage_event_batches SET deleted_at=?,blocked_reason=NULL WHERE id=?').run(catalog.now(),batch.id);
       catalog.audit(batch.user_id,batch.item_id,version.id,'event_rows_pruned',0,{batch:batch.id,rows:removed,highWater:high.high_water});
       return removed; // SQLite free pages are not reported as physical release.
-    });
+    },'storage_event_prune');
   }catch(e){catalog.db.prepare('UPDATE storage_event_batches SET blocked_reason=? WHERE id=?').run(e instanceof Error?e.message:'storage_event_archive_failed',batch.id);throw e;}
 }
 

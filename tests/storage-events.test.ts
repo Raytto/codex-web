@@ -12,6 +12,30 @@ import {StorageFileLifecycle} from '../server/storage-file-lifecycle.js';
 import {storagePolicy,STORAGE_DAY} from '../server/storage-lifecycle-policy.js';
 import {prepareEventBatch,archiveEventBatch,reconcileEventReferences} from '../server/storage-events.js';
 import {readEventHistory} from '../server/storage-event-reader.js';
+import {DatabaseSync} from 'node:sqlite';
+
+test('event serialization and fsync leave the WAL writer available, with bounded lossless partitions',t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'storage-event-contention-')),db=new AppDatabase(root,undefined,false);
+ const peer=new DatabaseSync(path.join(root,'codex-web.sqlite'));peer.exec('PRAGMA busy_timeout=1');
+ try{
+  const cid=crypto.randomUUID(),jid=crypto.randomUUID();db.createConversation(cid,'partition');db.createJob(jid,cid);
+  const insert=db.sqlite.prepare('INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)');
+  db.sqlite.exec('BEGIN IMMEDIATE');
+  for(let i=1;i<=500;i++)insert.run(jid,i,'progress','x'.repeat(8192),new Date(Date.now()-40*STORAGE_DAY).toISOString());
+  db.sqlite.exec('COMMIT');db.sqlite.prepare("UPDATE jobs SET status='completed' WHERE id=?").run(jid);
+  const original=fs.fsyncSync;let syncs=0;
+  t.mock.method(fs,'fsyncSync',(fd:number)=>{
+   assert.equal(db.sqlite.isTransaction,false,'slow disk work must not own the shared writer');
+   peer.prepare('UPDATE jobs SET updated_at=updated_at WHERE id=?').run(jid);syncs++;original(fd);
+  });
+  const catalog=new StorageCatalog(db.sqlite),directory=path.join(root,'events');
+  const batch=prepareEventBatch(catalog,jid,directory,256*1024**2)!;
+  assert.ok(syncs>0);assert.ok(batch.event_count>0&&batch.event_count<=256);
+  assert.ok(fs.statSync(path.join(directory,batch.id+'.jsonl')).size<=1024**2);
+  assert.equal(db.sqlite.prepare('SELECT count(*) n FROM job_events WHERE job_id=?').get(jid)!.n,500);
+  assert.equal(prepareEventBatch(catalog,jid,directory)!.id,batch.id,'idempotent existing partition');
+ }finally{peer.close();db.close();fs.rmSync(root,{recursive:true,force:true});}
+});
 
 test('old events are pruned only after verified cloud storage, and an empty event table never resets its sequence',async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'storage-events-')),db=new AppDatabase(path.join(root,'data'),undefined,false);

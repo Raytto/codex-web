@@ -162,13 +162,17 @@ export class VoiceSubmissionService {
       try {
         fs.copyFileSync(resolveVoiceRecordingPath(this.config.dataRoot, audio.relativePath), temporary);
         const conversation = this.db.getConversationForUser(row.conversation_id, row.user_id)!;
-        const lexicon = formatVoiceLexiconTerms(this.db.listVoiceLexiconTerms(row.user_id, conversation.project_id, this.config.voiceLexiconMaxTerms));
+        const selection = this.db.selectVoiceLexiconTerms(row.user_id, conversation.project_id, this.config.voiceLexiconMaxTerms);
+        const lexicon = formatVoiceLexiconTerms(selection.terms);
         const workspace = path.join(this.config.tenantRoot, row.user_id, "conversations", row.conversation_id);
         let usageSeconds: number | undefined;
         const text = await this.transcription.transcribe(path.basename(temporary), {
           purpose: "composer", draftText: [pending.content, pending.quote_excerpt].filter(Boolean).join("\n"), attachmentNames: pending.files.map(f => f.original_name),
           attachments: pending.files.map(f => ({ name: f.original_name, filePath: resolveInside(workspace, f.relative_path), mimeType: f.mime_type, size: f.size })),
-          recentMessages: this.db.listMessages(row.conversation_id).filter(m => m.created_at <= row.created_at).slice(-4).map(m => ({ role: m.role, content: m.content })),
+          recentMessages: this.db.listMessages(row.conversation_id).filter(m => m.created_at <= row.created_at).slice(-10).map(m => ({ role: m.role, content: m.content })),
+          projectTitle: conversation.project_id ? this.db.getActiveProjectForUser(conversation.project_id, row.user_id)?.name : undefined,
+          keywordSelection: selection.diagnostics,
+          excludedTerms: this.db.suppressedVoiceLexiconTerms(row.user_id, conversation.project_id),
           personalizedTerms: ["Codex Web", ...lexicon.lines],
         }, { signal: controller.signal, onUsage: seconds => { usageSeconds = seconds; } });
         if (!text.trim()) throw new Error("没有识别到清晰语音，请重试。");

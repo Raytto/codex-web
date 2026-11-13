@@ -204,3 +204,5 @@ Follow the [upgrade notes](UPGRADE_20261030.md) for the additive opportunity que
 ## Current application update
 
 Live steering now requires Codex with the same model and reasoning effort as the active turn. Antigravity additions stay queued; the composer explains image-file handling and the bounded cross-engine context handoff. Login and conversation menus scroll on short displays, chat text keeps the chosen size, and opportunity sidebar navigation stays in its section menu. This update has no new database migration, environment key, default dependency or Worker protocol. Follow [upgrade checks](UPGRADE_20261104.md); username/password login stays available.
+
+Current upgrade and verification checklist: [voice, execution ownership and build update](UPGRADE_20261114.md).

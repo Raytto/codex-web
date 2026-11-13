@@ -101,7 +101,7 @@ export class DotStore {
     memories(user: string) { this.owner(user); return this.sql.prepare("SELECT id,content,source_id,state,revision FROM dot_memories WHERE user_id=? AND state!='forgotten' ORDER BY updated_at DESC").all(user) as DotMemory[]; }
     events(user: string, after = 0) { this.owner(user); return this.sql.prepare('SELECT seq,kind,source_id,content,created_at FROM dot_events WHERE user_id=? AND seq>? ORDER BY seq LIMIT 100').all(user, after) as DotEvent[]; }
     source(user: string, id: string) { const s = this.session(user); const m = this.db.getMessage(id); if (m && m.conversation_id === s?.conversation_id && m.role === 'user')
-        return; const e = this.sql.prepare("SELECT 1 FROM dot_events WHERE user_id=? AND source_id=? AND kind='voice_user'").get(user, id); if (!e)
+        return; const e = this.sql.prepare("SELECT 1 FROM dot_events WHERE user_id=? AND source_id=? AND kind IN ('voice_user','voice_input')").get(user, id); if (!e)
         throw new DotError(400, '需要总管中的真实用户消息或语音事件作为来源。'); }
     operation<T>(user: string, key: unknown, action: string, body: unknown, fn: () => T): T { this.owner(user); const k = nonempty(160).parse(key); const hash = crypto.createHash('sha256').update(JSON.stringify({ action, body })).digest('hex'); this.sql.exec('BEGIN IMMEDIATE'); try {
         const old = this.sql.prepare('SELECT * FROM dot_operations WHERE user_id=? AND request_key=?').get(user, k) as {
@@ -211,7 +211,7 @@ export class DotStore {
             content: string;
         }[];
         for (const m of messages.reverse()) {
-            if (this.sql.prepare("SELECT 1 FROM dot_events WHERE user_id=? AND source_id=? AND kind IN ('voice_user','voice_assistant','voice_user_context')").get(user, m.id))
+            if (this.sql.prepare("SELECT 1 FROM dot_events WHERE user_id=? AND source_id=? AND kind IN ('voice_user','voice_user_display','voice_assistant','voice_user_context')").get(user, m.id))
                 continue;
             this.event(user, 'message_' + m.role, m.id, m.content);
         }
@@ -242,7 +242,7 @@ export class DotStore {
     context(user: string) { this.reconcile(user); const session = this.session(user), tasks = this.tasks(user), memories = this.memories(user); const forgotten = this.sql.prepare("SELECT id,source_id FROM dot_memories WHERE user_id=? AND state='forgotten'").all(user); return { session, tasks, memories, forgotten, projection: projectDot(this, user), projects: this.db.listProjects(user).filter(p => !p.archived_at).map(p => ({ id: p.id, name: p.name, executorId: p.executor_id, root: p.root_path, capabilities:this.executorInfo?.(user,p.executor_id) })), schemas: { task_preview: { projectId:'目标项目ID', taskType:'同task_create', difficulty:'同task_create', capabilityReason:'同task_create', model:'明确指定时提供', reasoningEffort:'明确指定时提供', note:'只读核实选型，不创建任务；task_create仍会再次校验' }, task_create: { requestKey: 'UUID', projectId: 'context.projects 中精确 ID', title: '任务名', prompt: '已授权要求', sourceId: '本会话用户消息 ID 或语音事件 ID', taskType: 'youtube | web_research | gemini_specialist | general；自动按任务目的分类，省略为general', capabilityReason: 'gemini_specialist必填：已核实能力依据', difficulty: 'simple | standard | complex；省略为standard', model: '仅用户明确指定时填该节点目录ID；自动选择时省略', reasoningEffort: '仅明确指定时填该型号支持的值；否则平台按难度选择' }, task_steer: { requestKey: 'UUID', revision: 1, content: '补充', sourceId: '用户来源' }, task_review:{requestKey:'UUID',revision:1,jobId:'task_detail.job.id',sourceId:'task_detail.resultMessage.id',state:'completed | waiting_user | failed',summary:'核对证据后的业务结论'}, task_cancel: { requestKey: 'UUID', revision: 1 }, memory_put: { requestKey: 'UUID', id: '更新时提供', revision: '更新时提供', content: '事实或偏好', sourceId: '用户来源', state: 'confirmed | candidate' }, memory_forget: { requestKey: 'UUID', id: '记忆 ID', revision: 1, sourceId: '用户来源' } }, instructions: DOT_INSTRUCTIONS }; }
     boundedContext(user: string, budget = 6000) {
         const c=this.context(user);
-        const recent=this.sql.prepare("SELECT seq,kind,source_id,content FROM dot_events WHERE user_id=? AND kind IN ('message_user','message_assistant','voice_user','voice_assistant','voice_user_context') AND seq > COALESCE((SELECT MAX(seq) FROM dot_events WHERE user_id=? AND kind='memory_forgotten'),0) ORDER BY seq DESC LIMIT 48").all(user,user).reverse().map(row=>{
+        const recent=this.sql.prepare("SELECT seq,kind,source_id,content FROM dot_events WHERE user_id=? AND kind IN ('message_user','message_assistant','voice_user','voice_user_display','voice_assistant','voice_user_context') AND seq > COALESCE((SELECT MAX(seq) FROM dot_events WHERE user_id=? AND kind='memory_forgotten'),0) ORDER BY seq DESC LIMIT 48").all(user,user).reverse().map(row=>{
             const metadata=this.sql.prepare("SELECT content FROM dot_events WHERE user_id=? AND kind='voice_segment' AND source_id=?").get(user,row.source_id) as {content:string}|undefined;
             return {...row,...(metadata?{voice:JSON.parse(metadata.content)}:{})};
         });

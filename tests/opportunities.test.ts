@@ -224,6 +224,9 @@ test('topic relative ordering persists, appends new topics and isolates owners a
 });
 
 test('inbox, working, processed and dismissed views separate feedback and keep research links', t => {
+ // This is a collection test, not a wall-clock rollover test. Keep the batch
+ // and the today view on one logical day even when CI crosses local midnight.
+ t.mock.timers.enable({apis:['Date'],now:day});
  const {s,db,c,topic,p}=fixture(t);
  s.updateTopic(u,topic.id,{...topic,read_recent:false,limit_count:10,revision:topic.revision});
  const b=s.begin(u,topic.id,c.id,null),created=s.ingest(u,b.id,c.id,Array.from({length:10},(_,n)=>({key:'flow-'+n,content:content(200+n)}))).map(v=>v.idea);

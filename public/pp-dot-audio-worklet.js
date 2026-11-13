@@ -1,5 +1,7 @@
 class Capture extends AudioWorkletProcessor {
-  constructor(){super();this.samples=[];this.phase=0;this.total=0;this.n=0;this.clock=0;this.seq=0;}
+  constructor(){super();this.samples=[];this.phase=0;this.total=0;this.n=0;this.clock=0;this.seq=0;
+    this.port.onmessage=({data})=>{if(data.type==='voice_protocol')this.port.postMessage({type:'voice_protocol',version:2});};
+  }
   process(inputs){
     const channel=inputs[0]?.[0];if(channel){this.clock=typeof currentTime==='number'?currentTime+channel.length/sampleRate:this.clock+channel.length/sampleRate;
       for(const x of channel){this.total+=x;this.n++;this.phase+=24000;

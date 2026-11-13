@@ -29,7 +29,7 @@ class Publisher(unittest.TestCase):
 const root=process.env.TEST_ROOT;
 export class StorageHost{
  constructor(){this.roots={lifecycleRoot:path.join(root,'state')};this.policy={remoteRoot:'/instance',recipient:path.join(root,'recipient'),identity:path.join(root,'key')};
- this.db={prepare:()=>({get:()=>undefined})};this.reader={
+ this.db={prepare:()=>({get:()=>undefined})};this.reader={fileId:()=>"fixture-file-id",
  putImmutable:async(source,remote)=>{let target=path.join(root,'cloud',remote);fs.mkdirSync(path.dirname(target),{recursive:true});
  if(fs.existsSync(target)&&!fs.readFileSync(target).equals(fs.readFileSync(source)))throw Error('immutable mismatch');
  fs.copyFileSync(source,target);fs.appendFileSync(path.join(root,'calls'),'put\\n');},
@@ -63,6 +63,18 @@ export class StorageHost{
    state=json.loads((root/'state/portable-catalog/state.json').read_text())
    self.assertEqual(state['catalogSha256'],hashlib.sha256(recover.encoded(catalog)).hexdigest())
    self.assertTrue(state['lastDelta'])
+   self.assertEqual(state['descriptorProof']['catalogSha256'],state['catalogSha256'])
+   self.assertEqual(state['descriptorProof']['fileId'],'fixture-file-id')
+   # Upgrade an already published catalogue without rereading old business
+   # objects: only a new empty delta and its receipt acquire the missing proof.
+   prior_descriptor=state['latestDescriptor'];state.pop('descriptorProof')
+   (root/'state/portable-catalog/state.json').write_text(json.dumps(state))
+   before=(root/'calls').read_text().splitlines();run()
+   state=json.loads((root/'state/portable-catalog/state.json').read_text())
+   self.assertNotEqual(state['latestDescriptor'],prior_descriptor)
+   self.assertEqual(state['descriptorProof']['catalogSha256'],state['catalogSha256'])
+   self.assertEqual((root/'calls').read_text().splitlines()[len(before):],['put','get','put','get'])
+   calls=(root/'calls').read_text();run();self.assertEqual((root/'calls').read_text(),calls)
 
 
 if __name__=='__main__':unittest.main()

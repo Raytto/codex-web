@@ -33,3 +33,9 @@ The default provider remains `dashscope`. Supply your own `DASHSCOPE_API_KEY`, r
 ## Context and privacy
 
 The OpenAI adapter sends bounded prose context as `prompt`, validated literal terms as `keywords[]`, and optional language hints as `languages[]`; it does not embed a term list into the prose prompt. Only relevant account/project context is selected. Browser audio is converted to 16 kHz mono PCM WAV with ffmpeg and rejected if it exceeds the provider byte limit; it is not silently cut off. Existing recording duration/input limits continue to apply. Synthetic tests use generated audio and mocked HTTP/local transports, including real conversion; they are not proof of recognition quality on a user's device or a successful paid API call.
+
+## Bounded context update (2026-11-14)
+
+Dynamic prose defaults to 2000 approximate tokens with the latest ten user/assistant messages. Weighted allocation keeps both the beginning and latest conclusion of long sources; an empty conversation may include its project title. Literal keywords are selected independently, capped at 200 terms, with account/project suppression respected. These controls do not grant a provider key or change any account's endpoint/model. Inspect actual provider/model diagnostics and test your own short recording after changing explicit settings.
+
+正文默认2000近似token、最近10条对话，长资料保留开头与结论；空会话可使用项目名。术语最多200项，去重、禁用词和关键词预算独立生效。已有环境覆盖继续优先；这不等于真实识别质量或付费接口验收。

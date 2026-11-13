@@ -1,3 +1,4 @@
+import { SqliteTelemetry, guardedCallback, reportBackgroundError, shortSqliteAttempt } from './sqlite-contention.js';
 import { ExecutionUncertainError } from "./execution-ownership.js";
 import type { GeminiAccountRequest, GeminiAccountResult, GeminiAccountsState } from "../remote-worker/src/gemini-account-types.js";
 import type { ResetConsumption } from "../remote-worker/src/codex-reset-consumer.js";
@@ -173,6 +174,7 @@ export class RemoteWorkerGateway extends EventEmitter {
   private readonly pendingSteers = new Map<string, { jobId: string; workerId: string; resolve(turnId: string): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private readonly pendingJobs = new Map<string, PendingJob>();
   private readonly bootstrapGrants = new Map<string, BootstrapGrant>();
+  private readonly telemetry: SqliteTelemetry;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private closing = false;
   transferBusy: (executorId: string) => boolean = () => false;
@@ -187,6 +189,7 @@ export class RemoteWorkerGateway extends EventEmitter {
     if (config.containerized && config.remoteWorkerEnrollmentToken && !this.targetRelease) {
       throw new Error("Remote Worker release package is missing from the production image");
     }
+    this.telemetry = new SqliteTelemetry(db.sqlite);
     for (const worker of db.listRemoteWorkers()) db.markRemoteWorkerOffline(worker.id);
     for (const worker of db.listRemoteWorkers()) this.maybeQueueAutomaticWorkerUpdate(worker.id);
     sweepOwnedStagingDirectories(config.dataRoot, "remote-worker-staging", (jobId) => {
@@ -207,12 +210,13 @@ export class RemoteWorkerGateway extends EventEmitter {
       if (pathname !== `${this.config.basePath}/api/remote-workers/connect`) { socket.destroy(); return; }
       this.server.handleUpgrade(request, socket, head, (ws) => this.server.emit("connection", ws, request));
     });
-    this.heartbeatTimer = setInterval(() => this.checkHeartbeats(), 15_000);
+    this.heartbeatTimer = setInterval(() => guardedCallback("worker_heartbeat_sweep", () => this.checkHeartbeats()), 15_000);
     this.heartbeatTimer.unref();
   }
 
   close(): void {
     this.closing = true;
+    this.telemetry.close();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     for (const connection of this.connections.values()) connection.socket.close(1001, "server shutdown");
     for (const [requestId, pending] of this.pendingFileFetches) {
@@ -986,16 +990,22 @@ export class RemoteWorkerGateway extends EventEmitter {
       // Only validated traffic from the current authenticated socket proves
       // liveness; heartbeat data still exclusively reconciles active jobs.
       current.lastMessageAt = Date.now();
-      this.handleMessage(authenticatedWorkerId, message);
+      try { shortSqliteAttempt(this.db.sqlite, () => this.handleMessage(authenticatedWorkerId!, message)); }
+      catch (error) {
+        reportBackgroundError(`worker_message_${message.type}`, error);
+        // Do not replay arbitrary messages. The Worker retains terminal results
+        // and reconnects to the existing run through the recovery protocol.
+        socket.close(1013, "database temporarily unavailable");
+      }
     });
-    socket.on("close", () => {
+    socket.on("close", () => guardedCallback("worker_socket_close", () => {
       clearTimeout(authTimer);
       if (!authenticatedWorkerId) return;
       const current = this.connections.get(authenticatedWorkerId);
       if (current && current.socket !== socket) return;
       if (current?.socket === socket) this.connections.delete(authenticatedWorkerId);
       if (this.closing) return;
-      this.db.markRemoteWorkerOffline(authenticatedWorkerId);
+      this.telemetry.put(`presence:${authenticatedWorkerId}`, () => this.db.markRemoteWorkerOffline(authenticatedWorkerId!));
       this.armJobDisconnectTimers(authenticatedWorkerId);
       for (const [requestId, pending] of this.pendingFileFetches) {
         if (pending.workerId !== authenticatedWorkerId) continue;
@@ -1017,7 +1027,7 @@ export class RemoteWorkerGateway extends EventEmitter {
         clearTimeout(pending.timer); this.pendingCodexAccounts.delete(requestId); pending.reject(new Error("远程电脑在 Codex 账号操作期间离线"));
       }
       this.emit("status", authenticatedWorkerId);
-    });
+    }));
   }
 
   private allowedLegacyMigration(workerId: string, token: string): boolean {
@@ -1132,9 +1142,12 @@ export class RemoteWorkerGateway extends EventEmitter {
     if (message.type === "quota_usage") {
       if (!message.usage || (message.usage.remainingPercent !== null && (typeof message.usage.remainingPercent !== "number" || !Number.isFinite(message.usage.remainingPercent)))) return;
       const executorId = remoteExecutorId(workerId);
-      if (this.db.setExecutorCodexQuota(executorId, message.usage, message.accountId)) {
-        this.emit("quota_usage", { workerId, executorId, usage: message.usage });
-      }
+      const observedAt = new Date().toISOString();
+      this.telemetry.put(`quota:${executorId}`, () => {
+        if (this.db.setExecutorCodexQuota(executorId, message.usage, message.accountId, observedAt)) {
+          this.emit("quota_usage", { workerId, executorId, usage: message.usage });
+        }
+      });
       return;
     }
     if (message.type === "thread_activity") {
@@ -1154,7 +1167,6 @@ export class RemoteWorkerGateway extends EventEmitter {
       if (connection) {
         connection.lastHeartbeat = Date.now();
         connection.activeJobs = new Set(message.activeJobs);
-        connection.heartbeatSeen = true;
       }
       // A missing Job only proves it was lost when a newly established Worker
       // connection reports its first process-local active set. During a normal
@@ -1162,6 +1174,7 @@ export class RemoteWorkerGateway extends EventEmitter {
       // event, so reconciling every heartbeat would mask the real error as a
       // reconnect failure and bypass the runner's retry policy.
       if (firstHeartbeat) this.reconcileWorkerJobs(workerId, message.activeJobs);
+      if (connection) connection.heartbeatSeen = true;
       for (const jobId of message.retainedJobs ?? []) {
         const job = this.db.getJob(jobId);
         const conversation = job ? this.db.getConversation(job.conversation_id) : undefined;
@@ -1170,7 +1183,7 @@ export class RemoteWorkerGateway extends EventEmitter {
           this.send(connection.socket, { type: "run_release", jobId });
         }
       }
-      this.db.updateRemoteWorkerPresence(workerId, "online", message.activeJobs.length);
+      this.telemetry.put(`presence:${workerId}`, () => this.db.updateRemoteWorkerPresence(workerId, "online", message.activeJobs.length));
       if (connection) this.send(connection.socket, { type: "heartbeat_ack", at: new Date().toISOString() });
       this.maybeQueueAutomaticWorkerUpdate(workerId);
       this.maybeDispatchWorkerUpdate(workerId);
@@ -1473,8 +1486,8 @@ export class RemoteWorkerGateway extends EventEmitter {
   private updatePresence(workerId: string): void {
     const connection = this.connections.get(workerId);
     const active = this.activeJobCount(workerId, connection);
-    this.db.updateRemoteWorkerPresence(workerId, connection ? "online" : "offline", active);
-    this.emit("status", workerId);
+    this.telemetry.put(`presence:${workerId}`, () => this.db.updateRemoteWorkerPresence(workerId, connection ? "online" : "offline", active));
+    guardedCallback("worker_presence_status", () => this.emit("status", workerId));
   }
 
   private activeJobCount(workerId: string, connection?: Connection): number {

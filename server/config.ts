@@ -171,7 +171,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     transcriptionTimeoutMs: overrides.transcriptionTimeoutMs ?? Number(process.env.TRANSCRIPTION_TIMEOUT_MS ?? 120000),
     transcriptionContextTokenBudget: boundedInteger(
       overrides.transcriptionContextTokenBudget ?? process.env.TRANSCRIPTION_CONTEXT_TOKEN_BUDGET,
-      500, 100, 4000,
+      2000, 100, 4000,
     ),
     transcriptionContextMaxImages: boundedInteger(
       overrides.transcriptionContextMaxImages ?? process.env.TRANSCRIPTION_CONTEXT_MAX_IMAGES,
@@ -186,7 +186,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     voiceLexiconDelayMs: boundedInteger(overrides.voiceLexiconDelayMs ?? process.env.VOICE_LEXICON_DELAY_MS, 3 * 60 * 60_000, 5 * 60_000, 24 * 60 * 60_000),
     voiceLexiconBatchThreshold: boundedInteger(overrides.voiceLexiconBatchThreshold ?? process.env.VOICE_LEXICON_BATCH_THRESHOLD, 20, 2, 100),
     voiceLexiconBatchSize: boundedInteger(overrides.voiceLexiconBatchSize ?? process.env.VOICE_LEXICON_BATCH_SIZE, 20, 1, 50),
-    voiceLexiconMaxTerms: boundedInteger(overrides.voiceLexiconMaxTerms ?? process.env.TRANSCRIPTION_LEXICON_MAX_TERMS, 100, 1, 100),
+    voiceLexiconMaxTerms: boundedInteger(overrides.voiceLexiconMaxTerms ?? process.env.TRANSCRIPTION_LEXICON_MAX_TERMS, 200, 1, 200),
     voiceLexiconTokenBudget: boundedInteger(overrides.voiceLexiconTokenBudget ?? process.env.TRANSCRIPTION_LEXICON_TOKEN_BUDGET, 1600, 100, 8000),
   };
 }

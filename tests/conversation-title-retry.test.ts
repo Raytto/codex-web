@@ -144,13 +144,13 @@ test("title retry falls back to the new request if the original has no usable te
   assert.equal(app.db.getConversation(app.id)?.title_source, "manual");
 });
 
-test("Antigravity titles use the shared retry lifecycle and audit Flash low without renaming a retired Codex thread", async (context) => {
+test("Antigravity titles use the same Codex naming, retry and manual-title protection without renaming a retired thread", async (context) => {
   const app = await fixture(context);
   app.db.sqlite.prepare("UPDATE conversations SET agent_model='antigravity:gemini-4-argon',reasoning_effort='high' WHERE id=?").run(app.id);
   const calls: unknown[][] = [];
   app.runner.generateConversationTitle = async (...args) => {
     calls.push(args);
-    if (calls.length === 1) throw new Error("temporary Gemini failure");
+    if (calls.length === 1) throw new Error("temporary naming failure");
     return JSON.stringify({ title: "整理季度销售" });
   };
   let renames = 0;
@@ -158,14 +158,17 @@ test("Antigravity titles use the shared retry lifecycle and audit Flash low with
   await app.submit("整理季度销售表格");
   await app.drain();
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][4], "antigravity");
+  assert.equal(calls[0][4], "codex");
   assert.equal(app.db.getLatestConversationTitleAudit(app.id)?.status, "failed");
   await app.submit("继续");
   await app.drain();
   assert.equal(calls.length, 2);
   assert.match(String(calls[1][2]), /整理季度销售表格/);
   const audit = app.db.getLatestConversationTitleAudit(app.id)!;
-  assert.equal(audit.model, "antigravity:gemini-title-fixture");
+  assert.equal(calls[1][4], "codex");
+  assert.equal(audit.model, "gpt-5.6-luna");
+  assert.equal(audit.prompt_version, "codex-title-v1");
+  assert.equal(JSON.parse(audit.context_json).conversationEngineId, "antigravity");
   assert.equal(audit.reasoning_effort, "low");
   assert.equal(audit.status, "succeeded");
   assert.equal(app.db.getConversation(app.id)?.title, "整理季度销售");

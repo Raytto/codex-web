@@ -62,10 +62,12 @@ if (cmd === 'upload') {
 }
 process.exit(2);
 `, { mode: 0o700 });
-    const roots = defaultColdStorageRoots({ aliyunpan: program });
+    const waits:number[]=[];
+    const roots = defaultColdStorageRoots({ aliyunpan: program, retryWait: ms => waits.push(ms) });
     if (mode === "listing-fails") {
       assert.throws(() => uploadColdArchive(roots, path.join(root, "hash.age"), "/archive"), /云端目录读取失败/);
       assert.equal(JSON.parse(fs.readFileSync(state, "utf8")).uploads, 0);
+      assert.deepEqual(waits,[1000,2000,1000,1000,2000,2000,1000,2000]);
     } else {
       uploadColdArchive(roots, path.join(root, "hash.age"), "/archive");
       const final = JSON.parse(fs.readFileSync(state, "utf8"));
@@ -85,6 +87,8 @@ const n = fs.existsSync(p) ? Number(fs.readFileSync(p)) : 0; fs.writeFileSync(p,
 if (process.argv[2] !== 'ls') process.exit(9);
 if (n > 0) console.log('当前目录: /archive');
 `, { mode: 0o700 });
-  ensureRemotePath(defaultColdStorageRoots({ aliyunpan: program }), "/archive");
+  const waits:number[]=[];
+  ensureRemotePath(defaultColdStorageRoots({ aliyunpan: program, retryWait: ms => waits.push(ms) }), "/archive");
+  assert.deepEqual(waits,[1000]);
   assert.equal(Number(fs.readFileSync(counter)), 2);
 });

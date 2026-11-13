@@ -1,4 +1,4 @@
-﻿# Codex Web 新云服务器部署与运维手册（供 AI 执行）
+# Codex Web 新云服务器部署与运维手册（供 AI 执行）
 
 > 核验日期：2026-08-26
 >
@@ -775,3 +775,5 @@ Apply the [upgrade checklist](docs/UPGRADE_20261020.md) after saving an operator
 ## Optional engine after basic installation
 
 First bring up the default `runtime` image and verify password login, persistence and isolation. Then optionally connect Gemini on the selected node following [MULTI_ENGINE](docs/MULTI_ENGINE.md). Keep its credentials local and configure naming only when desired. Apply [current migrations](docs/UPGRADE_20261025.md) on your own state; do not import another instance's data.
+
+Current upgrade and verification checklist: [voice, execution ownership and build update](docs/UPGRADE_20261114.md).

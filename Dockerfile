@@ -1,10 +1,12 @@
-FROM node:22-bookworm-slim AS source
-
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE} AS dependencies
 WORKDIR /app
 ARG NODE_OPTIONS=--max-old-space-size=1536
 ENV NODE_OPTIONS=$NODE_OPTIONS
-COPY package.json package-lock.json ./
-RUN npm ci && npm cache clean --force
+COPY --chmod=0644 package.json package-lock.json ./
+RUN --mount=type=cache,id=codex-web-npm,target=/root/.npm,sharing=locked npm ci --prefer-offline
+
+FROM dependencies AS source
 COPY index.html tsconfig*.json vite.config.ts ./
 COPY Dockerfile ./Dockerfile
 COPY compose.yaml ./
@@ -18,7 +20,11 @@ COPY account-resources ./account-resources
 COPY remote-worker ./remote-worker
 COPY scripts ./scripts
 
-FROM source AS test
+# Compilation is shared by optional verification and the default runtime build.
+FROM source AS compiled
+RUN npm run build
+
+FROM compiled AS test
 COPY .github ./.github
 COPY README.md ./README.md
 COPY docs ./docs
@@ -26,16 +32,24 @@ RUN mkdir -p /etc/ssl/certs \
     && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
     && sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl age ffmpeg git python3 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl age ffmpeg git python3 sqlite3 zip util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && npm --prefix remote-worker ci \
-    && npm run verify
+    && npm run lint && node tests/run-app-tests.mjs && npm run test:worker && npm run test:storage-tools
 
-FROM source AS build
-RUN npm run build && npm prune --omit=dev
+FROM compiled AS build
+RUN node scripts/process-manifests.mjs --prune
 
-FROM source AS worker-release
+# Worker source/dependencies no longer depend on web-only changes.
+FROM ${NODE_IMAGE} AS worker-dependencies
+WORKDIR /app/remote-worker
+COPY --chmod=0644 remote-worker/package.json remote-worker/package-lock.json ./
+RUN --mount=type=cache,id=codex-web-npm,target=/root/.npm,sharing=locked npm ci --prefer-offline
+
+FROM worker-dependencies AS worker-release
 ARG WORKER_RELEASE_COMMIT
+COPY remote-worker ./
+WORKDIR /app
 RUN test -n "$WORKER_RELEASE_COMMIT" || (echo "Set WORKER_RELEASE_COMMIT to the reviewed source SHA; scripts/build-image.sh supplies it automatically" >&2; exit 2)
 RUN mkdir -p /etc/ssl/certs \
     && node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n"))' \
@@ -43,18 +57,17 @@ RUN mkdir -p /etc/ssl/certs \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zip \
     && rm -rf /var/lib/apt/lists/* \
-    && npm --prefix remote-worker ci \
     && npm --prefix remote-worker run build \
     && npm --prefix remote-worker prune --omit=dev \
     && remote-worker/scripts/build-release-package.sh /app/worker-release "$WORKER_RELEASE_COMMIT"
 
-FROM node:22-bookworm-slim AS codex-baked
-ARG CODEX_CLI_VERSION=0.162.1
+FROM ${NODE_IMAGE} AS codex-baked
+ARG CODEX_CLI_VERSION=0.167.1
 RUN npm install --global --prefix /opt/codex-baked "@openai/codex@${CODEX_CLI_VERSION}" \
     && /opt/codex-baked/bin/codex --version \
     && npm cache clean --force
 
-FROM node:22-bookworm-slim AS runtime-base
+FROM ${NODE_IMAGE} AS runtime-base
 
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.12.12
@@ -70,6 +83,7 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/dist-server ./dist-server
+COPY --from=build /app/process-manifests ./process-manifests
 COPY --from=worker-release /app/worker-release ./worker-release
 COPY --from=codex-baked /opt/codex-baked /opt/codex-baked
 COPY package.json ./

@@ -506,7 +506,7 @@ test("wake plan card is appended after the conversation content", () => {
   assert.ok(messagesEnd > messagesStart);
   assert.ok(wakePlanRender > messagesEnd);
   assert.match(messageListSource, /afterMessages\?: React\.ReactNode/);
-  assert.match(appSource, /\[detail\?\.messages\.length, detail\?\.wakePlan\?\.id, activities, sending\]/);
+  assert.match(appSource, /\[detail\?\.messages\.length, detail\?\.wakePlan\?\.id, activities, sending, followMessageLayout\]/);
 });
 
 test("main chat and reader use the shared conversation primitives", () => {
@@ -2326,7 +2326,7 @@ test("personal memory management API reviews entries and bumps manual file revis
   assert.equal(loadPersonalContextForTurn(ensureTenant(tenantRoot, LEGACY_USER_ID).library, "existing-thread", 1, saved.body.revision)?.revision, 2);
 });
 
-test("voice lexicon management API exposes the ranked top one hundred and every candidate only to its owner", async (context) => {
+test("voice lexicon management API exposes the ranked top two hundred and every candidate only to its owner", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-voice-lexicon-management-test-"));
   const instance = createApp({ basePath: "",
     projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"),
@@ -2348,11 +2348,11 @@ test("voice lexicon management API exposes the ranked top one hundred and every 
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   const now = "2026-08-16T14:30:00.000Z";
-  for (let index = 0; index < 105; index += 1) {
+  for (let index = 0; index < 205; index += 1) {
     insert.run(
       crypto.randomUUID(), LEGACY_USER_ID, project.id, `term-${index}`, `Term ${index}`,
-      index === 104 ? '["听错词"]' : "[]", "product_name", "active",
-      index / 105, index + 1, index / 10, index / 200, index, now, now,
+      index === 204 ? '["听错词"]' : "[]", "product_name", "active",
+      index / 205, index + 1, index / 10, index / 200, index, now, now,
     );
   }
   for (let index = 0; index < 2; index += 1) {
@@ -2369,10 +2369,10 @@ test("voice lexicon management API exposes the ranked top one hundred and every 
   const login = await agent.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
   const response = await agent.get("/api/voice-lexicon").expect(200);
   assert.match(response.headers["cache-control"], /no-store/);
-  assert.equal(response.body.maxSelectedTerms, 100);
-  assert.equal(response.body.activeCount, 105);
-  assert.equal(response.body.selectedTerms.length, 100);
-  assert.equal(response.body.selectedTerms[0].canonical_text, "Term 104");
+  assert.equal(response.body.maxSelectedTerms, 200);
+  assert.equal(response.body.activeCount, 205);
+  assert.equal(response.body.selectedTerms.length, 200);
+  assert.equal(response.body.selectedTerms[0].canonical_text, "Term 204");
   assert.deepEqual(response.body.selectedTerms[0].aliases, ["听错词"]);
   assert.equal(response.body.selectedTerms.at(-1).canonical_text, "Term 5");
   assert.equal(response.body.candidateCount, 2);
@@ -2391,7 +2391,7 @@ test("voice lexicon management API exposes the ranked top one hundred and every 
   const disabled = await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: true }).expect(200);
   assert.equal(disabled.body.suppressedCount, 1);
   assert.equal(disabled.body.suppressedTerms[0].id, termId);
-  assert.equal(disabled.body.selectedTerms.length, 100);
+  assert.equal(disabled.body.selectedTerms.length, 200);
   assert.equal(disabled.body.selectedTerms.at(-1).canonical_text, "Term 4");
   assert.equal(instance.db.listVoiceLexiconTerms(LEGACY_USER_ID, project.id).some((term) => term.id === termId), false);
   await agent.patch(endpoint).set("X-CSRF-Token", login.body.csrfToken).send({ disabled: true }).expect(200);
@@ -3378,6 +3378,7 @@ test("remote activity observation does not replay Codex Web controlled turns as 
   });
   const job = db.createJob(crypto.randomUUID(), conversation.id, userMessageId, selection);
   db.updateJob(job.id, "running");
+  db.sqlite.prepare("UPDATE jobs SET created_at=? WHERE id=?").run("2026-07-24T09:10:57.000Z", job.id);
 
   const controlledSnapshot = {
     id: "thread-controlled", name: "连接测试", createdAt: 1_785_000_000, updatedAt: 1_785_000_010, status: "running" as const,
@@ -6058,13 +6059,13 @@ test("composer drafts and attachments survive browser sessions and are consumed 
   const awaitingInstruction = await firstBrowser.post(`/api/conversations/${fileOnlyId}/messages`)
     .set("X-CSRF-Token", firstLogin.body.csrfToken)
     .field("message", "").field("useComposerDraft", "true").expect(202);
-  assert.equal(awaitingInstruction.body.needsInstruction, true);
-  assert.equal(awaitingInstruction.body.editingPrompt.status, "editing");
-  assert.deepEqual(awaitingInstruction.body.editingPrompt.files.map((file: { original_name: string }) => file.original_name), ["needs-instruction.txt"]);
+  assert.equal(awaitingInstruction.body.needsInstruction, undefined);
+  assert.ok(awaitingInstruction.body.job);
+  assert.deepEqual(instance.db.listMessages(fileOnlyId).map(m=>({content:m.content,files:m.files.map(f=>f.original_name)})),[{content:"",files:["needs-instruction.txt"]}]);
   assert.equal(instance.db.getComposerDraft(fileOnlyId), undefined);
 });
 
-test("file-only submissions persist on the server and wait for a real instruction", async (context) => {
+test("file-only submissions execute, preserve drafts and queue edits, and reject genuinely empty messages", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cww-awaiting-instruction-test-"));
   const tenantRoot = path.join(root, "tenants");
   const instance = createApp({ basePath: "",
@@ -6078,71 +6079,39 @@ test("file-only submissions persist on the server and wait for a real instructio
   const created = await firstBrowser.post("/api/conversations").set("X-CSRF-Token", firstLogin.body.csrfToken).expect(201);
   const conversationId = created.body.conversation.id as string;
 
-  const uploadedOnly = await firstBrowser.post(`/api/conversations/${conversationId}/messages`)
-    .set("X-CSRF-Token", firstLogin.body.csrfToken)
-    .field("message", "   ")
-    .attach("files", Buffer.from("first image"), { filename: "first.png", contentType: "image/png" })
-    .expect(202);
-  assert.equal(uploadedOnly.body.needsInstruction, true);
-  assert.match(uploadedOnly.body.guidance, /具体操作/);
-  assert.equal(instance.db.listMessages(conversationId).length, 0);
-  assert.equal(instance.db.listActiveJobsForConversation(conversationId).length, 0);
-  assert.equal(instance.db.listQueuedJobs().length, 0);
-  const awaitingId = uploadedOnly.body.pendingPrompt.id as string;
-  let awaiting = instance.db.getPendingPrompt(awaitingId)!;
-  assert.equal(awaiting.status, "editing");
-  assert.equal(awaiting.content, "");
-  assert.deepEqual(awaiting.files.map((file) => file.original_name), ["first.png"]);
-  const workspace = ensureTenantWorkspace(tenantRoot, LEGACY_USER_ID, conversationId);
-  assert.equal(fs.existsSync(path.join(workspace, awaiting.files[0].relative_path)), true);
-
-  // A new HTTP session represents a closed/reopened browser. The draft and
-  // server-side upload must be recovered without any browser-local state.
-  const reopenedBrowser = request.agent(instance.app);
-  const reopenedLogin = await reopenedBrowser.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
-  let detail = await reopenedBrowser.get(`/api/conversations/${conversationId}`).expect(200);
-  assert.equal(detail.body.editingPrompt.id, awaitingId);
-  assert.deepEqual(detail.body.editingPrompt.files.map((file: { original_name: string }) => file.original_name), ["first.png"]);
-  await reopenedBrowser.post(`/api/conversations/${conversationId}/pending-prompts/${awaitingId}/restore`)
-    .set("X-CSRF-Token", reopenedLogin.body.csrfToken)
-    .expect(409);
-  assert.equal(instance.db.listQueuedJobs().length, 0);
-
-  const moreFiles = await reopenedBrowser.put(`/api/conversations/${conversationId}/pending-prompts/${awaitingId}`)
-    .set("X-CSRF-Token", reopenedLogin.body.csrfToken)
-    .field("message", " ")
-    .field("removedFileIds", "[]")
-    .attach("files", Buffer.from("second document"), { filename: "second.txt", contentType: "text/plain" })
-    .expect(202);
-  assert.equal(moreFiles.body.needsInstruction, true);
-  assert.equal(instance.db.listQueuedJobs().length, 0);
-  awaiting = instance.db.getPendingPrompt(awaitingId)!;
-  assert.equal(awaiting.status, "editing");
-  assert.deepEqual(awaiting.files.map((file) => file.original_name), ["first.png", "second.txt"]);
-
-  await reopenedBrowser.put(`/api/conversations/${conversationId}/pending-prompts/${awaitingId}`)
-    .set("X-CSRF-Token", reopenedLogin.body.csrfToken)
-    .field("message", "请把图片和文档整理成一份说明")
-    .field("removedFileIds", "[]")
-    .expect(200);
-  assert.equal(instance.db.getPendingPrompt(awaitingId)?.status, "queued");
-  assert.equal(instance.db.listMessages(conversationId).length, 0);
-
-  let executed: { prompt: string; files: string[] } | undefined;
-  instance.runner.run = async (jobId, id, prompt, uploads) => {
-    executed = { prompt, files: uploads.map((file) => file.original_name) };
-    instance.db.finishJob(jobId, id, "completed");
-  };
+  const headers={"X-CSRF-Token":firstLogin.body.csrfToken};
+  await firstBrowser.post(`/api/conversations/${conversationId}/messages`).set(headers).send({message:" \n "}).expect(400);
+  const submitted=await firstBrowser.post(`/api/conversations/${conversationId}/messages`).set(headers)
+    .field("message"," \n ").attach("files",Buffer.from("image"),{filename:"one.png",contentType:"image/png"}).expect(202);
+  assert.ok(submitted.body.job);assert.equal(submitted.body.needsInstruction,undefined);
+  assert.equal(instance.db.listMessages(conversationId)[0].content,"");
+  assert.equal(instance.db.listMessages(conversationId)[0].files.length,1);
+  // Further image + ordinary file is queued once, and survives an edit/restore.
+  const queued=await firstBrowser.post(`/api/conversations/${conversationId}/messages`).set(headers).field("message","")
+    .attach("files",Buffer.from("image2"),{filename:"two.png",contentType:"image/png"})
+    .attach("files",Buffer.from("document"),{filename:"notes.txt",contentType:"text/plain"}).expect(202);
+  const pid=queued.body.pendingPrompt.id;
+  await firstBrowser.post(`/api/conversations/${conversationId}/pending-prompts/${pid}/edit`).set(headers).expect(200);
+  await firstBrowser.put(`/api/conversations/${conversationId}/pending-prompts/${pid}`).set(headers).field("message","  ")
+    .field("removedFileIds",JSON.stringify(queued.body.pendingPrompt.files.map((f:{id:string})=>f.id))).expect(400);
+  assert.equal(instance.db.getPendingPrompt(pid)?.files.length,2,'failed edit preserves files');
+  await firstBrowser.put(`/api/conversations/${conversationId}/pending-prompts/${pid}`).set(headers).field("message","  ").expect(200);
+  assert.equal(instance.db.getPendingPrompt(pid)?.status,'queued');
+  await firstBrowser.put(`/api/conversations/${conversationId}/pending-prompts/${pid}`).set(headers).field("message","").expect(409);
+  await firstBrowser.post(`/api/conversations/${conversationId}/pending-prompts/${pid}/edit`).set(headers).expect(200);
+  await firstBrowser.post(`/api/conversations/${conversationId}/pending-prompts/${pid}/restore`).set(headers).expect(200);
+  const detail=await firstBrowser.get(`/api/conversations/${conversationId}`).expect(200);
+  assert.equal(detail.body.pendingPrompts[0].files.length,2);
+  const executed:Array<{prompt:string;files:string[]}>=[];
+  instance.runner.run=async(jobId,cid,prompt,uploads)=>{executed.push({prompt,files:uploads.map(f=>f.original_name)});instance.db.finishJob(jobId,cid,"completed");};
   await instance.pumpQueue();
-  for (let attempt = 0; attempt < 20 && !executed; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(executed, { prompt: "请把图片和文档整理成一份说明", files: ["first.png", "second.txt"] });
-  assert.equal(instance.db.getPendingPrompt(awaitingId), undefined);
-  assert.deepEqual(instance.db.listMessages(conversationId).map((message) => ({ content: message.content, files: message.files.map((file) => file.original_name) })), [
-    { content: "请把图片和文档整理成一份说明", files: ["first.png", "second.txt"] },
-  ]);
-  detail = await reopenedBrowser.get(`/api/conversations/${conversationId}`).expect(200);
-  assert.equal(detail.body.editingPrompt, null);
-  assert.equal(detail.body.pendingPrompts.length, 0);
+  for(let i=0;i<30&&executed.length<1;i++)await new Promise<void>(r=>setImmediate(r));
+  await instance.pumpQueue();
+  for(let i=0;i<30&&executed.length<2;i++)await new Promise<void>(r=>setImmediate(r));
+  assert.equal(executed.length,2);assert.match(executed[0].prompt,/平台附件上下文/);
+  assert.deepEqual(executed.map(e=>[...e.files].sort()),[["one.png"],["notes.txt","two.png"]]);
+  assert.deepEqual(instance.db.listMessages(conversationId).map(m=>m.content),["",""]);
+  assert.equal(instance.db.listPendingPrompts(conversationId).length,0);
 });
 
 test("later submissions stay out of chat as drafts and materialize one at a time", async (context) => {
@@ -6582,7 +6551,7 @@ test("maintenance deployment templates queue, verify, and publish a clean commit
   assert.match(selfMaintain, /ExecStart=.*codex-web-rebuild-coordinator/);
   assert.match(pathUnit, /PathExists=.*pending-commit/);
   const dockerfile = fs.readFileSync(path.join(process.cwd(), "Dockerfile"), "utf8");
-  assert.match(dockerfile, /npm run verify/);
+  assert.match(dockerfile, /npm run lint && node tests\/run-app-tests\.mjs && npm run test:worker && npm run test:storage-tools/);
   assert.match(dockerfile, /COPY deploy \.\/deploy/);
   assert.match(dockerfile, /COPY skills \.\/skills/);
   assert.match(dockerfile, /COPY account-resources \.\/account-resources/);
@@ -6701,13 +6670,13 @@ test("maintenance queue wakes automatically after the gate is removed", async (c
   assert.match(appSource, /latestQueueStatus\?\.label !== MAINTENANCE_QUEUE_GUIDANCE/);
 });
 
-test("sidebar distinguishes execution from grey animated waiting and preserves wake controls", () => {
+test("sidebar distinguishes execution from static waiting clocks and preserves wake controls", () => {
   const appSource = fs.readFileSync(path.join(process.cwd(), "src", "App.tsx"), "utf8");
   const styles = fs.readFileSync(path.join(process.cwd(), "src", "styles.css"), "utf8");
   assert.match(appSource, /conversation\.pinned_at && <Pin className="conversation-pin-icon"[^>]*aria-label="已置顶"/);
   assert.match(styles, /\.conversation-select > svg\.conversation-pin-icon \{ color: #b9bdcc; \}/);
   assert.match(styles, /\.conversation-row\.active \.conversation-select > svg \{ color: var\(--amber\); \}/);
-  assert.match(appSource, /conversation\.status === "running" \|\| conversation\.external_status === "running"[\s\S]*LoaderCircle[\s\S]*waitingLabel[\s\S]*CircleDashed[^>]*className="conversation-waiting spin"/);
+  assert.match(appSource, /conversation\.status === "running" \|\| conversation\.external_status === "running"[\s\S]*LoaderCircle[\s\S]*waitingLabel[\s\S]*Clock[^>]*className="conversation-waiting"/);
   assert.match(appSource, /Boolean\(conversation\.active_wake_count\) && conversation\.status !== "running" && conversation\.external_status !== "running" && <button[\s\S]*className="conversation-wake-trigger"/);
   assert.doesNotMatch(appSource, /conversation\.external_status !== "running" && !conversation\.has_pending_work && <button/);
   assert.match(appSource, /conversationWaitingLabel\(conversation, maintenancePhase\)/);
@@ -7218,4 +7187,26 @@ test("conversation activity snapshots retain five stage updates before the rolli
   assert.equal(activity.body.jobEvents.length, 55);
   assert.deepEqual(activity.body.jobEvents.slice(0, 5).map((event: { seq: number }) => event.seq), [2, 3, 4, 5, 6]);
   assert.deepEqual(activity.body.jobEvents.slice(5).map((event: { seq: number }) => event.seq), Array.from({ length: 50 }, (_, index) => index + 13));
+});
+
+test('public voice queue and old message pages hide delegation protocol by identity',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'voice-public-view-'));
+ const instance=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'pp',passwordHash:bcrypt.hashSync('Voice-View-2026!',8),sessionSecret:'test-voice-view-secret-longer-than-thirty-two'});
+ t.after(()=>{instance.db.close();fs.rmSync(root,{recursive:true,force:true});});
+ const agent=request.agent(instance.app),login=await agent.post('/api/auth/login').send({username:'pp',password:'Voice-View-2026!'}).expect(200),headers={'X-CSRF-Token':login.body.csrfToken};
+ const c=await agent.post('/api/conversations').set(headers).expect(201),cid=c.body.conversation.id,selection={model:c.body.agentSelection.model,reasoningEffort:c.body.agentSelection.reasoningEffort};
+ const p=instance.db.createPendingPrompt(crypto.randomUUID(),cid,'[本会话语音要求，第 1 版；来源 call:event] SECRET_CHECKPOINT_JSON',selection);
+ instance.db.sqlite.prepare('INSERT INTO conversation_voice_operations VALUES(?,?,?,?,?,?,?,?)').run(cid,'voice-operation',1,17,p.id,null,'queued_next_turn',new Date().toISOString());
+ const detail=await agent.get('/api/conversations/'+cid).expect(200);assert.equal(detail.body.pendingPrompts[0].voiceDelegation,true);assert.doesNotMatch(JSON.stringify(detail.body),/SECRET_CHECKPOINT|call:event/);
+ await agent.post(`/api/conversations/${cid}/pending-prompts/${p.id}/edit`).set(headers).expect(409);
+ const reordered=await agent.put(`/api/conversations/${cid}/pending-prompts/order`).set(headers).send({ids:[p.id]}).expect(200);assert.doesNotMatch(JSON.stringify(reordered.body),/SECRET_CHECKPOINT/);
+ // A pre-upgrade editing item can still be restored without returning its wrapper.
+ instance.db.beginEditingPendingPrompt(p.id);
+ const restored=await agent.post(`/api/conversations/${cid}/pending-prompts/${p.id}/restore`).set(headers).expect(200);
+ assert.equal(restored.body.pendingPrompt.voiceDelegation,true);assert.doesNotMatch(JSON.stringify(restored.body),/SECRET_CHECKPOINT/);
+ const job=instance.db.materializePendingPrompt(p.id,crypto.randomUUID(),crypto.randomUUID())!;
+ instance.db.sqlite.prepare('UPDATE messages SET is_internal=0 WHERE id=?').run(job.message_id!);
+ instance.db.addMessage({id:crypto.randomUUID(),conversation_id:cid,role:'user',content:'literal UUID and {"event_id":"example"}',created_at:new Date().toISOString()});
+ const history=await agent.get('/api/conversations/'+cid).expect(200);assert.equal(history.body.messages.length,1);assert.match(history.body.messages[0].content,/literal UUID/);assert.doesNotMatch(JSON.stringify(history.body),/SECRET_CHECKPOINT/);
+ assert.match(instance.db.getMessage(job.message_id!)!.content,/SECRET_CHECKPOINT/);
 });

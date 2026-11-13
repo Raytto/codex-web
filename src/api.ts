@@ -199,9 +199,11 @@ export type PublicFilePreview = {
   content: string | null;
 };
 export type Message = {
+  voice_playback?: "confirmed" | "unconfirmed";
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; attachment_references: string[]; created_at: string; files: WorkFile[];
 };
 export type PendingPrompt = {
+  voiceDelegation?: boolean;
   voiceSubmission?: { id: string; state: "queued" | "processing" | "failed" | "completed" | "cancelled"; error: string | null; steer_state: "requested" | "sending" | "failed" | null; steer_action: "steer" | "insert" | null; steer_error: string | null };
   id: string;
   conversation_id: string;
@@ -416,7 +418,7 @@ export type ConversationDetail = {
   pendingPrompts: PendingPrompt[];
   editingPrompt: PendingPrompt | null;
   composerDraft: ComposerDraft | null;
-  workflow?: {id:string; state:string; phase:string; reason:string; seq:number; title:string} | null;
+  workflow?: {waitingFor?:string|null; id:string; state:string; phase:string; reason:string; seq:number; title:string; recovery?:{phase:"terminal"|"executing"|"exit_unverified"|"waiting_capacity"|"pending_acceptance"|"waiting_continuation"|"ready_to_resume"}} | null;
   workflowCapacity?: number;
   wakePlan: WakePlan | null;
   wakeEvents: WakeEvent[];
@@ -429,6 +431,8 @@ export type ConversationDetail = {
 export type ConversationRestorePending = { restoring: true; state: Conversation["cold_storage_state"]; conversation: Conversation };
 export type ConversationActivation = { state: "local" | "metadata" | "restoring" | "error"; restoring: boolean; conversation: Conversation };
 export type ConversationActivity = {
+  workflow?: ConversationDetail["workflow"];
+  workflowCapacity?: number;
   conversationStatus: Conversation["status"];
   externalStatus: Conversation["external_status"];
   hasUnreadResult: boolean;

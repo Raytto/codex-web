@@ -66,10 +66,26 @@ test("AGY streams one request, preserves native resume ids and run environment w
     assert.equal(data.args.includes("complete this task"), false);
     assert.equal(data.event.event, "user");
     assert.match(data.event.message.content, /shared AGENTS.md/);
+    assert.match(data.event.message.content, /公开工作说明/);
     assert.equal(data.outputs, path.join(root, "outputs"));
     assert.equal(data.marker, "request-only");
   }
   assert.equal(process.env.CWW_OUTPUTS_DIR, before);
+});
+
+test("AGY emits readable call targets, failed read state, and keeps tool outputs out of progress", async (context) => {
+  const { root, executable } = fixture(context, `${prelude}lines.on('line',()=>{
+    init();
+    step({step_type:'tool',tool_name:'search_web',state:'ACTIVE',tool_info:{parameters:{query:'季度销售同比计算'}}});
+    step({step_type:'tool',tool_name:'search_web',state:'DONE',tool_info:{parameters:{query:'季度销售同比计算'},output:'private-result'}});
+    step({step_type:'tool',tool_name:'read_file',state:'DONE',tool_info:{parameters:{AbsolutePath:'/tmp/sales.csv'},error:{message:'file does not exist'}}});
+    result();
+  });`);
+  const running = run(root, executable);
+  await running.execution.result;
+  assert.ok(running.progress.some(item => item.label === "正在搜索网页" && item.detail === "季度销售同比计算"));
+  assert.ok(running.progress.some(item => item.label === "文件读取失败" && item.detail === "sales.csv"));
+  assert.doesNotMatch(JSON.stringify(running.progress), /private-result|文件读取完成/);
 });
 
 test("AGY never reports success after a denied tool, trailing stderr denial, partial timeout, or nonzero exit", async (context) => {

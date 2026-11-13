@@ -1,3 +1,4 @@
+import { fileChunkBytes, LEGACY_CHUNK_BYTES, MAX_CHUNK_BYTES } from './storage-chunk-layout.js';
 import {isStorageIdentity} from './storage-key.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -61,27 +62,27 @@ function ciphertextMatches(file:string,chunk:Pick<StorageChunk,'ciphertext_sha25
     && fs.statSync(file).size===chunk.ciphertext_bytes && sha256Path(file)===chunk.ciphertext_sha256;
 }
 
-/** 256 MiB chunks, one encrypted upload plus one verification download at a
+/** Bounded streaming chunks, one encrypted upload plus one verification download at a
  * time. No plaintext full-size staging or hardlinks to mutable originals. */
 export class StorageChunkStore {
   onProgress?: (value:StorageProgressTick)=>void;
   constructor(readonly catalog:StorageCatalog,readonly policy:StoragePolicy,readonly scratch:string,
     readonly transport:ChunkTransport,readonly age='age',readonly budgetRoot:string|string[]=scratch) {
     if(!policy.enabled)throw new Error('storage_lifecycle_disabled');
-    if(policy.chunkBytes<=0 || policy.chunkBytes>512*1024**2 || policy.scratchBytes<3*policy.chunkBytes)throw new Error('storage_chunk_budget_invalid');
+    if(!Number.isSafeInteger(policy.chunkBytes) || policy.chunkBytes<=0 || policy.chunkBytes>MAX_CHUNK_BYTES || !Number.isSafeInteger(policy.scratchBytes) || policy.scratchBytes<3*policy.chunkBytes)throw new Error('storage_chunk_budget_invalid');
     fs.mkdirSync(scratch,{recursive:true,mode:0o700});
     if(fs.realpathSync(scratch)!==path.resolve(scratch))throw new Error('storage_scratch_symlink');
   }
-  checkBudget():void {
+  checkBudget(chunkBytes=this.policy.chunkBytes, additionalBytes=3*chunkBytes):void {
     let used=0;
     const visit=(dir:string)=>{for(const name of fs.readdirSync(dir)){
       const file=path.join(dir,name),s=fs.lstatSync(file);
       if(s.isSymbolicLink())throw new Error('storage_scratch_unexpected_member');
       if(s.isDirectory())visit(file);else if(s.isFile())used+=s.size;else throw new Error('storage_scratch_unexpected_member');
     }};for(const directory of typeof this.budgetRoot==='string'?[this.budgetRoot]:this.budgetRoot)if(fs.existsSync(directory))visit(directory);
-    if(used+3*this.policy.chunkBytes>this.policy.scratchBytes)throw new Error('storage_scratch_budget');
+    if(used+additionalBytes>this.policy.scratchBytes)throw new Error('storage_scratch_budget');
     const disk=fs.statfsSync(this.scratch);
-    if(disk.bavail*disk.bsize-3*this.policy.chunkBytes<disk.blocks*disk.bsize*0.1)throw new Error('storage_disk_reserve');
+    if(disk.bavail*disk.bsize-additionalBytes<disk.blocks*disk.bsize*0.1)throw new Error('storage_disk_reserve');
   }
   private async ioLock():Promise<()=>void> {
     const fd=fs.openSync(path.join(path.dirname(this.scratch),`.${path.basename(this.scratch)}.io.lock`),fs.constants.O_CREAT|fs.constants.O_RDWR|fs.constants.O_NOFOLLOW,0o600);
@@ -89,23 +90,25 @@ export class StorageChunkStore {
       await processExit(child,'storage_io_lock');return ()=>fs.closeSync(fd);
     }catch(e){fs.closeSync(fd);throw e;}
   }
-  async archiveFile(userId:string,source:string):Promise<{sha256:string;bytes:number;fingerprint:string;chunks:StorageChunk[]}> {
+  async archiveFile(userId:string,source:string,options:{firstSeenAt?:number;legacyStream?:boolean}={}):Promise<{sha256:string;bytes:number;fingerprint:string;chunks:StorageChunk[]}> {
     if(isStorageIdentity(source,this.policy.identity))throw new Error('storage_identity_requires_external_custody');
     if(!/^[a-zA-Z0-9_-]+$/.test(userId))throw new Error('storage_user_path_invalid');
     const original=fs.lstatSync(source);
     if(!original.isFile() || original.isSymbolicLink() || original.nlink!==1)throw new Error('storage_source_not_exclusive_regular_file');
     const fingerprint=fileFingerprint(original),fullHash=sha256Path(source),chunks:StorageChunk[]=[];
-    for(let offset=0;offset<original.size || (offset===0 && original.size===0);offset+=this.policy.chunkBytes){
+    const chunkBytes=options.legacyStream?Math.min(this.policy.chunkBytes,LEGACY_CHUNK_BYTES)
+      :fileChunkBytes(this.catalog.db,userId,path.resolve(source),original,this.policy.chunkBytes,options.firstSeenAt);
+    for(let offset=0;offset<original.size || (offset===0 && original.size===0);offset+=chunkBytes){
       const release=await this.ioLock();
       try{
-      const bytes=Math.min(this.policy.chunkBytes,original.size-offset),plainHash=hashRange(source,offset,bytes);
+      const bytes=Math.min(chunkBytes,original.size-offset),plainHash=hashRange(source,offset,bytes);
       let chunk=this.catalog.chunk(userId,plainHash,bytes);
       if(chunk)this.catalog.protectChunk(chunk.id);
       if(!chunk) {
         let pending=this.catalog.db.prepare('SELECT * FROM storage_chunk_uploads WHERE user_id=? AND plaintext_sha256=? AND plaintext_bytes=?')
           .get(userId,plainHash,bytes) as Pending|undefined;
         if(!pending){
-          this.checkBudget();const id=crypto.randomUUID(),stage=path.join(this.scratch,`${id}.age`);
+          this.checkBudget(chunkBytes);const id=crypto.randomUUID(),stage=path.join(this.scratch,`${id}.age`);
           try {
             await encodeRange(source,offset,bytes,stage,this.policy.recipient,this.age);
             const cipherHash=sha256Path(stage),cipherBytes=fs.statSync(stage).size;
@@ -121,6 +124,9 @@ export class StorageChunkStore {
           || !pending.remote_path.startsWith(`${this.policy.remoteRoot}/${userId}/chunks/`))throw new Error('storage_upload_scope_mismatch');
         const download=path.join(this.scratch,`${pending.id}.verify`);
         try {
+          // A retry may coexist with interrupted uploads. Include the existing
+          // ciphertext and reserve space for verification before any transfer.
+          this.checkBudget(chunkBytes,pending.ciphertext_bytes);
           if(ciphertextMatches(pending.stage_path,pending))await this.transport.put(pending.stage_path,pending.remote_path);
           // After interruption, a lost stage is recoverable only from this exact
           // immutable remote name. Never generate different ciphertext under it.
@@ -148,9 +154,11 @@ export class StorageChunkStore {
       || !c.remote_path.startsWith(`${this.policy.remoteRoot}/${userId}/chunks/`)))throw new Error('storage_restore_scope_mismatch');
     if(chunks.reduce((n,c)=>n+c.plaintext_bytes,0)!==expected.bytes)throw new Error('storage_restore_size_mismatch');
     if(fs.existsSync(target))throw new Error('storage_restore_target_exists');
-    this.checkBudget();
+    const maxChunkBytes=chunks.reduce((n,c)=>Math.max(n,c.plaintext_bytes),1);
+    const maxCipherBytes=chunks.reduce((n,c)=>Math.max(n,c.ciphertext_bytes),1);
+    this.checkBudget(maxChunkBytes,maxCipherBytes);
     const disk=fs.statfsSync(path.dirname(target));
-    if(disk.bavail*disk.bsize-expected.bytes-2*this.policy.chunkBytes<disk.blocks*disk.bsize*0.1)throw new Error('storage_restore_disk_reserve');
+    if(disk.bavail*disk.bsize-expected.bytes-2*maxChunkBytes<disk.blocks*disk.bsize*0.1)throw new Error('storage_restore_disk_reserve');
     const fd=fs.openSync(target,'wx',0o600);
     let completed=0;
     try {
@@ -161,6 +169,7 @@ export class StorageChunkStore {
           this.onProgress?.({stage:'downloading',completed:completed+Math.min(1,downloaded/chunk.ciphertext_bytes)*chunk.plaintext_bytes*.85,total:expected.bytes,estimated:true});};
         reportDownload();const progressTimer=setInterval(reportDownload,500);progressTimer.unref();
         try {
+          this.checkBudget(chunk.plaintext_bytes,chunk.ciphertext_bytes);
           await this.transport.get(chunk.remote_path,download,{fileId:chunk.remote_file_id,bytes:chunk.ciphertext_bytes});
           clearInterval(progressTimer);
           if(!ciphertextMatches(download,chunk))throw new Error('storage_ciphertext_hash_mismatch');
@@ -187,7 +196,7 @@ export class StorageChunkStore {
         const release=await store.ioLock();
         const base=path.join(store.scratch,crypto.randomUUID()),encrypted=base+'.cipher',plain=base+'.plain';
         try{
-          store.checkBudget();
+          store.checkBudget(chunk.plaintext_bytes,chunk.ciphertext_bytes+chunk.plaintext_bytes);
           await store.transport.get(chunk.remote_path,encrypted,{fileId:chunk.remote_file_id,bytes:chunk.ciphertext_bytes});
           if(!ciphertextMatches(encrypted,chunk))throw new Error('storage_ciphertext_hash_mismatch');
           await decodeVerified(encrypted,store.policy.identity,store.age,{sha256:chunk.plaintext_sha256,bytes:chunk.plaintext_bytes},fs.createWriteStream(plain,{flags:'wx',mode:0o600}));
@@ -205,12 +214,13 @@ export class StorageChunkStore {
    * and its complete ciphertext verification have both committed. */
   async archiveStream(userId:string,input:Readable,expected:{sha256:string;bytes:number}):Promise<{sha256:string;bytes:number;fingerprint:string;chunks:StorageChunk[]}> {
     if(!/^[a-f0-9]{64}$/.test(expected.sha256) || !Number.isSafeInteger(expected.bytes) || expected.bytes<0)throw new Error('storage_stream_identity');
-    this.checkBudget();let total=0,partBytes=0,fd:number|undefined;
+    const chunkBytes=Math.min(this.policy.chunkBytes,LEGACY_CHUNK_BYTES);
+    this.checkBudget(chunkBytes);let total=0,partBytes=0,fd:number|undefined;
     const plain=path.join(this.scratch,`${crypto.randomUUID()}.plaintext-part`),hash=crypto.createHash('sha256'),chunks:StorageChunk[]=[];
     const flush=async()=>{
       if(fd===undefined)fd=fs.openSync(plain,'wx',0o600);
       fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;
-      const archived=await this.archiveFile(userId,plain);chunks.push(...archived.chunks);
+      const archived=await this.archiveFile(userId,plain,{legacyStream:true});chunks.push(...archived.chunks);
       fs.unlinkSync(plain);partBytes=0;
     };
     try{
@@ -219,11 +229,11 @@ export class StorageChunkStore {
         if(total+data.length>expected.bytes)throw new Error('storage_stream_size_exceeded');
         hash.update(data);total+=data.length;
         for(let offset=0;offset<data.length;){
-          if(fd===undefined){this.checkBudget();fd=fs.openSync(plain,'wx',0o600);}
-          const length=Math.min(this.policy.chunkBytes-partBytes,data.length-offset);
+          if(fd===undefined){this.checkBudget(chunkBytes);fd=fs.openSync(plain,'wx',0o600);}
+          const length=Math.min(chunkBytes-partBytes,data.length-offset);
           let written=0;while(written<length)written+=fs.writeSync(fd,data,offset+written,length-written);
           offset+=length;partBytes+=length;
-          if(partBytes===this.policy.chunkBytes)await flush();
+          if(partBytes===chunkBytes)await flush();
         }
       }
       if(partBytes || !total)await flush();

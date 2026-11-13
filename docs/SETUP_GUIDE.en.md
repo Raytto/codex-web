@@ -90,3 +90,5 @@ For explicit host setup, verification and shutdown, see [per-task memory protect
 Current continuous voice includes stale-playback suppression, physical connection retirement and timed transcript fragments after interruption. Missing network audio may still require repeating a sentence. Validate real microphones, iOS and paid cloud access independently.
 
 PP Dot now includes read-only task preview and fresh node-catalog checks. Public defaults follow the target node selection; [optional routing policy](DOT_ROUTING.md) can map task types/difficulty to explicit model/effort pairs. No personal model preference ships.
+
+Current upgrade and verification checklist: [voice, execution ownership and build update](UPGRADE_20261114.md).

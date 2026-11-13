@@ -119,3 +119,5 @@ PP Dot 已包含在公开源码中：固定总管会话、跨项目委派、任�
 已包含持续语音恢复修复：插话时阻断旧播放，重建连接后旧音频/转写不能恢复旧回答；保留带时间的转写段。网络丢失期间仍可能需要重复截断的句子，真实麦克风、iOS 与付费云链路需在自己的安装中验收。
 
 PP Dot 的任务预览、分类与节点目录检查已包含；公开默认使用目标节点当前选择，安装者可通过 `CODEX_WEB_DOT_ROUTING_POLICY` 配置类型/难度到模型和深度的映射，见[选型说明](DOT_ROUTING.md)。没有内置私人偏好。
+
+Current upgrade and verification checklist: [voice, execution ownership and build update](UPGRADE_20261114.md).

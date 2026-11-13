@@ -40,7 +40,7 @@ test("account settings exposes a mobile-ready voice keyword viewer with ranking 
   assert.match(styles, /@media \(max-width: 720px\)[\s\S]*\.voice-keyword-metrics \{ grid-template-columns:repeat\(2/);
 });
 
-test("voice lexicon selection is hard-capped to the top one hundred active terms", (t) => {
+test("voice lexicon selection is selects up to two hundred qualified terms without the old one-hundred cutoff", (t) => {
   const { db, project } = fixture(t);
   const insert = db.sqlite.prepare(`
     INSERT INTO voice_lexicon_terms(
@@ -48,13 +48,13 @@ test("voice lexicon selection is hard-capped to the top one hundred active terms
     ) VALUES(?,?,?,?,?,'active',?,?,?)
   `);
   const now = new Date().toISOString();
-  for (let index = 0; index < 105; index += 1) {
+  for (let index = 0; index < 205; index += 1) {
     insert.run(crypto.randomUUID(), LEGACY_USER_ID, project.id, `term-${index}`, `Term ${index}`, index, now, now);
   }
-  assert.equal(loadConfig({ voiceLexiconMaxTerms: 500 }).voiceLexiconMaxTerms, 100);
+  assert.equal(loadConfig({ voiceLexiconMaxTerms: 500 }).voiceLexiconMaxTerms, 200);
   const selected = db.listVoiceLexiconTerms(LEGACY_USER_ID, project.id, 500);
-  assert.equal(selected.length, 100);
-  assert.equal(selected[0]?.canonical_text, "Term 104");
+  assert.equal(selected.length, 200);
+  assert.equal(selected[0]?.canonical_text, "Term 204");
   assert.equal(selected.at(-1)?.canonical_text, "Term 5");
 });
 

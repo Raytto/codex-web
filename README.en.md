@@ -10,7 +10,9 @@ Use it from a desktop or mobile browser, with conversations, files and execution
 
 [Quick start](#quick-start) · [Optional capabilities](#optional-capabilities) · [Documentation](#documentation) · [Cloud deployment runbook](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
 
-[Complete setup guide](docs/SETUP_GUIDE.en.md) · [Upgrade checks](docs/UPGRADE_20261108.md)
+[Complete setup guide](docs/SETUP_GUIDE.en.md) · [Upgrade checks](docs/UPGRADE_20261114.md)
+
+Latest update: attachment-only sends, voice context and interruptions, durable remote steering, SQLite recovery and leaner builds. Preserve local state/configuration and refresh open tabs after upgrading.
 
 ## What you can do
 
@@ -197,7 +199,7 @@ The development URL is `http://127.0.0.1:5173/codex-web/`. The full application 
 | Project and personal tools | [Project boards](docs/features/PERSONAL_KANBAN.md) · [Opportunity cards](docs/OPPORTUNITY_CARDS.md) · [Judgment book](docs/JUDGMENT_BOOK.md) |
 | Reading and sharing | [Reader](docs/READER_PROGRESSIVE_LOADING.md) · [Public sharing](docs/PUBLIC_FILE_SHARING.md) · [Interactive HTML](docs/WEB_PRESENTATIONS.md) |
 | Other executors and models | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
-| Most recent public feature update | [November 8–9, 2026 upgrade notes](docs/UPGRADE_20261108.md) |
+| Most recent public feature update | [November 8–9, 2026 upgrade notes](docs/UPGRADE_20261114.md) |
 
 This page follows the implementation on public `main`. Historical updates and migration details live in the linked guides.
 

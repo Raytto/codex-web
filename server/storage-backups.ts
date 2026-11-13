@@ -1,3 +1,4 @@
+import { LEGACY_CHUNK_BYTES } from './storage-chunk-layout.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -75,7 +76,7 @@ export class StorageBackups{
   return this.capture(pointId,target,'file',data,{mode:stat.mode&0o777,uid:stat.uid,gid:stat.gid},userId);
  }
  async captureDatabase(pointId:string,target:string,source:string,userId=SHARED):Promise<BackupMaterial>{
-  this.chunks.checkBudget();const snapshot=createDatabaseSnapshot(source,this.chunks.scratch,this.chunks.policy.chunkBytes);
+  this.chunks.checkBudget();const snapshot=createDatabaseSnapshot(source,this.chunks.scratch,Math.min(this.chunks.policy.chunkBytes,LEGACY_CHUNK_BYTES));
   try{
    return await this.captureDatabaseSnapshot(pointId,target,source,snapshot,userId);
   }finally{snapshot.close();}

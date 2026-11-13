@@ -6,7 +6,7 @@ import { verifyWorkflowEvidence } from './workflow-evidence.js';
 const [command,...rest]=process.argv.slice(2);
 const args:Record<string,string>={};for(let i=0;i<rest.length;i+=2){if(!rest[i]?.startsWith('--') || rest[i+1]===undefined)throw new Error('Use --key value');args[rest[i].slice(2)]=rest[i+1];}
 if(!args.database)throw new Error('--database is required');
-const db=new DatabaseSync(args.database);
+const db=new DatabaseSync(args.database,{readOnly:command==='status'});
 if(command==='bootstrap') {db.exec('BEGIN IMMEDIATE');try{
  if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='workflows'").get())throw new Error('Bootstrap cannot replace an installed ledger');
  WorkflowStore.migrate(db);db.exec('COMMIT');
@@ -20,7 +20,7 @@ try{
    if(!args.user)throw new Error("Bootstrap requires explicit --user ID");
    const user=db.prepare("SELECT id FROM users WHERE id=?").get(args.user) as {id:string}|undefined;if(!user)throw new Error("User missing");
    result=store.external(args.key,user.id,args.title||'外部维护');
- } else if(command==='status') result=args.id?store.get(args.id):{capacity:store.capacity(),workflows:store.list()};
+ } else if(command==='status') result=args.id?{...store.get(args.id),recovery:store.recoveryStatus(args.id)}:{capacity:store.capacity(),workflows:store.list().map(w=>({...w,recovery:store.recoveryStatus(w.id)}))};
  else if(command==='enqueue') {
    if(!args.key || !args.title || !args.user)throw new Error('--key --title --user required');
    result=store.external(args.key,args.user,args.title);
@@ -35,7 +35,8 @@ try{
    result=store.prioritize(args.id,Number(args.priority),args.reason||'');
  } else if(command==='recover') {
    if(args['executors-stopped']!=='true')throw new Error('First verify actual processes, workers and background operations have exited');
-   store.recover(args.id,args.reason||'');result=store.get(args.id);
+   if(!args.revision || args['run-ids']===undefined)throw new Error('Use status, verify actual exits, then supply --revision and --run-ids (comma separated, empty for none)');
+   store.recover(args.id,args.reason||'',{revision:Number(args.revision),runIds:args['run-ids'].split(',').filter(Boolean)});result=store.get(args.id);
  } else if(command==='complete'||command==='abort') {
    if(args['executors-stopped']!=='true')throw new Error('Explicit --executors-stopped true after verification is required');
    const evidence=JSON.parse(fs.readFileSync(args.evidence,'utf8'));verifyWorkflowEvidence(evidence);

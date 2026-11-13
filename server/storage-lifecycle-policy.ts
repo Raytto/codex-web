@@ -21,7 +21,7 @@ export function storagePolicy(env: NodeJS.ProcessEnv = process.env): StoragePoli
   const policy = {
     enabled, instanceId: required('STORAGE_INSTANCE_ID'), remoteRoot: required('STORAGE_REMOTE_ROOT'),
     driveId: required('STORAGE_DRIVE_ID'), recipient: required('STORAGE_AGE_RECIPIENT'), identity: required('STORAGE_AGE_IDENTITY'),
-    graceMs: 3 * STORAGE_DAY, chunkBytes: 256 * 1024 ** 2, scratchBytes: 2 * STORAGE_GIB,
+    graceMs: 3 * STORAGE_DAY, chunkBytes: STORAGE_GIB, scratchBytes: 6 * STORAGE_GIB,
     hotBytes: 8 * STORAGE_GIB, softBytes: 24 * STORAGE_GIB, highBytes: 32 * STORAGE_GIB,
   };
   if (enabled && (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(policy.instanceId)

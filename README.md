@@ -10,7 +10,9 @@
 
 [快速开始](#快速开始) · [可选能力](#可选能力) · [文档导航](#文档导航) · [云服务器部署手册](AI_CLOUD_DEPLOYMENT_RUNBOOK.md)
 
-[从零配置到完整功能](docs/SETUP_GUIDE.zh-CN.md) · [本轮升级检查](docs/UPGRADE_20261108.md)
+[从零配置到完整功能](docs/SETUP_GUIDE.zh-CN.md) · [本轮升级检查](docs/UPGRADE_20261114.md)
+
+本次更新：仅附件发送、持续语音上下文与中断、远端引导对账、SQLite恢复及构建精简。升级前保留本实例数据与配置，升级后刷新网页。
 
 ## 主要能力
 
@@ -195,7 +197,7 @@ npm run dev
 | 项目与个人辅助功能 | [项目看板](docs/features/PERSONAL_KANBAN.md) · [机会卡片](docs/OPPORTUNITY_CARDS.md) · [判断簿](docs/JUDGMENT_BOOK.md) |
 | 文档阅读与分享 | [阅读器](docs/READER_PROGRESSIVE_LOADING.md) · [公开分享](docs/PUBLIC_FILE_SHARING.md) · [交互 HTML](docs/WEB_PRESENTATIONS.md) |
 | 其他执行器与模型 | [Remote Worker](remote-worker/README.md) · [Gemini / Antigravity](docs/MULTI_ENGINE.md) |
-| 最近一轮公开功能升级 | [本轮完整升级说明](docs/UPGRADE_20261108.md) |
+| 最近一轮公开功能升级 | [本轮完整升级说明](docs/UPGRADE_20261114.md) |
 
 本页按当前公开 `main` 的实现维护；历史更新和迁移细节放在专题文档中。
 

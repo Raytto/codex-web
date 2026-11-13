@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { guardedCallback, reportBackgroundError } from "./sqlite-contention.js";
 import type http from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import { WebSocket, WebSocketServer } from "ws";
@@ -282,11 +283,11 @@ export class NodeTransferCoordinator {
           throw new Error("CONTROL_TOO_LARGE");
         this.message(a, role, JSON.parse(raw.toString()));
       } catch (e) {
-        this.fail(a, errorText(e), false);
+        guardedCallback("node_transfer_failure", () => this.fail(a, errorText(e), false));
       }
     });
-    socket.on("error", () => this.disconnected(a));
-    socket.on("close", () => this.disconnected(a));
+    socket.on("error", () => guardedCallback("node_transfer_disconnect", () => this.disconnected(a)));
+    socket.on("close", () => guardedCallback("node_transfer_disconnect", () => this.disconnected(a)));
   }
   private message(
     a: Attempt,
@@ -321,10 +322,10 @@ export class NodeTransferCoordinator {
           a.paired = true;
           for (const r of roles)
             this.send(a[r], { type: "peer", key: a[other(r)].key });
-          a.timer = setTimeout(() => {
+          a.timer = setTimeout(() => guardedCallback("node_transfer_route", () => {
             a.fallbackDue = true;
             this.selectRoute(a, "relay");
-          }, 8_000);
+          }), 8_000);
           a.timer.unref();
         }
         break;
@@ -522,6 +523,10 @@ export class NodeTransferCoordinator {
           continue;
         await this.launch(row);
       }
+    } catch (error) {
+      // Retain the fenced transfer/cleanup receipt. A later tick may advance
+      // the existing attempt; never replay an acknowledged file operation here.
+      reportBackgroundError("node_transfer_tick", error);
     } finally {
       this.ticking = false;
     }

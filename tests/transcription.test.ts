@@ -126,9 +126,9 @@ test("Qwen Omni streams mixed-language text with bounded spelling context", asyn
     assert.match(submitted.messages[0].content, /当前尚未发送的输入草稿.*PowerPoint/s);
     assert.match(submitted.messages[0].content, /第一份文件开头 AlphaName/);
     assert.match(submitted.messages[0].content, /第二份文件开头 BetaName/);
-    assert.doesNotMatch(submitted.messages[0].content, /文件结尾不应出现/);
-    assert.doesNotMatch(submitted.messages[0].content, /这条太旧不应保留/);
-    assert.equal(imageOptions?.tokenBudget, 500);
+    assert.match(submitted.messages[0].content, /文件结尾不应出现/);
+    assert.match(submitted.messages[0].content, /这条太旧不应保留/);
+    assert.equal(imageOptions?.tokenBudget, 2000);
     assert.equal(imageOptions?.maxImages, 2);
     assert.equal(submitted.messages[1].content.filter((part: { type: string }) => part.type === "image_url").length, 2);
     assert.match(submitted.messages[1].content[2].input_audio.data, /\/api\/transcription-audio\/[0-9a-f-]+\.wav/);
@@ -297,7 +297,8 @@ test("transcription context is normalized, capped and marked as non-audio data",
   assert.doesNotMatch(prompt, /系统内容不应进入/);
   assert.match(prompt, /甲文件开头/);
   assert.match(prompt, /乙文件开头/);
-  assert.doesNotMatch(prompt, /甲文件末尾|乙文件末尾/);
+  assert.match(prompt, /甲文件末尾/);
+  assert.match(prompt, /乙文件末尾/);
   assert.match(prompt, /禁止把未说出口的上下文复制进结果/);
   assert.match(prompt, /Codex Web/);
   assert.doesNotMatch(prompt, /CWA|历史项目/);

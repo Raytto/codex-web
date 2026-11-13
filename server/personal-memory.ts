@@ -1,3 +1,4 @@
+import { reportBackgroundError, guardedCallback } from './sqlite-contention.js';
 import { decodePersonalMemoryResult, PERSONAL_MEMORY_EFFORT, personalMemoryError, type PersonalMemoryExecute } from "./codex-personal-memory.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -142,9 +143,9 @@ export class PersonalMemoryService {
 
   start(): void {
     if (this.timer || this.stopped) return;
-    this.timer = setInterval(() => void this.pump(), this.config.personalMemoryPollMs);
+    this.timer = setInterval(() => void this.pump().catch(error => reportBackgroundError("personal_memory_pump", error)), this.config.personalMemoryPollMs);
     this.timer.unref();
-    setImmediate(() => void this.pump());
+    setImmediate(() => void this.pump().catch(error => reportBackgroundError("personal_memory_pump", error)));
   }
 
   stop(): void {
@@ -186,7 +187,7 @@ export class PersonalMemoryService {
         let runRecorded = false;
         const controller = new AbortController();
         this.active = controller;
-        const yieldTimer = setInterval(() => { if (!this.canRun(account.userId)) controller.abort(); }, 500);
+        const yieldTimer = setInterval(() => guardedCallback("personal_memory_yield", () => { if (!this.canRun(account.userId)) controller.abort(); }), 500);
         yieldTimer.unref();
         try {
           const candidates = await this.extractor.extract(batch, readPersonalContext(account.library), controller.signal);

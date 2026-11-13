@@ -1,3 +1,4 @@
+import { migrateStorageChunkLayouts } from './storage-chunk-layout.js';
 import type { DatabaseSync } from "node:sqlite";
 
 /** Additive schema: legacy archives remain valid until individually imported. */
@@ -149,4 +150,5 @@ export function migrateStorageLifecycle(db: DatabaseSync): void {
     );
     CREATE INDEX storage_native_units_conversation ON storage_native_units(conversation_id,created_at);
   `);
+  migrateStorageChunkLayouts(db);
 }

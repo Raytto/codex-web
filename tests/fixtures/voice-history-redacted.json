@@ -1,0 +1,296 @@
+[
+  {
+    "role": "user",
+    "event_id": "fixture-0",
+    "delta": " user-0 ",
+    "start_ms": 4400,
+    "end_ms": 4600
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-1",
+    "delta": " assistant-1 ",
+    "start_ms": 5200,
+    "end_ms": 5400
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-2",
+    "delta": " assistant-2 ",
+    "start_ms": 5400,
+    "end_ms": 5600
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-3",
+    "delta": " assistant-3 ",
+    "start_ms": 5600,
+    "end_ms": 5800
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-4",
+    "delta": " assistant-4 ",
+    "start_ms": 5800,
+    "end_ms": 6000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-5",
+    "delta": " assistant-5 ",
+    "start_ms": 6000,
+    "end_ms": 6200
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-6",
+    "delta": " user-6 ",
+    "start_ms": 10400,
+    "end_ms": 10600
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-7",
+    "delta": " user-7 ",
+    "start_ms": 10600,
+    "end_ms": 10800
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-8",
+    "delta": " user-8 ",
+    "start_ms": 10800,
+    "end_ms": 11000
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-9",
+    "delta": " user-9 ",
+    "start_ms": 11000,
+    "end_ms": 11200
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-10",
+    "delta": " user-10 ",
+    "start_ms": 11400,
+    "end_ms": 11600
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-11",
+    "delta": " user-11 ",
+    "start_ms": 11800,
+    "end_ms": 12000
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-12",
+    "delta": " user-12 ",
+    "start_ms": 12000,
+    "end_ms": 12200
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-13",
+    "delta": " assistant-13 ",
+    "start_ms": 12200,
+    "end_ms": 12400
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-14",
+    "delta": " assistant-14 ",
+    "start_ms": 12600,
+    "end_ms": 12800
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-15",
+    "delta": " assistant-15 ",
+    "start_ms": 12800,
+    "end_ms": 13000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-16",
+    "delta": " assistant-16 ",
+    "start_ms": 13000,
+    "end_ms": 13200
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-17",
+    "delta": " assistant-17 ",
+    "start_ms": 13400,
+    "end_ms": 13600
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-18",
+    "delta": " assistant-18 ",
+    "start_ms": 13600,
+    "end_ms": 13800
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-19",
+    "delta": " assistant-19 ",
+    "start_ms": 13800,
+    "end_ms": 14000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-20",
+    "delta": " assistant-20 ",
+    "start_ms": 14000,
+    "end_ms": 14200
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-21",
+    "delta": " user-21 ",
+    "start_ms": 22600,
+    "end_ms": 22800
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-22",
+    "delta": " user-22 ",
+    "start_ms": 23600,
+    "end_ms": 23800
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-23",
+    "delta": " user-23 ",
+    "start_ms": 24200,
+    "end_ms": 24400
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-24",
+    "delta": " user-24 ",
+    "start_ms": 24600,
+    "end_ms": 24800
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-25",
+    "delta": " user-25 ",
+    "start_ms": 24800,
+    "end_ms": 25000
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-26",
+    "delta": " user-26 ",
+    "start_ms": 25200,
+    "end_ms": 25400
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-27",
+    "delta": " user-27 ",
+    "start_ms": 26200,
+    "end_ms": 26400
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-28",
+    "delta": " user-28 ",
+    "start_ms": 26600,
+    "end_ms": 26800
+  },
+  {
+    "role": "user",
+    "event_id": "fixture-29",
+    "delta": " user-29 ",
+    "start_ms": 27200,
+    "end_ms": 27400
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-30",
+    "delta": " assistant-30 ",
+    "start_ms": 27800,
+    "end_ms": 28000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-31",
+    "delta": " assistant-31 ",
+    "start_ms": 28000,
+    "end_ms": 28200
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-32",
+    "delta": " assistant-32 ",
+    "start_ms": 28400,
+    "end_ms": 28600
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-33",
+    "delta": " assistant-33 ",
+    "start_ms": 34600,
+    "end_ms": 34800
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-34",
+    "delta": " assistant-34 ",
+    "start_ms": 34800,
+    "end_ms": 35000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-35",
+    "delta": " assistant-35 ",
+    "start_ms": 35000,
+    "end_ms": 35200
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-36",
+    "delta": " assistant-36 ",
+    "start_ms": 35200,
+    "end_ms": 35400
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-37",
+    "delta": " assistant-37 ",
+    "start_ms": 35400,
+    "end_ms": 35600
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-38",
+    "delta": " assistant-38 ",
+    "start_ms": 35600,
+    "end_ms": 35800
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-39",
+    "delta": " assistant-39 ",
+    "start_ms": 35800,
+    "end_ms": 36000
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-40",
+    "delta": " assistant-40 ",
+    "start_ms": 36000,
+    "end_ms": 36200
+  },
+  {
+    "role": "assistant",
+    "event_id": "fixture-41",
+    "delta": " assistant-41 ",
+    "start_ms": 36400,
+    "end_ms": 36600
+  }
+]
