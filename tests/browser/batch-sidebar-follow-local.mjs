@@ -85,6 +85,18 @@ try{
  assert.ok(await bottom()>300,'opening an unread task retains the first-unread anchor');
  const anchorTop=await page.locator(`[data-message-id="${anchor}"]`).evaluate(e=>e.getBoundingClientRect().top);
  assert.ok(anchorTop>=0&&anchorTop<400);report.checks.push('opening unread task still anchors first unread result');
+ // A direct conversation URL must work when either the property or methods are blocked.
+ for (const width of [1440,390]) for (const mode of ['getter','methods']) {
+  const blocked=await browser.newContext({storageState:await context.storageState(),viewport:{width,height:844}});
+  await blocked.addInitScript(mode=>{
+   if(mode==='getter')Object.defineProperty(window,'localStorage',{get(){throw new DOMException('disabled','SecurityError')}});
+   else for(const key of ['getItem','setItem','removeItem'])Storage.prototype[key]=function(){throw new DOMException('disabled','SecurityError')};
+  },mode);
+  const probe=await blocked.newPage(),errors=[];probe.on('pageerror',e=>errors.push(e.name));
+  await probe.goto(origin+'/?conversation='+selected.id);await probe.locator('.composer textarea').waitFor();
+  assert.equal(new URL(probe.url()).searchParams.get('conversation'),selected.id);assert.deepEqual(errors,[]);await blocked.close();
+ }
+ report.checks.push('direct conversation links with storage getter/methods blocked at desktop/mobile');
  assert.deepEqual(report.errors,[]);report.ok=true;
 }catch(e){report.error=e.stack;report.page=await page?.locator('body').innerText().catch(()=>null);throw e;}
 finally{fs.writeFileSync(path.join(work,'result.json'),JSON.stringify(report,null,2));await browser?.close();await vite.close();app.beginShutdown();await new Promise(r=>api.close(r));app.db.close();fs.rmSync(fixture,{recursive:true,force:true});console.log(JSON.stringify({ok:report.ok||false,checks:report.checks,error:report.error?.split('\n')[0]}));}

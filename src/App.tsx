@@ -1,3 +1,4 @@
+import { browserStorage } from "./browser-storage";
 import { instance, BrandIcon } from "./instance";
 import {ConversationVoiceProvider,ConversationVoiceWorkspace,ConversationCallControl,useConversationCallActive} from './conversation-voice';
 import { DotEntry, DotProvider, DotLedgerMenuItem } from "./dot";
@@ -202,7 +203,7 @@ function normalizeSidebarWidth(value: number): number {
 
 function readStoredSidebarWidth(): number {
   try {
-    const stored = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    const stored = browserStorage.getItem(SIDEBAR_WIDTH_KEY);
     return stored === null ? SIDEBAR_WIDTH_DEFAULT : normalizeSidebarWidth(Number(stored));
   } catch {
     return SIDEBAR_WIDTH_DEFAULT;
@@ -247,7 +248,7 @@ export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readStoredThemePreference());
-  const [guestReaderThemePreference, setGuestReaderThemePreference] = useState<ThemePreference>(() => readStoredThemePreference(window.localStorage, GUEST_READER_THEME_PREFERENCE_KEY));
+  const [guestReaderThemePreference, setGuestReaderThemePreference] = useState<ThemePreference>(() => readStoredThemePreference(browserStorage, GUEST_READER_THEME_PREFERENCE_KEY));
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
   const publicPreviewFileId = publicFilePreviewIdFromPath(window.location.pathname);
   const previewFileId = publicPreviewFileId ? null : filePreviewIdFromPath(window.location.pathname);
@@ -268,7 +269,7 @@ export default function App() {
   useEffect(() => {
     applyThemePreference(effectiveThemePreference, systemPrefersDark);
     try {
-      window.localStorage.setItem(publicPreviewFileId ? GUEST_READER_THEME_PREFERENCE_KEY : THEME_PREFERENCE_KEY, effectiveThemePreference);
+      browserStorage.setItem(publicPreviewFileId ? GUEST_READER_THEME_PREFERENCE_KEY : THEME_PREFERENCE_KEY, effectiveThemePreference);
     } catch { /* Browser privacy settings may disable storage. */ }
   }, [effectiveThemePreference, publicPreviewFileId, systemPrefersDark]);
 
@@ -1007,8 +1008,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [featureSelectionOpen, setFeatureSelectionOpen] = useState(false);
   const closeFeatureSelection = useCallback(() => setFeatureSelectionOpen(false), []);
   const selectionStorageKeys = useMemo(() => accountSelectionStorageKeys(session.accountId!), [session.accountId]);
-  const savedProjectIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.project));
-  const savedConversationIdRef = useRef(readStoredSelection(window.localStorage, selectionStorageKeys.conversation));
+  const savedProjectIdRef = useRef(readStoredSelection(browserStorage, selectionStorageKeys.project));
+  const savedConversationIdRef = useRef(readStoredSelection(browserStorage, selectionStorageKeys.conversation));
   const [conversationRoute, setConversationRoute] = useState(() => ({ ...readConversationLocation(window.location.href), fromHistory: false }));
   const resolvingLinkRef = useRef(conversationRoute.explicit);
   const linkGenerationRef = useRef(0);
@@ -1059,7 +1060,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const kanbanLocationKey = `codex-web:${session.accountId}:kanban-location`;
   const [initialKanbanLocation] = useState(() => {
     try {
-      const saved = JSON.parse(window.localStorage.getItem(kanbanLocationKey) || "null");
+      const saved = JSON.parse(browserStorage.getItem(kanbanLocationKey) || "null");
       const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       return features.paraBoard && saved && typeof saved.board === "string" && uuid.test(saved.board)
         ? { board: saved.board as string, project: typeof saved.project === "string" && uuid.test(saved.project) ? saved.project as string : null } : null;
@@ -1070,8 +1071,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [paraVisible, setParaVisible] = useState(Boolean(initialKanbanLocation) && !conversationRoute.explicit);
   useEffect(() => {
     try {
-      if (features.paraBoard && paraVisible && paraBoardId) window.localStorage.setItem(kanbanLocationKey, JSON.stringify({ board: paraBoardId, project: paraProjectId }));
-      else window.localStorage.removeItem(kanbanLocationKey);
+      if (features.paraBoard && paraVisible && paraBoardId) browserStorage.setItem(kanbanLocationKey, JSON.stringify({ board: paraBoardId, project: paraProjectId }));
+      else browserStorage.removeItem(kanbanLocationKey);
     } catch { /* Private browsing may disallow local storage. */ }
   }, [kanbanLocationKey, features.paraBoard, paraVisible, paraBoardId, paraProjectId]);
   const [paraNavigation, setParaNavigation] = useState(0);
@@ -1262,10 +1263,10 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   draftUploadsRef.current = draftUploads;
   maintenancePhaseRef.current = maintenancePhase;
 
-  useEffect(() => clearLegacySelectionStorage(window.localStorage), []);
+  useEffect(() => clearLegacySelectionStorage(browserStorage), []);
 
   useEffect(() => {
-    try { window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth)); } catch { /* Browser privacy settings may disable storage. */ }
+    try { browserStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth)); } catch { /* Browser privacy settings may disable storage. */ }
   }, [sidebarWidth]);
 
   useEffect(() => () => document.documentElement.classList.remove("sidebar-resizing"), []);
@@ -1695,7 +1696,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       const active = chooseSelectedProject(savedProjectIdRef.current, result.projects, result.defaultProjectId);
       activeProjectIdRef.current = active;
       setActiveProjectId(active);
-      writeStoredSelection(window.localStorage, selectionStorageKeys.project, active);
+      writeStoredSelection(browserStorage, selectionStorageKeys.project, active);
       if (!active && !resolvingLinkRef.current) {
         conversationSelectionReadyRef.current = true;
         setConversationSelectionReady(true);
@@ -1760,7 +1761,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       retainedConversationNeedsNaturalPageRef.current = null;
       activeProjectIdRef.current = projectId;
       setActiveProjectId(projectId);
-      writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
+      writeStoredSelection(browserStorage, selectionStorageKeys.project, projectId);
       if (projectId && projects.some(project => project.id === projectId)) {
         collapsedProjectsRef.current = { ...collapsedProjectsRef.current, [projectId]: false };
         setCollapsedProjects(collapsedProjectsRef.current);
@@ -2002,8 +2003,8 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   useEffect(() => {
     if (!projectsLoaded) return;
     let disposed = false;
-    window.localStorage.removeItem("codex-web:model");
-    window.localStorage.removeItem("codex-web:reasoning");
+    browserStorage.removeItem("codex-web:model");
+    browserStorage.removeItem("codex-web:reasoning");
     void api.agentOptions(activeProjectId ? { projectId: activeProjectId } : {}).then((options) => {
       if (disposed) return;
       setAgentOptions(options);
@@ -2026,7 +2027,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     unreadScrollTargetRef.current = null;
     setLoadingOlderMessages(false);
     if (!selectedId) {
-      writeStoredSelection(window.localStorage, selectionStorageKeys.conversation, null);
+      writeStoredSelection(browserStorage, selectionStorageKeys.conversation, null);
       eventSourceRef.current?.close(); connectedJobRef.current = null;
       setDetail(null); setJob(null); setSending(false); setActivities([]); setActivitiesLoading(false);
       setEditingPending(null); setRemovedEditingFileIds([]); setAskAgentQuote("");
@@ -2038,7 +2039,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       }
       return;
     }
-    writeStoredSelection(window.localStorage, selectionStorageKeys.conversation, selectedId);
+    writeStoredSelection(browserStorage, selectionStorageKeys.conversation, selectedId);
     eventSourceRef.current?.close(); connectedJobRef.current = null; lastEventJobRef.current = null; lastEventIdRef.current = 0; setJob(null); setSending(false); setActivities([]); setActivitiesLoading(true);
     editingPendingRef.current = editingPending;
     const cached = draftCacheRef.current.get(selectedId);
@@ -2486,7 +2487,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setParaVisible(false); setOpportunityVisible(false);
     if (projectId === activeProjectIdRef.current) return;
     acceptManualConversationSelection();
-    writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
+    writeStoredSelection(browserStorage, selectionStorageKeys.project, projectId);
     activeProjectIdRef.current = projectId;
     queryRef.current = "";
     setQuery("");
@@ -2514,7 +2515,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         : null;
     }
     if (projectId !== activeProjectIdRef.current) {
-      writeStoredSelection(window.localStorage, selectionStorageKeys.project, projectId);
+      writeStoredSelection(browserStorage, selectionStorageKeys.project, projectId);
       activeProjectIdRef.current = projectId;
       setActiveProjectId(projectId);
     }
@@ -2657,7 +2658,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         const nextProjectId = nextProject?.id ?? null;
         activeProjectIdRef.current = nextProjectId;
         setActiveProjectId(nextProjectId);
-        writeStoredSelection(window.localStorage, selectionStorageKeys.project, nextProjectId);
+        writeStoredSelection(browserStorage, selectionStorageKeys.project, nextProjectId);
         const nextPage = nextProjectId ? pages[nextProjectId] : undefined;
         setConversations(nextPage?.conversations ?? []);
         setConversationTotal(nextPage?.total ?? 0);
@@ -2816,7 +2817,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       if (collapsedProjectsRef.current[targetProject.id]) toggleProject(targetProject.id);
       syncConversation(result.conversation);
       if (selectedIdRef.current === source.id) {
-        writeStoredSelection(window.localStorage, selectionStorageKeys.project, targetProject.id);
+        writeStoredSelection(browserStorage, selectionStorageKeys.project, targetProject.id);
         activeProjectIdRef.current = targetProject.id;
         setActiveProjectId(targetProject.id);
         setSelectedId(source.id);
@@ -3043,7 +3044,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         : project));
     }
 
-    writeStoredSelection(window.localStorage, selectionStorageKeys.conversation, null);
+    writeStoredSelection(browserStorage, selectionStorageKeys.conversation, null);
     selectedIdRef.current = null;
     setSelectedId(null);
     setDetail(null);
@@ -3188,7 +3189,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         refreshList(true, move.toProjectId),
       ]);
       if (selectedIdRef.current !== move.conversationId) return;
-      writeStoredSelection(window.localStorage, selectionStorageKeys.project, move.toProjectId);
+      writeStoredSelection(browserStorage, selectionStorageKeys.project, move.toProjectId);
       activeProjectIdRef.current = move.toProjectId;
       setActiveProjectId(move.toProjectId);
       void refreshDetail(move.conversationId);

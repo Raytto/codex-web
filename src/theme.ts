@@ -1,3 +1,4 @@
+import { browserStorage } from "./browser-storage";
 export const THEME_PREFERENCE_KEY = "codex-web:theme";
 export const GUEST_READER_THEME_PREFERENCE_KEY = "codex-web:guest-reader-theme";
 
@@ -24,7 +25,7 @@ export function themeCanvasColor(theme: ResolvedTheme): string {
   return THEME_CANVAS_COLORS[theme];
 }
 
-export function readStoredThemePreference(storage: Pick<Storage, "getItem"> = window.localStorage, key = THEME_PREFERENCE_KEY): ThemePreference {
+export function readStoredThemePreference(storage: Pick<Storage, "getItem"> = browserStorage, key = THEME_PREFERENCE_KEY): ThemePreference {
   try {
     return normalizeThemePreference(storage.getItem(key));
   } catch {
