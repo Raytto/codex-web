@@ -1214,7 +1214,7 @@ test("desktop sidebar width is resizable and its scrollbars use a trackless subt
   assert.match(appSource, /const SIDEBAR_WIDTH_KEY = "cww:sidebar-width"/);
   assert.match(appSource, /className="shell" style=\{\{ "--sidebar-width": `\$\{sidebarWidth\}px` \} as CSSProperties\}/);
   assert.match(appSource, /className="sidebar-resizer"[\s\S]*aria-label="调整侧边栏宽度"[\s\S]*onPointerDown=\{beginSidebarResize\}[\s\S]*onPointerMove=\{moveSidebarResize\}/);
-  assert.match(appSource, /window\.localStorage\.setItem\(SIDEBAR_WIDTH_KEY, String\(sidebarWidth\)\)/);
+  assert.match(appSource, /browserStorage\.setItem\(SIDEBAR_WIDTH_KEY, String\(sidebarWidth\)\)/);
   assert.match(appSource, /className="sidebar-scroll-region"><div className="project-list"/);
   assert.match(appSource, /className="sidebar-scroll-region"><div className="conversation-list"/);
   assert.match(styles, /\.sidebar \{[^}]*width: var\(--sidebar-width, 280px\);[^}]*flex: 0 0 var\(--sidebar-width, 280px\);/);
