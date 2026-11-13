@@ -60,7 +60,7 @@ async function main(){
    const next=path.join(directory,'next.json');fs.rmSync(next,{force:true});
    execFileSync('python3',[path.join(here,'storage-recovery-catalog.py'),'--database',process.env.STORAGE_DATABASE_PATH,'--output',next],{stdio:['ignore','ignore','pipe'],timeout:60000});
    const body=fs.readFileSync(next),sha=hash(body);
-   if(state.catalogSha256===sha){fs.unlinkSync(next);process.stdout.write(JSON.stringify({changed:false,cloudCatalogWrites:0})+'\n');return;}
+   if(state.catalogSha256===sha&&state.descriptorProof){fs.unlinkSync(next);process.stdout.write(JSON.stringify({changed:false,cloudCatalogWrites:0})+'\n');return;}
    const value=JSON.parse(body),priorFile=path.join(directory,'current.json');let payload=body,delta=false;
    if(state.catalogSha256&&fs.existsSync(priorFile)){
     const priorBody=fs.readFileSync(priorFile);if(hash(priorBody)!==state.catalogSha256)throw Error('recovery_catalog_local_chain_mismatch');
@@ -92,6 +92,8 @@ async function main(){
    fs.renameSync(nextFile,currentFile);
   }else if(!fs.existsSync(currentFile)||hash(fs.readFileSync(currentFile))!==pending.resultSha256)throw Error('recovery_pending_snapshot_missing');
   state.catalogSha256=pending.resultSha256;state.latestDescriptor=descriptorRemote;state.lastPublishedAt=new Date().toISOString();
+  state.descriptorProof={remote:descriptorRemote,bytes:descriptorBytes.length,sha256:hash(descriptorBytes),fileId:host.reader.fileId(descriptorRemote),catalogSha256:pending.resultSha256};
+  if(!state.descriptorProof.fileId)throw Error('recovery_descriptor_identity_missing');
   state.lastCipherBytes=pending.bytes;state.lastDelta=pending.delta;write(stateFile,JSON.stringify(state,null,2)+'\n');
   fs.unlinkSync(pendingFile);fs.unlinkSync(pending.cipher);fs.unlinkSync(descriptor);
   process.stdout.write(JSON.stringify({published:true,delta:pending.delta,ciphertextBytes:pending.bytes,remote:descriptorRemote,completeSiteBackup:false})+'\n');

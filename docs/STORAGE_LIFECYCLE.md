@@ -95,3 +95,11 @@ For a portable single-file recovery without the app, see [the cloud recovery not
 Stop the observer and archive/backup timers first. Setting `STORAGE_LIFECYCLE_ENABLED=0` stops new maintenance, but cold originals still require a working recovery path. Restore required objects before disabling the application's recovery integration. Keep verified remote objects, keys, descriptors and prior recovery points until their retention requirements and a real restore drill permit deletion. Do not run global Docker/cache pruning or delete another installation's archives.
 
 Legacy conversation v1/v2 remains readable; v3 includes descendant/native lineage and file ownership. The new lifecycle engine is a distinct opt-in migration. It does not automatically upload a different engine's unmanaged account directory or assert complete third-party history coverage. When the old source is missing, retain an explicit unavailable boundary instead of inventing recovered contents.
+
+## Object-only archival and local reclamation
+
+Whole-site backup and object recovery are separate verification scopes. The catalogue publisher can publish verified object metadata without claiming a whole-site restore drill. Its successful descriptor readback records `descriptorProof` with the catalogue hash, descriptor identity and byte/hash evidence. If an older state has the same catalogue hash but lacks this proof, republish and verify the descriptor before treating that state as usable recovery evidence.
+
+For an explicitly reviewed normal-mode service, set `STORAGE_MAINTENANCE_MODE=normal` in its own private host environment only after an independent object restore and key-recovery check. Retain the configured isolation grace plus version, reference, lease and active-process protections. This does not authorize deleting the cloud recovery chain, turning on whole-site backup/compaction or installing another instance's production timers. The public distribution keeps host scheduling opt-in; no private deployment installer or identity manifest is included.
+
+仅启用对象归档与本地回收时，仍须先验证独立对象恢复、密钥保管、目录发布回读和descriptorProof。后台保持既定隔离期及所有保护；不因此开启整站大备份、数据库压缩或删除云端索引。
